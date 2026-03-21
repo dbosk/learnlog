@@ -18,8 +18,9 @@ arguments with minimal boilerplate, and the modern
 <<[[cli.py]]>>=
 """Command-line interface for learnlog.
 
-Provides the ``learnlog`` command with subcommands for exporting
-and playing back the development log stored in ``.learnlog/``.
+Provides the ``learnlog`` command with subcommands for running
+Git commands against the log, exporting it as a bundle, and
+playing back the development log stored in ``.learnlog/``.
 """
 
 <<imports>>
@@ -1103,7 +1104,12 @@ after the first positional argument is passed through verbatim.
 def git_command(
     ctx: typer.Context,
 ):
-    """Run a git command on the learnlog repository."""
+    """Run a git command on the learnlog repository.
+
+    All arguments are forwarded to git, configured to
+    operate on the .learnlog/ directory.  For example,
+    ``learnlog git log`` lists the recorded commits.
+    """
     workdir = find_learnlog_dir()
     if workdir is None:
         raise SystemExit(
