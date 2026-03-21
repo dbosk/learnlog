@@ -319,10 +319,67 @@ def test_get_commits_has_required_keys(workdir):
 
 \subsection{Commit details}
 
-For a single commit, we fetch the full message and the diff.
-The diff shows what changed compared to the parent commit.
-For the initial commit, we use [[--root]] to show all files as
-additions.
+For a single commit we use [[git show]], which produces the
+commit header, the full message (containing the captured I/O),
+and the unified diff (showing the code that changed)---all in a
+single subprocess call.
+
+A teacher reviewing student work typically wants to see
+\emph{what changed} before reading the run metadata (script
+name, arguments, captured I/O).
+The default [[git show]] order is header, message, diff; we
+rearrange to header, diff, message so that code changes appear
+first.
+
+<<helper functions>>=
+def reorder_commit_detail(detail):
+    """Reorder ``git show`` output: header, diff, message.
+
+    Moves the unified diff before the commit message so that
+    code changes are visible first in the viewer.
+    """
+    lines = detail.split("\n")
+
+    <<find header boundary>>
+    <<find diff boundary>>
+
+    header = lines[:header_end + 1]
+    message = lines[header_end + 1:diff_start]
+    diff = lines[diff_start:]
+
+    return "\n".join(header + diff + [""] + message)
+@
+
+The [[git show]] output always starts with metadata lines
+(commit hash, author, date) followed by a blank line, then the
+indented commit message, then the diff.
+We locate the first blank line to separate the header from the
+message.
+
+<<find header boundary>>=
+header_end = 0
+for i, line in enumerate(lines):
+    if line == "":
+        header_end = i
+        break
+@
+
+The diff section starts at the first line matching
+[[diff --git]].
+When no diff is present---for example, the initial commit that
+only records a run without any file changes---we return the
+output unchanged.
+
+<<find diff boundary>>=
+diff_start = None
+for i, line in enumerate(lines):
+    if line.startswith("diff --git "):
+        diff_start = i
+        break
+
+if diff_start is None:
+    return detail
+@
 
 We load details lazily---only when the user navigates to a
 particular commit---to keep the viewer responsive even for
@@ -330,31 +387,14 @@ repositories with hundreds of commits.
 
 <<commit data functions>>=
 def get_commit_detail(repo, commit_hash):
-    """Return detailed information for a single commit.
+    """Return ``git show`` output for a single commit,
+    reordered so the diff appears before the message.
 
-    Returns a dict with ``message`` (full commit message) and
-    ``diff`` (unified diff against parent).
+    The result places code changes first, followed by the
+    commit message with run metadata and captured I/O.
     """
-    msg_result = repo.git(
-        "log", "-1", "--format=%B", commit_hash
-    )
-    message = msg_result.stdout.rstrip("\n")
-
-    parent_result = repo.git(
-        "rev-parse", commit_hash + "^"
-    )
-    if parent_result.returncode == 0:
-        diff_result = repo.git(
-            "diff", parent_result.stdout.strip(),
-            commit_hash
-        )
-    else:
-        diff_result = repo.git(
-            "diff", "--root", commit_hash
-        )
-    diff = diff_result.stdout
-
-    return {"message": message, "diff": diff}
+    result = repo.git("show", commit_hash)
+    return reorder_commit_detail(result.stdout)
 @
 
 <<test functions>>=
@@ -363,8 +403,7 @@ def test_get_commit_detail_initial(workdir):
     repo = LearnlogRepo(workdir)
     commits = get_commits(repo)
     detail = get_commit_detail(repo, commits[0]["hash"])
-    assert "message" in detail
-    assert "diff" in detail
+    assert "learnlog" in detail
 
 def test_get_commit_detail_with_diff(workdir):
     from learnlog.cli import get_commits, get_commit_detail
@@ -376,7 +415,28 @@ def test_get_commit_detail_with_diff(workdir):
     repo.begin_run("hello.py", [], t2)
     commits = get_commits(repo)
     detail = get_commit_detail(repo, commits[-1]["hash"])
-    assert "hello.py" in detail["diff"]
+    assert "hello.py" in detail
+
+def test_get_commit_detail_diff_before_message(workdir):
+    """Verify that the diff appears before the message."""
+    from learnlog.cli import get_commits, get_commit_detail
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[-1]["hash"])
+    diff_pos = detail.index("diff --git")
+    msg_lines = [
+        l for l in detail.split("\n")
+        if l.startswith("    ")
+    ]
+    assert msg_lines, "expected indented message lines"
+    first_msg_pos = detail.index(msg_lines[0])
+    assert diff_pos < first_msg_pos, \
+        "diff should appear before the commit message"
 @
 
 
@@ -485,10 +545,18 @@ def run(self):
 Each iteration draws the screen and waits for a keypress.
 We redraw on every key because the state may have changed.
 
+We call [[curses.use_default_colors]] so that the viewer inherits
+the terminal's native background and foreground colours instead
+of forcing white-on-black.
+This respects light themes, transparency, and custom colour
+schemes---details that matter when learnlog runs on diverse
+student and teacher machines.
+
 <<player methods>>=
 def _main_loop(self, stdscr):
     """Main event loop inside curses."""
     import curses
+    curses.use_default_colors()
     curses.curs_set(0)
     stdscr.clear()
 
@@ -513,16 +581,16 @@ handling arbitrarily long diffs.
 
 <<player methods>>=
 def _get_detail(self, commit_hash):
-    """Fetch and cache commit detail."""
+    """Fetch and cache the ``git show`` output."""
     if commit_hash not in self._detail_cache:
         self._detail_cache[commit_hash] = \
             get_commit_detail(self.repo, commit_hash)
     return self._detail_cache[commit_hash]
 @
 
-We cache commit details because [[get_commit_detail]] shells out to
-Git twice (once for the message, once for the diff).
-Without caching, every scroll keystroke would re-run those commands,
+We cache the [[git show]] output because fetching it shells out to
+Git.
+Without caching, every scroll keystroke would re-run the command,
 making the viewer sluggish on large repositories.
 
 <<player methods>>=
@@ -565,15 +633,13 @@ except curses.error:
     pass
 @
 
-The content combines the commit message and the diff,
-separated by a blank line.
+The content is the reordered [[git show]] output, which places
+the diff before the commit message so that code changes appear
+first.
 We split into lines for scrollable display.
 
 <<build content lines>>=
-content_text = detail["message"]
-if detail["diff"]:
-    content_text += "\n\n" + detail["diff"]
-content_lines = content_text.split("\n")
+content_lines = detail.split("\n")
 @
 
 We display lines starting from the scroll offset, filling
@@ -712,6 +778,43 @@ def test_handle_key_jump_endpoints():
 @
 
 
+\subsection{Batch playback}
+\label{sec:play-batch}
+
+The curses viewer requires a terminal, but sometimes we want to
+pipe the output through [[less]] or redirect it to a file.
+In batch mode the viewer simply prints all commits sequentially
+to standard output.
+This creates a natural reading flow: the captured output from
+one commit appears just before the diff of the next, so the
+reader sees what the program produced and what the student
+changed as a result in a single continuous stream.
+
+<<play viewer>>=
+def play_batch(repo, commits, start_index=0):
+    """Print commit details sequentially to stdout."""
+    for commit in commits[start_index:]:
+        detail = get_commit_detail(repo, commit["hash"])
+        sys.stdout.write(detail)
+        sys.stdout.write("\n")
+@
+
+Let's verify that batch playback produces the expected output
+for each commit:
+
+<<test functions>>=
+def test_play_batch_outputs_all_commits(workdir, capsys):
+    """Batch mode prints every commit's detail to stdout."""
+    from learnlog.cli import play_batch, get_commits
+    repo = LearnlogRepo(workdir)
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    captured = capsys.readouterr().out
+    for c in commits:
+        assert c["hash"][:7] in captured
+@
+
+
 \section{Typer application}
 
 We define the Typer app at module level with two commands.
@@ -799,6 +902,15 @@ directories and bundle files.
 When a bundle is used, [[resolve_source]] creates a temporary
 directory that we must clean up---hence the [[finally]] block.
 
+The [[-b]] / [[--batch]] flag selects batch mode
+(\cref{sec:play-batch}), which prints all commits to standard
+output instead of launching the curses viewer.
+When the flag is not given explicitly, we auto-detect: if
+standard output is not a terminal (for example when piped to
+[[less]]), batch mode activates automatically.
+This means [[learnlog play | less]] just works without the user
+having to remember the flag.
+
 <<typer commands>>=
 @app.command()
 def play(
@@ -815,8 +927,19 @@ def play(
     start: Annotated[
         Optional[str],
         typer.Option(
-            "--start",
+            "--start", "-s",
             help="Commit hash to start playback from.",
+        ),
+    ] = None,
+    batch: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--batch", "-b",
+            help=(
+                "Print all commits to stdout instead of "
+                "the interactive viewer.  Auto-enabled "
+                "when stdout is not a terminal."
+            ),
         ),
     ] = None,
 ):
@@ -833,15 +956,50 @@ def play(
         if start:
             <<find starting commit index>>
 
-        viewer = PlaybackViewer(repo, commits, start_index)
-        viewer.run()
+        <<choose playback mode>>
     finally:
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
-When the user specifies a [[--start]] commit, we find the
-matching index by prefix.
+When [[batch]] is [[None]] (the user did not pass [[-b]]),
+we fall back to TTY detection via [[sys.stdout.isatty()]].
+An explicit [[--batch]] or [[--no-batch]] always wins.
+
+<<choose playback mode>>=
+use_batch = (
+    batch if batch is not None
+    else not sys.stdout.isatty()
+)
+if use_batch:
+    play_batch(repo, commits, start_index)
+else:
+    viewer = PlaybackViewer(repo, commits, start_index)
+    viewer.run()
+@
+
+Typer's [[CliRunner]] does not connect a real terminal, so
+invoking [[play]] through it exercises the batch path
+automatically.
+We verify that the command succeeds and that every commit
+appears in the output:
+
+<<test functions>>=
+def test_play_batch_via_cli(workdir):
+    """The play command uses batch mode when not a TTY."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "diff --git" in result.output
+@
+
+When the user specifies a [[--start]] / [[-s]] commit, we find
+the matching index by prefix.
 Short hashes work because we match the beginning of the
 full hash, just like Git does.
 

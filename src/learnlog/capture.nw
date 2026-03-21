@@ -23,9 +23,11 @@ buffer while passing data through to the original streams unchanged.
 """
 
 import io
+import re
 import threading
 
 <<constants>>
+<<helper functions>>
 <<classes>>
 @
 
@@ -59,6 +61,66 @@ normally.
 MAX_IOLOG_BYTES = 1_000_000
 @
 
+\subsection{ANSI escape code stripping}
+\label{ansi-stripping}
+
+Starting with Python~3.13, the interpreter emits coloured tracebacks
+using ANSI escape codes (CSI sequences such as \verb|\x1b[31m| for red
+text).
+These sequences are meaningful to a terminal emulator but are
+unreadable noise when stored as plain text in a Git commit message.
+We therefore strip all CSI sequences from captured text before
+buffering it, while still passing the raw (coloured) text through to
+the student's terminal unchanged.
+
+The regex matches the standard CSI pattern: an escape character
+(\verb|\x1b|), a left bracket, optional numeric parameters separated
+by semicolons, and a single letter command.
+This covers colours, bold/underline, cursor movement, and line
+clearing---everything Python's traceback colouring produces.
+We precompile the pattern into a module-level constant because
+[[strip_ansi]] is called on every single write.
+
+<<helper functions>>=
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+def strip_ansi(text):
+    """Remove ANSI escape sequences from ``text``."""
+    return _ANSI_ESCAPE_RE.sub('', text)
+@
+
+We need to verify two directions: that escape codes are actually
+stripped (otherwise Python~3.13 tracebacks remain unreadable), and
+that plain text passes through unmodified (otherwise we would corrupt
+output that happens to contain bracket characters):
+
+<<test functions>>=
+def test_strip_ansi_removes_color_codes():
+    colored = "\x1b[31mError\x1b[0m: something failed"
+    assert strip_ansi(colored) == "Error: something failed"
+
+def test_strip_ansi_preserves_plain_text():
+    plain = "hello world\n"
+    assert strip_ansi(plain) == plain
+
+def test_strip_ansi_handles_multiple_codes():
+    text = "\x1b[1m\x1b[31mBold Red\x1b[0m Normal"
+    assert strip_ansi(text) == "Bold Red Normal"
+
+def test_strip_ansi_empty_string():
+    assert strip_ansi("") == ""
+
+def test_iolog_strips_ansi_from_logged_text():
+    log = IOLog()
+    log.log("stderr", "\x1b[31mTraceback\x1b[0m\n")
+    value = log.getvalue()
+    assert "\x1b[" not in value
+    assert "stderr: Traceback\n" in value
+@
+
+
+\subsection{The [[IOLog]] class}
+
 <<classes>>=
 class IOLog:
     """Thread-safe shared buffer for interleaved I/O logging.
@@ -82,6 +144,12 @@ class IOLog:
 \subsection{Logging a line}
 
 The [[log]] method is the core of [[IOLog]].
+Before splitting the text into lines, we strip any ANSI escape
+sequences (see \cref{ansi-stripping}).
+This ensures the buffered log is clean plain text, while the student's
+terminal still shows colours since [[StreamCapture.write]] passes
+the original (unstripped) text to the real stream.
+
 We split each write into individual lines so that the prefix appears on
 every line, making the log easy to scan.
 The alternative---prefixing only the first line of a multi-line
@@ -93,10 +161,12 @@ def log(self, prefix, text):
     """Log ``text`` with ``prefix`` (e.g. ``'stdout'``).
 
     Each line of ``text`` gets its own prefixed entry.
+    ANSI escape sequences are stripped before buffering.
     If the buffer is full, further writes are silently dropped.
     """
     if not text:
         return
+    text = strip_ansi(text)
     with self.lock:
         if self.truncated:
             return
