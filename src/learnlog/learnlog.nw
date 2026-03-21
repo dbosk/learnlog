@@ -93,8 +93,8 @@ It detects the main script, creates (or opens) the learnlog repository,
 records the run header, and installs the I/O wrappers.
 
 Why detect the main script via [[sys.argv[0]]] rather than
-[[\_\_file\_\_]]?
-Because [[\_\_file\_\_]] gives us the file that contains the import
+[[__file__]]?
+Because [[__file__]] gives us the file that contains the import
 statement, which might be a library module.
 We want the script the student actually invoked from the command line.
 
@@ -135,7 +135,7 @@ workdir = os.getcwd()
 
 We choose the current working directory as the root rather than the
 directory containing the script.
-Students typically run \texttt{python hello.py} from the project
+Students typically run [[python hello.py]] from the project
 directory, so [[os.getcwd()]] is the natural root for the repository.
 
 <<create repository and begin run>>=
@@ -214,7 +214,7 @@ before the program terminates.
 The hook records the exception details and then calls the original hook
 so that the traceback is still printed normally.
 
-Why not just inspect [[sys.exc\_info()]] in the exit handler?
+Why not just inspect [[sys.exc_info()]] in the exit handler?
 Because by the time [[atexit]] handlers run, the exception has already
 been cleared.
 The [[excepthook]] fires while the exception is still active, giving us

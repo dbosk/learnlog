@@ -374,7 +374,7 @@ def test_input_capture_readline():
 
 \subsection{Bulk reading}
 
-For programs that read stdin as a whole (\eg~\texttt{sys.stdin.read()}):
+For programs that read stdin as a whole (\eg~[[sys.stdin.read()]]):
 
 <<input capture methods>>=
 def read(self, size=-1):
@@ -413,7 +413,7 @@ def test_input_capture_readlines():
 
 \subsection{Iteration and delegation}
 
-Programs that iterate over stdin (\eg~\texttt{for line in sys.stdin})
+Programs that iterate over stdin (\eg~[[for line in sys.stdin]])
 need the iterator protocol:
 
 <<input capture methods>>=

@@ -2,12 +2,12 @@
 \label{gitrepo}
 
 We store the development log in a hidden Git repository
-(\texttt{.learnlog/}) inside the student's working directory.
-We use Git's \texttt{--git-dir} and \texttt{--work-tree} flags so that
+([[.learnlog/]]) inside the student's working directory.
+We use Git's [[--git-dir]] and [[--work-tree]] flags so that
 the student's files \emph{are} the working tree---no copying needed.
-The \texttt{.learnlog/} directory contains only Git internals.
+The [[.learnlog/]] directory contains only Git internals.
 
-We use \texttt{subprocess} rather than GitPython to keep the package
+We use [[subprocess]] rather than GitPython to keep the package
 dependency-free: Git is already installed on every lab machine, and our
 operations are simple (init, add, commit, amend).
 
@@ -165,7 +165,7 @@ def init_repo(self):
 We check whether Git can resolve a user name; if not, we provide a
 generic fallback.
 This handles lab machines where students have never run
-\texttt{git config}.
+[[git config]].
 We also disable GPG signing---these machine-generated commits do not
 need cryptographic signatures, and students may not have a GPG key
 configured:
@@ -178,11 +178,11 @@ if name_check.returncode != 0:
 self.git("config", "commit.gpgsign", "false")
 @
 
-The exclude file (\texttt{.learnlog/info/exclude}) keeps infrastructure
+The exclude file ([[.learnlog/info/exclude]]) keeps infrastructure
 files out of the log.
-We exclude \texttt{.learnlog} itself (to prevent recursion),
-\texttt{\_\_pycache\_\_}, virtual environments, and compiled bytecode.
-If the student has a \texttt{.learnlogignore} file, we append its
+We exclude [[.learnlog]] itself (to prevent recursion),
+[[__pycache__]], virtual environments, and compiled bytecode.
+If the student has a [[.learnlogignore]] file, we append its
 patterns too---this is the only configuration hook, and it is empty by
 default.
 
@@ -374,7 +374,7 @@ def test_begin_run_new_commit_after_edit(workdir):
 
 The run header is a plain-text block with key--value fields.
 We keep it simple---no YAML, no JSON---so it is easy to read in
-\texttt{git log} output.
+[[git log]] output.
 
 <<functions>>=
 def format_run_header(script, args, start_time):
@@ -421,7 +421,7 @@ This completes the run block that [[begin_run]] started.
 If the program was killed by SIGKILL, the [[atexit]] handler never
 fires and [[finalize_run]] is never called.
 The commit still exists with the run header from [[begin_run]], so we
-know a run was attempted---the missing \texttt{End-Time} field signals
+know a run was attempted---the missing [[End-Time]] field signals
 an abnormal termination.
 
 <<repo methods>>=
