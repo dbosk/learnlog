@@ -1,0 +1,48 @@
+[project]
+name = "learnlog"
+version = "0.1"
+description = "Automatic logging of student code development and test runs"
+license = "MIT"
+readme = "README.md"
+authors = [
+  {name = "Daniel Bosk", email = "daniel@bosk.se"}
+]
+maintainers = [
+  {name = "Daniel Bosk", email = "dbosk@kth.se"}
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Education",
+  "Topic :: Education"
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+repository = "https://github.com/dbosk/learnlog"
+"Bug Tracker" = "https://github.com/dbosk/learnlog/issues"
+
+[tool.poetry]
+packages = [{include = "learnlog", from = "src"}]
+include = [
+  {path = "src/**/*.py", format = "wheel"},
+]
+exclude = [
+  "src/learnlog/.gitignore",
+  "src/learnlog/Makefile",
+  "src/learnlog/*.nw",
+  "src/learnlog/*.tex",
+  "src/learnlog/CLAUDE.md",
+  "src/learnlog/ltxobj",
+]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=7.4)"
+]

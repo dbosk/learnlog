@@ -1,0 +1,49 @@
+\documentclass[a4paper,oneside]{memoir}
+\maxtocdepth{subsection}
+\setsecnumdepth{subsection}
+\nouppercaseheads
+
+\usepackage[hyphens]{url}
+\usepackage{authblk}
+
+\input{preamble.tex}
+
+\title{%
+  learnlog: Automatic Logging of Student Code Development
+}
+\author{%
+  Daniel Bosk
+}
+\affil{%
+  KTH Royal Institute of Technology\\
+  \email{dbosk@kth.se}
+}
+
+\begin{document}
+\frontmatter
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+  \input{abstract.tex}
+\end{abstract}
+
+\vspace*{\fill}
+\VerbatimInput{../LICENSE}
+\clearpage
+
+\tableofcontents
+\clearpage
+
+\mainmatter
+
+\input{../src/learnlog/learnlog.tex}
+\input{../src/learnlog/capture.tex}
+\input{../src/learnlog/gitrepo.tex}
+
+
+\backmatter
+\printbibliography
+
+
+\end{document}

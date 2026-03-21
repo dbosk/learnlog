@@ -1,0 +1,432 @@
+\chapter{Overview}
+\label{learnlog}
+
+The \texttt{learnlog} package provides automatic logging of student code
+development.
+Students add \mintinline{python}{import learnlog} as the first line of
+their Python files.
+When the program runs, the import triggers a chain of actions: it
+detects which script is running, stages any source code changes into a
+hidden Git repository, wraps the standard streams to capture all I/O,
+and registers cleanup handlers that finalise the log entry when the
+program exits.
+
+The design is guided by two constraints:
+\begin{description}
+\item[Transparency] The student's program must behave identically
+  whether or not learnlog is imported.
+  We must never crash, hang, or alter the program's output.
+\item[Crash resilience] Even if the program is killed mid-execution, we
+  want to record as much as possible.
+  We achieve this by committing the run header \emph{before} the
+  program executes and amending it with results afterwards.
+\end{description}
+
+
+\section{Code overview}
+
+<<[[__init__.py]]>>=
+"""Automatic logging of student code development.
+
+Import this module to record every program run: source code changes,
+command-line arguments, stdin/stdout/stderr, and errors.  Data is
+stored in a hidden ``.learnlog/`` Git repository.
+"""
+
+import sys
+import os
+import datetime
+import atexit
+import traceback
+
+from learnlog.capture import IOLog, StreamCapture, InputCapture
+from learnlog.gitrepo import LearnlogRepo
+
+<<module state>>
+<<functions>>
+
+<<auto-initialize on import>>
+@
+
+We also have integration tests that run actual scripts in subprocesses,
+verifying the full pipeline from import to commit:
+
+<<test [[learnlog.py]]>>=
+"""Integration tests for the learnlog package."""
+import tempfile
+import subprocess
+import os
+import sys
+import pytest
+
+<<test helpers>>
+<<test functions>>
+@
+
+
+\section{Module state}
+
+We need a handful of global variables to coordinate between
+initialisation (at import time) and cleanup (at exit time).
+The [[repo]] variable also serves as an initialisation guard: if it is
+not [[None]], we have already initialised and should not do so again.
+This handles the case where multiple files in the same program all
+\mintinline{python}{import learnlog}.
+
+<<module state>>=
+repo = None
+iolog = None
+original_stdout = None
+original_stderr = None
+original_stdin = None
+exception_info = None
+start_time = None
+main_script = None
+main_args = None
+@
+
+
+\section{Initialisation}
+
+The [[initialize]] function is called at import time.
+It detects the main script, creates (or opens) the learnlog repository,
+records the run header, and installs the I/O wrappers.
+
+Why detect the main script via [[sys.argv[0]]] rather than
+[[\_\_file\_\_]]?
+Because [[\_\_file\_\_]] gives us the file that contains the import
+statement, which might be a library module.
+We want the script the student actually invoked from the command line.
+
+The entire function is wrapped in a \texttt{try/except} that catches
+\emph{everything}.
+If learnlog fails for any reason---no Git installed, permission denied,
+disk full---the student's program must still work.
+
+<<functions>>=
+def initialize():
+    """Set up learnlog: detect script, init repo, wrap streams.
+
+    Called automatically on import.  Safe to call multiple times;
+    subsequent calls are no-ops.
+    """
+    global repo, iolog, start_time, main_script, main_args
+    global original_stdout, original_stderr, original_stdin
+
+    if repo is not None:
+        return
+
+    try:
+        <<detect main script>>
+        <<create repository and begin run>>
+        <<install I/O wrappers>>
+        <<install exception hook>>
+        atexit.register(on_exit)
+    except Exception:
+        pass
+@
+
+<<detect main script>>=
+main_script = os.path.basename(sys.argv[0])
+main_args = sys.argv[1:]
+start_time = datetime.datetime.now()
+workdir = os.getcwd()
+@
+
+We choose the current working directory as the root rather than the
+directory containing the script.
+Students typically run \texttt{python hello.py} from the project
+directory, so [[os.getcwd()]] is the natural root for the repository.
+
+<<create repository and begin run>>=
+repo = LearnlogRepo(workdir)
+repo.begin_run(main_script, main_args, start_time)
+@
+
+<<install I/O wrappers>>=
+iolog = IOLog()
+original_stdout = sys.stdout
+original_stderr = sys.stderr
+original_stdin = sys.stdin
+sys.stdout = StreamCapture(original_stdout, "stdout", iolog)
+sys.stderr = StreamCapture(original_stderr, "stderr", iolog)
+sys.stdin = InputCapture(original_stdin, iolog)
+@
+
+Let's verify that initialisation creates the repository and wraps
+streams.
+We run a script in a subprocess to avoid polluting the test process.
+The [[test_env]] fixture provides a Git identity so tests work even
+in CI environments without a global Git config:
+
+<<test helpers>>=
+@pytest.fixture
+def test_env():
+    """Environment with a test Git identity for isolation."""
+    env = os.environ.copy()
+    env["GIT_AUTHOR_NAME"] = "Test"
+    env["GIT_AUTHOR_EMAIL"] = "test@test"
+    env["GIT_COMMITTER_NAME"] = "Test"
+    env["GIT_COMMITTER_EMAIL"] = "test@test"
+    return env
+
+@pytest.fixture
+def workdir(tmp_path):
+    """Create a temporary working directory."""
+    return tmp_path
+@
+
+<<test functions>>=
+class TestInitialize:
+    def test_creates_learnlog_repo(self, workdir, test_env):
+        script = workdir / "test_init.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('hello')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert (workdir / ".learnlog").is_dir()
+
+    def test_stdout_still_works(self, workdir, test_env):
+        script = workdir / "test_stdout.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('visible')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert "visible" in result.stdout
+@
+
+
+\section{Exception handling}
+
+We install a custom [[sys.excepthook]] to capture unhandled exceptions
+before the program terminates.
+The hook records the exception details and then calls the original hook
+so that the traceback is still printed normally.
+
+Why not just inspect [[sys.exc\_info()]] in the exit handler?
+Because by the time [[atexit]] handlers run, the exception has already
+been cleared.
+The [[excepthook]] fires while the exception is still active, giving us
+access to the full traceback.
+
+<<install exception hook>>=
+original_excepthook = sys.excepthook
+
+def exception_hook(exc_type, exc_value, exc_tb):
+    global exception_info
+    exception_info = "".join(
+        traceback.format_exception(
+            exc_type, exc_value, exc_tb
+        )
+    )
+    original_excepthook(exc_type, exc_value, exc_tb)
+
+sys.excepthook = exception_hook
+@
+
+Let's verify that exceptions are captured and the traceback is still
+printed:
+
+<<test functions>>=
+class TestExceptionCapture:
+    def test_exception_recorded_in_commit(self, workdir, test_env):
+        script = workdir / "test_exc.py"
+        script.write_text(
+            "import learnlog\n"
+            "raise ValueError('test error')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode != 0
+        assert "ValueError" in result.stderr
+
+        # Check the commit message
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        assert "ValueError: test error" in git_result.stdout
+@
+
+
+\section{Exit handler}
+
+The [[on_exit]] function runs when the program terminates (via
+[[atexit]]).
+It restores the original streams---we must do this before running Git
+commands, otherwise our own output would be captured recursively---and
+then finalises the run in the repository.
+
+We wrap everything in a \texttt{try/except} for the same reason as
+[[initialize]]: learnlog must never cause an error at exit.
+
+<<functions>>=
+def on_exit():
+    """Finalise the learnlog entry on program exit.
+
+    Restores original streams and commits the I/O log, exception
+    information, and exit status.
+    """
+    global repo, iolog, exception_info
+    global original_stdout, original_stderr, original_stdin
+
+    if repo is None:
+        return
+
+    try:
+        <<restore original streams>>
+        <<finalise the run>>
+    except Exception:
+        pass
+@
+
+<<restore original streams>>=
+if original_stdout is not None:
+    sys.stdout = original_stdout
+if original_stderr is not None:
+    sys.stderr = original_stderr
+if original_stdin is not None:
+    sys.stdin = original_stdin
+@
+
+<<finalise the run>>=
+end_time = datetime.datetime.now()
+io_text = iolog.getvalue() if iolog else ""
+repo.finalize_run(
+    io_log=io_text,
+    exception_info=exception_info,
+    end_time=end_time,
+    exit_code=0 if exception_info is None else 1,
+)
+@
+
+Let's verify the full lifecycle: import, run, exit, and check the
+commit:
+
+<<test functions>>=
+class TestOnExit:
+    def test_commit_has_io_log(self, workdir, test_env):
+        script = workdir / "test_io.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('logged output')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert "stdout: logged output" in msg
+        assert "End-Time:" in msg
+        assert "Exit-Code: 0" in msg
+
+    def test_commit_has_run_metadata(self, workdir, test_env):
+        script = workdir / "test_meta.py"
+        script.write_text(
+            "import learnlog\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script), "arg1", "arg2"],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert "Script: test_meta.py" in msg
+        assert "arg1 arg2" in msg
+
+    def test_no_change_between_runs(self, workdir, test_env):
+        script = workdir / "test_amend.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('same')\n"
+        )
+        # Run twice without editing
+        for _ in range(2):
+            subprocess.run(
+                [sys.executable, str(script)],
+                cwd=str(workdir), env=test_env,
+                capture_output=True, text=True, timeout=30,
+            )
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "--oneline"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        lines = git_result.stdout.strip().split("\n")
+        assert len(lines) == 1  # single commit, two runs amended
+
+    def test_new_commit_after_edit(self, workdir, test_env):
+        script = workdir / "test_edit.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('v1')\n"
+        )
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        # Edit the file
+        script.write_text(
+            "import learnlog\n"
+            "print('v2')\n"
+        )
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "--oneline"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        lines = git_result.stdout.strip().split("\n")
+        assert len(lines) == 2
+@
+
+
+\section{Auto-initialization}
+
+The final piece: calling [[initialize]] at import time.
+This is what makes \mintinline{python}{import learnlog} sufficient---no
+explicit setup needed.
+
+<<auto-initialize on import>>=
+initialize()
+@

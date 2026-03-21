@@ -1,0 +1,592 @@
+\chapter{Git Repository Management}
+\label{gitrepo}
+
+We store the development log in a hidden Git repository
+(\texttt{.learnlog/}) inside the student's working directory.
+We use Git's \texttt{--git-dir} and \texttt{--work-tree} flags so that
+the student's files \emph{are} the working tree---no copying needed.
+The \texttt{.learnlog/} directory contains only Git internals.
+
+We use \texttt{subprocess} rather than GitPython to keep the package
+dependency-free: Git is already installed on every lab machine, and our
+operations are simple (init, add, commit, amend).
+
+\section{Code overview}
+
+<<[[gitrepo.py]]>>=
+"""Git repository management for learnlog.
+
+Manages a hidden ``.learnlog/`` Git repository that tracks source code
+changes and run metadata using the student's working directory as the
+work tree.
+"""
+
+import subprocess
+import os
+import pathlib
+import datetime
+
+<<classes>>
+<<functions>>
+@
+
+<<test [[gitrepo.py]]>>=
+"""Tests for the Git repository management module."""
+import tempfile
+import os
+import pathlib
+import subprocess
+import datetime
+import pytest
+from learnlog.gitrepo import *
+
+<<test helpers>>
+<<test functions>>
+@
+
+
+\section{The [[LearnlogRepo]] class}
+
+The class needs four operations: running Git commands, initialising the
+repository, beginning a run (committing or amending), and finalising a
+run (amending with results).
+We introduce the class shell here and fill in each method in its own
+section below.
+
+<<classes>>=
+class LearnlogRepo:
+    """Manages a ``.learnlog/`` Git repository.
+
+    Uses ``--git-dir=.learnlog --work-tree=.`` so the student's
+    working directory is the work tree.  The ``.learnlog/`` directory
+    contains only Git internals.
+    """
+
+    def __init__(self, workdir):
+        self.workdir = pathlib.Path(workdir)
+        self.git_dir = self.workdir / ".learnlog"
+        self.env = {
+            **os.environ,
+            "GIT_DIR": str(self.git_dir),
+            "GIT_WORK_TREE": str(self.workdir),
+        }
+        if not self.git_dir.exists():
+            self.init_repo()
+
+    <<repo methods>>
+@
+
+A test helper creates a temporary directory with a Python file, giving
+us an isolated environment for each test:
+
+<<test helpers>>=
+@pytest.fixture
+def workdir(tmp_path, monkeypatch):
+    """Create a temporary working directory with a Python file.
+
+    Sets a test Git identity so commits work even without a global
+    Git config (e.g. in CI environments).
+    """
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@test")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@test")
+    script = tmp_path / "hello.py"
+    script.write_text('print("hello")\n')
+    return tmp_path
+@
+
+
+\section{Running Git commands}
+
+Every Git command needs the same environment variables and working
+directory.
+The [[git]] method wraps this boilerplate and returns the
+[[CompletedProcess]] object for callers that need to inspect the result.
+We set a 10-second timeout to prevent hangs from blocking the student's
+program.
+
+<<repo methods>>=
+def git(self, *args):
+    """Run a Git command with the learnlog environment.
+
+    Returns the ``CompletedProcess`` object.  Raises no exception
+    on non-zero exit codes---callers check ``returncode`` themselves.
+    """
+    return subprocess.run(
+        ["git"] + list(args),
+        cwd=str(self.workdir),
+        env=self.env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+@
+
+Let's verify the helper runs Git commands in the right context:
+
+<<test functions>>=
+def test_git_runs_command(workdir):
+    repo = LearnlogRepo(workdir)
+    result = repo.git("status")
+    assert result.returncode == 0
+@
+
+
+\section{Repository initialisation}
+
+On the very first run, we need to create the Git repository, configure
+a committer identity, set up exclusion patterns, and make an initial
+commit of all source files.
+
+The learnlog repository inherits the student's global Git identity and
+GPG signing configuration.
+If a student has not configured Git at all, commits would fail---so we
+set a fallback identity only when no global one exists.
+This means commits are signed with the student's own key when available,
+which is the right thing for a log of \emph{their} work.
+
+<<repo methods>>=
+def init_repo(self):
+    """Initialise a new ``.learnlog/`` Git repository.
+
+    Creates the repository, sets a fallback committer identity
+    (only if the student has none configured globally), sets up
+    exclusion patterns, and makes an initial commit of all files.
+    """
+    self.git("init")
+    <<set fallback identity if needed>>
+
+
+    <<set up exclude patterns>>
+    <<initial commit>>
+@
+
+We check whether Git can resolve a user name; if not, we provide a
+generic fallback.
+This handles lab machines where students have never run
+\texttt{git config}.
+We also disable GPG signing---these machine-generated commits do not
+need cryptographic signatures, and students may not have a GPG key
+configured:
+
+<<set fallback identity if needed>>=
+name_check = self.git("config", "user.name")
+if name_check.returncode != 0:
+    self.git("config", "user.name", "learnlog")
+    self.git("config", "user.email", "learnlog@localhost")
+self.git("config", "commit.gpgsign", "false")
+@
+
+The exclude file (\texttt{.learnlog/info/exclude}) keeps infrastructure
+files out of the log.
+We exclude \texttt{.learnlog} itself (to prevent recursion),
+\texttt{\_\_pycache\_\_}, virtual environments, and compiled bytecode.
+If the student has a \texttt{.learnlogignore} file, we append its
+patterns too---this is the only configuration hook, and it is empty by
+default.
+
+<<set up exclude patterns>>=
+exclude_dir = self.git_dir / "info"
+exclude_dir.mkdir(parents=True, exist_ok=True)
+exclude_file = exclude_dir / "exclude"
+patterns = [
+    ".learnlog",
+    "__pycache__",
+    "*.pyc",
+    ".venv",
+    "venv",
+    "env",
+]
+ignore_file = self.workdir / ".learnlogignore"
+if ignore_file.exists():
+    patterns.extend(
+        ignore_file.read_text().splitlines()
+    )
+exclude_file.write_text(
+    "\n".join(patterns) + "\n"
+)
+@
+
+<<initial commit>>=
+self.git("add", ".")
+self.git(
+    "commit",
+    "--allow-empty",
+    "-m",
+    "learnlog: initial commit",
+)
+@
+
+Let's verify that initialisation creates a working repository with
+the expected properties:
+
+<<test functions>>=
+def test_init_creates_learnlog_dir(workdir):
+    repo = LearnlogRepo(workdir)
+    assert (workdir / ".learnlog").is_dir()
+
+def test_init_has_initial_commit(workdir):
+    repo = LearnlogRepo(workdir)
+    result = repo.git("log", "--oneline")
+    assert "initial commit" in result.stdout
+
+def test_init_tracks_source_files(workdir):
+    repo = LearnlogRepo(workdir)
+    result = repo.git("ls-files")
+    assert "hello.py" in result.stdout
+
+def test_init_excludes_pycache(workdir):
+    pycache = workdir / "__pycache__"
+    pycache.mkdir()
+    (pycache / "hello.cpython-311.pyc").write_bytes(b"fake")
+    repo = LearnlogRepo(workdir)
+    result = repo.git("ls-files")
+    assert "__pycache__" not in result.stdout
+
+def test_init_reads_learnlogignore(workdir):
+    (workdir / ".learnlogignore").write_text("data/\n*.csv\n")
+    (workdir / "data").mkdir()
+    (workdir / "data" / "big.csv").write_text("a,b,c\n")
+    repo = LearnlogRepo(workdir)
+    result = repo.git("ls-files")
+    assert "big.csv" not in result.stdout
+
+def test_init_is_idempotent(workdir):
+    repo1 = LearnlogRepo(workdir)
+    repo2 = LearnlogRepo(workdir)
+    result = repo2.git("log", "--oneline")
+    assert result.stdout.strip().count("\n") == 0
+@
+
+
+\section{Beginning a run}
+
+At the start of each program execution, [[begin_run]] stages all files
+and creates (or amends) a commit with the run header.
+
+The key decision is what to do when no files have changed since the last
+run.
+If the student runs the same program twice without editing anything,
+we do not want a new empty commit---that would clutter the log with
+duplicate snapshots.
+Instead, we amend the previous commit to append a new run block.
+This groups consecutive runs of identical code into a single commit,
+which is what you want when reviewing the log.
+
+When files \emph{have} changed, we create a fresh commit.
+The diff in that commit shows exactly what the student modified between
+runs.
+
+<<repo methods>>=
+def begin_run(self, script, args, start_time):
+    """Record the start of a program run.
+
+    Stages all files.  If there are changes, creates a new commit
+    with the run header.  If no files changed, amends the previous
+    commit to append a new run block.
+
+    Returns the run header string (needed by :meth:`finalize_run`).
+    """
+    header = format_run_header(script, args, start_time)
+
+    self.git("add", ".")
+    diff = self.git("diff", "--cached", "--quiet")
+    has_changes = diff.returncode != 0
+
+    if has_changes:
+        self.git("commit", "-m", header)
+    else:
+        <<amend previous commit with new run block>>
+
+    return header
+@
+
+To amend, we read the existing commit message, add a separator, and
+append the new run header.
+On the very first run (the initial commit), this produces a commit
+message with both the initial-commit line and the run header.
+
+<<amend previous commit with new run block>>=
+existing = self.git(
+    "log", "-1", "--format=%B"
+).stdout.rstrip("\n")
+combined = existing + "\n\n---\n\n" + header
+self.git(
+    "commit", "--amend", "--allow-empty",
+    "-m", combined,
+)
+@
+
+Let's verify both the new-commit and amend paths:
+
+<<test functions>>=
+def test_begin_run_new_commit_on_file_change(workdir):
+    repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text('print("changed")\n')
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", [], now)
+    result = repo.git("log", "--oneline")
+    lines = result.stdout.strip().split("\n")
+    assert len(lines) == 2  # initial + run
+
+def test_begin_run_amends_on_no_change(workdir):
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", [], now)
+    result = repo.git("log", "--oneline")
+    lines = result.stdout.strip().split("\n")
+    assert len(lines) == 1  # amended initial
+
+def test_begin_run_two_runs_no_change_single_commit(workdir):
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("hello.py", ["--verbose"], t2)
+    result = repo.git("log", "--oneline")
+    lines = result.stdout.strip().split("\n")
+    assert len(lines) == 1
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert "---" in msg  # separator between runs
+
+def test_begin_run_header_includes_args(workdir):
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", ["arg1", "arg2"], now)
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert "arg1 arg2" in msg
+
+def test_begin_run_new_commit_after_edit(workdir):
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    result = repo.git("log", "--oneline")
+    lines = result.stdout.strip().split("\n")
+    assert len(lines) == 2
+@
+
+
+\section{Formatting the run header}
+
+The run header is a plain-text block with key--value fields.
+We keep it simple---no YAML, no JSON---so it is easy to read in
+\texttt{git log} output.
+
+<<functions>>=
+def format_run_header(script, args, start_time):
+    """Format a run header block.
+
+    The header records which script was run, its arguments, and
+    the start time.
+    """
+    args_str = " ".join(args) if args else "(none)"
+    return (
+        f"Run: {script} {args_str}\n"
+        f"\n"
+        f"Script: {script}\n"
+        f"Arguments: {args_str}\n"
+        f"Start-Time: {start_time.isoformat()}"
+    )
+@
+
+Let's verify the format:
+
+<<test functions>>=
+def test_format_run_header_basic():
+    t = datetime.datetime(2026, 3, 20, 14, 30)
+    header = format_run_header("hello.py", ["arg1"], t)
+    assert "Run: hello.py arg1" in header
+    assert "Script: hello.py" in header
+    assert "Arguments: arg1" in header
+    assert "Start-Time: 2026-03-20T14:30:00" in header
+
+def test_format_run_header_no_args():
+    t = datetime.datetime(2026, 3, 20, 14, 30)
+    header = format_run_header("hello.py", [], t)
+    assert "Arguments: (none)" in header
+@
+
+
+\section{Finalising a run}
+
+After the program finishes (or crashes), [[finalize_run]] amends the
+current commit to append the I/O log, exception information, end time,
+and exit code.
+This completes the run block that [[begin_run]] started.
+
+If the program was killed by SIGKILL, the [[atexit]] handler never
+fires and [[finalize_run]] is never called.
+The commit still exists with the run header from [[begin_run]], so we
+know a run was attempted---the missing \texttt{End-Time} field signals
+an abnormal termination.
+
+<<repo methods>>=
+def finalize_run(self, io_log, exception_info,
+                 end_time, exit_code):
+    """Complete the current run block with results.
+
+    Amends the current commit to append I/O log, exception
+    information, end time, and exit code.
+    """
+    existing = self.git(
+        "log", "-1", "--format=%B"
+    ).stdout.rstrip("\n")
+
+    trailer = format_run_trailer(
+        io_log, exception_info, end_time, exit_code
+    )
+    combined = existing + "\n" + trailer
+
+    self.git("add", ".")
+    self.git(
+        "commit", "--amend", "--allow-empty",
+        "-m", combined,
+    )
+@
+
+Let's verify that finalisation completes the run block:
+
+<<test functions>>=
+def test_finalize_appends_io_and_exit(workdir):
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], now)
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=end,
+        exit_code=0,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert "End-Time:" in msg
+    assert "Exit-Code: 0" in msg
+    assert "stdout: hello" in msg
+    assert "--- exception ---\nNone" in msg
+
+def test_finalize_records_exception(workdir):
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], now)
+    end = datetime.datetime(2026, 1, 1, 10, 0, 1)
+    exc = "ValueError: bad input\n  File hello.py, line 1"
+    repo.finalize_run(
+        io_log="stderr: ValueError: bad input\n",
+        exception_info=exc,
+        end_time=end,
+        exit_code=1,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert "Exit-Code: 1" in msg
+    assert "ValueError: bad input" in msg
+
+def test_finalize_no_io(workdir):
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], now)
+    end = datetime.datetime(2026, 1, 1, 10, 0, 1)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end,
+        exit_code=0,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert "(no I/O)" in msg
+@
+
+
+\section{Formatting the run trailer}
+
+The trailer is appended by [[finalize_run]] and contains the end time,
+exit code, I/O log, and exception information.
+
+<<functions>>=
+def format_run_trailer(io_log, exception_info,
+                       end_time, exit_code):
+    """Format the trailer appended by :func:`finalize_run`.
+
+    Contains the end time, exit code, I/O log, and exception
+    information.
+    """
+    parts = [
+        f"End-Time: {end_time.isoformat()}",
+        f"Exit-Code: {exit_code}",
+        "",
+        "--- I/O ---",
+        io_log.rstrip("\n") if io_log else "(no I/O)",
+        "",
+        "--- exception ---",
+    ]
+    if exception_info:
+        parts.append(exception_info)
+    else:
+        parts.append("None")
+    return "\n".join(parts)
+@
+
+Let's verify the format:
+
+<<test functions>>=
+def test_format_run_trailer_basic():
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trailer = format_run_trailer(
+        "stdout: hello\n", None, end, 0
+    )
+    assert "End-Time: 2026-01-01T10:00:05" in trailer
+    assert "Exit-Code: 0" in trailer
+    assert "stdout: hello" in trailer
+    assert "None" in trailer
+
+def test_format_run_trailer_with_exception():
+    end = datetime.datetime(2026, 1, 1, 10, 0, 1)
+    trailer = format_run_trailer(
+        "", "ValueError: oops", end, 1
+    )
+    assert "Exit-Code: 1" in trailer
+    assert "ValueError: oops" in trailer
+@
+
+
+\section{Full lifecycle test}
+
+To verify the complete workflow, we simulate two runs: one where the
+student has not changed anything (amends), and one after an edit (new
+commit):
+
+<<test functions>>=
+def test_full_lifecycle(workdir):
+    """Simulate two runs: one with changes, one without."""
+    repo = LearnlogRepo(workdir)
+
+    # First run (amends initial commit since no change)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+
+    # Edit file
+    (workdir / "hello.py").write_text('print("v2")\n')
+
+    # Second run (new commit since file changed)
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    repo.finalize_run(
+        io_log="stdout: v2\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 2),
+        exit_code=0,
+    )
+
+    result = repo.git("log", "--oneline")
+    lines = result.stdout.strip().split("\n")
+    assert len(lines) == 2  # initial+run1, run2
+@

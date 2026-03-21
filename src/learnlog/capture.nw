@@ -1,0 +1,446 @@
+\chapter{I/O Capture}
+\label{capture}
+
+When a student runs their program, we want to record everything they see
+and type---standard output, standard error, and standard input---in the
+order it actually happens.
+The key design choice is a single shared buffer rather than three separate
+ones: if the program prints a prompt to stdout, the student types a
+response on stdin, and then the program prints output, we need to
+preserve that interleaving to make the log readable.
+
+\section{Code overview}
+
+The module provides three classes: [[IOLog]] as the shared buffer, and
+[[StreamCapture]] and [[InputCapture]] as transparent wrappers around
+the standard streams.
+
+<<[[capture.py]]>>=
+"""Stream capture wrappers for stdout, stderr, and stdin.
+
+Provides transparent tee-like wrappers that record all I/O to a shared
+buffer while passing data through to the original streams unchanged.
+"""
+
+import io
+import threading
+
+<<constants>>
+<<classes>>
+@
+
+We also want to test our capture classes thoroughly.
+
+<<test [[capture.py]]>>=
+"""Tests for the I/O capture module."""
+import io
+import threading
+import pytest
+from learnlog.capture import *
+
+<<test functions>>
+@
+
+
+\section{The shared I/O log}
+
+The central piece is [[IOLog]]---a thread-safe buffer that collects
+lines from all three streams in the order they arrive.
+We use a single [[threading.Lock]] so that a write from stdout and a
+read from stdin cannot interleave within a single line.
+
+We cap the buffer at a configurable maximum size (default 1~MB) to
+prevent a long-running program from consuming unbounded memory.
+Once the cap is reached, we stop recording but continue passing data
+through to the original streams---the student's program still works
+normally.
+
+<<constants>>=
+MAX_IOLOG_BYTES = 1_000_000
+@
+
+<<classes>>=
+class IOLog:
+    """Thread-safe shared buffer for interleaved I/O logging.
+
+    Each line is prefixed with the stream name (stdout, stderr, stdin)
+    to show the origin.  The buffer is capped at ``max_bytes`` to
+    prevent unbounded memory growth.
+    """
+
+    def __init__(self, max_bytes=MAX_IOLOG_BYTES):
+        self.max_bytes = max_bytes
+        self.lock = threading.Lock()
+        self.buf = io.StringIO()
+        self.size = 0
+        self.truncated = False
+
+    <<iolog methods>>
+@
+
+
+\subsection{Logging a line}
+
+The [[log]] method is the core of [[IOLog]].
+We split each write into individual lines so that the prefix appears on
+every line, making the log easy to scan.
+The alternative---prefixing only the first line of a multi-line
+write---would produce confusing output when stdout and stderr writes
+interleave mid-block.
+
+<<iolog methods>>=
+def log(self, prefix, text):
+    """Log ``text`` with ``prefix`` (e.g. ``'stdout'``).
+
+    Each line of ``text`` gets its own prefixed entry.
+    If the buffer is full, further writes are silently dropped.
+    """
+    if not text:
+        return
+    with self.lock:
+        if self.truncated:
+            return
+        for line in text.splitlines(keepends=True):
+            entry = f"{prefix}: {line}"
+            if self.size + len(entry) > self.max_bytes:
+                self.buf.write(
+                    "\n[learnlog: I/O log truncated "
+                    f"at {self.max_bytes} bytes]\n"
+                )
+                self.truncated = True
+                return
+            self.buf.write(entry)
+            self.size += len(entry)
+@
+
+Let's verify the basic logging behavior---single lines, interleaved
+streams, and multi-line writes:
+
+<<test functions>>=
+def test_iolog_logs_with_prefix():
+    log = IOLog()
+    log.log("stdout", "hello\n")
+    assert log.getvalue() == "stdout: hello\n"
+
+def test_iolog_interleaved_streams():
+    log = IOLog()
+    log.log("stdout", "prompt: ")
+    log.log("stdin", "answer\n")
+    log.log("stdout", "ok\n")
+    value = log.getvalue()
+    assert "stdout: prompt: " in value
+    assert "stdin: answer\n" in value
+    assert "stdout: ok\n" in value
+
+def test_iolog_multiline_write():
+    log = IOLog()
+    log.log("stderr", "line1\nline2\n")
+    value = log.getvalue()
+    assert "stderr: line1\n" in value
+    assert "stderr: line2\n" in value
+
+def test_iolog_empty_write_ignored():
+    log = IOLog()
+    log.log("stdout", "")
+    assert log.getvalue() == ""
+@
+
+
+\subsection{Truncation}
+
+Once the buffer exceeds [[max_bytes]], we stop recording and append a
+truncation notice.
+This is a safety valve for programs that produce megabytes of output.
+
+<<test functions>>=
+def test_iolog_truncation():
+    log = IOLog(max_bytes=50)
+    log.log("stdout", "x" * 100 + "\n")
+    value = log.getvalue()
+    assert "truncated" in value
+    assert log.truncated
+@
+
+
+\subsection{Retrieving the log}
+
+The [[getvalue]] method returns the full buffer contents.
+It acquires the lock to ensure a consistent snapshot.
+
+<<iolog methods>>=
+def getvalue(self):
+    """Return the full log contents as a string."""
+    with self.lock:
+        return self.buf.getvalue()
+@
+
+
+\subsection{Thread safety}
+
+Multiple threads may write to stdout and stderr concurrently.
+We verify that concurrent writes do not corrupt the buffer:
+
+<<test functions>>=
+def test_iolog_thread_safety():
+    log = IOLog()
+    errors = []
+
+    def writer(prefix, n):
+        try:
+            for i in range(n):
+                log.log(prefix, f"line {i}\n")
+        except Exception as e:
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=writer, args=("stdout", 100)),
+        threading.Thread(target=writer, args=("stderr", 100)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    value = log.getvalue()
+    assert value.count("stdout:") == 100
+    assert value.count("stderr:") == 100
+@
+
+
+\section{Output stream capture}
+
+[[StreamCapture]] wraps [[sys.stdout]] or [[sys.stderr]].
+We delegate all other attribute access to the original stream so that
+code checking [[sys.stdout.encoding]] or calling [[sys.stdout.isatty()]]
+still works.
+
+Why delegate via [[__getattr__]] rather than subclassing?
+Because [[sys.stdout]] might be a [[TextIOWrapper]], a
+[[_io.TextIOWrapper]], or any other object---we cannot know the concrete
+type at import time.
+Delegation works regardless of the original's type.
+
+<<classes>>=
+class StreamCapture:
+    """Transparent tee wrapper for an output stream.
+
+    Passes all writes through to the original stream while logging
+    them to a shared :class:`IOLog` with the given prefix.
+    """
+
+    def __init__(self, original, name, iolog):
+        self._original = original
+        self._name = name
+        self._iolog = iolog
+
+    <<stream capture methods>>
+@
+
+
+\subsection{Writing}
+
+Every call to [[write]] passes the text through to the original stream
+\emph{and} logs it to the shared [[IOLog]].
+We return the original's return value so that callers relying on it
+are unaffected.
+
+<<stream capture methods>>=
+def write(self, text):
+    """Write ``text`` to the original stream and log it."""
+    self._iolog.log(self._name, text)
+    return self._original.write(text)
+@
+
+Let's verify that writes pass through and get logged:
+
+<<test functions>>=
+def test_stream_capture_write_passes_through():
+    original = io.StringIO()
+    log = IOLog()
+    cap = StreamCapture(original, "stdout", log)
+    cap.write("hello")
+    assert original.getvalue() == "hello"
+
+def test_stream_capture_write_logs():
+    original = io.StringIO()
+    log = IOLog()
+    cap = StreamCapture(original, "stderr", log)
+    cap.write("error\n")
+    assert "stderr: error\n" in log.getvalue()
+@
+
+
+\subsection{Writing multiple lines}
+
+The [[writelines]] method handles iterables of strings, as expected by
+the file-like protocol:
+
+<<stream capture methods>>=
+def writelines(self, lines):
+    """Write an iterable of strings."""
+    for line in lines:
+        self.write(line)
+@
+
+<<test functions>>=
+def test_stream_capture_writelines():
+    original = io.StringIO()
+    log = IOLog()
+    cap = StreamCapture(original, "stdout", log)
+    cap.writelines(["a\n", "b\n"])
+    assert original.getvalue() == "a\nb\n"
+    assert "stdout: a\n" in log.getvalue()
+    assert "stdout: b\n" in log.getvalue()
+@
+
+
+\subsection{Flushing and delegation}
+
+We explicitly implement [[flush]] and delegate everything else via
+[[__getattr__]]:
+
+<<stream capture methods>>=
+def flush(self):
+    """Flush the original stream."""
+    return self._original.flush()
+
+def __getattr__(self, name):
+    return getattr(self._original, name)
+@
+
+<<test functions>>=
+def test_stream_capture_delegates_attributes():
+    original = io.StringIO()
+    log = IOLog()
+    cap = StreamCapture(original, "stdout", log)
+    assert cap.encoding == original.encoding
+
+def test_stream_capture_flush():
+    original = io.StringIO()
+    log = IOLog()
+    cap = StreamCapture(original, "stdout", log)
+    cap.flush()  # should not raise
+@
+
+
+\section{Input stream capture}
+
+[[InputCapture]] wraps [[sys.stdin]].
+Python's built-in [[input()]] function calls [[sys.stdin.readline()]]
+internally, so capturing [[readline]] is sufficient to record all
+interactive input.
+We also capture [[read]] for programs that read stdin in bulk
+(\eg~piped input).
+
+<<classes>>=
+class InputCapture:
+    """Transparent tee wrapper for an input stream.
+
+    Passes all reads through from the original stream while logging
+    the data read to a shared :class:`IOLog`.
+    """
+
+    def __init__(self, original, iolog):
+        self._original = original
+        self._iolog = iolog
+
+    <<input capture methods>>
+@
+
+
+\subsection{Reading a line}
+
+The [[readline]] method is the most important: it is what [[input()]]
+calls under the hood.
+
+<<input capture methods>>=
+def readline(self, limit=-1):
+    """Read a line from the original stream and log it."""
+    line = self._original.readline(limit)
+    self._iolog.log("stdin", line)
+    return line
+@
+
+<<test functions>>=
+def test_input_capture_readline():
+    original = io.StringIO("hello\nworld\n")
+    log = IOLog()
+    cap = InputCapture(original, log)
+    line = cap.readline()
+    assert line == "hello\n"
+    assert "stdin: hello\n" in log.getvalue()
+@
+
+
+\subsection{Bulk reading}
+
+For programs that read stdin as a whole (\eg~\texttt{sys.stdin.read()}):
+
+<<input capture methods>>=
+def read(self, size=-1):
+    """Read from the original stream and log it."""
+    data = self._original.read(size)
+    self._iolog.log("stdin", data)
+    return data
+
+def readlines(self, hint=-1):
+    """Read lines from the original stream and log them."""
+    lines = self._original.readlines(hint)
+    for line in lines:
+        self._iolog.log("stdin", line)
+    return lines
+@
+
+<<test functions>>=
+def test_input_capture_read():
+    original = io.StringIO("data")
+    log = IOLog()
+    cap = InputCapture(original, log)
+    data = cap.read()
+    assert data == "data"
+    assert "stdin: data" in log.getvalue()
+
+def test_input_capture_readlines():
+    original = io.StringIO("a\nb\n")
+    log = IOLog()
+    cap = InputCapture(original, log)
+    lines = cap.readlines()
+    assert lines == ["a\n", "b\n"]
+    assert "stdin: a\n" in log.getvalue()
+    assert "stdin: b\n" in log.getvalue()
+@
+
+
+\subsection{Iteration and delegation}
+
+Programs that iterate over stdin (\eg~\texttt{for line in sys.stdin})
+need the iterator protocol:
+
+<<input capture methods>>=
+def __iter__(self):
+    return self
+
+def __next__(self):
+    line = self.readline()
+    if not line:
+        raise StopIteration
+    return line
+
+def __getattr__(self, name):
+    return getattr(self._original, name)
+@
+
+<<test functions>>=
+def test_input_capture_iteration():
+    original = io.StringIO("a\nb\n")
+    log = IOLog()
+    cap = InputCapture(original, log)
+    lines = list(cap)
+    assert lines == ["a\n", "b\n"]
+
+def test_input_capture_delegates_attributes():
+    original = io.StringIO()
+    log = IOLog()
+    cap = InputCapture(original, log)
+    assert cap.encoding == original.encoding
+@

@@ -1,3 +1,6 @@
+# Learnlog's own development log
+.learnlog/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
