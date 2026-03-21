@@ -11,6 +11,20 @@ hidden Git repository, wraps the standard streams to capture all I/O,
 and registers cleanup handlers that finalise the log entry when the
 program exits.
 
+These logs serve two main use cases.
+First, a teacher can have students use learnlog to record their
+development process.
+The teacher can then study how students approach coding tasks---for
+research purposes or to help students refine their debugging
+techniques.
+
+Second, a teacher can use learnlog while live coding during a lecture
+or tutorial.
+After the session, the teacher runs [[learnlog export]] to
+produce a portable bundle, and the students replay it step by step
+with [[learnlog play]]---seeing the exact sequence of code
+changes, inputs, and outputs from the demonstration.
+
 The design is guided by two constraints:
 \begin{description}
 \item[Transparency] The student's program must behave identically
