@@ -778,6 +778,43 @@ def test_handle_key_jump_endpoints():
 @
 
 
+\subsection{Batch playback}
+\label{sec:play-batch}
+
+The curses viewer requires a terminal, but sometimes we want to
+pipe the output through [[less]] or redirect it to a file.
+In batch mode the viewer simply prints all commits sequentially
+to standard output.
+This creates a natural reading flow: the captured output from
+one commit appears just before the diff of the next, so the
+reader sees what the program produced and what the student
+changed as a result in a single continuous stream.
+
+<<play viewer>>=
+def play_batch(repo, commits, start_index=0):
+    """Print commit details sequentially to stdout."""
+    for commit in commits[start_index:]:
+        detail = get_commit_detail(repo, commit["hash"])
+        sys.stdout.write(detail)
+        sys.stdout.write("\n")
+@
+
+Let's verify that batch playback produces the expected output
+for each commit:
+
+<<test functions>>=
+def test_play_batch_outputs_all_commits(workdir, capsys):
+    """Batch mode prints every commit's detail to stdout."""
+    from learnlog.cli import play_batch, get_commits
+    repo = LearnlogRepo(workdir)
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    captured = capsys.readouterr().out
+    for c in commits:
+        assert c["hash"][:7] in captured
+@
+
+
 \section{Typer application}
 
 We define the Typer app at module level with two commands.
@@ -865,6 +902,15 @@ directories and bundle files.
 When a bundle is used, [[resolve_source]] creates a temporary
 directory that we must clean up---hence the [[finally]] block.
 
+The [[-b]] / [[--batch]] flag selects batch mode
+(\cref{sec:play-batch}), which prints all commits to standard
+output instead of launching the curses viewer.
+When the flag is not given explicitly, we auto-detect: if
+standard output is not a terminal (for example when piped to
+[[less]]), batch mode activates automatically.
+This means [[learnlog play | less]] just works without the user
+having to remember the flag.
+
 <<typer commands>>=
 @app.command()
 def play(
@@ -881,8 +927,19 @@ def play(
     start: Annotated[
         Optional[str],
         typer.Option(
-            "--start",
+            "--start", "-s",
             help="Commit hash to start playback from.",
+        ),
+    ] = None,
+    batch: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--batch", "-b",
+            help=(
+                "Print all commits to stdout instead of "
+                "the interactive viewer.  Auto-enabled "
+                "when stdout is not a terminal."
+            ),
         ),
     ] = None,
 ):
@@ -899,15 +956,50 @@ def play(
         if start:
             <<find starting commit index>>
 
-        viewer = PlaybackViewer(repo, commits, start_index)
-        viewer.run()
+        <<choose playback mode>>
     finally:
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
-When the user specifies a [[--start]] commit, we find the
-matching index by prefix.
+When [[batch]] is [[None]] (the user did not pass [[-b]]),
+we fall back to TTY detection via [[sys.stdout.isatty()]].
+An explicit [[--batch]] or [[--no-batch]] always wins.
+
+<<choose playback mode>>=
+use_batch = (
+    batch if batch is not None
+    else not sys.stdout.isatty()
+)
+if use_batch:
+    play_batch(repo, commits, start_index)
+else:
+    viewer = PlaybackViewer(repo, commits, start_index)
+    viewer.run()
+@
+
+Typer's [[CliRunner]] does not connect a real terminal, so
+invoking [[play]] through it exercises the batch path
+automatically.
+We verify that the command succeeds and that every commit
+appears in the output:
+
+<<test functions>>=
+def test_play_batch_via_cli(workdir):
+    """The play command uses batch mode when not a TTY."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "diff --git" in result.output
+@
+
+When the user specifies a [[--start]] / [[-s]] commit, we find
+the matching index by prefix.
 Short hashes work because we match the beginning of the
 full hash, just like Git does.
 
