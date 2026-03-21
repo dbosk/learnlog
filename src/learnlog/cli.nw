@@ -319,10 +319,14 @@ def test_get_commits_has_required_keys(workdir):
 
 \subsection{Commit details}
 
-For a single commit, we fetch the full message and the diff.
-The diff shows what changed compared to the parent commit.
-For the initial commit, we use [[--root]] to show all files as
-additions.
+For a single commit we use [[git show]], which produces exactly
+the output a teacher would see when inspecting the [[.learnlog/]]
+repository manually: the commit header, the full message
+(containing the captured I/O), and the unified diff (showing the
+code that changed).
+Using [[git show]] instead of separate calls for the message and
+the diff is both simpler and faster---one subprocess instead of
+three.
 
 We load details lazily---only when the user navigates to a
 particular commit---to keep the viewer responsive even for
@@ -330,31 +334,15 @@ repositories with hundreds of commits.
 
 <<commit data functions>>=
 def get_commit_detail(repo, commit_hash):
-    """Return detailed information for a single commit.
+    """Return the ``git show`` output for a single commit.
 
-    Returns a dict with ``message`` (full commit message) and
-    ``diff`` (unified diff against parent).
+    The result is a string containing the commit header,
+    message, and unified diff---the same output a teacher
+    would see by running ``git show`` in the ``.learnlog/``
+    repository.
     """
-    msg_result = repo.git(
-        "log", "-1", "--format=%B", commit_hash
-    )
-    message = msg_result.stdout.rstrip("\n")
-
-    parent_result = repo.git(
-        "rev-parse", commit_hash + "^"
-    )
-    if parent_result.returncode == 0:
-        diff_result = repo.git(
-            "diff", parent_result.stdout.strip(),
-            commit_hash
-        )
-    else:
-        diff_result = repo.git(
-            "diff", "--root", commit_hash
-        )
-    diff = diff_result.stdout
-
-    return {"message": message, "diff": diff}
+    result = repo.git("show", commit_hash)
+    return result.stdout
 @
 
 <<test functions>>=
@@ -363,8 +351,7 @@ def test_get_commit_detail_initial(workdir):
     repo = LearnlogRepo(workdir)
     commits = get_commits(repo)
     detail = get_commit_detail(repo, commits[0]["hash"])
-    assert "message" in detail
-    assert "diff" in detail
+    assert "learnlog" in detail
 
 def test_get_commit_detail_with_diff(workdir):
     from learnlog.cli import get_commits, get_commit_detail
@@ -376,7 +363,7 @@ def test_get_commit_detail_with_diff(workdir):
     repo.begin_run("hello.py", [], t2)
     commits = get_commits(repo)
     detail = get_commit_detail(repo, commits[-1]["hash"])
-    assert "hello.py" in detail["diff"]
+    assert "hello.py" in detail
 @
 
 
@@ -485,10 +472,18 @@ def run(self):
 Each iteration draws the screen and waits for a keypress.
 We redraw on every key because the state may have changed.
 
+We call [[curses.use_default_colors]] so that the viewer inherits
+the terminal's native background and foreground colours instead
+of forcing white-on-black.
+This respects light themes, transparency, and custom colour
+schemes---details that matter when learnlog runs on diverse
+student and teacher machines.
+
 <<player methods>>=
 def _main_loop(self, stdscr):
     """Main event loop inside curses."""
     import curses
+    curses.use_default_colors()
     curses.curs_set(0)
     stdscr.clear()
 
@@ -513,16 +508,16 @@ handling arbitrarily long diffs.
 
 <<player methods>>=
 def _get_detail(self, commit_hash):
-    """Fetch and cache commit detail."""
+    """Fetch and cache the ``git show`` output."""
     if commit_hash not in self._detail_cache:
         self._detail_cache[commit_hash] = \
             get_commit_detail(self.repo, commit_hash)
     return self._detail_cache[commit_hash]
 @
 
-We cache commit details because [[get_commit_detail]] shells out to
-Git twice (once for the message, once for the diff).
-Without caching, every scroll keystroke would re-run those commands,
+We cache the [[git show]] output because fetching it shells out to
+Git.
+Without caching, every scroll keystroke would re-run the command,
 making the viewer sluggish on large repositories.
 
 <<player methods>>=
@@ -565,15 +560,12 @@ except curses.error:
     pass
 @
 
-The content combines the commit message and the diff,
-separated by a blank line.
+The content is the raw [[git show]] output, which already
+combines the commit header, message, and diff.
 We split into lines for scrollable display.
 
 <<build content lines>>=
-content_text = detail["message"]
-if detail["diff"]:
-    content_text += "\n\n" + detail["diff"]
-content_lines = content_text.split("\n")
+content_lines = detail.split("\n")
 @
 
 We display lines starting from the scroll offset, filling
