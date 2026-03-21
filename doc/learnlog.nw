@@ -9,7 +9,7 @@
 \input{preamble.tex}
 
 \title{%
-  learnlog: Automatic Logging of Student Code Development
+  learnlog: Automatic Logging of Code Development
 }
 \author{%
   Daniel Bosk
