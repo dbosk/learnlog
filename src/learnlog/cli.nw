@@ -396,14 +396,12 @@ These self-referential entries clutter the playback with tool usage
 that is not part of the student's development.
 
 Since multiple runs without code changes are appended to the same
-commit (separated by [[\textbackslash n\textbackslash
-n---\textbackslash n\textbackslash n]], see \cref{gitrepo}), a single
+commit (separated by [[\n\n---\n\n]], see \cref{gitrepo}), a single
 commit can contain both student runs and learnlog runs.
 We therefore filter at the run-block level within each commit message,
 not at the commit level.
 
-The separator [[\textbackslash n\textbackslash
-n---\textbackslash n\textbackslash n]] is safe to split on because the
+The separator [[\n\n---\n\n]] is safe to split on because the
 section markers within a run block ([[--- I/O ---]],
 [[--- exception ---]]) always have additional text after the dashes.
 
@@ -467,12 +465,15 @@ def test_filter_learnlog_runs_preserves_io_separator():
     assert "stdout: hello" in result
 @
 
-To apply this filter to [[git show]] output, we need to extract the
-commit message (indented with four spaces in [[git show]] format),
-filter it, and reconstruct the output.
-We extract the message by finding the same boundaries that
-[[reorder_commit_detail]] uses: the first blank line ends the header,
-and the first [[diff --git]] line starts the diff.
+We could fetch the raw commit message separately
+([[git log --format=%B]]), but that would require an extra subprocess
+call per commit.
+Instead, we extract the message directly from the [[git show]]
+output---it is indented with four spaces---filter it, and reconstruct
+the output in place.
+We find the message boundaries the same way [[reorder_commit_detail]]
+does: the first blank line ends the header, and the first
+[[diff --git]] line starts the diff.
 
 <<helper functions>>=
 def filter_show_output(show_output):
@@ -529,8 +530,11 @@ diff = lines[diff_start:]
 return "\n".join(header + reindented + diff)
 @
 
-Now [[get_commit_detail]] uses filtering by default.
-The [[filter_learnlog]] parameter lets the [[--all]] flag disable it.
+Filtering is enabled by default because learnlog runs are never part
+of the student's development story---a teacher reviewing the log
+should not have to remember a flag to get a clean view.
+The [[filter_learnlog]] parameter lets the [[--all]] flag disable it
+for debugging or completeness.
 
 <<commit data functions>>=
 def get_commit_detail(repo, commit_hash,

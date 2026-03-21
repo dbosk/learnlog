@@ -135,7 +135,11 @@ workdir = os.getcwd()
 @
 
 When [[learnlog]] is invoked as a CLI tool (\eg [[learnlog play]] or
-[[learnlog export]]), we must not log the invocation---it would clutter
+[[learnlog export]]), we must not run initialisation.
+Without this guard, running [[learnlog play]] from the home directory
+would create a [[.learnlog/]] repository there---staging every file
+in [[\$HOME]] into Git.
+Even in a project directory, the CLI's own invocations would clutter
 the student's development log with tool usage rather than program runs.
 The entry point in [[pyproject.toml]] is [[learnlog.cli:app]], so
 [[sys.argv[0]]] resolves to the [[learnlog]] script.
