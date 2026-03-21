@@ -319,14 +319,67 @@ def test_get_commits_has_required_keys(workdir):
 
 \subsection{Commit details}
 
-For a single commit we use [[git show]], which produces exactly
-the output a teacher would see when inspecting the [[.learnlog/]]
-repository manually: the commit header, the full message
-(containing the captured I/O), and the unified diff (showing the
-code that changed).
-Using [[git show]] instead of separate calls for the message and
-the diff is both simpler and faster---one subprocess instead of
-three.
+For a single commit we use [[git show]], which produces the
+commit header, the full message (containing the captured I/O),
+and the unified diff (showing the code that changed)---all in a
+single subprocess call.
+
+A teacher reviewing student work typically wants to see
+\emph{what changed} before reading the run metadata (script
+name, arguments, captured I/O).
+The default [[git show]] order is header, message, diff; we
+rearrange to header, diff, message so that code changes appear
+first.
+
+<<helper functions>>=
+def reorder_commit_detail(detail):
+    """Reorder ``git show`` output: header, diff, message.
+
+    Moves the unified diff before the commit message so that
+    code changes are visible first in the viewer.
+    """
+    lines = detail.split("\n")
+
+    <<find header boundary>>
+    <<find diff boundary>>
+
+    header = lines[:header_end + 1]
+    message = lines[header_end + 1:diff_start]
+    diff = lines[diff_start:]
+
+    return "\n".join(header + diff + [""] + message)
+@
+
+The [[git show]] output always starts with metadata lines
+(commit hash, author, date) followed by a blank line, then the
+indented commit message, then the diff.
+We locate the first blank line to separate the header from the
+message.
+
+<<find header boundary>>=
+header_end = 0
+for i, line in enumerate(lines):
+    if line == "":
+        header_end = i
+        break
+@
+
+The diff section starts at the first line matching
+[[diff --git]].
+When no diff is present---for example, the initial commit that
+only records a run without any file changes---we return the
+output unchanged.
+
+<<find diff boundary>>=
+diff_start = None
+for i, line in enumerate(lines):
+    if line.startswith("diff --git "):
+        diff_start = i
+        break
+
+if diff_start is None:
+    return detail
+@
 
 We load details lazily---only when the user navigates to a
 particular commit---to keep the viewer responsive even for
@@ -334,15 +387,14 @@ repositories with hundreds of commits.
 
 <<commit data functions>>=
 def get_commit_detail(repo, commit_hash):
-    """Return the ``git show`` output for a single commit.
+    """Return ``git show`` output for a single commit,
+    reordered so the diff appears before the message.
 
-    The result is a string containing the commit header,
-    message, and unified diff---the same output a teacher
-    would see by running ``git show`` in the ``.learnlog/``
-    repository.
+    The result places code changes first, followed by the
+    commit message with run metadata and captured I/O.
     """
     result = repo.git("show", commit_hash)
-    return result.stdout
+    return reorder_commit_detail(result.stdout)
 @
 
 <<test functions>>=
@@ -364,6 +416,27 @@ def test_get_commit_detail_with_diff(workdir):
     commits = get_commits(repo)
     detail = get_commit_detail(repo, commits[-1]["hash"])
     assert "hello.py" in detail
+
+def test_get_commit_detail_diff_before_message(workdir):
+    """Verify that the diff appears before the message."""
+    from learnlog.cli import get_commits, get_commit_detail
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[-1]["hash"])
+    diff_pos = detail.index("diff --git")
+    msg_lines = [
+        l for l in detail.split("\n")
+        if l.startswith("    ")
+    ]
+    assert msg_lines, "expected indented message lines"
+    first_msg_pos = detail.index(msg_lines[0])
+    assert diff_pos < first_msg_pos, \
+        "diff should appear before the commit message"
 @
 
 
@@ -560,8 +633,9 @@ except curses.error:
     pass
 @
 
-The content is the raw [[git show]] output, which already
-combines the commit header, message, and diff.
+The content is the reordered [[git show]] output, which places
+the diff before the commit message so that code changes appear
+first.
 We split into lines for scrollable display.
 
 <<build content lines>>=
