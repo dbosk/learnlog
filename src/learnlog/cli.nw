@@ -1,10 +1,10 @@
 \chapter{Command-Line Interface}
 \label{cli}
 
-The \texttt{learnlog} command lets teachers and teaching assistants
+The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
-It provides two subcommands: \texttt{export} creates a portable bundle
-of the log, and \texttt{play} gives an interactive viewer for browsing
+It provides two subcommands: [[export]] creates a portable bundle
+of the log, and [[play]] gives an interactive viewer for browsing
 the commit history.
 
 We use Typer for the CLI framework because it gives us type-checked
@@ -518,7 +518,14 @@ def _get_detail(self, commit_hash):
         self._detail_cache[commit_hash] = \
             get_commit_detail(self.repo, commit_hash)
     return self._detail_cache[commit_hash]
+@
 
+We cache commit details because [[get_commit_detail]] shells out to
+Git twice (once for the message, once for the diff).
+Without caching, every scroll keystroke would re-run those commands,
+making the viewer sluggish on large repositories.
+
+<<player methods>>=
 def _draw(self, stdscr):
     """Render the current commit to the screen."""
     stdscr.erase()
@@ -554,7 +561,7 @@ try:
         " " * (width - len(header) - 1),
         curses.A_REVERSE,
     )
-except Exception:
+except curses.error:
     pass
 @
 
@@ -591,7 +598,7 @@ for i in range(visible):
     line = content_lines[line_idx][:width - 1]
     try:
         stdscr.addstr(content_start + i, 0, line)
-    except Exception:
+    except curses.error:
         pass
 @
 
@@ -617,7 +624,7 @@ try:
             " " * remaining,
             curses.A_REVERSE,
         )
-except Exception:
+except curses.error:
     pass
 @
 
@@ -718,6 +725,19 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+<<typer commands>>
+@
+
+
+\subsection{The [[export]] command}
+
+The [[export]] command resolves the learnlog directory and delegates
+to [[do_export]].
+We accept an explicit [[-C]] / [[--dir]] option rather than reusing
+[[resolve_source]] because export does not need bundle support---we
+are \emph{creating} bundles, not reading them.
+
+<<typer commands>>=
 @app.command()
 def export(
     output: Annotated[
@@ -753,8 +773,33 @@ def export(
     repo = LearnlogRepo(workdir)
     do_export(repo, output.resolve())
     typer.echo(f"Exported to {output}")
+@
+
+<<test functions>>=
+def test_export_command(workdir, monkeypatch):
+    """Integration test: export creates a valid bundle."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    bundle = workdir / "out.bundle"
+    result = runner.invoke(
+        app, ["export", "-o", str(bundle)]
+    )
+    assert result.exit_code == 0
+    assert bundle.exists()
+@
 
 
+\subsection{The [[play]] command}
+
+The [[play]] command uses [[resolve_source]] to handle both
+directories and bundle files.
+When a bundle is used, [[resolve_source]] creates a temporary
+directory that we must clean up---hence the [[finally]] block.
+
+<<typer commands>>=
 @app.command()
 def play(
     source: Annotated[
@@ -809,20 +854,4 @@ else:
     raise SystemExit(
         f"Commit {start} not found."
     )
-@
-
-<<test functions>>=
-def test_export_command(workdir, monkeypatch):
-    """Integration test: export creates a valid bundle."""
-    from learnlog.cli import app
-    from typer.testing import CliRunner
-    repo = LearnlogRepo(workdir)
-    monkeypatch.chdir(workdir)
-    runner = CliRunner()
-    bundle = workdir / "out.bundle"
-    result = runner.invoke(
-        app, ["export", "-o", str(bundle)]
-    )
-    assert result.exit_code == 0
-    assert bundle.exists()
 @

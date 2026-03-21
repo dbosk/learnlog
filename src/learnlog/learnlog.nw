@@ -1,7 +1,7 @@
 \chapter{Overview}
 \label{learnlog}
 
-The \texttt{learnlog} package provides automatic logging of student code
+The [[learnlog]] package provides automatic logging of student code
 development.
 Students add \mintinline{python}{import learnlog} as the first line of
 their Python files.
@@ -98,7 +98,7 @@ Because [[__file__]] gives us the file that contains the import
 statement, which might be a library module.
 We want the script the student actually invoked from the command line.
 
-The entire function is wrapped in a \texttt{try/except} that catches
+The entire function is wrapped in a [[try]]/[[except]] that catches
 \emph{everything}.
 If learnlog fails for any reason---no Git installed, permission denied,
 disk full---the student's program must still work.
@@ -273,7 +273,7 @@ It restores the original streams---we must do this before running Git
 commands, otherwise our own output would be captured recursively---and
 then finalises the run in the repository.
 
-We wrap everything in a \texttt{try/except} for the same reason as
+We wrap everything in a [[try]]/[[except]] for the same reason as
 [[initialize]]: learnlog must never cause an error at exit.
 
 <<functions>>=

@@ -157,7 +157,6 @@ def init_repo(self):
     self.git("init")
     <<set fallback identity if needed>>
 
-
     <<set up exclude patterns>>
     <<initial commit>>
 @

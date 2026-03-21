@@ -374,7 +374,9 @@ def test_input_capture_readline():
 
 \subsection{Bulk reading}
 
-For programs that read stdin as a whole (\eg~[[sys.stdin.read()]]):
+For programs that read all of stdin at once (\eg~piped input),
+we capture [[read]] so that bulk reads are logged the same way as
+line-by-line reads:
 
 <<input capture methods>>=
 def read(self, size=-1):
@@ -382,13 +384,6 @@ def read(self, size=-1):
     data = self._original.read(size)
     self._iolog.log("stdin", data)
     return data
-
-def readlines(self, hint=-1):
-    """Read lines from the original stream and log them."""
-    lines = self._original.readlines(hint)
-    for line in lines:
-        self._iolog.log("stdin", line)
-    return lines
 @
 
 <<test functions>>=
@@ -399,7 +394,25 @@ def test_input_capture_read():
     data = cap.read()
     assert data == "data"
     assert "stdin: data" in log.getvalue()
+@
 
+
+\subsection{Reading multiple lines}
+
+The [[readlines]] method returns all remaining lines as a list.
+We log each line individually so they get separate prefixed entries,
+matching the behavior of repeated [[readline]] calls:
+
+<<input capture methods>>=
+def readlines(self, hint=-1):
+    """Read lines from the original stream and log them."""
+    lines = self._original.readlines(hint)
+    for line in lines:
+        self._iolog.log("stdin", line)
+    return lines
+@
+
+<<test functions>>=
 def test_input_capture_readlines():
     original = io.StringIO("a\nb\n")
     log = IOLog()
@@ -411,10 +424,11 @@ def test_input_capture_readlines():
 @
 
 
-\subsection{Iteration and delegation}
+\subsection{Iteration}
 
 Programs that iterate over stdin (\eg~[[for line in sys.stdin]])
-need the iterator protocol:
+need the iterator protocol.
+We delegate to [[readline]] so that each line is automatically logged:
 
 <<input capture methods>>=
 def __iter__(self):
@@ -425,9 +439,6 @@ def __next__(self):
     if not line:
         raise StopIteration
     return line
-
-def __getattr__(self, name):
-    return getattr(self._original, name)
 @
 
 <<test functions>>=
@@ -437,7 +448,21 @@ def test_input_capture_iteration():
     cap = InputCapture(original, log)
     lines = list(cap)
     assert lines == ["a\n", "b\n"]
+@
 
+
+\subsection{Delegation}
+
+As with [[StreamCapture]], we delegate all other attribute access to
+the original stream so that code inspecting [[sys.stdin.encoding]] or
+similar properties still works:
+
+<<input capture methods>>=
+def __getattr__(self, name):
+    return getattr(self._original, name)
+@
+
+<<test functions>>=
 def test_input_capture_delegates_attributes():
     original = io.StringIO()
     log = IOLog()
