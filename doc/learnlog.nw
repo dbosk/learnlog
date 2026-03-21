@@ -40,6 +40,7 @@
 \input{../src/learnlog/learnlog.tex}
 \input{../src/learnlog/capture.tex}
 \input{../src/learnlog/gitrepo.tex}
+\input{../src/learnlog/cli.tex}
 
 
 \backmatter

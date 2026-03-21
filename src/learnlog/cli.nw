@@ -1,0 +1,828 @@
+\chapter{Command-Line Interface}
+\label{cli}
+
+The \texttt{learnlog} command lets teachers and teaching assistants
+review the development logs that students produce.
+It provides two subcommands: \texttt{export} creates a portable bundle
+of the log, and \texttt{play} gives an interactive viewer for browsing
+the commit history.
+
+We use Typer for the CLI framework because it gives us type-checked
+arguments with minimal boilerplate, and the modern
+[[Annotated]] style makes the parameter declarations self-documenting.
+
+
+\section{Code overview}
+
+<<[[cli.py]]>>=
+"""Command-line interface for learnlog.
+
+Provides the ``learnlog`` command with subcommands for exporting
+and playing back the development log stored in ``.learnlog/``.
+"""
+
+<<imports>>
+
+<<constants>>
+<<helper functions>>
+<<commit data functions>>
+<<export functions>>
+<<play viewer>>
+
+<<typer app>>
+@
+
+<<test [[cli.py]]>>=
+"""Tests for the CLI module."""
+import tempfile
+import os
+import pathlib
+import subprocess
+import datetime
+import pytest
+from learnlog.gitrepo import LearnlogRepo
+
+<<test helpers>>
+<<test functions>>
+@
+
+
+\section{Imports}
+
+We split imports into two groups: standard library and the learnlog
+package.
+The [[curses]] import is deferred to the [[play]] command because it
+is unavailable on Windows---we only need it when the user actually
+invokes the interactive viewer.
+
+<<imports>>=
+from __future__ import annotations
+
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+from typing import Annotated, Optional
+
+import typer
+
+from learnlog.gitrepo import LearnlogRepo
+@
+
+
+\section{Finding the learnlog directory}
+
+When the user runs [[learnlog play]] or [[learnlog export]] without
+specifying a directory, we need to find the [[.learnlog/]] directory.
+We walk up from the current directory, mirroring how Git itself
+searches for [[.git/]].
+This means the user can run the command from a subdirectory of their
+project and it will still work.
+
+<<helper functions>>=
+def find_learnlog_dir(start=None):
+    """Walk up from ``start`` to find a ``.learnlog/`` directory.
+
+    Returns the directory containing ``.learnlog/``, or ``None``
+    if no learnlog repository is found.
+    """
+    path = pathlib.Path(start or os.getcwd()).resolve()
+    while True:
+        if (path / ".learnlog").is_dir():
+            return path
+        parent = path.parent
+        if parent == path:
+            return None
+        path = parent
+@
+
+Let's verify the upward search works correctly:
+
+<<test helpers>>=
+@pytest.fixture
+def workdir(tmp_path, monkeypatch):
+    """Create a temporary working directory with a learnlog repo.
+
+    Sets a test Git identity so commits work even without a
+    global Git config.
+    """
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@test")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@test")
+    script = tmp_path / "hello.py"
+    script.write_text('print("hello")\n')
+    return tmp_path
+@
+
+<<test functions>>=
+def test_find_learnlog_dir_in_current(workdir):
+    from learnlog.cli import find_learnlog_dir
+    repo = LearnlogRepo(workdir)
+    assert find_learnlog_dir(workdir) == workdir
+
+def test_find_learnlog_dir_from_subdirectory(workdir):
+    from learnlog.cli import find_learnlog_dir
+    repo = LearnlogRepo(workdir)
+    sub = workdir / "subdir"
+    sub.mkdir()
+    assert find_learnlog_dir(sub) == workdir
+
+def test_find_learnlog_dir_returns_none(tmp_path):
+    from learnlog.cli import find_learnlog_dir
+    assert find_learnlog_dir(tmp_path) is None
+@
+
+
+\section{Resolving the source}
+
+The [[play]] command accepts an optional source that can be a
+directory (containing [[.learnlog/]]) or a bundle file.
+We need a single function that resolves any of these into a
+[[LearnlogRepo]] ready for querying.
+
+For bundle files, we clone them into a temporary directory.
+The caller is responsible for cleanup---we return both the repo
+and the temporary directory (or [[None]] if no temp dir was created).
+
+We detect bundles by checking whether [[git bundle verify]]
+succeeds on the file, rather than relying on file extensions.
+This is more robust: a user might name their bundle
+[[student-log.bin]] instead of [[student.bundle]].
+
+<<helper functions>>=
+def resolve_source(source=None):
+    """Resolve a source into a ``(LearnlogRepo, tmpdir)`` pair.
+
+    ``source`` can be ``None`` (search current directory),
+    a directory path, or a bundle file.  When a bundle is used,
+    ``tmpdir`` is the temporary directory that should be cleaned
+    up by the caller; otherwise it is ``None``.
+    """
+    if source is None:
+        workdir = find_learnlog_dir()
+        if workdir is None:
+            raise SystemExit(
+                "No .learnlog/ directory found. "
+                "Run this from a learnlog-tracked project."
+            )
+        return LearnlogRepo(workdir), None
+
+    path = pathlib.Path(source).resolve()
+
+    if path.is_dir():
+        if not (path / ".learnlog").is_dir():
+            raise SystemExit(
+                f"No .learnlog/ directory in {path}"
+            )
+        return LearnlogRepo(path), None
+
+    <<resolve bundle file>>
+@
+
+To unbundle, we create a temporary directory and use
+[[git clone]] with the bundle as the remote.
+We point [[GIT_DIR]] at the cloned repo's [[.git/]] so that
+[[LearnlogRepo.git()]] can query it.
+However, [[LearnlogRepo]] expects the git directory to be named
+[[.learnlog/]], so we rename it after cloning.
+
+<<resolve bundle file>>=
+if not path.is_file():
+    raise SystemExit(f"Not a file or directory: {path}")
+
+verify = subprocess.run(
+    ["git", "bundle", "verify", str(path)],
+    capture_output=True, text=True,
+)
+if verify.returncode != 0:
+    raise SystemExit(
+        f"Not a valid bundle file: {path}"
+    )
+
+tmpdir = tempfile.mkdtemp(prefix="learnlog-play-")
+tmppath = pathlib.Path(tmpdir)
+
+subprocess.run(
+    ["git", "clone", str(path), str(tmppath / "repo")],
+    capture_output=True, text=True, check=True,
+)
+
+cloned = tmppath / "repo"
+(cloned / ".git").rename(cloned / ".learnlog")
+
+return LearnlogRepo(cloned), tmpdir
+@
+
+<<test functions>>=
+def test_resolve_source_from_directory(workdir):
+    from learnlog.cli import resolve_source
+    repo = LearnlogRepo(workdir)
+    resolved, tmpdir = resolve_source(str(workdir))
+    assert tmpdir is None
+    assert resolved.workdir == workdir
+
+def test_resolve_source_none_finds_cwd(workdir, monkeypatch):
+    from learnlog.cli import resolve_source
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    resolved, tmpdir = resolve_source(None)
+    assert tmpdir is None
+    assert resolved.workdir == workdir
+
+def test_resolve_source_missing_dir(tmp_path):
+    from learnlog.cli import resolve_source
+    with pytest.raises(SystemExit, match="No .learnlog/"):
+        resolve_source(str(tmp_path))
+
+def test_resolve_source_bundle(workdir):
+    import shutil
+    from learnlog.cli import resolve_source
+    repo = LearnlogRepo(workdir)
+    bundle_path = workdir / "test.bundle"
+    repo.git(
+        "bundle", "create", str(bundle_path), "--all"
+    )
+    resolved, tmpdir = resolve_source(str(bundle_path))
+    try:
+        assert tmpdir is not None
+        result = resolved.git("log", "--oneline")
+        assert result.returncode == 0
+    finally:
+        shutil.rmtree(tmpdir)
+@
+
+
+\section{Querying commit data}
+
+The viewer and exporter both need to list commits and fetch
+details for individual commits.
+We keep these as standalone functions rather than methods on
+[[LearnlogRepo]]---the repo class handles recording; these
+functions handle reading, which is a different concern.
+
+\subsection{Listing commits}
+
+We list commits in chronological order (oldest first) because
+that matches the natural playback direction: the student starts
+writing code and we watch their progress forward in time.
+
+<<commit data functions>>=
+def get_commits(repo):
+    """Return a list of commits in chronological order.
+
+    Each entry is a dict with ``hash``, ``subject``, and
+    ``date`` keys.
+    """
+    result = repo.git(
+        "log", "--format=%H\t%s\t%aI", "--reverse"
+    )
+    if result.returncode != 0:
+        return []
+    commits = []
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            commits.append({
+                "hash": parts[0],
+                "subject": parts[1],
+                "date": parts[2],
+            })
+    return commits
+@
+
+<<test functions>>=
+def test_get_commits_returns_chronological(workdir):
+    from learnlog.cli import get_commits
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    assert len(commits) >= 2
+    assert commits[0]["hash"] != commits[-1]["hash"]
+
+def test_get_commits_has_required_keys(workdir):
+    from learnlog.cli import get_commits
+    repo = LearnlogRepo(workdir)
+    commits = get_commits(repo)
+    assert len(commits) >= 1
+    for key in ("hash", "subject", "date"):
+        assert key in commits[0]
+@
+
+
+\subsection{Commit details}
+
+For a single commit, we fetch the full message and the diff.
+The diff shows what changed compared to the parent commit.
+For the initial commit, we use [[--root]] to show all files as
+additions.
+
+We load details lazily---only when the user navigates to a
+particular commit---to keep the viewer responsive even for
+repositories with hundreds of commits.
+
+<<commit data functions>>=
+def get_commit_detail(repo, commit_hash):
+    """Return detailed information for a single commit.
+
+    Returns a dict with ``message`` (full commit message) and
+    ``diff`` (unified diff against parent).
+    """
+    msg_result = repo.git(
+        "log", "-1", "--format=%B", commit_hash
+    )
+    message = msg_result.stdout.rstrip("\n")
+
+    parent_result = repo.git(
+        "rev-parse", commit_hash + "^"
+    )
+    if parent_result.returncode == 0:
+        diff_result = repo.git(
+            "diff", parent_result.stdout.strip(),
+            commit_hash
+        )
+    else:
+        diff_result = repo.git(
+            "diff", "--root", commit_hash
+        )
+    diff = diff_result.stdout
+
+    return {"message": message, "diff": diff}
+@
+
+<<test functions>>=
+def test_get_commit_detail_initial(workdir):
+    from learnlog.cli import get_commits, get_commit_detail
+    repo = LearnlogRepo(workdir)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[0]["hash"])
+    assert "message" in detail
+    assert "diff" in detail
+
+def test_get_commit_detail_with_diff(workdir):
+    from learnlog.cli import get_commits, get_commit_detail
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[-1]["hash"])
+    assert "hello.py" in detail["diff"]
+@
+
+
+\section{The export command}
+\label{sec:export}
+
+The export command creates a Git bundle of the [[.learnlog/]]
+repository.
+A bundle is a single file that contains the complete history
+and can be cloned or passed to [[learnlog play]] for playback.
+This is the natural serialisation format for a Git repository---it
+handles pack files correctly and can be verified with
+[[git bundle verify]].
+
+The default output filename is [[learnlog.bundle]], placed in the
+current directory.
+
+<<constants>>=
+DEFAULT_BUNDLE_NAME = "learnlog.bundle"
+@
+
+<<export functions>>=
+def do_export(repo, output):
+    """Export the learnlog repository as a Git bundle.
+
+    Creates a bundle file at ``output`` containing the full
+    commit history.
+    """
+    result = repo.git(
+        "bundle", "create", str(output), "--all"
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"Failed to create bundle: {result.stderr}"
+        )
+@
+
+<<test functions>>=
+def test_do_export_creates_bundle(workdir):
+    from learnlog.cli import do_export
+    repo = LearnlogRepo(workdir)
+    bundle = workdir / "test.bundle"
+    do_export(repo, bundle)
+    assert bundle.exists()
+    verify = subprocess.run(
+        ["git", "bundle", "verify", str(bundle)],
+        capture_output=True,
+    )
+    assert verify.returncode == 0
+@
+
+
+\section{The play viewer}
+\label{sec:play}
+
+The interactive viewer uses [[curses]] to show one commit at a
+time with vi-style navigation.
+We chose [[curses]] over a prompt-based loop because single-keypress
+navigation feels natural for browsing a log---the user never needs
+to press Enter.
+Since [[curses]] is a standard library module on Unix systems and
+learnlog targets university lab machines (Linux), this is a
+pragmatic choice.
+
+The viewer state is simple: the current commit index and a vertical
+scroll offset within the commit's content.
+We cache the detail for the currently displayed commit to avoid
+re-fetching on every scroll.
+
+\subsection{The [[PlaybackViewer]] class}
+
+<<play viewer>>=
+class PlaybackViewer:
+    """Interactive curses-based commit viewer.
+
+    Displays commits one at a time with vi-style navigation:
+    ``H``/``L`` for previous/next commit, ``j``/``k`` for
+    scrolling within a commit, ``q`` to quit.
+    """
+
+    def __init__(self, repo, commits, start_index=0):
+        self.repo = repo
+        self.commits = commits
+        self.index = start_index
+        self.scroll = 0
+        self._detail_cache = {}
+
+    <<player methods>>
+@
+
+\subsection{Running the viewer}
+
+The [[run]] method enters curses mode and drives the main loop.
+We use [[curses.wrapper]] to ensure the terminal is restored
+even if an exception occurs.
+
+<<player methods>>=
+def run(self):
+    """Enter curses mode and run the interactive viewer."""
+    import curses
+    curses.wrapper(self._main_loop)
+@
+
+\subsection{The main loop}
+
+Each iteration draws the screen and waits for a keypress.
+We redraw on every key because the state may have changed.
+
+<<player methods>>=
+def _main_loop(self, stdscr):
+    """Main event loop inside curses."""
+    import curses
+    curses.curs_set(0)
+    stdscr.clear()
+
+    while True:
+        self._draw(stdscr)
+        key = stdscr.getch()
+        if not self._handle_key(key):
+            break
+@
+
+\subsection{Drawing the screen}
+
+The screen has three regions: a header showing position and
+commit subject, the scrollable content area with the commit
+message and diff, and a footer with key bindings.
+
+We build the content as a list of lines, then display the
+portion that fits in the terminal window starting from the
+scroll offset.
+This approach avoids the complexity of [[curses]] pads while
+handling arbitrarily long diffs.
+
+<<player methods>>=
+def _get_detail(self, commit_hash):
+    """Fetch and cache commit detail."""
+    if commit_hash not in self._detail_cache:
+        self._detail_cache[commit_hash] = \
+            get_commit_detail(self.repo, commit_hash)
+    return self._detail_cache[commit_hash]
+
+def _draw(self, stdscr):
+    """Render the current commit to the screen."""
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+
+    commit = self.commits[self.index]
+    detail = self._get_detail(commit["hash"])
+
+    <<draw header>>
+    <<build content lines>>
+    <<draw content area>>
+    <<draw footer>>
+
+    stdscr.refresh()
+@
+
+The header shows the position in the commit list, the short
+hash, and the commit subject.
+We truncate to the terminal width to avoid curses errors.
+
+<<draw header>>=
+header = (
+    f"[{self.index + 1}/{len(self.commits)}] "
+    f"{commit['hash'][:7]} "
+    f"— {commit['subject']}"
+)
+header = header[:width - 1]
+try:
+    import curses
+    stdscr.addstr(0, 0, header, curses.A_REVERSE)
+    stdscr.addstr(
+        0, len(header),
+        " " * (width - len(header) - 1),
+        curses.A_REVERSE,
+    )
+except Exception:
+    pass
+@
+
+The content combines the commit message and the diff,
+separated by a blank line.
+We split into lines for scrollable display.
+
+<<build content lines>>=
+content_text = detail["message"]
+if detail["diff"]:
+    content_text += "\n\n" + detail["diff"]
+content_lines = content_text.split("\n")
+@
+
+We display lines starting from the scroll offset, filling
+the area between the header (row~0) and the footer
+(last row).
+
+<<draw content area>>=
+content_start = 1
+content_end = height - 2
+visible = content_end - content_start
+
+self.scroll = max(
+    0,
+    min(self.scroll,
+        len(content_lines) - visible),
+)
+
+for i in range(visible):
+    line_idx = self.scroll + i
+    if line_idx >= len(content_lines):
+        break
+    line = content_lines[line_idx][:width - 1]
+    try:
+        stdscr.addstr(content_start + i, 0, line)
+    except Exception:
+        pass
+@
+
+The footer shows key bindings.
+It sits on the last row of the terminal.
+
+<<draw footer>>=
+footer = (
+    " H/\u2190: prev  L/\u2192: next  "
+    "j/\u2193: down  k/\u2191: up  "
+    "g: first  G: last  q: quit"
+)
+footer = footer[:width - 1]
+try:
+    import curses
+    stdscr.addstr(
+        height - 1, 0, footer, curses.A_REVERSE
+    )
+    remaining = width - len(footer) - 1
+    if remaining > 0:
+        stdscr.addstr(
+            height - 1, len(footer),
+            " " * remaining,
+            curses.A_REVERSE,
+        )
+except Exception:
+    pass
+@
+
+
+\subsection{Handling key presses}
+
+The key handler updates the viewer state and returns [[False]]
+when the user presses [[q]] to quit.
+We support both the letter keys ([[H]], [[L]], [[j]], [[k]])
+and arrow keys for accessibility.
+
+<<player methods>>=
+def _handle_key(self, key):
+    """Process a keypress.  Return ``False`` to quit."""
+    import curses
+
+    if key in (ord("q"), ord("Q")):
+        return False
+    elif key in (ord("h"), ord("H"), curses.KEY_LEFT):
+        if self.index > 0:
+            self.index -= 1
+            self.scroll = 0
+    elif key in (ord("l"), ord("L"), curses.KEY_RIGHT):
+        if self.index < len(self.commits) - 1:
+            self.index += 1
+            self.scroll = 0
+    elif key in (ord("j"), curses.KEY_DOWN):
+        self.scroll += 1
+    elif key in (ord("k"), curses.KEY_UP):
+        self.scroll = max(0, self.scroll - 1)
+    elif key == ord("g"):
+        self.index = 0
+        self.scroll = 0
+    elif key == ord("G"):
+        self.index = len(self.commits) - 1
+        self.scroll = 0
+
+    return True
+@
+
+We test the key handler logic without a real curses screen
+by calling it directly with key codes:
+
+<<test functions>>=
+def test_handle_key_quit():
+    from learnlog.cli import PlaybackViewer
+    viewer = PlaybackViewer(None, [{"hash": "a"}], 0)
+    assert viewer._handle_key(ord("q")) is False
+
+def test_handle_key_navigation():
+    from learnlog.cli import PlaybackViewer
+    commits = [
+        {"hash": "a"}, {"hash": "b"}, {"hash": "c"}
+    ]
+    viewer = PlaybackViewer(None, commits, 0)
+    viewer._handle_key(ord("l"))
+    assert viewer.index == 1
+    viewer._handle_key(ord("l"))
+    assert viewer.index == 2
+    viewer._handle_key(ord("l"))
+    assert viewer.index == 2  # at end, stays
+    viewer._handle_key(ord("h"))
+    assert viewer.index == 1
+
+def test_handle_key_scroll():
+    from learnlog.cli import PlaybackViewer
+    viewer = PlaybackViewer(None, [{"hash": "a"}], 0)
+    viewer._handle_key(ord("j"))
+    assert viewer.scroll == 1
+    viewer._handle_key(ord("k"))
+    assert viewer.scroll == 0
+    viewer._handle_key(ord("k"))
+    assert viewer.scroll == 0  # floor at 0
+
+def test_handle_key_jump_endpoints():
+    from learnlog.cli import PlaybackViewer
+    commits = [
+        {"hash": "a"}, {"hash": "b"}, {"hash": "c"}
+    ]
+    viewer = PlaybackViewer(None, commits, 1)
+    viewer._handle_key(ord("G"))
+    assert viewer.index == 2
+    viewer._handle_key(ord("g"))
+    assert viewer.index == 0
+@
+
+
+\section{Typer application}
+
+We define the Typer app at module level with two commands.
+The [[app]] object is the entry point referenced by
+[[pyproject.toml]].
+
+<<typer app>>=
+app = typer.Typer(
+    name="learnlog",
+    help="Review student development logs.",
+    no_args_is_help=True,
+)
+
+@app.command()
+def export(
+    output: Annotated[
+        pathlib.Path,
+        typer.Option(
+            "--output", "-o",
+            help="Output bundle file path.",
+        ),
+    ] = pathlib.Path(DEFAULT_BUNDLE_NAME),
+    directory: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "--dir", "-C",
+            help="Directory containing .learnlog/.",
+        ),
+    ] = None,
+):
+    """Export the learnlog repository as a Git bundle."""
+    workdir = directory
+    if workdir is None:
+        workdir = find_learnlog_dir()
+        if workdir is None:
+            raise SystemExit(
+                "No .learnlog/ directory found."
+            )
+    else:
+        workdir = pathlib.Path(workdir).resolve()
+        if not (workdir / ".learnlog").is_dir():
+            raise SystemExit(
+                f"No .learnlog/ directory in {workdir}"
+            )
+
+    repo = LearnlogRepo(workdir)
+    do_export(repo, output.resolve())
+    typer.echo(f"Exported to {output}")
+
+
+@app.command()
+def play(
+    source: Annotated[
+        Optional[str],
+        typer.Argument(
+            help=(
+                "Source: directory with .learnlog/ "
+                "or a .bundle file. "
+                "Defaults to current directory."
+            ),
+        ),
+    ] = None,
+    start: Annotated[
+        Optional[str],
+        typer.Option(
+            "--start",
+            help="Commit hash to start playback from.",
+        ),
+    ] = None,
+):
+    """Interactively play back the development log."""
+    import shutil
+
+    repo, tmpdir = resolve_source(source)
+    try:
+        commits = get_commits(repo)
+        if not commits:
+            raise SystemExit("No commits found.")
+
+        start_index = 0
+        if start:
+            <<find starting commit index>>
+
+        viewer = PlaybackViewer(repo, commits, start_index)
+        viewer.run()
+    finally:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+When the user specifies a [[--start]] commit, we find the
+matching index by prefix.
+Short hashes work because we match the beginning of the
+full hash, just like Git does.
+
+<<find starting commit index>>=
+for i, c in enumerate(commits):
+    if c["hash"].startswith(start):
+        start_index = i
+        break
+else:
+    raise SystemExit(
+        f"Commit {start} not found."
+    )
+@
+
+<<test functions>>=
+def test_export_command(workdir, monkeypatch):
+    """Integration test: export creates a valid bundle."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    bundle = workdir / "out.bundle"
+    result = runner.invoke(
+        app, ["export", "-o", str(bundle)]
+    )
+    assert result.exit_code == 0
+    assert bundle.exists()
+@
