@@ -24,7 +24,7 @@ compile:
 	poetry build
 
 .PHONY: publish publish-github publish-pypi
-publish: publish-github
+publish: publish-github publish-pypi
 
 publish-github: doc/learnlog.pdf
 	git push
