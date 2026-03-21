@@ -331,6 +331,41 @@ The default [[git show]] order is header, message, diff; we
 rearrange to header, diff, message so that code changes appear
 first.
 
+The [[git show]] output always starts with metadata lines
+(commit hash, author, date) followed by a blank line, then the
+indented commit message, then the diff.
+Both reordering and filtering need to locate these three sections,
+so we extract the boundary-finding into a single function.
+
+The header ends at the first blank line.
+The diff starts at the first [[diff --git]] line; when no diff is
+present---for example, the initial commit that only records a run
+without any file changes---[[diff_start]] is [[None]].
+
+<<helper functions>>=
+def parse_show_sections(lines):
+    """Find section boundaries in ``git show`` output.
+
+    Returns ``(header_end, diff_start)`` where
+    ``header_end`` is the index of the first blank line and
+    ``diff_start`` is the index of the first ``diff --git``
+    line, or ``None`` if no diff is present.
+    """
+    header_end = 0
+    for i, line in enumerate(lines):
+        if line == "":
+            header_end = i
+            break
+
+    diff_start = None
+    for i, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            diff_start = i
+            break
+
+    return header_end, diff_start
+@
+
 <<helper functions>>=
 def reorder_commit_detail(detail):
     """Reorder ``git show`` output: header, diff, message.
@@ -339,9 +374,10 @@ def reorder_commit_detail(detail):
     code changes are visible first in the viewer.
     """
     lines = detail.split("\n")
+    header_end, diff_start = parse_show_sections(lines)
 
-    <<find header boundary>>
-    <<find diff boundary>>
+    if diff_start is None:
+        return detail
 
     header = lines[:header_end + 1]
     message = lines[header_end + 1:diff_start]
@@ -350,51 +386,166 @@ def reorder_commit_detail(detail):
     return "\n".join(header + diff + [""] + message)
 @
 
-The [[git show]] output always starts with metadata lines
-(commit hash, author, date) followed by a blank line, then the
-indented commit message, then the diff.
-We locate the first blank line to separate the header from the
-message.
-
-<<find header boundary>>=
-header_end = 0
-for i, line in enumerate(lines):
-    if line == "":
-        header_end = i
-        break
-@
-
-The diff section starts at the first line matching
-[[diff --git]].
-When no diff is present---for example, the initial commit that
-only records a run without any file changes---we return the
-output unchanged.
-
-<<find diff boundary>>=
-diff_start = None
-for i, line in enumerate(lines):
-    if line.startswith("diff --git "):
-        diff_start = i
-        break
-
-if diff_start is None:
-    return detail
-@
-
 We load details lazily---only when the user navigates to a
 particular commit---to keep the viewer responsive even for
 repositories with hundreds of commits.
 
+
+\subsection{Filtering learnlog's own runs}
+\label{sec:filter-learnlog}
+
+When the [[learnlog]] CLI is invoked (\eg [[learnlog play]]), the
+package's [[__init__.py]] logs the invocation as a run block---just
+like any student program.
+These self-referential entries clutter the playback with tool usage
+that is not part of the student's development.
+
+Since multiple runs without code changes are appended to the same
+commit (separated by [[\n\n---\n\n]], see \cref{gitrepo}), a single
+commit can contain both student runs and learnlog runs.
+We therefore filter at the run-block level within each commit message,
+not at the commit level.
+
+The separator [[\n\n---\n\n]] is safe to split on because the
+section markers within a run block ([[--- I/O ---]],
+[[--- exception ---]]) always have additional text after the dashes.
+
+<<helper functions>>=
+def filter_learnlog_runs(message):
+    """Remove learnlog CLI run blocks from a commit message.
+
+    Splits on the ``---`` block separator and removes blocks
+    whose header starts with ``Run: learnlog``.
+    Returns the filtered message, which may be empty if all
+    blocks were learnlog runs.
+    """
+    BLOCK_SEP = "\n\n---\n\n"
+    blocks = message.split(BLOCK_SEP)
+    filtered = [
+        b for b in blocks
+        if not b.lstrip().startswith("Run: learnlog")
+    ]
+    return BLOCK_SEP.join(filtered)
+@
+
+Let's verify that filtering works for mixed, student-only, and
+learnlog-only commit messages:
+
+<<test functions>>=
+def test_filter_learnlog_runs_removes_block():
+    from learnlog.cli import filter_learnlog_runs
+    msg = (
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "\n\n---\n\n"
+        "Run: learnlog play\n\nScript: learnlog\n"
+    )
+    result = filter_learnlog_runs(msg)
+    assert "hello.py" in result
+    assert "learnlog" not in result
+
+def test_filter_learnlog_runs_preserves_student():
+    from learnlog.cli import filter_learnlog_runs
+    msg = "Run: hello.py (none)\n\nScript: hello.py\n"
+    assert filter_learnlog_runs(msg) == msg
+
+def test_filter_learnlog_runs_all_learnlog():
+    from learnlog.cli import filter_learnlog_runs
+    msg = (
+        "Run: learnlog play\n\nScript: learnlog\n"
+        "\n\n---\n\n"
+        "Run: learnlog export\n\nScript: learnlog\n"
+    )
+    result = filter_learnlog_runs(msg)
+    assert result.strip() == ""
+
+def test_filter_learnlog_runs_preserves_io_separator():
+    """The --- I/O --- marker within a block is not a separator."""
+    from learnlog.cli import filter_learnlog_runs
+    msg = (
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "\n--- I/O ---\nstdout: hello\n"
+        "\n--- exception ---\nNone"
+    )
+    result = filter_learnlog_runs(msg)
+    assert "stdout: hello" in result
+@
+
+We could fetch the raw commit message separately
+([[git log --format=%B]]), but that would require an extra subprocess
+call per commit.
+Instead, we extract the message directly from the [[git show]]
+output---it is indented with four spaces---filter it, and reconstruct
+the output in place, reusing [[parse_show_sections]] to locate the
+boundaries.
+
+<<helper functions>>=
+def filter_show_output(show_output):
+    """Filter learnlog runs from ``git show`` output.
+
+    Extracts the indented commit message, strips the four-space
+    indentation, filters learnlog run blocks, re-indents, and
+    reconstructs the full output.  Returns ``None`` if all run
+    blocks were filtered out.
+    """
+    lines = show_output.split("\n")
+    header_end, diff_start = parse_show_sections(lines)
+
+    <<extract and filter raw message>>
+    <<reconstruct show output>>
+@
+
+<<extract and filter raw message>>=
+end = diff_start if diff_start is not None else len(lines)
+msg_lines = lines[header_end + 1:end]
+raw_msg = "\n".join(
+    line[4:] if line.startswith("    ") else line
+    for line in msg_lines
+)
+filtered_msg = filter_learnlog_runs(raw_msg)
+
+if not filtered_msg.strip():
+    return None
+@
+
+<<reconstruct show output>>=
+reindented = []
+for line in filtered_msg.split("\n"):
+    if line:
+        reindented.append("    " + line)
+    else:
+        reindented.append("")
+
+header = lines[:header_end + 1]
+diff = lines[end:] if diff_start is not None else []
+return "\n".join(header + reindented + diff)
+@
+
+Filtering is enabled by default because learnlog runs are never part
+of the student's development story---a teacher reviewing the log
+should not have to remember a flag to get a clean view.
+The [[filter_learnlog]] parameter lets the [[--all]] flag disable it
+for debugging or completeness.
+
 <<commit data functions>>=
-def get_commit_detail(repo, commit_hash):
+def get_commit_detail(repo, commit_hash,
+                      filter_learnlog=True):
     """Return ``git show`` output for a single commit,
     reordered so the diff appears before the message.
 
-    The result places code changes first, followed by the
-    commit message with run metadata and captured I/O.
+    When ``filter_learnlog`` is ``True`` (the default),
+    learnlog's own run blocks are stripped from the commit
+    message.  Returns ``None`` if all runs in the commit
+    were learnlog runs.
     """
     result = repo.git("show", commit_hash)
-    return reorder_commit_detail(result.stdout)
+    detail = result.stdout
+
+    if filter_learnlog:
+        detail = filter_show_output(detail)
+        if detail is None:
+            return None
+
+    return reorder_commit_detail(detail)
 @
 
 <<test functions>>=
@@ -517,11 +668,13 @@ class PlaybackViewer:
     scrolling within a commit, ``q`` to quit.
     """
 
-    def __init__(self, repo, commits, start_index=0):
+    def __init__(self, repo, commits, start_index=0,
+                 filter_learnlog=True):
         self.repo = repo
         self.commits = commits
         self.index = start_index
         self.scroll = 0
+        self.filter_learnlog = filter_learnlog
         self._detail_cache = {}
 
     <<player methods>>
@@ -584,7 +737,10 @@ def _get_detail(self, commit_hash):
     """Fetch and cache the ``git show`` output."""
     if commit_hash not in self._detail_cache:
         self._detail_cache[commit_hash] = \
-            get_commit_detail(self.repo, commit_hash)
+            get_commit_detail(
+                self.repo, commit_hash,
+                self.filter_learnlog,
+            )
     return self._detail_cache[commit_hash]
 @
 
@@ -601,6 +757,8 @@ def _draw(self, stdscr):
 
     commit = self.commits[self.index]
     detail = self._get_detail(commit["hash"])
+    if detail is None:
+        detail = "(learnlog internal run)"
 
     <<draw header>>
     <<build content lines>>
@@ -791,10 +949,19 @@ reader sees what the program produced and what the student
 changed as a result in a single continuous stream.
 
 <<play viewer>>=
-def play_batch(repo, commits, start_index=0):
-    """Print commit details sequentially to stdout."""
+def play_batch(repo, commits, start_index=0,
+               filter_learnlog=True):
+    """Print commit details sequentially to stdout.
+
+    When ``filter_learnlog`` is ``True``, learnlog's own run
+    blocks are stripped and all-learnlog commits are skipped.
+    """
     for commit in commits[start_index:]:
-        detail = get_commit_detail(repo, commit["hash"])
+        detail = get_commit_detail(
+            repo, commit["hash"], filter_learnlog,
+        )
+        if detail is None:
+            continue
         sys.stdout.write(detail)
         sys.stdout.write("\n")
 @
@@ -911,6 +1078,12 @@ standard output is not a terminal (for example when piped to
 This means [[learnlog play | less]] just works without the user
 having to remember the flag.
 
+By default, learnlog's own runs are filtered from the output
+(\cref{sec:filter-learnlog}).
+The [[--all]] / [[-a]] flag disables this filter, showing every
+run block including those from [[learnlog play]] and
+[[learnlog export]] invocations.
+
 <<typer commands>>=
 @app.command()
 def play(
@@ -942,6 +1115,16 @@ def play(
             ),
         ),
     ] = None,
+    show_all: Annotated[
+        bool,
+        typer.Option(
+            "--all", "-a",
+            help=(
+                "Include learnlog's own runs in the "
+                "output."
+            ),
+        ),
+    ] = False,
 ):
     """Interactively play back the development log."""
     import shutil
@@ -967,14 +1150,18 @@ we fall back to TTY detection via [[sys.stdout.isatty()]].
 An explicit [[--batch]] or [[--no-batch]] always wins.
 
 <<choose playback mode>>=
+filter_learnlog = not show_all
 use_batch = (
     batch if batch is not None
     else not sys.stdout.isatty()
 )
 if use_batch:
-    play_batch(repo, commits, start_index)
+    play_batch(repo, commits, start_index,
+               filter_learnlog)
 else:
-    viewer = PlaybackViewer(repo, commits, start_index)
+    viewer = PlaybackViewer(
+        repo, commits, start_index, filter_learnlog,
+    )
     viewer.run()
 @
 
@@ -996,6 +1183,43 @@ def test_play_batch_via_cli(workdir):
     )
     assert result.exit_code == 0
     assert "diff --git" in result.output
+@
+
+We verify that learnlog's own runs are filtered from playback by
+default and that [[--all]] restores them:
+
+<<test functions>>=
+def test_play_hides_learnlog_runs(workdir):
+    """Learnlog runs are filtered from batch output."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["play"], t1)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "Script: hello.py" in result.output
+    assert "Script: learnlog" not in result.output
+
+def test_play_all_shows_learnlog_runs(workdir):
+    """The --all flag includes learnlog runs."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["play"], t1)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "--all", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "Script: hello.py" in result.output
+    assert "Script: learnlog" in result.output
 @
 
 When the user specifies a [[--start]] / [[-s]] commit, we find
