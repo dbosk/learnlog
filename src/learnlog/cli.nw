@@ -3,7 +3,8 @@
 
 The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
-It provides two subcommands: [[export]] creates a portable bundle
+It provides three subcommands: [[git]] forwards Git commands to
+the log repository, [[export]] creates a portable bundle
 of the log, and [[play]] gives an interactive viewer for browsing
 the commit history.
 
@@ -17,8 +18,9 @@ arguments with minimal boilerplate, and the modern
 <<[[cli.py]]>>=
 """Command-line interface for learnlog.
 
-Provides the ``learnlog`` command with subcommands for exporting
-and playing back the development log stored in ``.learnlog/``.
+Provides the ``learnlog`` command with subcommands for running
+Git commands against the log, exporting it as a bundle, and
+playing back the development log stored in ``.learnlog/``.
 """
 
 <<imports>>
@@ -984,7 +986,7 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
 
 \section{Typer application}
 
-We define the Typer app at module level with two commands.
+We define the Typer app at module level with three commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
@@ -1059,6 +1061,114 @@ def test_export_command(workdir, monkeypatch):
     )
     assert result.exit_code == 0
     assert bundle.exists()
+@
+
+
+\subsection{The [[git]] command}
+\label{sec:git}
+
+Students sometimes need to inspect their development log directly---for
+example, to check what was recorded before exporting, or to search for
+a particular session.
+The natural tool for this is Git itself, but the [[.learnlog/]]
+directory requires setting [[GIT_DIR]] and [[GIT_WORK_TREE]]
+correctly, which is an implementation detail students should not have
+to know.
+
+The [[git]] subcommand hides this: [[learnlog git log --oneline]]
+works exactly like [[git log --oneline]] would if [[.learnlog/]]
+were a normal [[.git/]] directory.
+We do not capture Git's output---standard input, output, and error
+inherit from the parent process so that pagers, colours, and
+interactive Git commands all work naturally.
+We also forward Git's exit code, which makes the command usable in
+scripts (\eg [[learnlog git diff --quiet]] to test for uncommitted
+changes).
+
+Typer normally parses options like [[--oneline]] as its own flags.
+We prevent this with three context settings: [[ignore_unknown_options]]
+stops Typer from rejecting flags it does not recognise,
+[[allow_extra_args]] collects them in [[ctx.args]], and
+[[allow_interspersed_args]] set to [[False]] ensures that everything
+after the first positional argument is passed through verbatim.
+
+<<typer commands>>=
+@app.command(
+    name="git",
+    context_settings={
+        "allow_extra_args": True,
+        "allow_interspersed_args": False,
+        "ignore_unknown_options": True,
+    },
+)
+def git_command(
+    ctx: typer.Context,
+):
+    """Run a git command on the learnlog repository.
+
+    All arguments are forwarded to git, configured to
+    operate on the .learnlog/ directory.  For example,
+    ``learnlog git log`` lists the recorded commits.
+    """
+    workdir = find_learnlog_dir()
+    if workdir is None:
+        raise SystemExit(
+            "No .learnlog/ directory found."
+        )
+
+    learnlog_dir = workdir / ".learnlog"
+    env = {
+        **os.environ,
+        "GIT_DIR": str(learnlog_dir),
+        "GIT_WORK_TREE": str(workdir),
+    }
+
+    result = subprocess.run(
+        ["git"] + ctx.args,
+        env=env,
+        cwd=str(workdir),
+    )
+    raise typer.Exit(code=result.returncode)
+@
+
+Let's verify that the command forwards to Git correctly, reports
+an error when no repository exists, and propagates Git's exit code:
+
+<<test functions>>=
+def test_git_command_forwards_to_git(workdir, monkeypatch):
+    """The git subcommand runs git on the .learnlog repo."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["git", "log", "--oneline"]
+    )
+    assert result.exit_code == 0
+
+def test_git_command_no_learnlog_dir(tmp_path, monkeypatch):
+    """Error when no .learnlog/ directory exists."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["git", "log"])
+    assert result.exit_code == 1
+
+def test_git_command_forwards_exit_code(
+    workdir, monkeypatch
+):
+    """Git's exit code is propagated."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["git", "log", "--invalid-option"]
+    )
+    assert result.exit_code != 0
 @
 
 
