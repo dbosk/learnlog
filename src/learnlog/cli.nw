@@ -3,10 +3,11 @@
 
 The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
-It provides three subcommands: [[git]] forwards Git commands to
-the log repository, [[export]] creates a portable bundle
-of the log, and [[play]] gives an interactive viewer for browsing
-the commit history.
+It provides four subcommands: [[list]] gives a compact overview of
+the recorded commits, [[git]] forwards Git commands to the log
+repository, [[export]] creates a portable bundle of the log, and
+[[play]] gives an interactive viewer for browsing the commit
+history.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -60,6 +61,7 @@ invokes the interactive viewer.
 <<imports>>=
 from __future__ import annotations
 
+import datetime
 import os
 import pathlib
 import subprocess
@@ -319,6 +321,128 @@ def test_get_commits_has_required_keys(workdir):
 @
 
 
+\subsection{Summarising commits for listing}
+
+The [[list]] command (\cref{sec:list-command}) needs a compact
+one-line summary of each commit: the command that was run, when it
+started, and how many runs the commit contains.
+All of this information lives in the commit message body, so we
+parse it here rather than making additional Git calls.
+
+We split the message on the block separator to count runs, then
+extract the command from the first [[Run:]] line and the start
+time from the first [[Start-Time:]] field.
+The function returns [[None]] when the message contains no run
+blocks---this happens for the initial commit or when all runs
+have been filtered out.
+
+<<commit data functions>>=
+def parse_run_summary(message):
+    """Extract a summary from a commit message body.
+
+    Returns ``(command, start_time, run_count)`` where
+    ``command`` is the script and arguments string,
+    ``start_time`` is formatted as ``YYYY-MM-DD HH:MM``,
+    and ``run_count`` is the number of run blocks.
+    Returns ``None`` if the message contains no runs.
+    """
+    if not message or not message.strip():
+        return None
+
+    blocks = message.split(BLOCK_SEP)
+    run_blocks = [
+        b for b in blocks
+        if b.strip().startswith("Run:")
+    ]
+    if not run_blocks:
+        return None
+
+    <<extract command from first run block>>
+    <<extract start time from first run block>>
+
+    return (command, start_time, len(run_blocks))
+@
+
+The first line of a run block is [[Run: script args]], so we
+strip the [[Run: ]] prefix to get the command string.
+
+<<extract command from first run block>>=
+first = run_blocks[0].strip()
+first_line = first.split("\n", 1)[0]
+command = first_line[len("Run: "):]
+@
+
+The [[Start-Time:]] field is an ISO\,8601 timestamp.
+We reformat it to a human-friendly [[YYYY-MM-DD HH:MM]] since
+full ISO timestamps are noisy in a compact listing.
+
+<<extract start time from first run block>>=
+start_time = ""
+for line in first.split("\n"):
+    if line.startswith("Start-Time:"):
+        iso = line.split(":", 1)[1].strip()
+        try:
+            dt = datetime.datetime.fromisoformat(iso)
+            start_time = dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            start_time = iso
+        break
+@
+
+Let's verify the summary extraction for single runs, multiple
+runs, and empty messages:
+
+<<test functions>>=
+def test_parse_run_summary_single_run():
+    from learnlog.cli import parse_run_summary
+    msg = (
+        "Run: hello.py arg1 arg2\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: arg1 arg2\n"
+        "Start-Time: 2026-03-20T14:30:00"
+    )
+    result = parse_run_summary(msg)
+    assert result is not None
+    command, start_time, count = result
+    assert command == "hello.py arg1 arg2"
+    assert start_time == "2026-03-20 14:30"
+    assert count == 1
+
+def test_parse_run_summary_multiple_runs():
+    from learnlog.cli import parse_run_summary
+    msg = (
+        "Run: hello.py (none)\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:00:00"
+        "\n\n---\n\n"
+        "Run: hello.py --verbose\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: --verbose\n"
+        "Start-Time: 2026-01-01T10:05:00"
+    )
+    result = parse_run_summary(msg)
+    assert result is not None
+    command, start_time, count = result
+    assert command == "hello.py (none)"
+    assert start_time == "2026-01-01 10:00"
+    assert count == 2
+
+def test_parse_run_summary_empty():
+    from learnlog.cli import parse_run_summary
+    assert parse_run_summary("") is None
+    assert parse_run_summary("   ") is None
+
+def test_parse_run_summary_no_runs():
+    from learnlog.cli import parse_run_summary
+    msg = "learnlog: initial commit"
+    assert parse_run_summary(msg) is None
+@
+
+
 \subsection{Commit details}
 
 For a single commit we use [[git show]], which produces the
@@ -412,6 +536,10 @@ The separator [[\n\n---\n\n]] is safe to split on because the
 section markers within a run block ([[--- I/O ---]],
 [[--- exception ---]]) always have additional text after the dashes.
 
+<<constants>>=
+BLOCK_SEP = "\n\n---\n\n"
+@
+
 <<helper functions>>=
 def filter_learnlog_runs(message):
     """Remove learnlog CLI run blocks from a commit message.
@@ -421,7 +549,6 @@ def filter_learnlog_runs(message):
     Returns the filtered message, which may be empty if all
     blocks were learnlog runs.
     """
-    BLOCK_SEP = "\n\n---\n\n"
     blocks = message.split(BLOCK_SEP)
     filtered = [
         b for b in blocks
@@ -986,7 +1113,7 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
 
 \section{Typer application}
 
-We define the Typer app at module level with three commands.
+We define the Typer app at module level with four commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
@@ -998,6 +1125,154 @@ app = typer.Typer(
 )
 
 <<typer commands>>
+@
+
+
+\subsection{The [[list]] command}
+\label{sec:list-command}
+
+The [[list]] command gives a compact overview of the development
+log, one line per commit---like [[git log --oneline]] but showing
+the start time and command instead of the commit message subject.
+This is useful for quickly finding a session to inspect with
+[[play]], or for checking what a student has been working on.
+
+When a commit contains multiple runs (because the student ran the
+same code several times without editing), we show the first run's
+details and append [[(N runs)]] so the teacher knows there is more
+to explore.
+
+<<typer commands>>=
+@app.command(name="list")
+def list_commits(
+    source: Annotated[
+        Optional[str],
+        typer.Argument(
+            help=(
+                "Source: directory with .learnlog/ "
+                "or a .bundle file. "
+                "Defaults to current directory."
+            ),
+        ),
+    ] = None,
+    show_all: Annotated[
+        bool,
+        typer.Option(
+            "--all", "-a",
+            help=(
+                "Include learnlog's own runs in the "
+                "output."
+            ),
+        ),
+    ] = False,
+):
+    """List commits with start time and command."""
+    import shutil
+
+    repo, tmpdir = resolve_source(source)
+    try:
+        commits = get_commits(repo)
+        if not commits:
+            raise SystemExit("No commits found.")
+
+        filter_lr = not show_all
+        for commit in commits:
+            <<get and summarise commit>>
+    finally:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+For each commit we fetch the full message body, optionally filter
+out learnlog's own runs using [[filter_learnlog_runs]], and then
+extract the summary with [[parse_run_summary]].
+Commits whose runs are all filtered out (or that have no run
+blocks, like the initial commit) are silently skipped.
+
+<<get and summarise commit>>=
+body = repo.git(
+    "log", "-1", "--format=%B", commit["hash"],
+).stdout.rstrip("\n")
+if filter_lr:
+    body = filter_learnlog_runs(body)
+summary = parse_run_summary(body)
+if summary is None:
+    continue
+command, start_time, run_count = summary
+short_hash = commit["hash"][:7]
+suffix = (
+    f" ({run_count} runs)" if run_count > 1 else ""
+)
+typer.echo(
+    f"{short_hash} {start_time} {command}{suffix}"
+)
+@
+
+Let's verify that the command lists commits with the expected
+format:
+
+<<test functions>>=
+def test_list_command_via_cli(workdir):
+    """The list command shows commit summaries."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 3, 20, 14, 30)
+    repo.begin_run("hello.py", ["arg1"], t1)
+    runner = CliRunner()
+    result = runner.invoke(app, ["list", str(workdir)])
+    assert result.exit_code == 0
+    assert "hello.py arg1" in result.output
+    assert "2026-03-20 14:30" in result.output
+
+def test_list_command_multiple_runs(workdir):
+    """Multiple runs in one commit show run count."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("hello.py", [], t2)
+    runner = CliRunner()
+    result = runner.invoke(app, ["list", str(workdir)])
+    assert result.exit_code == 0
+    assert "(2 runs)" in result.output
+
+def test_list_command_filters_learnlog(workdir):
+    """Learnlog runs are hidden by default."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["play"], t1)
+    runner = CliRunner()
+    result = runner.invoke(app, ["list", str(workdir)])
+    assert result.exit_code == 0
+    assert "hello.py" in result.output
+    assert "learnlog" not in result.output
+
+def test_list_command_all_shows_learnlog(workdir):
+    """The --all flag counts learnlog runs too."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["play"], t1)
+    runner = CliRunner()
+    # Without --all, the learnlog run is filtered out.
+    filtered = runner.invoke(
+        app, ["list", str(workdir)]
+    )
+    assert "(2 runs)" not in filtered.output
+    # With --all, both runs are counted.
+    unfiltered = runner.invoke(
+        app, ["list", "--all", str(workdir)]
+    )
+    assert unfiltered.exit_code == 0
+    assert "(2 runs)" in unfiltered.output
 @
 
 
