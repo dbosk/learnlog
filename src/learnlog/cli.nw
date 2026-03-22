@@ -4,8 +4,8 @@
 The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
 It provides four subcommands: [[list]] gives a compact overview of
-the recorded commits, [[git]] forwards Git commands to the log
-repository, [[export]] creates a portable bundle of the log, and
+the recorded commits, [[export]] creates a portable bundle of the
+log, [[git]] forwards Git commands to the log repository, and
 [[play]] gives an interactive viewer for browsing the commit
 history.
 
@@ -363,8 +363,10 @@ def parse_run_summary(message):
     return (command, start_time, len(run_blocks))
 @
 
-The first line of a run block is [[Run: script args]], so we
-strip the [[Run: ]] prefix to get the command string.
+The first line of a run block is [[Run: script args]]---the same
+text that [[git log --oneline]] shows as the commit subject.
+We strip the [[Run: ]] prefix to recover the command string as
+the student typed it.
 
 <<extract command from first run block>>=
 first = run_blocks[0].strip()
@@ -372,9 +374,11 @@ first_line = first.split("\n", 1)[0]
 command = first_line[len("Run: "):]
 @
 
-The [[Start-Time:]] field is an ISO\,8601 timestamp.
-We reformat it to a human-friendly [[YYYY-MM-DD HH:MM]] since
-full ISO timestamps are noisy in a compact listing.
+The [[Start-Time:]] field sits in the same first run block
+([[first]]) parsed above.
+Its value is an ISO\,8601 timestamp that we reformat to a
+human-friendly [[YYYY-MM-DD HH:MM]] since full ISO timestamps
+are noisy in a compact listing.
 
 <<extract start time from first run block>>=
 start_time = ""
