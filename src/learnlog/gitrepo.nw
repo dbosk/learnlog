@@ -43,6 +43,8 @@ from learnlog.gitrepo import *
 <<test functions>>
 @
 
+\section{Shared test fixtures}
+
 Several test modules need the same environment: a temporary directory
 with a dummy Python file and a Git identity that works even in CI
 (where no global Git config exists).
@@ -52,9 +54,8 @@ once in a shared [[conftest.py]] that pytest discovers automatically.
 <<[[conftest.py]]>>=
 """Shared test fixtures for learnlog.
 
-Provides the ``workdir`` fixture used by gitrepo and CLI tests.
+Provides the ``workdir`` fixture used by all learnlog test modules.
 """
-import pathlib
 import pytest
 
 @pytest.fixture

@@ -132,8 +132,7 @@ def find_learnlog_dir(start=None):
 
 Let's verify that the upward search works correctly.
 These tests use [[LearnlogRepo]] (\cref{gitrepo}) to create a
-[[.learnlog/]] directory and the [[workdir]] fixture defined in the
-initialisation tests below:
+[[.learnlog/]] directory in an isolated temporary directory:
 
 <<test functions>>=
 class TestFindLearnlogDir:
@@ -261,11 +260,6 @@ def test_env():
     env["GIT_COMMITTER_NAME"] = "Test"
     env["GIT_COMMITTER_EMAIL"] = "test@test"
     return env
-
-@pytest.fixture
-def workdir(tmp_path):
-    """Create a temporary working directory."""
-    return tmp_path
 @
 
 <<test functions>>=
