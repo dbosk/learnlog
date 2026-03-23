@@ -73,37 +73,17 @@ from typing import Annotated, Optional
 
 import typer
 
+from learnlog import find_learnlog_dir
 from learnlog.gitrepo import LearnlogRepo
 @
 
 
-\section{Finding the learnlog directory}
-
-When the user runs a command like [[learnlog play]] without
-specifying a directory, we need to find the [[.learnlog/]] directory.
-We walk up from the current directory, mirroring how Git itself
-searches for [[.git/]].
-This means the user can run the command from a subdirectory of their
-project and it will still work.
-
-<<helper functions>>=
-def find_learnlog_dir(start=None):
-    """Walk up from ``start`` to find a ``.learnlog/`` directory.
-
-    Returns the directory containing ``.learnlog/``, or ``None``
-    if no learnlog repository is found.
-    """
-    path = pathlib.Path(start or os.getcwd()).resolve()
-    while True:
-        if (path / ".learnlog").is_dir():
-            return path
-        parent = path.parent
-        if parent == path:
-            return None
-        path = parent
-@
-
 \section{Resolving the working directory}
+
+The [[find_learnlog_dir]] function (defined in the core module,
+\cref{learnlog}) walks up from a starting directory to find
+[[.learnlog/]].
+Both import-time initialisation and the CLI use it.
 
 Several commands ([[export]], [[set-remote]], [[push]]) accept an
 optional [[-C]] / [[--dir]] argument that points at the project
@@ -163,8 +143,6 @@ def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
 @
 
 
-Let's verify the upward search works correctly:
-
 <<test helpers>>=
 @pytest.fixture
 def workdir(tmp_path, monkeypatch):
@@ -180,24 +158,6 @@ def workdir(tmp_path, monkeypatch):
     script = tmp_path / "hello.py"
     script.write_text('print("hello")\n')
     return tmp_path
-@
-
-<<test functions>>=
-def test_find_learnlog_dir_in_current(workdir):
-    from learnlog.cli import find_learnlog_dir
-    repo = LearnlogRepo(workdir)
-    assert find_learnlog_dir(workdir) == workdir
-
-def test_find_learnlog_dir_from_subdirectory(workdir):
-    from learnlog.cli import find_learnlog_dir
-    repo = LearnlogRepo(workdir)
-    sub = workdir / "subdir"
-    sub.mkdir()
-    assert find_learnlog_dir(sub) == workdir
-
-def test_find_learnlog_dir_returns_none(tmp_path):
-    from learnlog.cli import find_learnlog_dir
-    assert find_learnlog_dir(tmp_path) is None
 @
 
 
