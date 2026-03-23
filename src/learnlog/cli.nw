@@ -3,11 +3,12 @@
 
 The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
-It provides four subcommands: [[list]] gives a compact overview of
+It provides six subcommands: [[list]] gives a compact overview of
 the recorded commits, [[export]] creates a portable bundle of the
-log, [[git]] forwards Git commands to the log repository, and
-[[play]] gives an interactive viewer for browsing the commit
-history.
+log, [[set-remote]] and [[push]] configure and deliver the log to
+a remote Git repository, [[git]] forwards Git commands to the log
+repository, and [[play]] gives an interactive viewer for browsing
+the commit history.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -20,8 +21,9 @@ arguments with minimal boilerplate, and the modern
 """Command-line interface for learnlog.
 
 Provides the ``learnlog`` command with subcommands for running
-Git commands against the log, exporting it as a bundle, and
-playing back the development log stored in ``.learnlog/``.
+Git commands against the log, exporting it as a bundle,
+pushing to a remote repository, and playing back the
+development log stored in ``.learnlog/``.
 """
 
 <<imports>>
@@ -77,7 +79,7 @@ from learnlog.gitrepo import LearnlogRepo
 
 \section{Finding the learnlog directory}
 
-When the user runs [[learnlog play]] or [[learnlog export]] without
+When the user runs a command like [[learnlog play]] without
 specifying a directory, we need to find the [[.learnlog/]] directory.
 We walk up from the current directory, mirroring how Git itself
 searches for [[.git/]].
@@ -100,6 +102,66 @@ def find_learnlog_dir(start=None):
             return None
         path = parent
 @
+
+\section{Resolving the working directory}
+
+Several commands ([[export]], [[set-remote]], [[push]]) accept an
+optional [[-C]] / [[--dir]] argument that points at the project
+directory.
+When omitted, they search upward from the current directory using
+[[find_learnlog_dir]].
+Rather than duplicate this eight-line pattern in every command, we
+centralise it in a helper that either resolves the explicit path or
+falls back to the search.
+
+<<helper functions>>=
+def resolve_workdir(directory=None):
+    """Locate the working directory containing ``.learnlog/``.
+
+    If ``directory`` is given, verifies that it contains a
+    ``.learnlog/`` subdirectory.  Otherwise, searches upward
+    from the current working directory.
+    """
+    if directory is None:
+        workdir = find_learnlog_dir()
+        if workdir is None:
+            raise SystemExit(
+                "No .learnlog/ directory found."
+            )
+        return workdir
+
+    workdir = pathlib.Path(directory).resolve()
+    if not (workdir / ".learnlog").is_dir():
+        raise SystemExit(
+            f"No .learnlog/ directory in {workdir}"
+        )
+    return workdir
+@
+
+<<test functions>>=
+def test_resolve_workdir_finds_cwd(workdir, monkeypatch):
+    from learnlog.cli import resolve_workdir
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    assert resolve_workdir() == workdir
+
+def test_resolve_workdir_explicit_dir(workdir):
+    from learnlog.cli import resolve_workdir
+    repo = LearnlogRepo(workdir)
+    assert resolve_workdir(workdir) == workdir
+
+def test_resolve_workdir_missing_learnlog(tmp_path):
+    from learnlog.cli import resolve_workdir
+    with pytest.raises(SystemExit, match="No .learnlog/"):
+        resolve_workdir(tmp_path)
+
+def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
+    from learnlog.cli import resolve_workdir
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="No .learnlog/"):
+        resolve_workdir()
+@
+
 
 Let's verify the upward search works correctly:
 
@@ -1117,7 +1179,7 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
 
 \section{Typer application}
 
-We define the Typer app at module level with four commands.
+We define the Typer app at module level with six commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
@@ -1282,11 +1344,11 @@ def test_list_command_all_shows_learnlog(workdir):
 
 \subsection{The [[export]] command}
 
-The [[export]] command resolves the learnlog directory and delegates
-to [[do_export]].
-We accept an explicit [[-C]] / [[--dir]] option rather than reusing
-[[resolve_source]] because export does not need bundle support---we
-are \emph{creating} bundles, not reading them.
+The [[export]] command resolves the learnlog directory using
+[[resolve_workdir]] and delegates to [[do_export]].
+It uses [[-C]] / [[--dir]] rather than [[resolve_source]] because
+export does not need bundle support---we are \emph{creating}
+bundles, not reading them.
 
 <<typer commands>>=
 @app.command()
@@ -1307,20 +1369,7 @@ def export(
     ] = None,
 ):
     """Export the learnlog repository as a Git bundle."""
-    workdir = directory
-    if workdir is None:
-        workdir = find_learnlog_dir()
-        if workdir is None:
-            raise SystemExit(
-                "No .learnlog/ directory found."
-            )
-    else:
-        workdir = pathlib.Path(workdir).resolve()
-        if not (workdir / ".learnlog").is_dir():
-            raise SystemExit(
-                f"No .learnlog/ directory in {workdir}"
-            )
-
+    workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
     do_export(repo, output.resolve())
     typer.echo(f"Exported to {output}")
@@ -1340,6 +1389,259 @@ def test_export_command(workdir, monkeypatch):
     )
     assert result.exit_code == 0
     assert bundle.exists()
+@
+
+
+\subsection{The [[set-remote]] command}
+\label{sec:set-remote}
+
+The [[export]] command (\cref{sec:export}) produces a portable bundle
+file, but for workflows where the destination is a remote Git
+repository---such as a university GitLab instance---repeatedly
+exporting and manually delivering bundles is tedious.
+A simpler alternative is to configure a remote on the [[.learnlog/]]
+repository and push directly.
+
+The [[set-remote]] command configures the destination; [[push]]
+(\cref{sec:push}) delivers the data.
+We always use the remote name [[origin]] because [[.learnlog/]] is a
+single-purpose recording artefact with one destination---there is no
+practical need for multiple remotes.
+
+If [[origin]] already exists we update its URL with
+[[git remote set-url]]; otherwise we create it with
+[[git remote add]].
+We detect the current state by checking the exit code of
+[[git remote get-url]], which fails when the remote does not exist.
+
+<<typer commands>>=
+@app.command(name="set-remote")
+def set_remote(
+    url: Annotated[
+        str,
+        typer.Argument(
+            help="URL of the remote repository.",
+        ),
+    ],
+    directory: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "--dir", "-C",
+            help="Directory containing .learnlog/.",
+        ),
+    ] = None,
+):
+    """Set the remote origin URL for the learnlog repository."""
+    workdir = resolve_workdir(directory)
+    repo = LearnlogRepo(workdir)
+
+    check = repo.git("remote", "get-url", "origin")
+    if check.returncode == 0:
+        result = repo.git(
+            "remote", "set-url", "origin", url
+        )
+    else:
+        result = repo.git(
+            "remote", "add", "origin", url
+        )
+
+    if result.returncode != 0:
+        raise SystemExit(
+            f"Failed to set remote: {result.stderr}"
+        )
+
+    typer.echo(f"Remote origin set to {url}")
+@
+
+Let's verify that [[set-remote]] both adds a new remote and updates
+an existing one:
+
+<<test functions>>=
+def test_set_remote_adds_origin(workdir, monkeypatch):
+    """set-remote configures origin on a fresh repo."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["set-remote", "https://example.com/repo.git"]
+    )
+    assert result.exit_code == 0
+    url = repo.git("remote", "get-url", "origin")
+    assert url.stdout.strip() == \
+        "https://example.com/repo.git"
+
+def test_set_remote_updates_existing(workdir, monkeypatch):
+    """set-remote updates the URL when origin already exists."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    runner.invoke(
+        app, ["set-remote", "https://old.example.com/r.git"]
+    )
+    result = runner.invoke(
+        app, ["set-remote", "https://new.example.com/r.git"]
+    )
+    assert result.exit_code == 0
+    url = repo.git("remote", "get-url", "origin")
+    assert url.stdout.strip() == \
+        "https://new.example.com/r.git"
+@
+
+
+\subsection{The [[push]] command}
+\label{sec:push}
+
+The [[push]] command sends all branches to [[origin]] with tracking
+([[--all -u]]).
+The expected workflow is that the remote repository starts empty, so
+a regular push suffices.
+For the less common case where the remote already contains commits
+(\eg a GitLab repository initialised with a README), the optional
+[[--force]] / [[-f]] flag overrides the remote's history.
+This is safe because [[.learnlog/]] is a single-writer recording
+artefact---there is no risk of overwriting someone else's work.
+
+Unlike [[repo.git()]], which captures output with a ten-second
+timeout, [[push]] uses [[subprocess.run]] with inherited standard
+I/O---the same approach as the [[git]] passthrough command
+(\cref{sec:git}).
+This lets the user see transfer progress and respond to credential
+prompts.
+
+<<typer commands>>=
+@app.command()
+def push(
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force", "-f",
+            help=(
+                "Force-push, overwriting remote history. "
+                "Useful when the remote was initialised "
+                "with its own commits."
+            ),
+        ),
+    ] = False,
+    directory: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "--dir", "-C",
+            help="Directory containing .learnlog/.",
+        ),
+    ] = None,
+):
+    """Push the learnlog repository to its remote."""
+    workdir = resolve_workdir(directory)
+    repo = LearnlogRepo(workdir)
+
+    cmd = ["git", "push", "--all", "-u"]
+    if force:
+        cmd.append("--force")
+    cmd.append("origin")
+
+    result = subprocess.run(
+        cmd,
+        env=repo.env,
+        cwd=str(repo.workdir),
+    )
+    raise typer.Exit(code=result.returncode)
+@
+
+We test [[push]] by creating a bare repository as the remote target,
+configuring [[origin]] to point at it, and verifying that the commits
+arrive:
+
+<<test functions>>=
+def test_push_command(workdir, monkeypatch):
+    """Push sends commits to a bare remote."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir.parent / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    runner.invoke(
+        app, ["set-remote", str(bare)]
+    )
+    result = runner.invoke(app, ["push"])
+    assert result.exit_code == 0
+    log = subprocess.run(
+        ["git", "--git-dir", str(bare),
+         "log", "--oneline"],
+        capture_output=True, text=True,
+    )
+    assert log.returncode == 0
+    assert "learnlog" in log.stdout
+
+def test_push_to_divergent_remote(workdir, monkeypatch):
+    """Force-push works when remote has divergent history."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    # Simulate a GitLab repo initialised with a README:
+    # create a helper repo with a commit, then clone it
+    # as a bare repo to serve as the remote.
+    helper = workdir.parent / "helper"
+    helper.mkdir()
+    subprocess.run(
+        ["git", "init", str(helper)],
+        capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(helper),
+         "config", "commit.gpgsign", "false"],
+        capture_output=True, check=True,
+    )
+    (helper / "README.md").write_text("# Project\n")
+    subprocess.run(
+        ["git", "-C", str(helper), "add", "."],
+        capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(helper),
+         "commit", "-m", "Initial commit"],
+        capture_output=True, check=True,
+        env={**os.environ,
+             "GIT_AUTHOR_NAME": "Test",
+             "GIT_AUTHOR_EMAIL": "test@test",
+             "GIT_COMMITTER_NAME": "Test",
+             "GIT_COMMITTER_EMAIL": "test@test"},
+    )
+    bare = workdir.parent / "divergent-remote.git"
+    subprocess.run(
+        ["git", "clone", "--bare",
+         str(helper), str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    runner.invoke(
+        app, ["set-remote", str(bare)]
+    )
+    # Without --force, divergent history is rejected.
+    result = runner.invoke(app, ["push"])
+    assert result.exit_code != 0
+    # With --force, it succeeds.
+    result = runner.invoke(app, ["push", "--force"])
+    assert result.exit_code == 0
+
+def test_push_no_remote_fails(workdir, monkeypatch):
+    """Push fails when no remote is configured."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["push"])
+    assert result.exit_code != 0
 @
 
 
