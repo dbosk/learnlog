@@ -138,15 +138,15 @@ initialisation tests below:
 <<test functions>>=
 class TestFindLearnlogDir:
     def test_find_in_current(self, workdir):
-        """[[find_learnlog_dir]] returns the directory
-        containing [[.learnlog/]]."""
+        """find_learnlog_dir returns the directory
+        containing .learnlog/."""
         from learnlog import find_learnlog_dir
         LearnlogRepo(workdir)
         assert find_learnlog_dir(workdir) == workdir
 
     def test_find_from_subdirectory(self, workdir):
-        """[[find_learnlog_dir]] walks up to find
-        [[.learnlog/]] in a parent."""
+        """find_learnlog_dir walks up to find
+        .learnlog/ in a parent."""
         from learnlog import find_learnlog_dir
         LearnlogRepo(workdir)
         sub = workdir / "subdir"
@@ -154,8 +154,8 @@ class TestFindLearnlogDir:
         assert find_learnlog_dir(sub) == workdir
 
     def test_returns_none_when_missing(self, tmp_path):
-        """[[find_learnlog_dir]] returns [[None]] if no
-        [[.learnlog/]] exists."""
+        """find_learnlog_dir returns None if no
+        .learnlog/ exists."""
         from learnlog import find_learnlog_dir
         assert find_learnlog_dir(tmp_path) is None
 @
@@ -225,12 +225,10 @@ if main_script == "learnlog":
     return
 @
 
-We search upward for an existing [[.learnlog/]] directory so that a
-student can work in lab subdirectories while all runs are recorded in
-the course-level repository.
-If no repository is found, we fall back to the current working
-directory---which is the natural root when the student runs
-[[python hello.py]] from the project directory for the first time.
+If [[find_learnlog_dir]] finds no existing repository, the fallback to
+[[os.getcwd()]] causes [[LearnlogRepo]] to create a fresh one in the
+current working directory---so the very first run still works without
+any manual setup.
 
 <<create repository and begin run>>=
 repo = LearnlogRepo(workdir)
@@ -318,18 +316,19 @@ class TestInitialize:
     def test_uses_existing_repo_from_subdirectory(
         self, workdir, test_env
     ):
-        """When [[.learnlog/]] exists in a parent, initialisation
+        """When .learnlog/ exists in a parent, initialisation
         uses that repository instead of creating a new one."""
         script = workdir / "setup.py"
         script.write_text(
             "import learnlog\n"
             "print('setup')\n"
         )
-        subprocess.run(
+        result = subprocess.run(
             [sys.executable, str(script)],
             cwd=str(workdir), env=test_env,
             capture_output=True, text=True, timeout=30,
         )
+        assert result.returncode == 0
         sub = workdir / "lab1"
         sub.mkdir()
         child = sub / "hello.py"

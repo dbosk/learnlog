@@ -80,19 +80,14 @@ from learnlog.gitrepo import LearnlogRepo
 
 \section{Resolving the working directory}
 
-The [[find_learnlog_dir]] function (defined in the core module,
-\cref{learnlog}) walks up from a starting directory to find
-[[.learnlog/]].
-Both import-time initialisation and the CLI use it.
-
 Several commands ([[export]], [[set-remote]], [[push]]) accept an
 optional [[-C]] / [[--dir]] argument that points at the project
 directory.
 When omitted, they search upward from the current directory using
-[[find_learnlog_dir]].
-Rather than duplicate this eight-line pattern in every command, we
-centralise it in a helper that either resolves the explicit path or
-falls back to the search.
+[[find_learnlog_dir]] (defined in the core module, \cref{learnlog}).
+Rather than duplicate this pattern in every command, we centralise it
+in a helper that either resolves the explicit path or falls back to
+the search.
 
 <<helper functions>>=
 def resolve_workdir(directory=None):
