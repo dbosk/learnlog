@@ -49,6 +49,7 @@ stored in a hidden ``.learnlog/`` Git repository.
 
 import sys
 import os
+import pathlib
 import datetime
 import atexit
 import traceback
@@ -70,8 +71,10 @@ verifying the full pipeline from import to commit:
 import tempfile
 import subprocess
 import os
+import pathlib
 import sys
 import pytest
+from learnlog.gitrepo import LearnlogRepo
 
 <<test helpers>>
 <<test functions>>
@@ -97,6 +100,63 @@ exception_info = None
 start_time = None
 main_script = None
 main_args = None
+@
+
+
+\section{Finding the learnlog directory}
+
+Before creating a new repository, we search upward from the current
+directory for an existing [[.learnlog/]] directory, mirroring how Git
+itself searches for [[.git/]].
+This lets a student work across multiple lab subdirectories while all
+activity is recorded in a single repository at the course root.
+The function lives in the core module because both import-time
+initialisation and the CLI need it.
+
+<<functions>>=
+def find_learnlog_dir(start=None):
+    """Walk up from ``start`` to find a ``.learnlog/`` directory.
+
+    Returns the directory containing ``.learnlog/``, or ``None``
+    if no learnlog repository is found.
+    """
+    path = pathlib.Path(start or os.getcwd()).resolve()
+    while True:
+        if (path / ".learnlog").is_dir():
+            return path
+        parent = path.parent
+        if parent == path:
+            return None
+        path = parent
+@
+
+Let's verify that the upward search works correctly.
+These tests use [[LearnlogRepo]] (\cref{gitrepo}) to create a
+[[.learnlog/]] directory in an isolated temporary directory:
+
+<<test functions>>=
+class TestFindLearnlogDir:
+    def test_find_in_current(self, workdir):
+        """find_learnlog_dir returns the directory
+        containing .learnlog/."""
+        from learnlog import find_learnlog_dir
+        LearnlogRepo(workdir)
+        assert find_learnlog_dir(workdir) == workdir
+
+    def test_find_from_subdirectory(self, workdir):
+        """find_learnlog_dir walks up to find
+        .learnlog/ in a parent."""
+        from learnlog import find_learnlog_dir
+        LearnlogRepo(workdir)
+        sub = workdir / "subdir"
+        sub.mkdir()
+        assert find_learnlog_dir(sub) == workdir
+
+    def test_returns_none_when_missing(self, tmp_path):
+        """find_learnlog_dir returns None if no
+        .learnlog/ exists."""
+        from learnlog import find_learnlog_dir
+        assert find_learnlog_dir(tmp_path) is None
 @
 
 
@@ -145,7 +205,7 @@ def initialize():
 main_script = os.path.basename(sys.argv[0])
 main_args = sys.argv[1:]
 start_time = datetime.datetime.now()
-workdir = os.getcwd()
+workdir = find_learnlog_dir() or os.getcwd()
 @
 
 When [[learnlog]] is invoked as a CLI tool (\eg [[learnlog play]] or
@@ -164,10 +224,10 @@ if main_script == "learnlog":
     return
 @
 
-We choose the current working directory as the root rather than the
-directory containing the script.
-Students typically run [[python hello.py]] from the project
-directory, so [[os.getcwd()]] is the natural root for the repository.
+If [[find_learnlog_dir]] finds no existing repository, the fallback to
+[[os.getcwd()]] causes [[LearnlogRepo]] to create a fresh one in the
+current working directory---so the very first run still works without
+any manual setup.
 
 <<create repository and begin run>>=
 repo = LearnlogRepo(workdir)
@@ -200,11 +260,6 @@ def test_env():
     env["GIT_COMMITTER_NAME"] = "Test"
     env["GIT_COMMITTER_EMAIL"] = "test@test"
     return env
-
-@pytest.fixture
-def workdir(tmp_path):
-    """Create a temporary working directory."""
-    return tmp_path
 @
 
 <<test functions>>=
@@ -251,6 +306,44 @@ class TestInitialize:
             capture_output=True, text=True, timeout=30,
         )
         assert result.returncode == 0
+
+    def test_uses_existing_repo_from_subdirectory(
+        self, workdir, test_env
+    ):
+        """When .learnlog/ exists in a parent, initialisation
+        uses that repository instead of creating a new one."""
+        script = workdir / "setup.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('setup')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        sub = workdir / "lab1"
+        sub.mkdir()
+        child = sub / "hello.py"
+        child.write_text(
+            "import learnlog\n"
+            "print('from sub')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(child)],
+            cwd=str(sub), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert not (sub / ".learnlog").is_dir()
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "--oneline"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        assert "hello.py" in git_result.stdout
 @
 
 
