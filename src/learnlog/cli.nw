@@ -79,7 +79,7 @@ from learnlog.gitrepo import LearnlogRepo
 
 \section{Finding the learnlog directory}
 
-When the user runs [[learnlog play]] or [[learnlog export]] without
+When the user runs a command like [[learnlog play]] without
 specifying a directory, we need to find the [[.learnlog/]] directory.
 We walk up from the current directory, mirroring how Git itself
 searches for [[.git/]].
@@ -1179,7 +1179,7 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
 
 \section{Typer application}
 
-We define the Typer app at module level with four commands.
+We define the Typer app at module level with six commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
@@ -1437,9 +1437,18 @@ def set_remote(
 
     check = repo.git("remote", "get-url", "origin")
     if check.returncode == 0:
-        repo.git("remote", "set-url", "origin", url)
+        result = repo.git(
+            "remote", "set-url", "origin", url
+        )
     else:
-        repo.git("remote", "add", "origin", url)
+        result = repo.git(
+            "remote", "add", "origin", url
+        )
+
+    if result.returncode != 0:
+        raise SystemExit(
+            f"Failed to set remote: {result.stderr}"
+        )
 
     typer.echo(f"Remote origin set to {url}")
 @
@@ -1572,7 +1581,7 @@ def test_push_command(workdir, monkeypatch):
     assert log.returncode == 0
     assert "learnlog" in log.stdout
 
-def test_push_to_empty_remote(workdir, monkeypatch):
+def test_push_to_divergent_remote(workdir, monkeypatch):
     """Force-push works when remote has divergent history."""
     from learnlog.cli import app
     from typer.testing import CliRunner
