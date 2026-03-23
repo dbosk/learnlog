@@ -101,6 +101,66 @@ def find_learnlog_dir(start=None):
         path = parent
 @
 
+\section{Resolving the working directory}
+
+Several commands ([[export]], [[set-remote]], [[push]]) accept an
+optional [[-C]] / [[--dir]] argument that points at the project
+directory.
+When omitted, they search upward from the current directory using
+[[find_learnlog_dir]].
+Rather than duplicate this eight-line pattern in every command, we
+centralise it in a helper that either resolves the explicit path or
+falls back to the search.
+
+<<helper functions>>=
+def resolve_workdir(directory=None):
+    """Locate the working directory containing ``.learnlog/``.
+
+    If ``directory`` is given, verifies that it contains a
+    ``.learnlog/`` subdirectory.  Otherwise, searches upward
+    from the current working directory.
+    """
+    if directory is None:
+        workdir = find_learnlog_dir()
+        if workdir is None:
+            raise SystemExit(
+                "No .learnlog/ directory found."
+            )
+        return workdir
+
+    workdir = pathlib.Path(directory).resolve()
+    if not (workdir / ".learnlog").is_dir():
+        raise SystemExit(
+            f"No .learnlog/ directory in {workdir}"
+        )
+    return workdir
+@
+
+<<test functions>>=
+def test_resolve_workdir_finds_cwd(workdir, monkeypatch):
+    from learnlog.cli import resolve_workdir
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    assert resolve_workdir() == workdir
+
+def test_resolve_workdir_explicit_dir(workdir):
+    from learnlog.cli import resolve_workdir
+    repo = LearnlogRepo(workdir)
+    assert resolve_workdir(workdir) == workdir
+
+def test_resolve_workdir_missing_learnlog(tmp_path):
+    from learnlog.cli import resolve_workdir
+    with pytest.raises(SystemExit, match="No .learnlog/"):
+        resolve_workdir(tmp_path)
+
+def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
+    from learnlog.cli import resolve_workdir
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="No .learnlog/"):
+        resolve_workdir()
+@
+
+
 Let's verify the upward search works correctly:
 
 <<test helpers>>=
@@ -1282,11 +1342,11 @@ def test_list_command_all_shows_learnlog(workdir):
 
 \subsection{The [[export]] command}
 
-The [[export]] command resolves the learnlog directory and delegates
-to [[do_export]].
-We accept an explicit [[-C]] / [[--dir]] option rather than reusing
-[[resolve_source]] because export does not need bundle support---we
-are \emph{creating} bundles, not reading them.
+The [[export]] command resolves the learnlog directory using
+[[resolve_workdir]] and delegates to [[do_export]].
+It uses [[-C]] / [[--dir]] rather than [[resolve_source]] because
+export does not need bundle support---we are \emph{creating}
+bundles, not reading them.
 
 <<typer commands>>=
 @app.command()
@@ -1307,20 +1367,7 @@ def export(
     ] = None,
 ):
     """Export the learnlog repository as a Git bundle."""
-    workdir = directory
-    if workdir is None:
-        workdir = find_learnlog_dir()
-        if workdir is None:
-            raise SystemExit(
-                "No .learnlog/ directory found."
-            )
-    else:
-        workdir = pathlib.Path(workdir).resolve()
-        if not (workdir / ".learnlog").is_dir():
-            raise SystemExit(
-                f"No .learnlog/ directory in {workdir}"
-            )
-
+    workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
     do_export(repo, output.resolve())
     typer.echo(f"Exported to {output}")
