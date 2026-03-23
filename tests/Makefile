@@ -31,9 +31,14 @@ TESTS := $(shell $(find_tests))
 # Extract just the test filenames for dependencies
 TEST_MODULES := $(foreach entry,$(TESTS),$(shell echo $(entry) | cut -d: -f1))
 
+# Shared test fixtures (conftest.py is defined in gitrepo.nw)
+unit/conftest.py: ../src/learnlog/gitrepo.nw
+	@mkdir -p $(dir $@)
+	notangle -R"[[conftest.py]]" $< | cpif $@
+
 # Main targets
 .PHONY: all
-all: $(TEST_MODULES)
+all: unit/conftest.py $(TEST_MODULES)
 
 # Generate rules for each test
 $(foreach entry,$(TESTS),$(eval $(call def_target,$(entry))))
@@ -50,6 +55,6 @@ compile:
 # Clean generated test files
 .PHONY: clean
 clean:
-	$(RM) $(TEST_MODULES)
+	$(RM) $(TEST_MODULES) unit/conftest.py
 	$(RM) -r .pytest_cache __pycache__ unit/__pycache__
 	$(RM) -r htmlcov .coverage
