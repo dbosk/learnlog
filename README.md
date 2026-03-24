@@ -15,14 +15,14 @@ stored in a hidden local Git repository.
   repository:
 
   ```bash
-  learnlog set-remote <url>
+  learnlog set-remote git@gitlab.kth.se:dbosk/lecture01.git
   learnlog push
   ```
 
   Students clone the log and replay it step by step:
 
   ```bash
-  learnlog clone <url>
+  learnlog clone git@gitlab.kth.se:dbosk/lecture01.git
   learnlog play
   ```
 
@@ -45,7 +45,7 @@ stored in a hidden local Git repository.
   adds `import learnlog` to their programs and pushes the log:
 
   ```bash
-  learnlog set-remote <url>
+  learnlog set-remote git@gitlab.kth.se:dbosk/alice-log.git
   learnlog push
   ```
 
@@ -53,7 +53,7 @@ stored in a hidden local Git repository.
   development data:
 
   ```bash
-  learnlog clone <url>
+  learnlog clone git@gitlab.kth.se:dbosk/alice-log.git
   learnlog play
   ```
 

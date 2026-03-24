@@ -20,12 +20,12 @@ Every run is recorded automatically.
 After the session, the teacher points the log at a remote
 repository and pushes:
 \begin{minted}{bash}
-learnlog set-remote git@gitlab.kth.se:dbosk/demo-log.git
+learnlog set-remote git@gitlab.kth.se:dbosk/lecture01.git
 learnlog push
 \end{minted}
 Students then clone the log and replay it step by step:
 \begin{minted}{bash}
-learnlog clone git@gitlab.kth.se:dbosk/demo-log.git
+learnlog clone git@gitlab.kth.se:dbosk/lecture01.git
 learnlog play
 \end{minted}
 They see the exact sequence of code changes, inputs, and outputs
