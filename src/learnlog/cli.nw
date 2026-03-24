@@ -1592,8 +1592,7 @@ A teacher cloning a student's pushed learnlog to review it, or a
 student moving to a new machine, both need a way to get the
 [[.learnlog/]] data from the remote.
 
-The [[clone]] command fills this role.
-It takes a remote URL, performs a standard [[git clone]] into a
+The command takes a remote URL, performs a standard [[git clone]] into a
 temporary directory, and then moves the resulting [[.git/]] directory
 to [[.learnlog/]] in the target working directory.
 We use a temporary directory rather than [[git clone --bare]] because
@@ -1648,8 +1647,9 @@ def clone(
         )
         if result.returncode != 0:
             raise SystemExit("Clone failed.")
-        pathlib.Path(tmpdir, ".git").rename(
-            learnlog_dir
+        shutil.move(
+            str(pathlib.Path(tmpdir, ".git")),
+            str(learnlog_dir),
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
