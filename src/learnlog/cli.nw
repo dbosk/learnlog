@@ -799,7 +799,7 @@ A ProgSnap2 dataset is a zip file containing:
   subdirectory per unique code state.
 \end{description}
 
-We use the \texttt{.progsnap2} extension to distinguish these
+We use the [[.progsnap2]] extension to distinguish these
 files from Git bundles.
 
 <<constants>>=
@@ -844,17 +844,18 @@ def parse_run_block(block_text):
         "exception_info": None,
     }
 
-    <<parse header fields>>
+    <<parse key-value fields>>
     <<parse trailer fields>>
 
     return result
 @
 
-The header fields are simple key--value pairs, one per line.
+Both header and trailer use simple [[Key: value]] lines, so
+we parse them in a single pass.
 We skip the first [[Run:]] line because it duplicates the
 [[Script:]] and [[Arguments:]] fields in a less structured form.
 
-<<parse header fields>>=
+<<parse key-value fields>>=
 for line in block_text.split("\n"):
     if line.startswith("Script:"):
         result["script"] = line.split(":", 1)[1].strip()
@@ -1153,10 +1154,10 @@ output chunk.
 
 Each chunk is a tuple of [[(event_type, text)]]:
 \begin{description}
-\item[\texttt{X-Run.Output}] contains the joined output
+\item[[[X-Run.Output]]] contains the joined output
   lines (with [[stderr]] merged into output, since
   ProgSnap2 does not distinguish them).
-\item[\texttt{X-Run.Input}] contains the text of a single
+\item[[[X-Run.Input]]] contains the text of a single
   [[stdin]] line.
 \end{description}
 
@@ -1283,6 +1284,8 @@ We assign incrementing integer IDs to each unique tree hash,
 starting from~0.
 The caller passes a mutable [[seen_trees]] dict that maps tree
 hashes to IDs across all commits.
+We return both the ID and the tree hash so that callers can
+reuse it without a second [[git rev-parse]] call.
 
 <<export functions>>=
 def get_code_state_id(repo, commit_hash, seen_trees):
@@ -1291,7 +1294,7 @@ def get_code_state_id(repo, commit_hash, seen_trees):
     Uses the Git tree hash to deduplicate: commits with
     identical file trees share the same ID.  ``seen_trees``
     is a mutable dict mapping tree hashes to integer IDs.
-    Returns the integer CodeStateID.
+    Returns ``(state_id, tree_hash)``.
     """
     result = repo.git(
         "rev-parse", f"{commit_hash}^{{tree}}"
@@ -1301,7 +1304,7 @@ def get_code_state_id(repo, commit_hash, seen_trees):
     if tree_hash not in seen_trees:
         seen_trees[tree_hash] = len(seen_trees)
 
-    return seen_trees[tree_hash]
+    return seen_trees[tree_hash], tree_hash
 @
 
 To populate [[CodeStates/]], we extract the file tree for each
@@ -1354,7 +1357,8 @@ def test_get_code_state_id_deduplicates(workdir):
     hashes = [h for h in hashes if h]
     # All commits without file changes share the same tree
     ids = [
-        get_code_state_id(repo, h, seen) for h in hashes
+        get_code_state_id(repo, h, seen)[0]
+        for h in hashes
     ]
     assert len(set(ids)) == 1
 
@@ -1368,7 +1372,7 @@ def test_get_code_state_id_new_for_changes(workdir):
         repo, repo.git(
             "log", "-1", "--format=%H"
         ).stdout.strip(), seen
-    )
+    )[0]
     (workdir / "hello.py").write_text('print("v2")\n')
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t2)
@@ -1376,7 +1380,7 @@ def test_get_code_state_id_new_for_changes(workdir):
         repo, repo.git(
             "log", "-1", "--format=%H"
         ).stdout.strip(), seen
-    )
+    )[0]
     assert id1 != id2
 
 def test_extract_code_state(workdir):
@@ -1467,14 +1471,9 @@ author_result = repo.git(
 )
 subject_id = author_result.stdout.strip()
 
-code_state_id = get_code_state_id(
+code_state_id, current_tree = get_code_state_id(
     repo, commit_hash, seen_trees,
 )
-
-tree_result = repo.git(
-    "rev-parse", f"{commit_hash}^{{tree}}"
-)
-current_tree = tree_result.stdout.strip()
 @
 
 A [[File.Edit]] event signals that the student changed their
@@ -1620,6 +1619,8 @@ for evt_type, text in io_chunks:
     events.append(io_event)
 @
 
+\subsubsection{Writing the zip file}
+
 We build the zip in a temporary directory, extracting code
 states into numbered subdirectories.
 The [[DatasetMetadata.csv]] and [[MainTable.csv]] are written
@@ -1636,6 +1637,11 @@ with tempfile.TemporaryDirectory(
     <<build main table csv string>>
     <<assemble zip file>>
 @
+
+We need a reverse mapping from tree hashes to commit hashes so
+we can call [[extract_code_state]] with a concrete commit.
+Multiple commits may share the same tree hash; we only need one
+representative commit per tree, so we keep the first one seen.
 
 <<extract code states to temp directory>>=
 states_dir = tmppath / "CodeStates"
@@ -1707,9 +1713,10 @@ for event in events:
 main_csv = main_buf.getvalue()
 @
 
-We use [[zipfile.ZipFile]] to assemble the archive.
-CSV files are written from the in-memory strings;
-code state files are added from the temporary directory.
+We write CSVs from in-memory strings rather than temporary files
+to avoid extra I/O, and iterate subdirectories in sorted order
+so that repeated exports of the same data produce
+byte-identical archives---useful for checksumming and caching.
 
 <<assemble zip file>>=
 with zipfile.ZipFile(
