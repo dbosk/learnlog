@@ -58,6 +58,15 @@ the development data:
 learnlog clone git@gitlab.kth.se:dbosk/alice-log.git
 learnlog play
 \end{minted}
+Alternatively, the student can export the log as a bundle and
+submit it through the course platform:
+\begin{minted}{bash}
+learnlog export -o alice-log.bundle
+\end{minted}
+The researcher then replays it directly:
+\begin{minted}{bash}
+learnlog play alice-log.bundle
+\end{minted}
 This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
 refine their debugging techniques.

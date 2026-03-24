@@ -57,6 +57,19 @@ stored in a hidden local Git repository.
   learnlog play
   ```
 
+  Alternatively, the student can export the log as a bundle and submit it
+  through the course platform:
+
+  ```bash
+  learnlog export -o alice-log.bundle
+  ```
+
+  The researcher then replays it directly:
+
+  ```bash
+  learnlog play alice-log.bundle
+  ```
+
   This gives a complete timeline of how students develop and debug their
   code — for research purposes or to help students refine their debugging
   techniques.
