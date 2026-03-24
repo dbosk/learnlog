@@ -5,7 +5,8 @@ The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
 It provides eight subcommands: [[list]] gives a compact overview
 of the recorded commits, [[export]] creates a portable bundle of
-the log, [[set-remote]], [[push]], [[clone]], and [[pull]] manage
+the log (or a ProgSnap2 dataset for CS education analysis),
+[[set-remote]], [[push]], [[clone]], and [[pull]] manage
 synchronisation with a remote Git repository, [[git]] forwards
 Git commands to the log repository, and [[play]] gives an
 interactive viewer for browsing the commit history.
@@ -21,18 +22,17 @@ arguments with minimal boilerplate, and the modern
 """Command-line interface for learnlog.
 
 Provides the ``learnlog`` command with subcommands for running
-Git commands against the log, exporting it as a bundle,
-cloning from and synchronising with a remote repository, and
-playing back the development log stored in ``.learnlog/``.
+Git commands against the log, exporting it as a bundle or
+ProgSnap2 dataset, cloning from and synchronising with a remote
+repository, and playing back the development log stored in
+``.learnlog/``.
 """
 
 <<imports>>
 
 <<constants>>
 <<helper functions>>
-<<commit data functions>>
 <<export functions>>
-<<play viewer>>
 
 <<typer app>>
 @
@@ -41,9 +41,11 @@ playing back the development log stored in ``.learnlog/``.
 """Tests for the CLI module."""
 import tempfile
 import os
+import io
 import pathlib
 import subprocess
 import datetime
+import zipfile
 import pytest
 from learnlog.gitrepo import LearnlogRepo
 
@@ -55,14 +57,15 @@ from learnlog.gitrepo import LearnlogRepo
 
 We split imports into two groups: standard library and the learnlog
 package.
-The [[curses]] import is deferred to the [[play]] command because it
-is unavailable on Windows---we only need it when the user actually
-invokes the interactive viewer.
+
+The commit querying functions ([[get_commits]], [[parse_run_summary]],
+etc.) live in the [[commits]] module (\cref{commits}).
+The ProgSnap2 exporter lives in [[progsnap2]] (\cref{progsnap2}).
+The interactive viewer lives in [[viewer]] (\cref{viewer}).
 
 <<imports>>=
 from __future__ import annotations
 
-import datetime
 import os
 import pathlib
 import subprocess
@@ -74,6 +77,16 @@ import typer
 
 from learnlog import find_learnlog_dir
 from learnlog.gitrepo import LearnlogRepo
+from learnlog.commits import (
+    get_commits,
+    parse_run_summary,
+    filter_learnlog_runs,
+)
+from learnlog.progsnap2 import (
+    DEFAULT_PROGSNAP2_NAME,
+    do_export_progsnap2,
+)
+from learnlog.viewer import PlaybackViewer, play_batch
 @
 
 
@@ -256,472 +269,6 @@ def test_resolve_source_bundle(workdir):
 @
 
 
-\section{Querying commit data}
-
-The viewer and exporter both need to list commits and fetch
-details for individual commits.
-We keep these as standalone functions rather than methods on
-[[LearnlogRepo]]---the repo class handles recording; these
-functions handle reading, which is a different concern.
-
-\subsection{Listing commits}
-
-We list commits in chronological order (oldest first) because
-that matches the natural playback direction: the student starts
-writing code and we watch their progress forward in time.
-
-<<commit data functions>>=
-def get_commits(repo):
-    """Return a list of commits in chronological order.
-
-    Each entry is a dict with ``hash``, ``subject``, and
-    ``date`` keys.
-    """
-    result = repo.git(
-        "log", "--format=%H\t%s\t%aI", "--reverse"
-    )
-    if result.returncode != 0:
-        return []
-    commits = []
-    for line in result.stdout.strip().split("\n"):
-        if not line:
-            continue
-        parts = line.split("\t", 2)
-        if len(parts) == 3:
-            commits.append({
-                "hash": parts[0],
-                "subject": parts[1],
-                "date": parts[2],
-            })
-    return commits
-@
-
-<<test functions>>=
-def test_get_commits_returns_chronological(workdir):
-    from learnlog.cli import get_commits
-    repo = LearnlogRepo(workdir)
-    t1 = datetime.datetime(2026, 1, 1, 10, 0)
-    repo.begin_run("hello.py", [], t1)
-    (workdir / "hello.py").write_text('print("v2")\n')
-    t2 = datetime.datetime(2026, 1, 1, 10, 5)
-    repo.begin_run("hello.py", [], t2)
-    commits = get_commits(repo)
-    assert len(commits) >= 2
-    assert commits[0]["hash"] != commits[-1]["hash"]
-
-def test_get_commits_has_required_keys(workdir):
-    from learnlog.cli import get_commits
-    repo = LearnlogRepo(workdir)
-    commits = get_commits(repo)
-    assert len(commits) >= 1
-    for key in ("hash", "subject", "date"):
-        assert key in commits[0]
-@
-
-
-\subsection{Summarising commits for listing}
-
-The [[list]] command (\cref{sec:list-command}) needs a compact
-one-line summary of each commit: the command that was run, when it
-started, and how many runs the commit contains.
-All of this information lives in the commit message body, so we
-parse it here rather than making additional Git calls.
-
-We split the message on the block separator to count runs, then
-extract the command from the first [[Run:]] line and the start
-time from the first [[Start-Time:]] field.
-The function returns [[None]] when the message contains no run
-blocks---this happens for the initial commit or when all runs
-have been filtered out.
-
-<<commit data functions>>=
-def parse_run_summary(message):
-    """Extract a summary from a commit message body.
-
-    Returns ``(command, start_time, run_count)`` where
-    ``command`` is the script and arguments string,
-    ``start_time`` is formatted as ``YYYY-MM-DD HH:MM``,
-    and ``run_count`` is the number of run blocks.
-    Returns ``None`` if the message contains no runs.
-    """
-    if not message or not message.strip():
-        return None
-
-    blocks = message.split(BLOCK_SEP)
-    run_blocks = [
-        b for b in blocks
-        if b.strip().startswith("Run:")
-    ]
-    if not run_blocks:
-        return None
-
-    <<extract command from first run block>>
-    <<extract start time from first run block>>
-
-    return (command, start_time, len(run_blocks))
-@
-
-The first line of a run block is [[Run: script args]]---the same
-text that [[git log --oneline]] shows as the commit subject.
-We strip the [[Run: ]] prefix to recover the command string as
-the student typed it.
-
-<<extract command from first run block>>=
-first = run_blocks[0].strip()
-first_line = first.split("\n", 1)[0]
-command = first_line[len("Run: "):]
-@
-
-The [[Start-Time:]] field sits in the same first run block
-([[first]]) parsed above.
-Its value is an ISO\,8601 timestamp that we reformat to a
-human-friendly [[YYYY-MM-DD HH:MM]] since full ISO timestamps
-are noisy in a compact listing.
-
-<<extract start time from first run block>>=
-start_time = ""
-for line in first.split("\n"):
-    if line.startswith("Start-Time:"):
-        iso = line.split(":", 1)[1].strip()
-        try:
-            dt = datetime.datetime.fromisoformat(iso)
-            start_time = dt.strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            start_time = iso
-        break
-@
-
-Let's verify the summary extraction for single runs, multiple
-runs, and empty messages:
-
-<<test functions>>=
-def test_parse_run_summary_single_run():
-    from learnlog.cli import parse_run_summary
-    msg = (
-        "Run: hello.py arg1 arg2\n"
-        "\n"
-        "Script: hello.py\n"
-        "Arguments: arg1 arg2\n"
-        "Start-Time: 2026-03-20T14:30:00"
-    )
-    result = parse_run_summary(msg)
-    assert result is not None
-    command, start_time, count = result
-    assert command == "hello.py arg1 arg2"
-    assert start_time == "2026-03-20 14:30"
-    assert count == 1
-
-def test_parse_run_summary_multiple_runs():
-    from learnlog.cli import parse_run_summary
-    msg = (
-        "Run: hello.py (none)\n"
-        "\n"
-        "Script: hello.py\n"
-        "Arguments: (none)\n"
-        "Start-Time: 2026-01-01T10:00:00"
-        "\n\n---\n\n"
-        "Run: hello.py --verbose\n"
-        "\n"
-        "Script: hello.py\n"
-        "Arguments: --verbose\n"
-        "Start-Time: 2026-01-01T10:05:00"
-    )
-    result = parse_run_summary(msg)
-    assert result is not None
-    command, start_time, count = result
-    assert command == "hello.py (none)"
-    assert start_time == "2026-01-01 10:00"
-    assert count == 2
-
-def test_parse_run_summary_empty():
-    from learnlog.cli import parse_run_summary
-    assert parse_run_summary("") is None
-    assert parse_run_summary("   ") is None
-
-def test_parse_run_summary_no_runs():
-    from learnlog.cli import parse_run_summary
-    msg = "learnlog: initial commit"
-    assert parse_run_summary(msg) is None
-@
-
-
-\subsection{Commit details}
-
-For a single commit we use [[git show]], which produces the
-commit header, the full message (containing the captured I/O),
-and the unified diff (showing the code that changed)---all in a
-single subprocess call.
-
-A teacher reviewing student work typically wants to see
-\emph{what changed} before reading the run metadata (script
-name, arguments, captured I/O).
-The default [[git show]] order is header, message, diff; we
-rearrange to header, diff, message so that code changes appear
-first.
-
-The [[git show]] output always starts with metadata lines
-(commit hash, author, date) followed by a blank line, then the
-indented commit message, then the diff.
-Both reordering and filtering need to locate these three sections,
-so we extract the boundary-finding into a single function.
-
-The header ends at the first blank line.
-The diff starts at the first [[diff --git]] line; when no diff is
-present---for example, the initial commit that only records a run
-without any file changes---[[diff_start]] is [[None]].
-
-<<helper functions>>=
-def parse_show_sections(lines):
-    """Find section boundaries in ``git show`` output.
-
-    Returns ``(header_end, diff_start)`` where
-    ``header_end`` is the index of the first blank line and
-    ``diff_start`` is the index of the first ``diff --git``
-    line, or ``None`` if no diff is present.
-    """
-    header_end = 0
-    for i, line in enumerate(lines):
-        if line == "":
-            header_end = i
-            break
-
-    diff_start = None
-    for i, line in enumerate(lines):
-        if line.startswith("diff --git "):
-            diff_start = i
-            break
-
-    return header_end, diff_start
-@
-
-<<helper functions>>=
-def reorder_commit_detail(detail):
-    """Reorder ``git show`` output: header, diff, message.
-
-    Moves the unified diff before the commit message so that
-    code changes are visible first in the viewer.
-    """
-    lines = detail.split("\n")
-    header_end, diff_start = parse_show_sections(lines)
-
-    if diff_start is None:
-        return detail
-
-    header = lines[:header_end + 1]
-    message = lines[header_end + 1:diff_start]
-    diff = lines[diff_start:]
-
-    return "\n".join(header + diff + [""] + message)
-@
-
-We load details lazily---only when the user navigates to a
-particular commit---to keep the viewer responsive even for
-repositories with hundreds of commits.
-
-
-\subsection{Filtering learnlog's own runs}
-\label{sec:filter-learnlog}
-
-When the [[learnlog]] CLI is invoked (\eg [[learnlog play]]), the
-package's [[__init__.py]] logs the invocation as a run block---just
-like any student program.
-These self-referential entries clutter the playback with tool usage
-that is not part of the student's development.
-
-Since multiple runs without code changes are appended to the same
-commit (separated by [[\n\n---\n\n]], see \cref{gitrepo}), a single
-commit can contain both student runs and learnlog runs.
-We therefore filter at the run-block level within each commit message,
-not at the commit level.
-
-The separator [[\n\n---\n\n]] is safe to split on because the
-section markers within a run block ([[--- I/O ---]],
-[[--- exception ---]]) always have additional text after the dashes.
-
-<<constants>>=
-BLOCK_SEP = "\n\n---\n\n"
-@
-
-<<helper functions>>=
-def filter_learnlog_runs(message):
-    """Remove learnlog CLI run blocks from a commit message.
-
-    Splits on the ``---`` block separator and removes blocks
-    whose header starts with ``Run: learnlog``.
-    Returns the filtered message, which may be empty if all
-    blocks were learnlog runs.
-    """
-    blocks = message.split(BLOCK_SEP)
-    filtered = [
-        b for b in blocks
-        if not b.lstrip().startswith("Run: learnlog")
-    ]
-    return BLOCK_SEP.join(filtered)
-@
-
-Let's verify that filtering works for mixed, student-only, and
-learnlog-only commit messages:
-
-<<test functions>>=
-def test_filter_learnlog_runs_removes_block():
-    from learnlog.cli import filter_learnlog_runs
-    msg = (
-        "Run: hello.py (none)\n\nScript: hello.py\n"
-        "\n\n---\n\n"
-        "Run: learnlog play\n\nScript: learnlog\n"
-    )
-    result = filter_learnlog_runs(msg)
-    assert "hello.py" in result
-    assert "learnlog" not in result
-
-def test_filter_learnlog_runs_preserves_student():
-    from learnlog.cli import filter_learnlog_runs
-    msg = "Run: hello.py (none)\n\nScript: hello.py\n"
-    assert filter_learnlog_runs(msg) == msg
-
-def test_filter_learnlog_runs_all_learnlog():
-    from learnlog.cli import filter_learnlog_runs
-    msg = (
-        "Run: learnlog play\n\nScript: learnlog\n"
-        "\n\n---\n\n"
-        "Run: learnlog export\n\nScript: learnlog\n"
-    )
-    result = filter_learnlog_runs(msg)
-    assert result.strip() == ""
-
-def test_filter_learnlog_runs_preserves_io_separator():
-    """The --- I/O --- marker within a block is not a separator."""
-    from learnlog.cli import filter_learnlog_runs
-    msg = (
-        "Run: hello.py (none)\n\nScript: hello.py\n"
-        "\n--- I/O ---\nstdout: hello\n"
-        "\n--- exception ---\nNone"
-    )
-    result = filter_learnlog_runs(msg)
-    assert "stdout: hello" in result
-@
-
-We could fetch the raw commit message separately
-([[git log --format=%B]]), but that would require an extra subprocess
-call per commit.
-Instead, we extract the message directly from the [[git show]]
-output---it is indented with four spaces---filter it, and reconstruct
-the output in place, reusing [[parse_show_sections]] to locate the
-boundaries.
-
-<<helper functions>>=
-def filter_show_output(show_output):
-    """Filter learnlog runs from ``git show`` output.
-
-    Extracts the indented commit message, strips the four-space
-    indentation, filters learnlog run blocks, re-indents, and
-    reconstructs the full output.  Returns ``None`` if all run
-    blocks were filtered out.
-    """
-    lines = show_output.split("\n")
-    header_end, diff_start = parse_show_sections(lines)
-
-    <<extract and filter raw message>>
-    <<reconstruct show output>>
-@
-
-<<extract and filter raw message>>=
-end = diff_start if diff_start is not None else len(lines)
-msg_lines = lines[header_end + 1:end]
-raw_msg = "\n".join(
-    line[4:] if line.startswith("    ") else line
-    for line in msg_lines
-)
-filtered_msg = filter_learnlog_runs(raw_msg)
-
-if not filtered_msg.strip():
-    return None
-@
-
-<<reconstruct show output>>=
-reindented = []
-for line in filtered_msg.split("\n"):
-    if line:
-        reindented.append("    " + line)
-    else:
-        reindented.append("")
-
-header = lines[:header_end + 1]
-diff = lines[end:] if diff_start is not None else []
-return "\n".join(header + reindented + diff)
-@
-
-Filtering is enabled by default because learnlog runs are never part
-of the student's development story---a teacher reviewing the log
-should not have to remember a flag to get a clean view.
-The [[filter_learnlog]] parameter lets the [[--all]] flag disable it
-for debugging or completeness.
-
-<<commit data functions>>=
-def get_commit_detail(repo, commit_hash,
-                      filter_learnlog=True):
-    """Return ``git show`` output for a single commit,
-    reordered so the diff appears before the message.
-
-    When ``filter_learnlog`` is ``True`` (the default),
-    learnlog's own run blocks are stripped from the commit
-    message.  Returns ``None`` if all runs in the commit
-    were learnlog runs.
-    """
-    result = repo.git("show", commit_hash)
-    detail = result.stdout
-
-    if filter_learnlog:
-        detail = filter_show_output(detail)
-        if detail is None:
-            return None
-
-    return reorder_commit_detail(detail)
-@
-
-<<test functions>>=
-def test_get_commit_detail_initial(workdir):
-    from learnlog.cli import get_commits, get_commit_detail
-    repo = LearnlogRepo(workdir)
-    commits = get_commits(repo)
-    detail = get_commit_detail(repo, commits[0]["hash"])
-    assert "learnlog" in detail
-
-def test_get_commit_detail_with_diff(workdir):
-    from learnlog.cli import get_commits, get_commit_detail
-    repo = LearnlogRepo(workdir)
-    t1 = datetime.datetime(2026, 1, 1, 10, 0)
-    repo.begin_run("hello.py", [], t1)
-    (workdir / "hello.py").write_text('print("v2")\n')
-    t2 = datetime.datetime(2026, 1, 1, 10, 5)
-    repo.begin_run("hello.py", [], t2)
-    commits = get_commits(repo)
-    detail = get_commit_detail(repo, commits[-1]["hash"])
-    assert "hello.py" in detail
-
-def test_get_commit_detail_diff_before_message(workdir):
-    """Verify that the diff appears before the message."""
-    from learnlog.cli import get_commits, get_commit_detail
-    repo = LearnlogRepo(workdir)
-    t1 = datetime.datetime(2026, 1, 1, 10, 0)
-    repo.begin_run("hello.py", [], t1)
-    (workdir / "hello.py").write_text('print("v2")\n')
-    t2 = datetime.datetime(2026, 1, 1, 10, 5)
-    repo.begin_run("hello.py", [], t2)
-    commits = get_commits(repo)
-    detail = get_commit_detail(repo, commits[-1]["hash"])
-    diff_pos = detail.index("diff --git")
-    msg_lines = [
-        l for l in detail.split("\n")
-        if l.startswith("    ")
-    ]
-    assert msg_lines, "expected indented message lines"
-    first_msg_pos = detail.index(msg_lines[0])
-    assert diff_pos < first_msg_pos, \
-        "diff should appear before the commit message"
-@
-
-
 \section{The export command}
 \label{sec:export}
 
@@ -771,351 +318,9 @@ def test_do_export_creates_bundle(workdir):
 @
 
 
-\section{The play viewer}
-\label{sec:play}
-
-The interactive viewer uses [[curses]] to show one commit at a
-time with vi-style navigation.
-We chose [[curses]] over a prompt-based loop because single-keypress
-navigation feels natural for browsing a log---the user never needs
-to press Enter.
-Since [[curses]] is a standard library module on Unix systems and
-learnlog targets university lab machines (Linux), this is a
-pragmatic choice.
-
-The viewer state is simple: the current commit index and a vertical
-scroll offset within the commit's content.
-We cache the detail for the currently displayed commit to avoid
-re-fetching on every scroll.
-
-\subsection{The [[PlaybackViewer]] class}
-
-<<play viewer>>=
-class PlaybackViewer:
-    """Interactive curses-based commit viewer.
-
-    Displays commits one at a time with vi-style navigation:
-    ``H``/``L`` for previous/next commit, ``j``/``k`` for
-    scrolling within a commit, ``q`` to quit.
-    """
-
-    def __init__(self, repo, commits, start_index=0,
-                 filter_learnlog=True):
-        self.repo = repo
-        self.commits = commits
-        self.index = start_index
-        self.scroll = 0
-        self.filter_learnlog = filter_learnlog
-        self._detail_cache = {}
-
-    <<player methods>>
-@
-
-\subsection{Running the viewer}
-
-The [[run]] method enters curses mode and drives the main loop.
-We use [[curses.wrapper]] to ensure the terminal is restored
-even if an exception occurs.
-
-<<player methods>>=
-def run(self):
-    """Enter curses mode and run the interactive viewer."""
-    import curses
-    curses.wrapper(self._main_loop)
-@
-
-\subsection{The main loop}
-
-Each iteration draws the screen and waits for a keypress.
-We redraw on every key because the state may have changed.
-
-We call [[curses.use_default_colors]] so that the viewer inherits
-the terminal's native background and foreground colours instead
-of forcing white-on-black.
-This respects light themes, transparency, and custom colour
-schemes---details that matter when learnlog runs on diverse
-student and teacher machines.
-
-<<player methods>>=
-def _main_loop(self, stdscr):
-    """Main event loop inside curses."""
-    import curses
-    curses.use_default_colors()
-    curses.curs_set(0)
-    stdscr.clear()
-
-    while True:
-        self._draw(stdscr)
-        key = stdscr.getch()
-        if not self._handle_key(key):
-            break
-@
-
-\subsection{Drawing the screen}
-
-The screen has three regions: a header showing position and
-commit subject, the scrollable content area with the commit
-message and diff, and a footer with key bindings.
-
-We build the content as a list of lines, then display the
-portion that fits in the terminal window starting from the
-scroll offset.
-This approach avoids the complexity of [[curses]] pads while
-handling arbitrarily long diffs.
-
-<<player methods>>=
-def _get_detail(self, commit_hash):
-    """Fetch and cache the ``git show`` output."""
-    if commit_hash not in self._detail_cache:
-        self._detail_cache[commit_hash] = \
-            get_commit_detail(
-                self.repo, commit_hash,
-                self.filter_learnlog,
-            )
-    return self._detail_cache[commit_hash]
-@
-
-We cache the [[git show]] output because fetching it shells out to
-Git.
-Without caching, every scroll keystroke would re-run the command,
-making the viewer sluggish on large repositories.
-
-<<player methods>>=
-def _draw(self, stdscr):
-    """Render the current commit to the screen."""
-    stdscr.erase()
-    height, width = stdscr.getmaxyx()
-
-    commit = self.commits[self.index]
-    detail = self._get_detail(commit["hash"])
-    if detail is None:
-        detail = "(learnlog internal run)"
-
-    <<draw header>>
-    <<build content lines>>
-    <<draw content area>>
-    <<draw footer>>
-
-    stdscr.refresh()
-@
-
-The header shows the position in the commit list, the short
-hash, and the commit subject.
-We truncate to the terminal width to avoid curses errors.
-
-<<draw header>>=
-header = (
-    f"[{self.index + 1}/{len(self.commits)}] "
-    f"{commit['hash'][:7]} "
-    f"— {commit['subject']}"
-)
-header = header[:width - 1]
-try:
-    import curses
-    stdscr.addstr(0, 0, header, curses.A_REVERSE)
-    stdscr.addstr(
-        0, len(header),
-        " " * (width - len(header) - 1),
-        curses.A_REVERSE,
-    )
-except curses.error:
-    pass
-@
-
-The content is the reordered [[git show]] output, which places
-the diff before the commit message so that code changes appear
-first.
-We split into lines for scrollable display.
-
-<<build content lines>>=
-content_lines = detail.split("\n")
-@
-
-We display lines starting from the scroll offset, filling
-the area between the header (row~0) and the footer
-(last row).
-
-<<draw content area>>=
-content_start = 1
-content_end = height - 2
-visible = content_end - content_start
-
-self.scroll = max(
-    0,
-    min(self.scroll,
-        len(content_lines) - visible),
-)
-
-for i in range(visible):
-    line_idx = self.scroll + i
-    if line_idx >= len(content_lines):
-        break
-    line = content_lines[line_idx][:width - 1]
-    try:
-        stdscr.addstr(content_start + i, 0, line)
-    except curses.error:
-        pass
-@
-
-The footer shows key bindings.
-It sits on the last row of the terminal.
-
-<<draw footer>>=
-footer = (
-    " H/\u2190: prev  L/\u2192: next  "
-    "j/\u2193: down  k/\u2191: up  "
-    "g: first  G: last  q: quit"
-)
-footer = footer[:width - 1]
-try:
-    import curses
-    stdscr.addstr(
-        height - 1, 0, footer, curses.A_REVERSE
-    )
-    remaining = width - len(footer) - 1
-    if remaining > 0:
-        stdscr.addstr(
-            height - 1, len(footer),
-            " " * remaining,
-            curses.A_REVERSE,
-        )
-except curses.error:
-    pass
-@
-
-
-\subsection{Handling key presses}
-
-The key handler updates the viewer state and returns [[False]]
-when the user presses [[q]] to quit.
-We support both the letter keys ([[H]], [[L]], [[j]], [[k]])
-and arrow keys for accessibility.
-
-<<player methods>>=
-def _handle_key(self, key):
-    """Process a keypress.  Return ``False`` to quit."""
-    import curses
-
-    if key in (ord("q"), ord("Q")):
-        return False
-    elif key in (ord("h"), ord("H"), curses.KEY_LEFT):
-        if self.index > 0:
-            self.index -= 1
-            self.scroll = 0
-    elif key in (ord("l"), ord("L"), curses.KEY_RIGHT):
-        if self.index < len(self.commits) - 1:
-            self.index += 1
-            self.scroll = 0
-    elif key in (ord("j"), curses.KEY_DOWN):
-        self.scroll += 1
-    elif key in (ord("k"), curses.KEY_UP):
-        self.scroll = max(0, self.scroll - 1)
-    elif key == ord("g"):
-        self.index = 0
-        self.scroll = 0
-    elif key == ord("G"):
-        self.index = len(self.commits) - 1
-        self.scroll = 0
-
-    return True
-@
-
-We test the key handler logic without a real curses screen
-by calling it directly with key codes:
-
-<<test functions>>=
-def test_handle_key_quit():
-    from learnlog.cli import PlaybackViewer
-    viewer = PlaybackViewer(None, [{"hash": "a"}], 0)
-    assert viewer._handle_key(ord("q")) is False
-
-def test_handle_key_navigation():
-    from learnlog.cli import PlaybackViewer
-    commits = [
-        {"hash": "a"}, {"hash": "b"}, {"hash": "c"}
-    ]
-    viewer = PlaybackViewer(None, commits, 0)
-    viewer._handle_key(ord("l"))
-    assert viewer.index == 1
-    viewer._handle_key(ord("l"))
-    assert viewer.index == 2
-    viewer._handle_key(ord("l"))
-    assert viewer.index == 2  # at end, stays
-    viewer._handle_key(ord("h"))
-    assert viewer.index == 1
-
-def test_handle_key_scroll():
-    from learnlog.cli import PlaybackViewer
-    viewer = PlaybackViewer(None, [{"hash": "a"}], 0)
-    viewer._handle_key(ord("j"))
-    assert viewer.scroll == 1
-    viewer._handle_key(ord("k"))
-    assert viewer.scroll == 0
-    viewer._handle_key(ord("k"))
-    assert viewer.scroll == 0  # floor at 0
-
-def test_handle_key_jump_endpoints():
-    from learnlog.cli import PlaybackViewer
-    commits = [
-        {"hash": "a"}, {"hash": "b"}, {"hash": "c"}
-    ]
-    viewer = PlaybackViewer(None, commits, 1)
-    viewer._handle_key(ord("G"))
-    assert viewer.index == 2
-    viewer._handle_key(ord("g"))
-    assert viewer.index == 0
-@
-
-
-\subsection{Batch playback}
-\label{sec:play-batch}
-
-The curses viewer requires a terminal, but sometimes we want to
-pipe the output through [[less]] or redirect it to a file.
-In batch mode the viewer simply prints all commits sequentially
-to standard output.
-This creates a natural reading flow: the captured output from
-one commit appears just before the diff of the next, so the
-reader sees what the program produced and what the student
-changed as a result in a single continuous stream.
-
-<<play viewer>>=
-def play_batch(repo, commits, start_index=0,
-               filter_learnlog=True):
-    """Print commit details sequentially to stdout.
-
-    When ``filter_learnlog`` is ``True``, learnlog's own run
-    blocks are stripped and all-learnlog commits are skipped.
-    """
-    for commit in commits[start_index:]:
-        detail = get_commit_detail(
-            repo, commit["hash"], filter_learnlog,
-        )
-        if detail is None:
-            continue
-        sys.stdout.write(detail)
-        sys.stdout.write("\n")
-@
-
-Let's verify that batch playback produces the expected output
-for each commit:
-
-<<test functions>>=
-def test_play_batch_outputs_all_commits(workdir, capsys):
-    """Batch mode prints every commit's detail to stdout."""
-    from learnlog.cli import play_batch, get_commits
-    repo = LearnlogRepo(workdir)
-    commits = get_commits(repo)
-    play_batch(repo, commits)
-    captured = capsys.readouterr().out
-    for c in commits:
-        assert c["hash"][:7] in captured
-@
-
-
 \section{Typer application}
 
-We define the Typer app at module level with six commands.
+We define the Typer app at module level with eight commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
@@ -1281,10 +486,17 @@ def test_list_command_all_shows_learnlog(workdir):
 \subsection{The [[export]] command}
 
 The [[export]] command resolves the learnlog directory using
-[[resolve_workdir]] and delegates to [[do_export]].
+[[resolve_workdir]] and delegates to [[do_export]] or
+[[do_export_progsnap2]] depending on the [[--progsnap2]] flag.
 It uses [[-C]] / [[--dir]] rather than [[resolve_source]] because
 export does not need bundle support---we are \emph{creating}
 bundles, not reading them.
+
+When [[--progsnap2]] is set, the default output changes from
+[[learnlog.bundle]] to [[learnlog.progsnap2]].
+We detect this by checking whether the user explicitly passed
+[[-o]]---if the output still equals the bundle default, we
+substitute the ProgSnap2 default.
 
 <<typer commands>>=
 @app.command()
@@ -1293,7 +505,7 @@ def export(
         pathlib.Path,
         typer.Option(
             "--output", "-o",
-            help="Output bundle file path.",
+            help="Output file path.",
         ),
     ] = pathlib.Path(DEFAULT_BUNDLE_NAME),
     directory: Annotated[
@@ -1303,11 +515,30 @@ def export(
             help="Directory containing .learnlog/.",
         ),
     ] = None,
+    progsnap2: Annotated[
+        bool,
+        typer.Option(
+            "--progsnap2",
+            help=(
+                "Export as ProgSnap2 zip instead of "
+                "a Git bundle."
+            ),
+        ),
+    ] = False,
 ):
-    """Export the learnlog repository as a Git bundle."""
+    """Export the learnlog repository."""
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
-    do_export(repo, output.resolve())
+
+    if progsnap2:
+        if output == pathlib.Path(DEFAULT_BUNDLE_NAME):
+            output = pathlib.Path(
+                DEFAULT_PROGSNAP2_NAME
+            )
+        do_export_progsnap2(repo, output.resolve())
+    else:
+        do_export(repo, output.resolve())
+
     typer.echo(f"Exported to {output}")
 @
 
@@ -1325,6 +556,38 @@ def test_export_command(workdir, monkeypatch):
     )
     assert result.exit_code == 0
     assert bundle.exists()
+
+def test_export_progsnap2_command(workdir, monkeypatch):
+    """Export with --progsnap2 creates a zip file."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["export", "--progsnap2"]
+    )
+    assert result.exit_code == 0
+    ps2 = pathlib.Path("learnlog.progsnap2")
+    assert ps2.exists() or \
+        (workdir / "learnlog.progsnap2").exists()
+
+def test_export_progsnap2_custom_output(
+    workdir, monkeypatch,
+):
+    """Export with --progsnap2 -o uses custom path."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    out = workdir / "custom.progsnap2"
+    result = runner.invoke(
+        app,
+        ["export", "--progsnap2", "-o", str(out)],
+    )
+    assert result.exit_code == 0
+    assert out.exists()
 @
 
 

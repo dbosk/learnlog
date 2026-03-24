@@ -1,0 +1,387 @@
+\chapter{The Play Viewer}
+\label{viewer}
+
+The interactive viewer uses [[curses]] to show one commit at a
+time with vi-style navigation.
+We chose [[curses]] over a prompt-based loop because single-keypress
+navigation feels natural for browsing a log---the user never needs
+to press Enter.
+Since [[curses]] is a standard library module on Unix systems and
+learnlog targets university lab machines (Linux), this is a
+pragmatic choice.
+
+The viewer state is simple: the current commit index and a vertical
+scroll offset within the commit's content.
+We cache the detail for the currently displayed commit to avoid
+re-fetching on every scroll.
+
+
+\section{Code overview}
+
+<<[[viewer.py]]>>=
+"""Interactive curses-based commit viewer for learnlog.
+
+Provides the ``PlaybackViewer`` class for terminal-based
+navigation and ``play_batch`` for non-interactive output.
+"""
+
+<<viewer imports>>
+
+<<viewer classes>>
+<<viewer functions>>
+@
+
+<<test [[viewer.py]]>>=
+"""Tests for the viewer module."""
+import pytest
+
+<<viewer test functions>>
+@
+
+
+\section{Imports}
+
+We import [[sys]] for [[play_batch]]'s stdout access and
+[[get_commit_detail]] from the commits module for fetching
+the display data.
+The [[curses]] import is deferred to inside methods because
+it is unavailable on Windows---we only need it when the user
+actually invokes the interactive viewer.
+
+<<viewer imports>>=
+from __future__ import annotations
+
+import sys
+
+from learnlog.commits import get_commit_detail
+@
+
+
+\section{The [[PlaybackViewer]] class}
+
+<<viewer classes>>=
+class PlaybackViewer:
+    """Interactive curses-based commit viewer.
+
+    Displays commits one at a time with vi-style navigation:
+    ``H``/``L`` for previous/next commit, ``j``/``k`` for
+    scrolling within a commit, ``q`` to quit.
+    """
+
+    def __init__(self, repo, commits, start_index=0,
+                 filter_learnlog=True):
+        self.repo = repo
+        self.commits = commits
+        self.index = start_index
+        self.scroll = 0
+        self.filter_learnlog = filter_learnlog
+        self._detail_cache = {}
+
+    <<player methods>>
+@
+
+
+\subsection{Running the viewer}
+
+The [[run]] method enters curses mode and drives the main loop.
+We use [[curses.wrapper]] to ensure the terminal is restored
+even if an exception occurs.
+
+<<player methods>>=
+def run(self):
+    """Enter curses mode and run the interactive viewer."""
+    import curses
+    curses.wrapper(self._main_loop)
+@
+
+
+\subsection{The main loop}
+
+Each iteration draws the screen and waits for a keypress.
+We redraw on every key because the state may have changed.
+
+We call [[curses.use_default_colors]] so that the viewer inherits
+the terminal's native background and foreground colours instead
+of forcing white-on-black.
+This respects light themes, transparency, and custom colour
+schemes---details that matter when learnlog runs on diverse
+student and teacher machines.
+
+<<player methods>>=
+def _main_loop(self, stdscr):
+    """Main event loop inside curses."""
+    import curses
+    curses.use_default_colors()
+    curses.curs_set(0)
+    stdscr.clear()
+
+    while True:
+        self._draw(stdscr)
+        key = stdscr.getch()
+        if not self._handle_key(key):
+            break
+@
+
+
+\subsection{Drawing the screen}
+
+The screen has three regions: a header showing position and
+commit subject, the scrollable content area with the commit
+message and diff, and a footer with key bindings.
+
+We build the content as a list of lines, then display the
+portion that fits in the terminal window starting from the
+scroll offset.
+This approach avoids the complexity of [[curses]] pads while
+handling arbitrarily long diffs.
+
+We cache the [[git show]] output because fetching it shells out to
+Git.
+Without caching, every scroll keystroke would re-run the command,
+making the viewer sluggish on large repositories.
+
+<<player methods>>=
+def _get_detail(self, commit_hash):
+    """Fetch and cache the ``git show`` output."""
+    if commit_hash not in self._detail_cache:
+        self._detail_cache[commit_hash] = \
+            get_commit_detail(
+                self.repo, commit_hash,
+                self.filter_learnlog,
+            )
+    return self._detail_cache[commit_hash]
+@
+
+<<player methods>>=
+def _draw(self, stdscr):
+    """Render the current commit to the screen."""
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+
+    commit = self.commits[self.index]
+    detail = self._get_detail(commit["hash"])
+    if detail is None:
+        detail = "(learnlog internal run)"
+
+    <<draw header>>
+    <<build content lines>>
+    <<draw content area>>
+    <<draw footer>>
+
+    stdscr.refresh()
+@
+
+The header shows the position in the commit list, the short
+hash, and the commit subject.
+We truncate to the terminal width to avoid curses errors.
+
+<<draw header>>=
+header = (
+    f"[{self.index + 1}/{len(self.commits)}] "
+    f"{commit['hash'][:7]} "
+    f"\u2014 {commit['subject']}"
+)
+header = header[:width - 1]
+try:
+    import curses
+    stdscr.addstr(0, 0, header, curses.A_REVERSE)
+    stdscr.addstr(
+        0, len(header),
+        " " * (width - len(header) - 1),
+        curses.A_REVERSE,
+    )
+except curses.error:
+    pass
+@
+
+The content is the reordered [[git show]] output, which places
+the diff before the commit message so that code changes appear
+first.
+We split into lines for scrollable display.
+
+<<build content lines>>=
+content_lines = detail.split("\n")
+@
+
+We display lines starting from the scroll offset, filling
+the area between the header (row~0) and the footer
+(last row).
+
+<<draw content area>>=
+content_start = 1
+content_end = height - 2
+visible = content_end - content_start
+
+self.scroll = max(
+    0,
+    min(self.scroll,
+        len(content_lines) - visible),
+)
+
+for i in range(visible):
+    line_idx = self.scroll + i
+    if line_idx >= len(content_lines):
+        break
+    line = content_lines[line_idx][:width - 1]
+    try:
+        stdscr.addstr(content_start + i, 0, line)
+    except curses.error:
+        pass
+@
+
+The footer shows key bindings.
+It sits on the last row of the terminal.
+
+<<draw footer>>=
+footer = (
+    " H/\u2190: prev  L/\u2192: next  "
+    "j/\u2193: down  k/\u2191: up  "
+    "g: first  G: last  q: quit"
+)
+footer = footer[:width - 1]
+try:
+    import curses
+    stdscr.addstr(
+        height - 1, 0, footer, curses.A_REVERSE
+    )
+    remaining = width - len(footer) - 1
+    if remaining > 0:
+        stdscr.addstr(
+            height - 1, len(footer),
+            " " * remaining,
+            curses.A_REVERSE,
+        )
+except curses.error:
+    pass
+@
+
+
+\subsection{Handling key presses}
+
+The key handler updates the viewer state and returns [[False]]
+when the user presses [[q]] to quit.
+We support both the letter keys ([[H]], [[L]], [[j]], [[k]])
+and arrow keys for accessibility.
+
+<<player methods>>=
+def _handle_key(self, key):
+    """Process a keypress.  Return ``False`` to quit."""
+    import curses
+
+    if key in (ord("q"), ord("Q")):
+        return False
+    elif key in (ord("h"), ord("H"), curses.KEY_LEFT):
+        if self.index > 0:
+            self.index -= 1
+            self.scroll = 0
+    elif key in (ord("l"), ord("L"), curses.KEY_RIGHT):
+        if self.index < len(self.commits) - 1:
+            self.index += 1
+            self.scroll = 0
+    elif key in (ord("j"), curses.KEY_DOWN):
+        self.scroll += 1
+    elif key in (ord("k"), curses.KEY_UP):
+        self.scroll = max(0, self.scroll - 1)
+    elif key == ord("g"):
+        self.index = 0
+        self.scroll = 0
+    elif key == ord("G"):
+        self.index = len(self.commits) - 1
+        self.scroll = 0
+
+    return True
+@
+
+We test the key handler logic without a real curses screen
+by calling it directly with key codes:
+
+<<viewer test functions>>=
+def test_handle_key_quit():
+    from learnlog.viewer import PlaybackViewer
+    viewer = PlaybackViewer(None, [{"hash": "a"}], 0)
+    assert viewer._handle_key(ord("q")) is False
+
+def test_handle_key_navigation():
+    from learnlog.viewer import PlaybackViewer
+    commits = [
+        {"hash": "a"}, {"hash": "b"}, {"hash": "c"}
+    ]
+    viewer = PlaybackViewer(None, commits, 0)
+    viewer._handle_key(ord("l"))
+    assert viewer.index == 1
+    viewer._handle_key(ord("l"))
+    assert viewer.index == 2
+    viewer._handle_key(ord("l"))
+    assert viewer.index == 2  # at end, stays
+    viewer._handle_key(ord("h"))
+    assert viewer.index == 1
+
+def test_handle_key_scroll():
+    from learnlog.viewer import PlaybackViewer
+    viewer = PlaybackViewer(None, [{"hash": "a"}], 0)
+    viewer._handle_key(ord("j"))
+    assert viewer.scroll == 1
+    viewer._handle_key(ord("k"))
+    assert viewer.scroll == 0
+    viewer._handle_key(ord("k"))
+    assert viewer.scroll == 0  # floor at 0
+
+def test_handle_key_jump_endpoints():
+    from learnlog.viewer import PlaybackViewer
+    commits = [
+        {"hash": "a"}, {"hash": "b"}, {"hash": "c"}
+    ]
+    viewer = PlaybackViewer(None, commits, 1)
+    viewer._handle_key(ord("G"))
+    assert viewer.index == 2
+    viewer._handle_key(ord("g"))
+    assert viewer.index == 0
+@
+
+
+\section{Batch playback}
+\label{sec:play-batch}
+
+The curses viewer requires a terminal, but sometimes we want to
+pipe the output through [[less]] or redirect it to a file.
+In batch mode the viewer simply prints all commits sequentially
+to standard output.
+This creates a natural reading flow: the captured output from
+one commit appears just before the diff of the next, so the
+reader sees what the program produced and what the student
+changed as a result in a single continuous stream.
+
+<<viewer functions>>=
+def play_batch(repo, commits, start_index=0,
+               filter_learnlog=True):
+    """Print commit details sequentially to stdout.
+
+    When ``filter_learnlog`` is ``True``, learnlog's own run
+    blocks are stripped and all-learnlog commits are skipped.
+    """
+    for commit in commits[start_index:]:
+        detail = get_commit_detail(
+            repo, commit["hash"], filter_learnlog,
+        )
+        if detail is None:
+            continue
+        sys.stdout.write(detail)
+        sys.stdout.write("\n")
+@
+
+Let's verify that batch playback produces the expected output
+for each commit:
+
+<<viewer test functions>>=
+def test_play_batch_outputs_all_commits(workdir, capsys):
+    """Batch mode prints every commit's detail to stdout."""
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    repo = LearnlogRepo(workdir)
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    captured = capsys.readouterr().out
+    for c in commits:
+        assert c["hash"][:7] in captured
+@

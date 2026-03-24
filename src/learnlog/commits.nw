@@ -1,0 +1,538 @@
+\chapter{Querying Commit Data}
+\label{commits}
+
+The viewer (\cref{viewer}), the exporter (\cref{progsnap2}),
+and the [[list]] command (\cref{sec:list-command}) all need to
+list commits and fetch details for individual commits.
+We keep these as standalone functions rather than methods on
+[[LearnlogRepo]]---the repo class handles \emph{recording}; these
+functions handle \emph{reading}, which is a different concern.
+
+Separating reading from recording also avoids circular imports:
+several modules depend on these functions, but none of them need
+to import the CLI module.
+
+
+\section{Code overview}
+
+<<[[commits.py]]>>=
+"""Functions for querying learnlog commit data.
+
+Provides commit listing, summary parsing, detail
+retrieval, and filtering of learnlog's own run blocks.
+"""
+
+<<commits imports>>
+
+<<commits constants>>
+<<commits functions>>
+@
+
+<<test [[commits.py]]>>=
+"""Tests for the commits module."""
+import datetime
+import pytest
+from learnlog.gitrepo import LearnlogRepo
+
+<<commits test functions>>
+@
+
+
+\section{Imports}
+
+We need [[datetime]] for timestamp parsing and [[LearnlogRepo]]
+for type annotations in docstrings---the functions accept a repo
+instance but do not construct one.
+
+<<commits imports>>=
+from __future__ import annotations
+
+import datetime
+
+from learnlog.gitrepo import LearnlogRepo
+@
+
+
+\section{Block separator}
+\label{sec:block-sep}
+
+Multiple runs without code changes are appended to the same
+commit message, separated by a line of three dashes surrounded
+by blank lines (see \cref{gitrepo}).
+This separator is safe to split on because the section markers
+within a run block ([[--- I/O ---]], [[--- exception ---]])
+always have additional text after the dashes.
+
+We define it here rather than in the CLI module because both
+the commit functions and the ProgSnap2 exporter need it.
+
+<<commits constants>>=
+BLOCK_SEP = "\n\n---\n\n"
+@
+
+
+\section{Listing commits}
+
+We list commits in chronological order (oldest first) because
+that matches the natural playback direction: the student starts
+writing code and we watch their progress forward in time.
+
+<<commits functions>>=
+def get_commits(repo):
+    """Return a list of commits in chronological order.
+
+    Each entry is a dict with ``hash``, ``subject``, and
+    ``date`` keys.
+    """
+    result = repo.git(
+        "log", "--format=%H\t%s\t%aI", "--reverse"
+    )
+    if result.returncode != 0:
+        return []
+    commits = []
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            commits.append({
+                "hash": parts[0],
+                "subject": parts[1],
+                "date": parts[2],
+            })
+    return commits
+@
+
+<<commits test functions>>=
+def test_get_commits_returns_chronological(workdir):
+    from learnlog.commits import get_commits
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    assert len(commits) >= 2
+    assert commits[0]["hash"] != commits[-1]["hash"]
+
+def test_get_commits_has_required_keys(workdir):
+    from learnlog.commits import get_commits
+    repo = LearnlogRepo(workdir)
+    commits = get_commits(repo)
+    assert len(commits) >= 1
+    for key in ("hash", "subject", "date"):
+        assert key in commits[0]
+@
+
+
+\section{Summarising commits for listing}
+
+The [[list]] command (\cref{sec:list-command}) needs a compact
+one-line summary of each commit: the command that was run, when it
+started, and how many runs the commit contains.
+All of this information lives in the commit message body, so we
+parse it here rather than making additional Git calls.
+
+We split the message on the block separator to count runs, then
+extract the command from the first [[Run:]] line and the start
+time from the first [[Start-Time:]] field.
+The function returns [[None]] when the message contains no run
+blocks---this happens for the initial commit or when all runs
+have been filtered out.
+
+<<commits functions>>=
+def parse_run_summary(message):
+    """Extract a summary from a commit message body.
+
+    Returns ``(command, start_time, run_count)`` where
+    ``command`` is the script and arguments string,
+    ``start_time`` is formatted as ``YYYY-MM-DD HH:MM``,
+    and ``run_count`` is the number of run blocks.
+    Returns ``None`` if the message contains no runs.
+    """
+    if not message or not message.strip():
+        return None
+
+    blocks = message.split(BLOCK_SEP)
+    run_blocks = [
+        b for b in blocks
+        if b.strip().startswith("Run:")
+    ]
+    if not run_blocks:
+        return None
+
+    <<extract command from first run block>>
+    <<extract start time from first run block>>
+
+    return (command, start_time, len(run_blocks))
+@
+
+The first line of a run block is [[Run: script args]]---the same
+text that [[git log --oneline]] shows as the commit subject.
+We strip the [[Run: ]] prefix to recover the command string as
+the student typed it.
+
+<<extract command from first run block>>=
+first = run_blocks[0].strip()
+first_line = first.split("\n", 1)[0]
+command = first_line[len("Run: "):]
+@
+
+The [[Start-Time:]] field sits in the same first run block
+([[first]]) parsed above.
+Its value is an ISO\,8601 timestamp that we reformat to a
+human-friendly [[YYYY-MM-DD HH:MM]] since full ISO timestamps
+are noisy in a compact listing.
+
+<<extract start time from first run block>>=
+start_time = ""
+for line in first.split("\n"):
+    if line.startswith("Start-Time:"):
+        iso = line.split(":", 1)[1].strip()
+        try:
+            dt = datetime.datetime.fromisoformat(iso)
+            start_time = dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            start_time = iso
+        break
+@
+
+Let's verify the summary extraction for single runs, multiple
+runs, and empty messages:
+
+<<commits test functions>>=
+def test_parse_run_summary_single_run():
+    from learnlog.commits import parse_run_summary
+    msg = (
+        "Run: hello.py arg1 arg2\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: arg1 arg2\n"
+        "Start-Time: 2026-03-20T14:30:00"
+    )
+    result = parse_run_summary(msg)
+    assert result is not None
+    command, start_time, count = result
+    assert command == "hello.py arg1 arg2"
+    assert start_time == "2026-03-20 14:30"
+    assert count == 1
+
+def test_parse_run_summary_multiple_runs():
+    from learnlog.commits import parse_run_summary
+    msg = (
+        "Run: hello.py (none)\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:00:00"
+        "\n\n---\n\n"
+        "Run: hello.py --verbose\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: --verbose\n"
+        "Start-Time: 2026-01-01T10:05:00"
+    )
+    result = parse_run_summary(msg)
+    assert result is not None
+    command, start_time, count = result
+    assert command == "hello.py (none)"
+    assert start_time == "2026-01-01 10:00"
+    assert count == 2
+
+def test_parse_run_summary_empty():
+    from learnlog.commits import parse_run_summary
+    assert parse_run_summary("") is None
+    assert parse_run_summary("   ") is None
+
+def test_parse_run_summary_no_runs():
+    from learnlog.commits import parse_run_summary
+    msg = "learnlog: initial commit"
+    assert parse_run_summary(msg) is None
+@
+
+
+\section{Commit details}
+
+For a single commit we use [[git show]], which produces the
+commit header, the full message (containing the captured I/O),
+and the unified diff (showing the code that changed)---all in a
+single subprocess call.
+
+A teacher reviewing student work typically wants to see
+\emph{what changed} before reading the run metadata (script
+name, arguments, captured I/O).
+The default [[git show]] order is header, message, diff; we
+rearrange to header, diff, message so that code changes appear
+first.
+
+
+\subsection{Parsing [[git show]] sections}
+
+The [[git show]] output always starts with metadata lines
+(commit hash, author, date) followed by a blank line, then the
+indented commit message, then the diff.
+Both reordering and filtering need to locate these three sections,
+so we extract the boundary-finding into a single function.
+
+The header ends at the first blank line.
+The diff starts at the first [[diff --git]] line; when no diff is
+present---for example, the initial commit that only records a run
+without any file changes---[[diff_start]] is [[None]].
+
+<<commits functions>>=
+def parse_show_sections(lines):
+    """Find section boundaries in ``git show`` output.
+
+    Returns ``(header_end, diff_start)`` where
+    ``header_end`` is the index of the first blank line and
+    ``diff_start`` is the index of the first ``diff --git``
+    line, or ``None`` if no diff is present.
+    """
+    header_end = 0
+    for i, line in enumerate(lines):
+        if line == "":
+            header_end = i
+            break
+
+    diff_start = None
+    for i, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            diff_start = i
+            break
+
+    return header_end, diff_start
+@
+
+
+\subsection{Reordering commit detail}
+
+Given the section boundaries, rearranging is a matter of slicing the
+lines into header, message, and diff, then reassembling them in the
+order that puts code changes first.
+When no diff is present (the initial commit), we leave the output
+unchanged.
+
+<<commits functions>>=
+def reorder_commit_detail(detail):
+    """Reorder ``git show`` output: header, diff, message.
+
+    Moves the unified diff before the commit message so that
+    code changes are visible first in the viewer.
+    """
+    lines = detail.split("\n")
+    header_end, diff_start = parse_show_sections(lines)
+
+    if diff_start is None:
+        return detail
+
+    header = lines[:header_end + 1]
+    message = lines[header_end + 1:diff_start]
+    diff = lines[diff_start:]
+
+    return "\n".join(header + diff + [""] + message)
+@
+
+
+\section{Filtering learnlog's own runs}
+\label{sec:filter-learnlog}
+
+When the [[learnlog]] CLI is invoked (\eg [[learnlog play]]), the
+package's [[__init__.py]] logs the invocation as a run block---just
+like any student program.
+These self-referential entries clutter the playback with tool usage
+that is not part of the student's development.
+
+Since multiple runs without code changes are appended to the same
+commit (separated by [[BLOCK_SEP]], see \cref{gitrepo}), a single
+commit can contain both student runs and learnlog runs.
+We therefore filter at the run-block level within each commit message,
+not at the commit level.
+
+<<commits functions>>=
+def filter_learnlog_runs(message):
+    """Remove learnlog CLI run blocks from a commit message.
+
+    Splits on the ``---`` block separator and removes blocks
+    whose header starts with ``Run: learnlog``.
+    Returns the filtered message, which may be empty if all
+    blocks were learnlog runs.
+    """
+    blocks = message.split(BLOCK_SEP)
+    filtered = [
+        b for b in blocks
+        if not b.lstrip().startswith("Run: learnlog")
+    ]
+    return BLOCK_SEP.join(filtered)
+@
+
+Let's verify that filtering works for mixed, student-only, and
+learnlog-only commit messages:
+
+<<commits test functions>>=
+def test_filter_learnlog_runs_removes_block():
+    from learnlog.commits import filter_learnlog_runs
+    msg = (
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "\n\n---\n\n"
+        "Run: learnlog play\n\nScript: learnlog\n"
+    )
+    result = filter_learnlog_runs(msg)
+    assert "hello.py" in result
+    assert "learnlog" not in result
+
+def test_filter_learnlog_runs_preserves_student():
+    from learnlog.commits import filter_learnlog_runs
+    msg = "Run: hello.py (none)\n\nScript: hello.py\n"
+    assert filter_learnlog_runs(msg) == msg
+
+def test_filter_learnlog_runs_all_learnlog():
+    from learnlog.commits import filter_learnlog_runs
+    msg = (
+        "Run: learnlog play\n\nScript: learnlog\n"
+        "\n\n---\n\n"
+        "Run: learnlog export\n\nScript: learnlog\n"
+    )
+    result = filter_learnlog_runs(msg)
+    assert result.strip() == ""
+
+def test_filter_learnlog_runs_preserves_io_separator():
+    """The --- I/O --- marker within a block is not a separator."""
+    from learnlog.commits import filter_learnlog_runs
+    msg = (
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "\n--- I/O ---\nstdout: hello\n"
+        "\n--- exception ---\nNone"
+    )
+    result = filter_learnlog_runs(msg)
+    assert "stdout: hello" in result
+@
+
+
+\section{Filtering [[git show]] output}
+
+We could fetch the raw commit message separately
+([[git log --format=%B]]), but that would require an extra subprocess
+call per commit.
+Instead, we extract the message directly from the [[git show]]
+output---it is indented with four spaces---filter it, and reconstruct
+the output in place, reusing [[parse_show_sections]] to locate the
+boundaries.
+
+<<commits functions>>=
+def filter_show_output(show_output):
+    """Filter learnlog runs from ``git show`` output.
+
+    Extracts the indented commit message, strips the four-space
+    indentation, filters learnlog run blocks, re-indents, and
+    reconstructs the full output.  Returns ``None`` if all run
+    blocks were filtered out.
+    """
+    lines = show_output.split("\n")
+    header_end, diff_start = parse_show_sections(lines)
+
+    <<extract and filter raw message>>
+    <<reconstruct show output>>
+@
+
+<<extract and filter raw message>>=
+end = diff_start if diff_start is not None else len(lines)
+msg_lines = lines[header_end + 1:end]
+raw_msg = "\n".join(
+    line[4:] if line.startswith("    ") else line
+    for line in msg_lines
+)
+filtered_msg = filter_learnlog_runs(raw_msg)
+
+if not filtered_msg.strip():
+    return None
+@
+
+<<reconstruct show output>>=
+reindented = []
+for line in filtered_msg.split("\n"):
+    if line:
+        reindented.append("    " + line)
+    else:
+        reindented.append("")
+
+header = lines[:header_end + 1]
+diff = lines[end:] if diff_start is not None else []
+return "\n".join(header + reindented + diff)
+@
+
+
+\section{Retrieving commit detail}
+
+Filtering is enabled by default because learnlog runs are never part
+of the student's development story---a teacher reviewing the log
+should not have to remember a flag to get a clean view.
+The [[filter_learnlog]] parameter lets the [[--all]] flag disable it
+for debugging or completeness.
+
+<<commits functions>>=
+def get_commit_detail(repo, commit_hash,
+                      filter_learnlog=True):
+    """Return ``git show`` output for a single commit,
+    reordered so the diff appears before the message.
+
+    When ``filter_learnlog`` is ``True`` (the default),
+    learnlog's own run blocks are stripped from the commit
+    message.  Returns ``None`` if all runs in the commit
+    were learnlog runs.
+    """
+    result = repo.git("show", commit_hash)
+    detail = result.stdout
+
+    if filter_learnlog:
+        detail = filter_show_output(detail)
+        if detail is None:
+            return None
+
+    return reorder_commit_detail(detail)
+@
+
+<<commits test functions>>=
+def test_get_commit_detail_initial(workdir):
+    from learnlog.commits import get_commits, \
+        get_commit_detail
+    repo = LearnlogRepo(workdir)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[0]["hash"])
+    assert "learnlog" in detail
+
+def test_get_commit_detail_with_diff(workdir):
+    from learnlog.commits import get_commits, \
+        get_commit_detail
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[-1]["hash"])
+    assert "hello.py" in detail
+
+def test_get_commit_detail_diff_before_message(workdir):
+    """Verify that the diff appears before the message."""
+    from learnlog.commits import get_commits, \
+        get_commit_detail
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[-1]["hash"])
+    diff_pos = detail.index("diff --git")
+    msg_lines = [
+        l for l in detail.split("\n")
+        if l.startswith("    ")
+    ]
+    assert msg_lines, "expected indented message lines"
+    first_msg_pos = detail.index(msg_lines[0])
+    assert diff_pos < first_msg_pos, \
+        "diff should appear before the commit message"
+@
