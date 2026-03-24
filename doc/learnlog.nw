@@ -40,6 +40,9 @@
 \input{../src/learnlog/learnlog.tex}
 \input{../src/learnlog/capture.tex}
 \input{../src/learnlog/gitrepo.tex}
+\input{../src/learnlog/commits.tex}
+\input{../src/learnlog/progsnap2.tex}
+\input{../src/learnlog/viewer.tex}
 \input{../src/learnlog/cli.tex}
 
 

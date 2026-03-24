@@ -8,6 +8,9 @@ weave: learnlog.tex
 ../src/learnlog/learnlog.tex: ../src/learnlog/learnlog.nw
 ../src/learnlog/capture.tex: ../src/learnlog/capture.nw
 ../src/learnlog/gitrepo.tex: ../src/learnlog/gitrepo.nw
+../src/learnlog/commits.tex: ../src/learnlog/commits.nw
+../src/learnlog/progsnap2.tex: ../src/learnlog/progsnap2.nw
+../src/learnlog/viewer.tex: ../src/learnlog/viewer.nw
 ../src/learnlog/cli.tex: ../src/learnlog/cli.nw
 
 %.tex: %.nw
@@ -20,6 +23,9 @@ learnlog.pdf: learnlog.tex
 learnlog.pdf: ../src/learnlog/learnlog.tex
 learnlog.pdf: ../src/learnlog/capture.tex
 learnlog.pdf: ../src/learnlog/gitrepo.tex
+learnlog.pdf: ../src/learnlog/commits.tex
+learnlog.pdf: ../src/learnlog/progsnap2.tex
+learnlog.pdf: ../src/learnlog/viewer.tex
 learnlog.pdf: ../src/learnlog/cli.tex
 learnlog.pdf: bibliography.bib preamble.tex
 
