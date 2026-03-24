@@ -26,9 +26,19 @@ stored in a hidden local Git repository.
   learnlog play
   ```
 
-  Alternatively, the teacher can run `learnlog export` to create a portable
-  bundle file that students import and replay with `learnlog play` — useful
-  when a shared Git remote is not available.
+  Alternatively, when a shared Git remote is not available, the teacher can
+  export the log as a portable bundle file:
+
+  ```bash
+  learnlog export -o lecture01.bundle
+  ```
+
+  The teacher distributes the file (e.g. via a course page) and students
+  replay it directly:
+
+  ```bash
+  learnlog play lecture01.bundle
+  ```
 
 - **Studying how students code.**
   A researcher creates an empty Git repository for each student. Each student

@@ -19,22 +19,28 @@ demonstration scripts used during a lecture or tutorial.
 Every run is recorded automatically.
 After the session, the teacher points the log at a remote
 repository and pushes:
-\begin{verbatim}
-learnlog set-remote <url>
+\begin{minted}{bash}
+learnlog set-remote git@gitlab.kth.se:dbosk/demo-log.git
 learnlog push
-\end{verbatim}
+\end{minted}
 Students then clone the log and replay it step by step:
-\begin{verbatim}
-learnlog clone <url>
+\begin{minted}{bash}
+learnlog clone git@gitlab.kth.se:dbosk/demo-log.git
 learnlog play
-\end{verbatim}
+\end{minted}
 They see the exact sequence of code changes, inputs, and outputs
 from the demonstration.
 
-Alternatively, the teacher can run
-[[learnlog export]] to produce a portable bundle file that
-students import and replay with [[learnlog play]]---useful when
-a shared Git remote is not available.
+Alternatively, when a shared Git remote is not available, the
+teacher can export the log as a portable bundle file:
+\begin{minted}{bash}
+learnlog export -o lecture01.bundle
+\end{minted}
+The teacher distributes the file (\eg via a course page) and
+students replay it directly:
+\begin{minted}{bash}
+learnlog play lecture01.bundle
+\end{minted}
 
 \paragraph{Studying how students code.}
 A researcher (or teacher) creates an empty Git repository for each
@@ -42,16 +48,16 @@ student---for instance, one repository per student on a shared
 server.
 Each student adds \mintinline{python}{import learnlog} to their
 programs and configures the remote:
-\begin{verbatim}
-learnlog set-remote <url>
+\begin{minted}{bash}
+learnlog set-remote git@gitlab.kth.se:dbosk/alice-log.git
 learnlog push
-\end{verbatim}
+\end{minted}
 The researcher then clones each student's repository to analyse
 the development data:
-\begin{verbatim}
-learnlog clone <url>
+\begin{minted}{bash}
+learnlog clone git@gitlab.kth.se:dbosk/alice-log.git
 learnlog play
-\end{verbatim}
+\end{minted}
 This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
 refine their debugging techniques.
