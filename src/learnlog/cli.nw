@@ -3,12 +3,12 @@
 
 The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
-It provides six subcommands: [[list]] gives a compact overview of
-the recorded commits, [[export]] creates a portable bundle of the
-log, [[set-remote]] and [[push]] configure and deliver the log to
-a remote Git repository, [[git]] forwards Git commands to the log
-repository, and [[play]] gives an interactive viewer for browsing
-the commit history.
+It provides eight subcommands: [[list]] gives a compact overview
+of the recorded commits, [[export]] creates a portable bundle of
+the log, [[set-remote]], [[push]], [[clone]], and [[pull]] manage
+synchronisation with a remote Git repository, [[git]] forwards
+Git commands to the log repository, and [[play]] gives an
+interactive viewer for browsing the commit history.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -22,8 +22,8 @@ arguments with minimal boilerplate, and the modern
 
 Provides the ``learnlog`` command with subcommands for running
 Git commands against the log, exporting it as a bundle,
-pushing to a remote repository, and playing back the
-development log stored in ``.learnlog/``.
+cloning from and synchronising with a remote repository, and
+playing back the development log stored in ``.learnlog/``.
 """
 
 <<imports>>
@@ -1339,7 +1339,9 @@ A simpler alternative is to configure a remote on the [[.learnlog/]]
 repository and push directly.
 
 The [[set-remote]] command configures the destination; [[push]]
-(\cref{sec:push}) delivers the data.
+(\cref{sec:push}) delivers the data, [[clone]] (\cref{sec:clone})
+retrieves a remote log locally, and [[pull]] (\cref{sec:pull})
+fetches subsequent updates.
 We always use the remote name [[origin]] because [[.learnlog/]] is a
 single-purpose recording artefact with one destination---there is no
 practical need for multiple remotes.
@@ -1577,6 +1579,262 @@ def test_push_no_remote_fails(workdir, monkeypatch):
     monkeypatch.chdir(workdir)
     runner = CliRunner()
     result = runner.invoke(app, ["push"])
+    assert result.exit_code != 0
+@
+
+
+\subsection{The [[clone]] command}
+\label{sec:clone}
+
+The [[push]] command delivers a local log to a remote repository, but
+we also need the reverse: retrieving a remote log locally.
+A teacher cloning a student's pushed learnlog to review it, or a
+student moving to a new machine, both need a way to get the
+[[.learnlog/]] data from the remote.
+
+The command takes a remote URL, performs a standard [[git clone]] into a
+temporary directory, and then moves the resulting [[.git/]] directory
+to [[.learnlog/]] in the target working directory.
+We use a temporary directory rather than [[git clone --bare]] because
+a standard clone produces a properly configured repository with remote
+tracking branches---so subsequent [[push]] and [[pull]]
+(\cref{sec:pull}) operations work without additional setup.
+
+Like [[push]], we use [[subprocess.run]] with inherited I/O so the
+user sees clone progress and can respond to credential prompts.
+We deliberately avoid constructing a [[LearnlogRepo]] before the
+clone completes, because its constructor auto-initialises an empty
+repository when [[.learnlog/]] is absent.
+
+<<typer commands>>=
+@app.command()
+def clone(
+    url: Annotated[
+        str,
+        typer.Argument(
+            help="URL of the remote repository to clone.",
+        ),
+    ],
+    directory: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "--dir", "-C",
+            help=(
+                "Target directory for the clone. "
+                "Defaults to current directory."
+            ),
+        ),
+    ] = None,
+):
+    """Clone a remote learnlog repository into .learnlog/."""
+    import shutil
+
+    workdir = pathlib.Path(
+        directory or os.getcwd()
+    ).resolve()
+    learnlog_dir = workdir / ".learnlog"
+
+    if learnlog_dir.exists():
+        raise SystemExit(
+            f".learnlog/ already exists in {workdir}"
+        )
+
+    tmpdir = tempfile.mkdtemp(prefix="learnlog-clone-")
+    try:
+        result = subprocess.run(
+            ["git", "clone", url, tmpdir],
+            cwd=str(workdir),
+        )
+        if result.returncode != 0:
+            raise SystemExit("Clone failed.")
+        shutil.move(
+            str(pathlib.Path(tmpdir, ".git")),
+            str(learnlog_dir),
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    typer.echo(f"Cloned into {learnlog_dir}")
+@
+
+We test [[clone]] by first pushing a learnlog repository to a bare
+remote, then cloning from it into a fresh directory.
+The cloned [[.learnlog/]] should contain the same commits as the
+original:
+
+<<test functions>>=
+def test_clone_creates_learnlog(workdir, monkeypatch):
+    """Clone creates .learnlog/ in the target directory."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    runner = CliRunner()
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    target = workdir / "clone-target"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    result = runner.invoke(
+        app, ["clone", str(bare)]
+    )
+    assert result.exit_code == 0
+    assert (target / ".learnlog").is_dir()
+
+def test_clone_has_commits(workdir, monkeypatch):
+    """Cloned repo contains the original commits."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    runner = CliRunner()
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    target = workdir / "clone-target"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    runner.invoke(app, ["clone", str(bare)])
+    cloned_repo = LearnlogRepo(target)
+    log = cloned_repo.git("log", "--oneline")
+    assert "learnlog" in log.stdout
+
+def test_clone_fails_if_exists(workdir, monkeypatch):
+    """Clone errors when .learnlog/ already exists."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["clone", "https://example.com/repo.git"],
+    )
+    assert result.exit_code != 0
+
+def test_clone_with_dir_option(workdir, monkeypatch):
+    """Clone respects the -C option."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    runner = CliRunner()
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    target = workdir / "clone-target"
+    target.mkdir()
+    result = runner.invoke(
+        app,
+        ["clone", str(bare), "-C", str(target)],
+    )
+    assert result.exit_code == 0
+    assert (target / ".learnlog").is_dir()
+@
+
+
+\subsection{The [[pull]] command}
+\label{sec:pull}
+
+The [[pull]] command is the receiving counterpart to [[push]]: it
+fetches new commits from [[origin]] and updates the local branches.
+Where [[push]] uses [[git push --all -u]], [[pull]] uses
+[[git pull --all]] to mirror the operation in the other direction.
+
+Merge conflicts are not a practical concern because [[.learnlog/]]
+is a single-writer recording artefact---the same assumption that
+makes [[--force]] safe on [[push]].
+
+Like [[push]] and [[clone]], we use inherited I/O for transfer
+progress and credential prompts.
+
+<<typer commands>>=
+@app.command()
+def pull(
+    directory: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "--dir", "-C",
+            help="Directory containing .learnlog/.",
+        ),
+    ] = None,
+):
+    """Pull new commits from the remote."""
+    workdir = resolve_workdir(directory)
+    repo = LearnlogRepo(workdir)
+
+    result = subprocess.run(
+        ["git", "pull", "--all"],
+        env=repo.env,
+        cwd=str(repo.workdir),
+    )
+    raise typer.Exit(code=result.returncode)
+@
+
+We test [[pull]] by pushing from the original repository, cloning
+into a second directory, adding a new commit to the original and
+pushing again, then pulling in the clone.
+The clone should see the new commit after the pull:
+
+<<test functions>>=
+def test_pull_after_clone(workdir, monkeypatch):
+    """Pull retrieves new commits after clone."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    runner = CliRunner()
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    target = workdir / "clone-target"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    runner.invoke(app, ["clone", str(bare)])
+    # Add a new commit in the original and push.
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text(
+        'print("v2")\n'
+    )
+    t = datetime.datetime(2026, 1, 1, 11, 0)
+    repo.begin_run("hello.py", [], t)
+    runner.invoke(app, ["push"])
+    # Pull in the cloned directory.
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+    assert result.exit_code == 0
+    cloned_repo = LearnlogRepo(target)
+    log = cloned_repo.git(
+        "log", "--oneline"
+    )
+    lines = log.stdout.strip().split("\n")
+    assert len(lines) >= 2
+
+def test_pull_no_remote_fails(workdir, monkeypatch):
+    """Pull fails when no remote is configured."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["pull"])
     assert result.exit_code != 0
 @
 
