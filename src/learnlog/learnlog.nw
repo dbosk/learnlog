@@ -12,18 +12,49 @@ and registers cleanup handlers that finalise the log entry when the
 program exits.
 
 These logs serve two main use cases.
-First, a teacher can have students use learnlog to record their
-development process.
-The teacher can then study how students approach coding tasks---for
-research purposes or to help students refine their debugging
-techniques.
 
-Second, a teacher can use learnlog while live coding during a lecture
-or tutorial.
-After the session, the teacher runs [[learnlog export]] to
-produce a portable bundle, and the students replay it step by step
-with [[learnlog play]]---seeing the exact sequence of code
-changes, inputs, and outputs from the demonstration.
+\paragraph{Sharing live-coding sessions.}
+A teacher adds \mintinline{python}{import learnlog} to the
+demonstration scripts used during a lecture or tutorial.
+Every run is recorded automatically.
+After the session, the teacher points the log at a remote
+repository and pushes:
+\begin{verbatim}
+learnlog set-remote <url>
+learnlog push
+\end{verbatim}
+Students then clone the log and replay it step by step:
+\begin{verbatim}
+learnlog clone <url>
+learnlog play
+\end{verbatim}
+They see the exact sequence of code changes, inputs, and outputs
+from the demonstration.
+
+Alternatively, the teacher can run
+[[learnlog export]] to produce a portable bundle file that
+students import and replay with [[learnlog play]]---useful when
+a shared Git remote is not available.
+
+\paragraph{Studying how students code.}
+A researcher (or teacher) creates an empty Git repository for each
+student---for instance, one repository per student on a shared
+server.
+Each student adds \mintinline{python}{import learnlog} to their
+programs and configures the remote:
+\begin{verbatim}
+learnlog set-remote <url>
+learnlog push
+\end{verbatim}
+The researcher then clones each student's repository to analyse
+the development data:
+\begin{verbatim}
+learnlog clone <url>
+learnlog play
+\end{verbatim}
+This gives a complete timeline of how students develop and debug
+their code---useful for research purposes or to help students
+refine their debugging techniques.
 
 The design is guided by two constraints:
 \begin{description}
