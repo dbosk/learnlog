@@ -1,6 +1,6 @@
 [project]
 name = "learnlog"
-version = "0.7"
+version = "0.8"
 description = "Automatic logging of student code development and test runs"
 license = "MIT"
 readme = "README.md"
