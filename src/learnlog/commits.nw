@@ -1,7 +1,7 @@
 \chapter{Querying Commit Data}
 \label{commits}
 
-The viewer (\cref{sec:play}), the exporter (\cref{sec:progsnap2}),
+The viewer (\cref{viewer}), the exporter (\cref{progsnap2}),
 and the [[list]] command (\cref{sec:list-command}) all need to
 list commits and fetch details for individual commits.
 We keep these as standalone functions rather than methods on
@@ -306,6 +306,12 @@ def parse_show_sections(lines):
 
 
 \subsection{Reordering commit detail}
+
+Given the section boundaries, rearranging is a matter of slicing the
+lines into header, message, and diff, then reassembling them in the
+order that puts code changes first.
+When no diff is present (the initial commit), we leave the output
+unchanged.
 
 <<commits functions>>=
 def reorder_commit_detail(detail):

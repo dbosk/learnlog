@@ -57,14 +57,11 @@ from learnlog.gitrepo import LearnlogRepo
 
 We split imports into two groups: standard library and the learnlog
 package.
-The [[curses]] import is deferred to the [[play]] command because it
-is unavailable on Windows---we only need it when the user actually
-invokes the interactive viewer.
 
 The commit querying functions ([[get_commits]], [[parse_run_summary]],
 etc.) live in the [[commits]] module (\cref{commits}).
-The ProgSnap2 exporter lives in [[progsnap2]] (\cref{sec:progsnap2}).
-The interactive viewer lives in [[viewer]] (\cref{sec:play}).
+The ProgSnap2 exporter lives in [[progsnap2]] (\cref{progsnap2}).
+The interactive viewer lives in [[viewer]] (\cref{viewer}).
 
 <<imports>>=
 from __future__ import annotations
@@ -81,11 +78,9 @@ import typer
 from learnlog import find_learnlog_dir
 from learnlog.gitrepo import LearnlogRepo
 from learnlog.commits import (
-    BLOCK_SEP,
     get_commits,
     parse_run_summary,
     filter_learnlog_runs,
-    get_commit_detail,
 )
 from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
@@ -325,7 +320,7 @@ def test_do_export_creates_bundle(workdir):
 
 \section{Typer application}
 
-We define the Typer app at module level with six commands.
+We define the Typer app at module level with eight commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 

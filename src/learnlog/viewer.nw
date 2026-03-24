@@ -1,5 +1,5 @@
 \chapter{The Play Viewer}
-\label{sec:play}
+\label{viewer}
 
 The interactive viewer uses [[curses]] to show one commit at a
 time with vi-style navigation.
@@ -135,6 +135,11 @@ scroll offset.
 This approach avoids the complexity of [[curses]] pads while
 handling arbitrarily long diffs.
 
+We cache the [[git show]] output because fetching it shells out to
+Git.
+Without caching, every scroll keystroke would re-run the command,
+making the viewer sluggish on large repositories.
+
 <<player methods>>=
 def _get_detail(self, commit_hash):
     """Fetch and cache the ``git show`` output."""
@@ -146,11 +151,6 @@ def _get_detail(self, commit_hash):
             )
     return self._detail_cache[commit_hash]
 @
-
-We cache the [[git show]] output because fetching it shells out to
-Git.
-Without caching, every scroll keystroke would re-run the command,
-making the viewer sluggish on large repositories.
 
 <<player methods>>=
 def _draw(self, stdscr):
