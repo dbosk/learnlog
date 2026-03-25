@@ -3,13 +3,14 @@
 
 The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
-It provides eight subcommands: [[list]] gives a compact overview
+It provides nine subcommands: [[list]] gives a compact overview
 of the recorded commits, [[export]] creates a portable bundle of
 the log (or a ProgSnap2 dataset for CS education analysis),
 [[set-remote]], [[push]], [[clone]], and [[pull]] manage
 synchronisation with a remote Git repository, [[git]] forwards
-Git commands to the log repository, and [[play]] gives an
-interactive viewer for browsing the commit history.
+Git commands to the log repository, [[tag]] manages named
+markers in the log (such as [[lab1]] or [[lab2]]), and [[play]]
+gives an interactive viewer for browsing the commit history.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -1210,12 +1211,113 @@ def test_git_command_forwards_exit_code(
 @
 
 
-\subsection{The [[play]] command}
+\subsection{The [[tag]] command}
+\label{sec:tag}
 
-The [[play]] command uses [[resolve_source]] to handle both
-directories and bundle files.
-When a bundle is used, [[resolve_source]] creates a temporary
-directory that we must clean up---hence the [[finally]] block.
+While [[learnlog git tag lab1]] already works via the
+[[git]] passthrough, typing [[learnlog tag lab1]] is more
+discoverable---students see it in [[learnlog --help]]
+alongside [[play]] and [[export]], which reinforces that
+tagging is a first-class operation rather than a Git
+implementation detail.
+
+The implementation mirrors the [[git]] passthrough
+(\cref{sec:git}): we find the [[.learnlog/]] directory,
+set the Git environment, and forward all arguments to
+[[git tag]].
+
+<<typer commands>>=
+@app.command(
+    name="tag",
+    context_settings={
+        "allow_extra_args": True,
+        "allow_interspersed_args": False,
+        "ignore_unknown_options": True,
+    },
+)
+def tag_command(
+    ctx: typer.Context,
+):
+    """Manage tags on the learnlog repository.
+
+    All arguments are forwarded to ``git tag``,
+    configured to operate on the ``.learnlog/``
+    directory.  For example, ``learnlog tag lab1``
+    creates a tag named ``lab1`` on the current HEAD.
+    """
+    workdir = find_learnlog_dir()
+    if workdir is None:
+        raise SystemExit(
+            "No .learnlog/ directory found."
+        )
+
+    learnlog_dir = workdir / ".learnlog"
+    env = {
+        **os.environ,
+        "GIT_DIR": str(learnlog_dir),
+        "GIT_WORK_TREE": str(workdir),
+    }
+
+    result = subprocess.run(
+        ["git", "tag"] + ctx.args,
+        env=env,
+        cwd=str(workdir),
+    )
+    raise typer.Exit(code=result.returncode)
+@
+
+Let's verify that the command creates and lists tags, and
+reports an error when no repository exists:
+
+<<test functions>>=
+def test_tag_command_creates_tag(workdir, monkeypatch):
+    """The tag subcommand creates a tag."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0
+    tags = repo.git("tag", "-l").stdout.strip()
+    assert "lab1" in tags
+
+def test_tag_command_lists_tags(workdir, monkeypatch):
+    """The tag subcommand lists tags."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    repo.git("tag", "lab1")
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["tag", "-l"])
+    assert result.exit_code == 0
+
+def test_tag_command_no_learnlog_dir(
+    tmp_path, monkeypatch
+):
+    """Error when no .learnlog/ directory exists."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 1
+@
+
+
+\subsection{The [[play]] command}
+\label{sec:play}
+
+The most common use of [[play]] is jumping to a tagged
+session: [[learnlog play lab1]] starts playback from the
+commit tagged [[lab1]].
+Therefore the optional positional argument is a Git ref
+(tag name, branch, or commit hash), not the source
+directory.
+The source---a directory containing [[.learnlog/]] or a
+bundle file---is specified with [[--from]] / [[-f]] when
+needed; it defaults to the current directory.
 
 The [[-b]] / [[--batch]] flag selects batch mode
 (\cref{sec:play-batch}), which prints all commits to standard
@@ -1235,21 +1337,24 @@ run block including those from [[learnlog play]] and
 <<typer commands>>=
 @app.command()
 def play(
-    source: Annotated[
+    start: Annotated[
         Optional[str],
         typer.Argument(
+            help=(
+                "Tag, commit hash, or branch to start "
+                "playback from."
+            ),
+        ),
+    ] = None,
+    source: Annotated[
+        Optional[str],
+        typer.Option(
+            "--from", "-f",
             help=(
                 "Source: directory with .learnlog/ "
                 "or a .bundle file. "
                 "Defaults to current directory."
             ),
-        ),
-    ] = None,
-    start: Annotated[
-        Optional[str],
-        typer.Option(
-            "--start", "-s",
-            help="Commit hash to start playback from.",
         ),
     ] = None,
     batch: Annotated[
@@ -1327,7 +1432,7 @@ def test_play_batch_via_cli(workdir):
     repo = LearnlogRepo(workdir)
     runner = CliRunner()
     result = runner.invoke(
-        app, ["play", str(workdir)]
+        app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
     assert "diff --git" in result.output
@@ -1347,7 +1452,7 @@ def test_play_hides_learnlog_runs(workdir):
     repo.begin_run("learnlog", ["play"], t1)
     runner = CliRunner()
     result = runner.invoke(
-        app, ["play", str(workdir)]
+        app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
     assert "Script: hello.py" in result.output
@@ -1363,25 +1468,93 @@ def test_play_all_shows_learnlog_runs(workdir):
     repo.begin_run("learnlog", ["play"], t1)
     runner = CliRunner()
     result = runner.invoke(
-        app, ["play", "--all", str(workdir)]
+        app,
+        ["play", "--all", "--from", str(workdir)],
     )
     assert result.exit_code == 0
     assert "Script: hello.py" in result.output
     assert "Script: learnlog" in result.output
 @
 
-When the user specifies a [[--start]] / [[-s]] commit, we find
-the matching index by prefix.
-Short hashes work because we match the beginning of the
-full hash, just like Git does.
+We resolve the starting ref through [[git rev-parse]], which
+handles tag names, branch names, and abbreviated hashes
+uniformly.
+If [[rev-parse]] fails (for example, a typo), we fall back
+to prefix matching on the commit list---this covers the
+case where a short hash is ambiguous in Git but unique among
+the commits we have.
 
 <<find starting commit index>>=
-for i, c in enumerate(commits):
-    if c["hash"].startswith(start):
-        start_index = i
-        break
+resolved = repo.git("rev-parse", start)
+if resolved.returncode == 0:
+    full_hash = resolved.stdout.strip()
+    for i, c in enumerate(commits):
+        if c["hash"] == full_hash:
+            start_index = i
+            break
+    else:
+        raise SystemExit(
+            f"Ref {start} resolves to "
+            f"{full_hash[:8]} which is not "
+            f"in the commit list."
+        )
 else:
-    raise SystemExit(
-        f"Commit {start} not found."
+    for i, c in enumerate(commits):
+        if c["hash"].startswith(start):
+            start_index = i
+            break
+    else:
+        raise SystemExit(
+            f"Commit {start} not found."
+        )
+@
+
+Let's verify that tags and commit hashes both work as
+starting points for playback:
+
+<<test functions>>=
+def test_play_start_from_tag(workdir, monkeypatch):
+    """A tag name resolves to the correct starting commit."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    from learnlog.commits import get_commits
+    commits = get_commits(repo)
+    repo.git("tag", "lab2", commits[-1]["hash"])
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["play", "lab2"])
+    assert result.exit_code == 0
+
+def test_play_start_from_hash_prefix(
+    workdir, monkeypatch
+):
+    """A short commit hash works as a start ref."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    from learnlog.commits import get_commits
+    commits = get_commits(repo)
+    short = commits[0]["hash"][:7]
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["play", short])
+    assert result.exit_code == 0
+
+def test_play_invalid_ref(workdir, monkeypatch):
+    """An invalid ref produces an error."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "nonexistent"]
     )
+    assert result.exit_code == 1
 @
