@@ -19,7 +19,8 @@ to import the CLI module.
 """Functions for querying learnlog commit data.
 
 Provides commit listing, summary parsing, detail
-retrieval, and filtering of learnlog's own run blocks.
+retrieval, filtering of learnlog's own run blocks,
+and tag resolution.
 """
 
 <<commits imports>>
@@ -535,4 +536,81 @@ def test_get_commit_detail_diff_before_message(workdir):
     first_msg_pos = detail.index(msg_lines[0])
     assert diff_pos < first_msg_pos, \
         "diff should appear before the commit message"
+@
+
+
+\section{Tag resolution}
+\label{sec:tag-resolution}
+
+Git tags let users mark meaningful points in a development
+log---for instance, the start of each lab session.
+We need a mapping from commit hashes to tag names for two
+purposes: the ProgSnap2 exporter adds an [[X-Tag]] column
+to the event table (\cref{progsnap2}), and the [[play]]
+command resolves tag names to starting commits
+(\cref{sec:play}).
+
+We query all tags in a single [[git tag -l]] call rather
+than checking each commit individually, because the number
+of tags is small (typically one per lab session) and a
+single subprocess call is cheaper than one per commit.
+
+<<commits functions>>=
+def get_tag_map(repo):
+    """Map commit hashes to tag names.
+
+    Returns a dict where keys are full commit hashes
+    and values are lists of tag names pointing at that
+    commit.
+    """
+    result = repo.git(
+        "tag", "-l",
+        "--format=%(objectname) %(refname:short)",
+    )
+    if result.returncode != 0:
+        return {}
+    tag_map = {}
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            commit_hash, tag_name = parts
+            tag_map.setdefault(
+                commit_hash, []
+            ).append(tag_name)
+    return tag_map
+@
+
+Let's verify that the tag map correctly associates commits
+with their tags:
+
+<<commits test functions>>=
+def test_get_tag_map_single_tag(workdir):
+    """A tag on HEAD appears in the map."""
+    from learnlog.commits import get_tag_map, get_commits
+    repo = LearnlogRepo(workdir)
+    repo.git("tag", "lab1")
+    commits = get_commits(repo)
+    tag_map = get_tag_map(repo)
+    assert "lab1" in tag_map[commits[-1]["hash"]]
+
+def test_get_tag_map_multiple_tags(workdir):
+    """Multiple tags on the same commit all appear."""
+    from learnlog.commits import get_tag_map, get_commits
+    repo = LearnlogRepo(workdir)
+    repo.git("tag", "lab1")
+    repo.git("tag", "milestone")
+    commits = get_commits(repo)
+    tag_map = get_tag_map(repo)
+    names = tag_map[commits[-1]["hash"]]
+    assert "lab1" in names
+    assert "milestone" in names
+
+def test_get_tag_map_no_tags(workdir):
+    """A repo with no tags returns an empty map."""
+    from learnlog.commits import get_tag_map
+    repo = LearnlogRepo(workdir)
+    tag_map = get_tag_map(repo)
+    assert tag_map == {}
 @

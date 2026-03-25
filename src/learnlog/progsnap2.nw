@@ -53,9 +53,11 @@ from learnlog.gitrepo import LearnlogRepo
 
 The export needs CSV writing, temporary directories for code state
 extraction, and zip file creation.
-We import [[get_commits]], [[filter_learnlog_runs]], and
-[[BLOCK_SEP]] from the commits module rather than reimplementing
-the commit-walking logic.
+We import [[get_commits]], [[filter_learnlog_runs]],
+[[BLOCK_SEP]], and [[get_tag_map]] from the commits module
+rather than reimplementing the commit-walking logic.
+The tag map lets us populate the [[X-Tag]] column in the
+event table.
 
 <<progsnap2 imports>>=
 from __future__ import annotations
@@ -71,6 +73,7 @@ import zipfile
 
 from learnlog.commits import (
     get_commits,
+    get_tag_map,
     filter_learnlog_runs,
     BLOCK_SEP,
 )
@@ -734,6 +737,7 @@ suffices.
 
 <<collect events and code states>>=
 commits = get_commits(repo)
+tag_map = get_tag_map(repo)
 seen_trees = {}
 events = []
 resource_files = []
@@ -742,6 +746,9 @@ prev_tree = None
 
 for commit in commits:
     commit_hash = commit["hash"]
+    commit_tags = ";".join(
+        tag_map.get(commit_hash, [])
+    )
 
     <<get subject and code state for commit>>
     <<optionally emit File.Edit event>>
@@ -794,6 +801,7 @@ if prev_tree is not None and current_tree != prev_tree:
         "X-ExceptionMessage": "",
         "ProgramOutput": "",
         "ProgramInput": "",
+        "X-Tag": commit_tags,
     })
 @
 
@@ -849,6 +857,7 @@ for run in runs:
         "X-ExceptionMessage": exc_msg or "",
         "ProgramOutput": "",
         "ProgramInput": "",
+        "X-Tag": commit_tags,
     })
 
     <<emit I/O events for run>>
@@ -900,6 +909,7 @@ for evt_type, text in io_chunks:
         "X-ExceptionMessage": "",
         "ProgramOutput": "",
         "ProgramInput": "",
+        "X-Tag": commit_tags,
     }
     resource_path = f"Resources/io_{order}.txt"
     if evt_type == "X-Run.Output":
@@ -982,6 +992,11 @@ parent [[Run.Program]] (v8, \S4.3.6, lines~902--912),
 the standard [[ProgramOutput]] and [[ProgramInput]] columns
 referencing files in [[Resources/]], and custom [[X-]]
 columns for Python-specific metadata.
+The [[X-Tag]] column carries any Git tags that point at
+the commit that produced the event, semicolon-delimited
+when a commit has multiple tags.
+This lets analysis tools segment the dataset by lab session
+or other user-defined milestones.
 
 <<build main table csv string>>=
 main_columns = [
@@ -994,6 +1009,7 @@ main_columns = [
     "X-ExceptionType", "X-ExceptionMessage",
     "ProgramOutput",
     "ProgramInput",
+    "X-Tag",
 ]
 main_buf = io.StringIO()
 main_writer = csv.DictWriter(
@@ -1310,4 +1326,45 @@ def test_progsnap2_no_io_events_when_empty(workdir):
     ]
     assert len(io_evts) == 0
     assert len(resources) == 0
+@
+
+Tags attached to commits appear in the [[X-Tag]] column of
+the exported event table.
+We verify that a tagged commit carries the tag name and
+that untagged commits have an empty [[X-Tag]] value.
+
+<<progsnap2 test functions>>=
+def test_progsnap2_tag_column(workdir):
+    """Tagged commits have X-Tag populated."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    from learnlog.commits import get_commits
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text(
+        'print("v2")\n'
+    )
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    repo.git("tag", "lab1", commits[-1]["hash"])
+    output = workdir / "out.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read(
+            "MainTable.csv"
+        ).decode("utf-8")
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+    tagged = [
+        e for e in events
+        if e["X-Tag"] == "lab1"
+    ]
+    assert len(tagged) >= 1
+    untagged = [
+        e for e in events
+        if e["X-Tag"] == ""
+    ]
+    assert len(untagged) >= 1
 @
