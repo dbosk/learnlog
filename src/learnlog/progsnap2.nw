@@ -14,6 +14,8 @@ A ProgSnap2 dataset is a zip file containing:
 \item[MainTable.csv] One row per event (file edits, program runs).
 \item[CodeStates/] A directory of source file snapshots, one
   subdirectory per unique code state.
+\item[Resources/] Individual I/O text files referenced by the
+  [[ProgramOutput]] and [[ProgramInput]] columns.
 \end{description}
 
 We use the [[.progsnap2]] extension to distinguish these
@@ -689,11 +691,13 @@ a zip file.
 
 The algorithm has three phases:
 \begin{enumerate}
-\item Walk commits to build the event rows and collect
-  unique code state tree hashes.
+\item Walk commits to build the event rows, collect
+  unique code state tree hashes, and accumulate I/O
+  resource files.
 \item Extract each unique code state into a temporary directory.
 \item Write the zip file with [[DatasetMetadata.csv]],
-  [[MainTable.csv]], and [[CodeStates/]] entries.
+  [[MainTable.csv]], [[CodeStates/]], and [[Resources/]]
+  entries.
 \end{enumerate}
 
 We separate these phases because code state extraction requires
@@ -706,8 +710,9 @@ def do_export_progsnap2(repo, output_path,
     """Export the learnlog repository as a ProgSnap2 zip.
 
     Creates a zip file at ``output_path`` containing
-    ``DatasetMetadata.csv``, ``MainTable.csv``, and a
-    ``CodeStates/`` directory with source file snapshots.
+    ``DatasetMetadata.csv``, ``MainTable.csv``, a
+    ``CodeStates/`` directory with source file snapshots,
+    and a ``Resources/`` directory with I/O text files.
     """
     <<collect events and code states>>
     <<write progsnap2 zip file>>
@@ -731,6 +736,7 @@ suffices.
 commits = get_commits(repo)
 seen_trees = {}
 events = []
+resource_files = []
 order = 0
 prev_tree = None
 
@@ -786,8 +792,8 @@ if prev_tree is not None and current_tree != prev_tree:
         "X-Arguments": "",
         "X-ExceptionType": "",
         "X-ExceptionMessage": "",
-        "X-ProgramOutput.Value": "",
-        "X-ProgramInput.Value": "",
+        "ProgramOutput": "",
+        "ProgramInput": "",
     })
 @
 
@@ -841,8 +847,8 @@ for run in runs:
         "X-Arguments": run["arguments"] or "",
         "X-ExceptionType": exc_type or "",
         "X-ExceptionMessage": exc_msg or "",
-        "X-ProgramOutput.Value": "",
-        "X-ProgramInput.Value": "",
+        "ProgramOutput": "",
+        "ProgramInput": "",
     })
 
     <<emit I/O events for run>>
@@ -854,14 +860,14 @@ The ProgSnap2 spec defines [[ProgramInput]] and
 [[ProgramOutput]] as URL-typed columns that reference files
 in the [[Resources/]] directory (v8, \S4.4.2,
 lines~1224--1261).
-Since our captured I/O is typically short and managing
-separate resource files would add complexity with little
-benefit, we store the text inline in custom columns
-[[X-ProgramOutput.Value]] and [[X-ProgramInput.Value]].
-The [[X-]] prefix is required for non-standard columns
-(v8, \S2.4, lines~568--571), and the [[.Value]] suffix
-distinguishes our inline text from the spec's URL-typed
-columns.
+Each I/O chunk is written to a separate file named
+[[io_{EventID}.txt]] under [[Resources/]], and the CSV
+cell contains the relative path to that file.
+Using the standard columns rather than custom inline
+ones ensures that generic ProgSnap2 analysis tools can
+read the I/O data without special handling---custom
+[[X-]] columns are ignored by tools that do not
+explicitly support them.
 
 We use custom event types [[X-Run.Output]] and
 [[X-Run.Input]] rather than embedding all I/O in the
@@ -892,13 +898,15 @@ for evt_type, text in io_chunks:
         "X-Arguments": "",
         "X-ExceptionType": "",
         "X-ExceptionMessage": "",
-        "X-ProgramOutput.Value": "",
-        "X-ProgramInput.Value": "",
+        "ProgramOutput": "",
+        "ProgramInput": "",
     }
+    resource_path = f"Resources/io_{order}.txt"
     if evt_type == "X-Run.Output":
-        io_event["X-ProgramOutput.Value"] = text
+        io_event["ProgramOutput"] = resource_path
     else:
-        io_event["X-ProgramInput.Value"] = text
+        io_event["ProgramInput"] = resource_path
+    resource_files.append((resource_path, text))
     events.append(io_event)
 @
 
@@ -971,8 +979,9 @@ metadata_csv = metadata_buf.getvalue()
 The main table includes the standard ProgSnap2 columns,
 [[ParentEventID]] for linking I/O child events to their
 parent [[Run.Program]] (v8, \S4.3.6, lines~902--912),
-and our custom [[X-]] columns for Python-specific metadata
-and inline I/O values.
+the standard [[ProgramOutput]] and [[ProgramInput]] columns
+referencing files in [[Resources/]], and custom [[X-]]
+columns for Python-specific metadata.
 
 <<build main table csv string>>=
 main_columns = [
@@ -983,8 +992,8 @@ main_columns = [
     "ProgramResult",
     "X-ExitCode", "X-Script", "X-Arguments",
     "X-ExceptionType", "X-ExceptionMessage",
-    "X-ProgramOutput.Value",
-    "X-ProgramInput.Value",
+    "ProgramOutput",
+    "ProgramInput",
 ]
 main_buf = io.StringIO()
 main_writer = csv.DictWriter(
@@ -1000,6 +1009,9 @@ We write CSVs from in-memory strings rather than temporary files
 to avoid extra I/O, and iterate subdirectories in sorted order
 so that repeated exports of the same data produce
 byte-identical archives---useful for checksumming and caching.
+Resource files are likewise written from in-memory strings
+collected during event generation; they are already ordered
+by [[EventID]], so no additional sorting is needed.
 
 <<assemble zip file>>=
 with zipfile.ZipFile(
@@ -1021,6 +1033,9 @@ with zipfile.ZipFile(
                     )
                 )
                 zf.write(str(fpath), arcname)
+
+    for arcname, text in resource_files:
+        zf.writestr(arcname, text)
 @
 
 Let's verify the complete export pipeline:
@@ -1049,6 +1064,11 @@ def test_do_export_progsnap2_creates_zip(workdir):
             if n.startswith("CodeStates/")
         ]
         assert len(code_states) >= 1
+        resources = [
+            n for n in names
+            if n.startswith("Resources/")
+        ]
+        assert len(resources) >= 1
 
 def test_progsnap2_metadata_version(workdir):
     import csv as csv_mod
@@ -1135,12 +1155,14 @@ def test_progsnap2_file_edit_event(workdir):
 
 Let's verify that a run with interactive I/O produces chunked
 [[X-Run.Output]] and [[X-Run.Input]] events linked to their
-parent [[Run.Program]] via [[ParentEventID]]:
+parent [[Run.Program]] via [[ParentEventID]], with each
+I/O chunk stored as a file in [[Resources/]]:
 
 <<progsnap2 test functions>>=
 def test_progsnap2_io_events(workdir):
     """I/O log produces X-Run.Output and X-Run.Input
-    events linked to the parent Run.Program."""
+    events with ProgramOutput/ProgramInput referencing
+    resource files."""
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
     repo = LearnlogRepo(workdir)
@@ -1164,32 +1186,50 @@ def test_progsnap2_io_events(workdir):
         main = zf.read(
             "MainTable.csv"
         ).decode("utf-8")
-    reader = csv_mod.DictReader(io.StringIO(main))
-    events = list(reader)
+        reader = csv_mod.DictReader(
+            io.StringIO(main)
+        )
+        events = list(reader)
 
-    run_evt = [
-        e for e in events
-        if e["EventType"] == "Run.Program"
-    ][0]
-    io_evts = [
-        e for e in events
-        if e["EventType"].startswith("X-Run.")
-    ]
+        run_evt = [
+            e for e in events
+            if e["EventType"] == "Run.Program"
+        ][0]
+        io_evts = [
+            e for e in events
+            if e["EventType"].startswith("X-Run.")
+        ]
 
-    assert len(io_evts) == 3
-    # All I/O events reference the parent Run.Program
-    for e in io_evts:
-        assert e["ParentEventID"] == run_evt["EventID"]
-    # Check event types in order
-    assert io_evts[0]["EventType"] == "X-Run.Output"
-    assert io_evts[1]["EventType"] == "X-Run.Input"
-    assert io_evts[2]["EventType"] == "X-Run.Output"
-    # Check values
-    assert io_evts[0]["X-ProgramOutput.Value"] \
-        == "Enter name:"
-    assert io_evts[1]["X-ProgramInput.Value"] == "Alice"
-    assert io_evts[2]["X-ProgramOutput.Value"] \
-        == "Hello Alice!"
+        assert len(io_evts) == 3
+        for e in io_evts:
+            assert (
+                e["ParentEventID"]
+                == run_evt["EventID"]
+            )
+        # Check event types in order
+        assert io_evts[0]["EventType"] \
+            == "X-Run.Output"
+        assert io_evts[1]["EventType"] \
+            == "X-Run.Input"
+        assert io_evts[2]["EventType"] \
+            == "X-Run.Output"
+        # Columns reference resource files
+        assert io_evts[0]["ProgramOutput"] \
+            .startswith("Resources/")
+        assert io_evts[1]["ProgramInput"] \
+            .startswith("Resources/")
+        assert io_evts[2]["ProgramOutput"] \
+            .startswith("Resources/")
+        # Resource files contain the I/O text
+        assert zf.read(
+            io_evts[0]["ProgramOutput"]
+        ).decode("utf-8") == "Enter name:"
+        assert zf.read(
+            io_evts[1]["ProgramInput"]
+        ).decode("utf-8") == "Alice"
+        assert zf.read(
+            io_evts[2]["ProgramOutput"]
+        ).decode("utf-8") == "Hello Alice!"
 
 def test_progsnap2_io_events_order(workdir):
     """I/O events have monotonically increasing Order
@@ -1237,7 +1277,8 @@ def test_progsnap2_io_events_order(workdir):
     assert len(set(io_orders)) == len(io_orders)
 
 def test_progsnap2_no_io_events_when_empty(workdir):
-    """A run with no I/O log produces no X-Run.* events."""
+    """A run with no I/O log produces no X-Run.* events
+    and no Resources/ entries."""
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
     repo = LearnlogRepo(workdir)
@@ -1257,6 +1298,10 @@ def test_progsnap2_no_io_events_when_empty(workdir):
         main = zf.read(
             "MainTable.csv"
         ).decode("utf-8")
+        resources = [
+            n for n in zf.namelist()
+            if n.startswith("Resources/")
+        ]
     reader = csv_mod.DictReader(io.StringIO(main))
     events = list(reader)
     io_evts = [
@@ -1264,4 +1309,5 @@ def test_progsnap2_no_io_events_when_empty(workdir):
         if e["EventType"].startswith("X-Run.")
     ]
     assert len(io_evts) == 0
+    assert len(resources) == 0
 @
