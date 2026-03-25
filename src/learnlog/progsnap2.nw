@@ -861,11 +861,13 @@ The ProgSnap2 spec defines [[ProgramInput]] and
 in the [[Resources/]] directory (v8, \S4.4.2,
 lines~1224--1261).
 Each I/O chunk is written to a separate file named
-[[io_\{EventID\}.txt]] under [[Resources/]], and the CSV
+[[io_{EventID}.txt]] under [[Resources/]], and the CSV
 cell contains the relative path to that file.
-This adheres to the standard rather than using custom
-inline columns, making the export consumable by any
-ProgSnap2-compatible analysis tool.
+Using the standard columns rather than custom inline
+ones ensures that generic ProgSnap2 analysis tools can
+read the I/O data without special handling---custom
+[[X-]] columns are ignored by tools that do not
+explicitly support them.
 
 We use custom event types [[X-Run.Output]] and
 [[X-Run.Input]] rather than embedding all I/O in the
