@@ -602,8 +602,8 @@ def test_get_tag_map_multiple_tags(workdir):
     repo.git("tag", "lab1")
     repo.git("tag", "milestone")
     commits = get_commits(repo)
-    tags = tag_map = get_tag_map(repo)
-    names = tags[commits[-1]["hash"]]
+    tag_map = get_tag_map(repo)
+    names = tag_map[commits[-1]["hash"]]
     assert "lab1" in names
     assert "milestone" in names
 

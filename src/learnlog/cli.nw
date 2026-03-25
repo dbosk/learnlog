@@ -1283,7 +1283,7 @@ def test_tag_command_creates_tag(workdir, monkeypatch):
     assert "lab1" in tags
 
 def test_tag_command_lists_tags(workdir, monkeypatch):
-    """The tag subcommand lists tags."""
+    """The tag subcommand lists tags without error."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
