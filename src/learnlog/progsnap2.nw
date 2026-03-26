@@ -1380,6 +1380,25 @@ def test_progsnap2_tag_column(workdir):
         if e["X-Tag"] == ""
     ]
     assert len(untagged) >= 1
+
+def test_progsnap2_no_duplicate_edit_when_filtered(workdir):
+    """Filtered learnlog runs do not create duplicate edits."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("learnlog", ["play"], t1)
+    output = workdir / "filtered.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+    edit_events = [
+        e for e in events
+        if e["EventType"] == "File.Edit"
+    ]
+    assert len(edit_events) == 1
 @
 
 
@@ -1565,8 +1584,18 @@ Edge cases: an edit with no following run gets
 We group by [[X-Tag]] because tags represent logical
 milestones (lab sessions, exercises) that the instructor
 defined.
-Events with an empty tag are grouped under the key
-[[""]].
+When a commit has multiple Git tags, the exporter stores them
+as a semicolon-delimited [[X-Tag]] value; the analyser splits
+that field back into individual tags so the same pair appears
+under each relevant heading.
+Events with an empty tag are grouped under the key [[""]].
+
+<<progsnap2 functions>>=
+def _iter_event_tags(tag_value):
+    """Yield individual tags from a semicolon-delimited value."""
+    tags = [tag for tag in (tag_value or "").split(";") if tag]
+    return tags or [""]
+@
 
 <<progsnap2 functions>>=
 def group_edit_run_pairs(events):
@@ -1643,17 +1672,18 @@ no run yet, we flush the orphan edit as a pair with
 
 <<flush pending edit without run>>=
 if current_edit is not None:
-    t = current_tag
-    if t not in pairs_by_tag:
-        pairs_by_tag[t] = []
-    pairs_by_tag[t].append({
+    pair = {
         "edit": current_edit,
         "run": None,
         "io": [],
         "code_state_id": (
             current_edit["CodeStateID"]
         ),
-    })
+    }
+    for t in _iter_event_tags(current_tag):
+        if t not in pairs_by_tag:
+            pairs_by_tag[t] = []
+        pairs_by_tag[t].append(pair)
     current_edit = None
 @
 
@@ -1663,18 +1693,17 @@ We record the pair index in [[run_io_map]] so that
 subsequent I/O events can find their parent pair.
 
 <<create pair from edit and run>>=
-t = tag if current_edit is None else current_tag
-if current_edit is not None:
-    t = current_tag
-if t not in pairs_by_tag:
-    pairs_by_tag[t] = []
+tag_value = tag if current_edit is None else current_tag
 pair = {
     "edit": current_edit,
     "run": event,
     "io": [],
     "code_state_id": event["CodeStateID"],
 }
-pairs_by_tag[t].append(pair)
+for t in _iter_event_tags(tag_value):
+    if t not in pairs_by_tag:
+        pairs_by_tag[t] = []
+    pairs_by_tag[t].append(pair)
 run_io_map[event["EventID"]] = pair
 current_edit = None
 @
@@ -1694,17 +1723,18 @@ run is flushed.
 
 <<flush final pending edit>>=
 if current_edit is not None:
-    t = current_tag
-    if t not in pairs_by_tag:
-        pairs_by_tag[t] = []
-    pairs_by_tag[t].append({
+    pair = {
         "edit": current_edit,
         "run": None,
         "io": [],
         "code_state_id": (
             current_edit["CodeStateID"]
         ),
-    })
+    }
+    for t in _iter_event_tags(current_tag):
+        if t not in pairs_by_tag:
+            pairs_by_tag[t] = []
+        pairs_by_tag[t].append(pair)
 @
 
 Let's verify the grouping with a basic scenario: one edit
@@ -1800,6 +1830,34 @@ def test_group_edit_run_pairs_multiple_tags():
     assert "lab2" in grouped["Alice"]
     assert len(grouped["Alice"]["lab1"]) == 1
     assert len(grouped["Alice"]["lab2"]) == 1
+
+def test_group_edit_run_pairs_split_semicolon_tags():
+    """A semicolon-delimited X-Tag populates each tag bucket."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1;lab2",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "2", "Order": "2",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1;lab2",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+    ]
+    grouped = group_edit_run_pairs(events)
+    assert len(grouped["Alice"]["lab1"]) == 1
+    assert len(grouped["Alice"]["lab2"]) == 1
+    assert grouped["Alice"]["lab1"][0] is grouped["Alice"]["lab2"][0]
 
 def test_group_edit_run_pairs_edit_without_run():
     """An edit with no following run gets run=None."""
@@ -2069,12 +2127,19 @@ def format_edit_latex(pair, prev_pair, code_states):
 
 When there is no previous state, we show each file
 in its entirety.
+To keep the filename visible in the rendered document, we emit
+an explicit label rather than a LaTeX comment.
 
 <<format first edit as full file>>=
 parts = []
 for filename in sorted(current.keys()):
     content = current[filename]
-    parts.append(f"% {filename}")
+    parts.append(
+        "\\textbf{File: "
+        f"\\texttt{{{_latex_escape(filename)}}}"
+        "}"
+    )
+    parts.append("")
     parts.append("\\begin{minted}{python}")
     parts.append(content.rstrip())
     parts.append("\\end{minted}")
@@ -2226,25 +2291,28 @@ names).
 Full escaping of all special characters is needed
 to prevent compilation errors from underscores, ampersands,
 and similar characters in student names or filenames.
+We escape one character at a time so replacement text is not
+re-escaped by later substitutions.
 
 <<progsnap2 functions>>=
 def _latex_escape(text):
     """Escape LaTeX special characters in text."""
-    replacements = [
-        ("\\", "\\textbackslash{}"),
-        ("&", "\\&"),
-        ("%", "\\%"),
-        ("$", "\\$"),
-        ("#", "\\#"),
-        ("_", "\\_"),
-        ("{", "\\{"),
-        ("}", "\\}"),
-        ("~", "\\textasciitilde{}"),
-        ("^", "\\textasciicircum{}"),
-    ]
-    for old, new in replacements:
-        text = text.replace(old, new)
-    return text
+    replacements = {
+        "\\": "\\textbackslash{}",
+        "&": "\\&",
+        "%": "\\%",
+        "$": "\\$",
+        "#": "\\#",
+        "_": "\\_",
+        "{": "\\{",
+        "}": "\\}",
+        "~": "\\textasciitilde{}",
+        "^": "\\textasciicircum{}",
+    }
+    return "".join(
+        replacements.get(char, char)
+        for char in text
+    )
 @
 
 Let's verify the \LaTeX{} generation produces correct
@@ -2396,7 +2464,15 @@ def test_format_edit_latex_first_edit():
     }
     result = format_edit_latex(pair, None, code_states)
     assert "\\begin{minted}{python}" in result
+    assert "\\texttt{hello.py}" in result
+    assert "% hello.py" not in result
     assert 'print("hello")' in result
+
+def test_latex_escape_handles_backslash_and_braces():
+    """Escaping backslashes does not double-escape braces."""
+    from learnlog.progsnap2 import _latex_escape
+    result = _latex_escape(r"a\\b{c}")
+    assert result == r"a\textbackslash{}\textbackslash{}b\{c\}"
 
 def test_format_edit_latex_diff():
     """Subsequent edit shows unified diff."""
