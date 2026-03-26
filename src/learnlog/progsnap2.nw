@@ -1,4 +1,4 @@
-\chapter{ProgSnap2 Export}
+\chapter{ProgSnap2 Export and Analysis}
 \label{progsnap2}
 
 ProgSnap2 is a standardised data format for programming process
@@ -21,14 +21,24 @@ A ProgSnap2 dataset is a zip file containing:
 We use the [[.progsnap2]] extension to distinguish these
 files from Git bundles.
 
+This chapter covers both \emph{writing} ProgSnap2 datasets
+(the export pipeline) and \emph{reading} them back for
+analysis.
+The reading side parses a zip file into structured Python
+data, groups events into edit--run pairs, and generates
+\LaTeX{} output that presents the student's development
+process.
+
 
 \section{Code overview}
 
 <<[[progsnap2.py]]>>=
-"""ProgSnap2 export for learnlog repositories.
+"""ProgSnap2 export and analysis for learnlog repositories.
 
 Converts the commit history into a ProgSnap2 zip file
 containing event tables and source code snapshots.
+Also provides reading, grouping, and LaTeX generation
+for analysing student development sessions.
 """
 
 <<progsnap2 imports>>
@@ -38,7 +48,8 @@ containing event tables and source code snapshots.
 @
 
 <<test [[progsnap2.py]]>>=
-"""Tests for the ProgSnap2 export module."""
+"""Tests for the ProgSnap2 export and analysis module."""
+import csv as csv_mod
 import datetime
 import io
 import zipfile
@@ -64,6 +75,7 @@ from __future__ import annotations
 
 import csv
 import datetime
+import difflib
 import io
 import pathlib
 import subprocess
@@ -1368,4 +1380,1083 @@ def test_progsnap2_tag_column(workdir):
         if e["X-Tag"] == ""
     ]
     assert len(untagged) >= 1
+@
+
+
+\section{Reading a ProgSnap2 dataset}
+\label{sec:read-progsnap2}
+
+The export pipeline writes ProgSnap2 datasets; the analysis
+pipeline needs to read them back.
+Rather than coupling the analyser to the internal export
+data structures, we read from the standard zip format.
+This means the analyser works equally well on datasets
+exported by learnlog and on datasets produced by other
+tools that follow the ProgSnap2 specification.
+
+The reader returns a dict with four keys:
+\begin{description}
+\item[[[metadata]]] The [[DatasetMetadata.csv]] key--value
+  pairs as a dict.
+\item[[[events]]] The [[MainTable.csv]] rows as a list of
+  dicts, preserving the CSV column names as keys.
+\item[[[code_states]]] A nested dict mapping each
+  [[CodeStateID]] to a dict of
+  \{filename: file content\} pairs.
+\item[[[resources]]] A dict mapping resource paths
+  (e.g.\ [[Resources/io_3.txt]]) to their text content.
+\end{description}
+
+<<progsnap2 functions>>=
+def read_progsnap2(source):
+    """Read a ProgSnap2 dataset from a zip file.
+
+    ``source`` may be a file path (string or ``Path``) or
+    a file-like object (e.g. ``BytesIO``).
+
+    Returns a dict with keys ``metadata``, ``events``,
+    ``code_states``, and ``resources``.
+    """
+    with zipfile.ZipFile(source, "r") as zf:
+        <<read metadata csv>>
+        <<read main table csv>>
+        <<read code states from zip>>
+        <<read resource files from zip>>
+
+    return {
+        "metadata": metadata,
+        "events": events,
+        "code_states": code_states,
+        "resources": resources,
+    }
+@
+
+The metadata CSV has two columns ([[Property]] and [[Value]]);
+we flatten it into a simple dict.
+
+<<read metadata csv>>=
+meta_text = zf.read(
+    "DatasetMetadata.csv"
+).decode("utf-8")
+reader = csv.DictReader(io.StringIO(meta_text))
+metadata = {
+    row["Property"]: row["Value"]
+    for row in reader
+}
+@
+
+The main table is the heart of the dataset---one row per event.
+We preserve all columns as strings, matching the CSV
+representation.
+
+<<read main table csv>>=
+main_text = zf.read(
+    "MainTable.csv"
+).decode("utf-8")
+reader = csv.DictReader(io.StringIO(main_text))
+events = list(reader)
+@
+
+Code states live under [[CodeStates/{id}/]] in the zip.
+We read each file's content as a string, grouping by state ID.
+Binary files are skipped---ProgSnap2 is designed for source
+code, and our code states contain only text files.
+
+<<read code states from zip>>=
+code_states = {}
+for name in zf.namelist():
+    if not name.startswith("CodeStates/"):
+        continue
+    parts = name[len("CodeStates/"):].split("/", 1)
+    if len(parts) < 2 or not parts[1]:
+        continue
+    state_id = parts[0]
+    filename = parts[1]
+    if state_id not in code_states:
+        code_states[state_id] = {}
+    try:
+        code_states[state_id][filename] = (
+            zf.read(name).decode("utf-8")
+        )
+    except UnicodeDecodeError:
+        pass
+@
+
+Resource files (I/O text) live under [[Resources/]].
+
+<<read resource files from zip>>=
+resources = {}
+for name in zf.namelist():
+    if not name.startswith("Resources/"):
+        continue
+    resources[name] = (
+        zf.read(name).decode("utf-8")
+    )
+@
+
+We verify the reader by round-tripping through the export
+pipeline: export a repository, then read it back and check
+that the structure is intact.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_roundtrip(workdir):
+    """Export then read produces matching structure."""
+    from learnlog.progsnap2 import (
+        do_export_progsnap2, read_progsnap2,
+    )
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+    output = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, output)
+    dataset = read_progsnap2(output)
+
+    assert dataset["metadata"]["Version"] == "8"
+    assert len(dataset["events"]) >= 2
+    run_evts = [
+        e for e in dataset["events"]
+        if e["EventType"] == "Run.Program"
+    ]
+    assert len(run_evts) >= 1
+    assert run_evts[0]["X-Script"] == "hello.py"
+    assert len(dataset["code_states"]) >= 1
+    assert "0" in dataset["code_states"]
+    assert "hello.py" in dataset["code_states"]["0"]
+    assert len(dataset["resources"]) >= 1
+
+def test_read_progsnap2_from_buffer(workdir):
+    """Reader accepts file-like objects."""
+    from learnlog.progsnap2 import (
+        do_export_progsnap2, read_progsnap2,
+    )
+    repo = LearnlogRepo(workdir)
+    output = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, output)
+    buf = io.BytesIO(output.read_bytes())
+    dataset = read_progsnap2(buf)
+    assert "events" in dataset
+    assert "metadata" in dataset
+@
+
+
+\section{Grouping events into edit--run pairs}
+\label{sec:group-pairs}
+
+An analysis of student behaviour focuses on the
+\emph{edit--run cycle}: the student changes their code,
+runs the program, observes the result, and edits again.
+To present this cycle we group the flat event list into
+pairs of (edit, run) within each student and tag.
+
+The grouping algorithm walks events in [[Order]] for each
+[[SubjectID]].
+A [[File.Edit]] event opens a new pair; the next
+[[Run.Program]] event (with its I/O children) closes it.
+Edge cases: an edit with no following run gets
+[[run=None]], and a re-run without a preceding edit gets
+[[edit=None]].
+
+We group by [[X-Tag]] because tags represent logical
+milestones (lab sessions, exercises) that the instructor
+defined.
+Events with an empty tag are grouped under the key
+[[""]].
+
+<<progsnap2 functions>>=
+def group_edit_run_pairs(events):
+    """Group events into edit--run pairs per subject and tag.
+
+    Returns a nested dict::
+
+        {subject_id: {tag: [pair, ...]}}
+
+    where each pair is a dict with keys ``edit``, ``run``,
+    ``io``, and ``code_state_id``.
+    """
+    <<sort events by subject and order>>
+    <<walk events to form pairs>>
+    return grouped
+@
+
+We first partition events by [[SubjectID]], sorting each
+partition by [[Order]] to ensure chronological processing.
+
+<<sort events by subject and order>>=
+by_subject = {}
+for event in events:
+    sid = event["SubjectID"]
+    if sid not in by_subject:
+        by_subject[sid] = []
+    by_subject[sid].append(event)
+
+for sid in by_subject:
+    by_subject[sid].sort(key=lambda e: int(e["Order"]))
+@
+
+For each subject we walk the sorted events.
+A [[File.Edit]] starts a new pair accumulator.
+A [[Run.Program]] completes the current pair.
+I/O events ([[X-Run.Output]], [[X-Run.Input]]) are attached
+to the most recent [[Run.Program]] via [[ParentEventID]].
+When a [[Run.Program]] appears without a preceding
+[[File.Edit]], we create a pair with [[edit=None]]---this
+happens when the student re-runs without editing.
+
+<<walk events to form pairs>>=
+grouped = {}
+for sid, subj_events in by_subject.items():
+    grouped[sid] = {}
+    current_edit = None
+    current_tag = ""
+    pairs_by_tag = {}
+    run_io_map = {}
+
+    for event in subj_events:
+        etype = event["EventType"]
+        tag = event.get("X-Tag", "") or ""
+
+        if etype == "File.Edit":
+            <<flush pending edit without run>>
+            current_edit = event
+            current_tag = tag
+        elif etype == "Run.Program":
+            <<create pair from edit and run>>
+        elif etype in (
+            "X-Run.Output", "X-Run.Input"
+        ):
+            <<attach I/O to parent run>>
+
+    <<flush final pending edit>>
+
+    grouped[sid] = pairs_by_tag
+@
+
+If a new [[File.Edit]] arrives while a previous edit has
+no run yet, we flush the orphan edit as a pair with
+[[run=None]].
+
+<<flush pending edit without run>>=
+if current_edit is not None:
+    t = current_tag
+    if t not in pairs_by_tag:
+        pairs_by_tag[t] = []
+    pairs_by_tag[t].append({
+        "edit": current_edit,
+        "run": None,
+        "io": [],
+        "code_state_id": (
+            current_edit["CodeStateID"]
+        ),
+    })
+    current_edit = None
+@
+
+When a [[Run.Program]] arrives we pair it with the pending
+edit (or [[None]] if there was no edit).
+We record the pair index in [[run_io_map]] so that
+subsequent I/O events can find their parent pair.
+
+<<create pair from edit and run>>=
+t = tag if current_edit is None else current_tag
+if current_edit is not None:
+    t = current_tag
+if t not in pairs_by_tag:
+    pairs_by_tag[t] = []
+pair = {
+    "edit": current_edit,
+    "run": event,
+    "io": [],
+    "code_state_id": event["CodeStateID"],
+}
+pairs_by_tag[t].append(pair)
+run_io_map[event["EventID"]] = pair
+current_edit = None
+@
+
+I/O events reference their parent [[Run.Program]] via
+[[ParentEventID]].
+We look up the parent pair and append the I/O event.
+
+<<attach I/O to parent run>>=
+parent_id = event.get("ParentEventID", "")
+if parent_id in run_io_map:
+    run_io_map[parent_id]["io"].append(event)
+@
+
+At the end of the event stream, a trailing edit with no
+run is flushed.
+
+<<flush final pending edit>>=
+if current_edit is not None:
+    t = current_tag
+    if t not in pairs_by_tag:
+        pairs_by_tag[t] = []
+    pairs_by_tag[t].append({
+        "edit": current_edit,
+        "run": None,
+        "io": [],
+        "code_state_id": (
+            current_edit["CodeStateID"]
+        ),
+    })
+@
+
+Let's verify the grouping with a basic scenario: one edit
+followed by one run with I/O.
+
+<<progsnap2 test functions>>=
+def test_group_edit_run_pairs_basic():
+    """Edit + Run + I/O grouped into one pair."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "2", "Order": "2",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "X-Run.Output",
+            "EventID": "3", "Order": "3",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "2",
+            "X-Tag": "lab1",
+            "ProgramOutput": "Resources/io_3.txt",
+            "ProgramInput": "",
+        },
+    ]
+    grouped = group_edit_run_pairs(events)
+    assert "Alice" in grouped
+    assert "lab1" in grouped["Alice"]
+    pairs = grouped["Alice"]["lab1"]
+    assert len(pairs) == 1
+    assert pairs[0]["edit"]["EventID"] == "1"
+    assert pairs[0]["run"]["EventID"] == "2"
+    assert len(pairs[0]["io"]) == 1
+    assert pairs[0]["code_state_id"] == "0"
+
+def test_group_edit_run_pairs_multiple_tags():
+    """Events with different tags form separate groups."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "2", "Order": "2",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "File.Edit",
+            "EventID": "3", "Order": "3",
+            "SubjectID": "Alice",
+            "CodeStateID": "1",
+            "ParentEventID": "",
+            "X-Tag": "lab2",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "4", "Order": "4",
+            "SubjectID": "Alice",
+            "CodeStateID": "1",
+            "ParentEventID": "",
+            "X-Tag": "lab2",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+    ]
+    grouped = group_edit_run_pairs(events)
+    assert "lab1" in grouped["Alice"]
+    assert "lab2" in grouped["Alice"]
+    assert len(grouped["Alice"]["lab1"]) == 1
+    assert len(grouped["Alice"]["lab2"]) == 1
+
+def test_group_edit_run_pairs_edit_without_run():
+    """An edit with no following run gets run=None."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+    ]
+    grouped = group_edit_run_pairs(events)
+    pairs = grouped["Alice"][""]
+    assert len(pairs) == 1
+    assert pairs[0]["edit"] is not None
+    assert pairs[0]["run"] is None
+
+def test_group_edit_run_pairs_run_without_edit():
+    """A re-run without a preceding edit gets edit=None."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    events = [
+        {
+            "EventType": "Run.Program",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+    ]
+    grouped = group_edit_run_pairs(events)
+    pairs = grouped["Alice"][""]
+    assert len(pairs) == 1
+    assert pairs[0]["edit"] is None
+    assert pairs[0]["run"] is not None
+@
+
+
+\section{\LaTeX{} analysis output}
+\label{sec:latex-analysis}
+
+The analysis generates \LaTeX{} source that presents
+the student's edit--run cycle.
+The output uses [[minted]] for syntax-highlighted code
+listings and [[paracol]] for the side-by-side mode.
+We generate a fragment by default (sections and
+subsections that the user [[\\input]]s into their own
+document) and optionally a standalone document.
+
+\subsection{Main generation function}
+
+The entry point takes the dataset (from
+[[read_progsnap2]]), the grouped pairs (from
+[[group_edit_run_pairs]]), and mode flags.
+It returns a string of \LaTeX{} source.
+
+<<progsnap2 functions>>=
+def generate_analysis_latex(
+    dataset, grouped,
+    side_by_side=False, standalone=False,
+):
+    """Generate LaTeX analysis of edit--run pairs.
+
+    Returns a string of LaTeX source code.  When
+    ``standalone`` is true, the output is a complete
+    document; otherwise it is a fragment suitable for
+    ``\\input{}``.
+    """
+    lines = []
+
+    if standalone:
+        <<emit standalone preamble>>
+
+    for subject_id in sorted(grouped.keys()):
+        <<emit subject section>>
+
+    if standalone:
+        lines.append("\\end{document}")
+
+    return "\n".join(lines) + "\n"
+@
+
+<<emit standalone preamble>>=
+lines.append("\\documentclass{article}")
+lines.append("\\usepackage{minted}")
+lines.append("\\usepackage{paracol}")
+lines.append("\\begin{document}")
+lines.append("")
+@
+
+\subsection{Subject and tag sections}
+
+Each student gets a [[\\section]] and each tag a
+[[\\subsection]].
+When all events for a subject are untagged (single
+empty-string key), we skip the [[\\subsection]] level
+to avoid a pointless heading.
+
+<<emit subject section>>=
+lines.append(
+    f"\\section{{{_latex_escape(subject_id)}}}"
+)
+lines.append("")
+tags = grouped[subject_id]
+only_untagged = (
+    list(tags.keys()) == [""]
+)
+
+for tag in sorted(tags.keys()):
+    pairs = tags[tag]
+    if not only_untagged:
+        tag_label = tag if tag else "(untagged)"
+        lines.append(
+            "\\subsection{"
+            f"{_latex_escape(tag_label)}"
+            "}"
+        )
+        lines.append("")
+
+    if side_by_side:
+        <<emit pairs side by side>>
+    else:
+        <<emit pairs sequentially>>
+@
+
+\subsection{Sequential mode}
+
+In the default mode, each edit--run pair is listed
+top to bottom.
+The edit shows a unified diff (or the full file for
+the first edit), and the run shows the script, result,
+and captured I/O.
+
+<<emit pairs sequentially>>=
+prev_pair = None
+for i, pair in enumerate(pairs, 1):
+    edit_tex = format_edit_latex(
+        pair, prev_pair,
+        dataset["code_states"],
+    )
+    if edit_tex:
+        lines.append(
+            f"\\paragraph{{Edit {i}}}"
+        )
+        lines.append(edit_tex)
+        lines.append("")
+
+    run_tex = format_run_latex(
+        pair, dataset["resources"],
+    )
+    if run_tex:
+        lines.append(
+            f"\\paragraph{{Run {i}}}"
+        )
+        lines.append(run_tex)
+        lines.append("")
+
+    prev_pair = pair
+@
+
+\subsection{Side-by-side mode}
+
+The side-by-side mode uses [[paracol]] to show the
+causal chain: the left column contains the previous
+run result (what the student observed), the right
+column contains the current edit and run (what the
+student did in response).
+For pair~$N$, the left column shows pair~$N{-}1$'s
+run result; the right column shows pair~$N$'s edit
+and run.
+The first pair has an empty left column.
+
+<<emit pairs side by side>>=
+lines.append("\\begin{paracol}{2}")
+prev_pair = None
+for i, pair in enumerate(pairs, 1):
+    lines.append("\\switchcolumn[0]")
+    if prev_pair is not None:
+        prev_run = format_run_latex(
+            prev_pair, dataset["resources"],
+        )
+        if prev_run:
+            lines.append(
+                "\\paragraph{"
+                f"Run {i - 1} result"
+                "}"
+            )
+            lines.append(prev_run)
+    lines.append("")
+
+    lines.append("\\switchcolumn[1]")
+    edit_tex = format_edit_latex(
+        pair, prev_pair,
+        dataset["code_states"],
+    )
+    if edit_tex:
+        lines.append(
+            f"\\paragraph{{Edit {i}}}"
+        )
+        lines.append(edit_tex)
+        lines.append("")
+
+    run_tex = format_run_latex(
+        pair, dataset["resources"],
+    )
+    if run_tex:
+        lines.append(
+            f"\\paragraph{{Run {i}}}"
+        )
+        lines.append(run_tex)
+        lines.append("")
+
+    prev_pair = pair
+lines.append("\\end{paracol}")
+lines.append("")
+@
+
+\subsection{Formatting an edit}
+
+An edit is shown as a unified diff between the previous
+and current code states.
+For the first edit (no previous state), we show the full
+file content instead---the student wrote this code from
+scratch.
+If the pair has no edit ([[edit=None]], a re-run), we
+return an empty string.
+
+We use [[difflib.unified_diff]] to compute the diff.
+When multiple files changed, we concatenate the diffs
+for each file.
+
+<<progsnap2 functions>>=
+def format_edit_latex(pair, prev_pair, code_states):
+    """Format the edit part of a pair as LaTeX.
+
+    Returns a string with a ``minted`` block showing
+    either a unified diff or the full file content.
+    Returns an empty string if there is no edit.
+    """
+    if pair["edit"] is None:
+        return ""
+
+    state_id = pair["code_state_id"]
+    current = code_states.get(state_id, {})
+
+    prev_state_id = (
+        prev_pair["code_state_id"]
+        if prev_pair is not None
+        else None
+    )
+    previous = (
+        code_states.get(prev_state_id, {})
+        if prev_state_id is not None
+        else {}
+    )
+
+    if not previous:
+        <<format first edit as full file>>
+    else:
+        <<format edit as unified diff>>
+@
+
+When there is no previous state, we show each file
+in its entirety.
+
+<<format first edit as full file>>=
+parts = []
+for filename in sorted(current.keys()):
+    content = current[filename]
+    parts.append(f"% {filename}")
+    parts.append("\\begin{minted}{python}")
+    parts.append(content.rstrip())
+    parts.append("\\end{minted}")
+return "\n".join(parts)
+@
+
+For subsequent edits, we compute a unified diff per
+file.
+Files that did not change are skipped.
+New files show as additions; deleted files as removals.
+
+<<format edit as unified diff>>=
+all_files = sorted(
+    set(list(previous.keys())
+        + list(current.keys()))
+)
+parts = []
+for filename in all_files:
+    old = previous.get(filename, "")
+    new = current.get(filename, "")
+    if old == new:
+        continue
+    diff_lines = list(difflib.unified_diff(
+        old.splitlines(keepends=True),
+        new.splitlines(keepends=True),
+        fromfile=f"a/{filename}",
+        tofile=f"b/{filename}",
+    ))
+    if diff_lines:
+        parts.append("\\begin{minted}{diff}")
+        parts.append(
+            "".join(diff_lines).rstrip()
+        )
+        parts.append("\\end{minted}")
+if not parts:
+    return ""
+return "\n".join(parts)
+@
+
+\subsection{Formatting a run}
+
+A run shows the script name, result classification,
+and captured I/O.
+If the pair has no run ([[run=None]]), we return an
+empty string.
+
+<<progsnap2 functions>>=
+def format_run_latex(pair, resources):
+    """Format the run part of a pair as LaTeX.
+
+    Returns a string with script info and I/O in a
+    ``minted`` block.  Returns empty string if no run.
+    """
+    if pair["run"] is None:
+        return ""
+
+    run = pair["run"]
+    parts = []
+
+    script = run.get("X-Script", "")
+    result = run.get("ProgramResult", "")
+    exit_code = run.get("X-ExitCode", "")
+
+    info_parts = []
+    if script:
+        info_parts.append(
+            f"Script: \\texttt{{{_latex_escape(script)}}}"
+        )
+    if result:
+        info_parts.append(f"Result: {result}")
+    if exit_code:
+        info_parts.append(
+            f"Exit code: {exit_code}"
+        )
+    if info_parts:
+        parts.append(" \\\\\n".join(info_parts))
+        parts.append("")
+
+    <<format exception info>>
+
+    io_text = format_io_latex(
+        pair["io"], resources,
+    )
+    if io_text:
+        parts.append("\\begin{minted}{text}")
+        parts.append(io_text)
+        parts.append("\\end{minted}")
+
+    return "\n".join(parts)
+@
+
+If the run produced an exception, we show it in its
+own [[minted]] block so the reader can see what error
+the student encountered.
+
+<<format exception info>>=
+exc_type = run.get("X-ExceptionType", "")
+exc_msg = run.get("X-ExceptionMessage", "")
+if exc_type:
+    exc_str = exc_type
+    if exc_msg:
+        exc_str += f": {exc_msg}"
+    parts.append("\\begin{minted}{pytb}")
+    parts.append(exc_str)
+    parts.append("\\end{minted}")
+    parts.append("")
+@
+
+\subsection{Formatting I/O}
+
+I/O events are stored as resource files in the zip.
+We read each resource and concatenate them, prefixing
+input lines with [[>~]] so the reader can distinguish
+what the student typed from what the program printed.
+
+<<progsnap2 functions>>=
+def format_io_latex(io_events, resources):
+    """Format I/O events as plain text for minted.
+
+    Input lines are prefixed with ``> `` to distinguish
+    them from program output.
+    Returns an empty string if there are no I/O events.
+    """
+    if not io_events:
+        return ""
+
+    parts = []
+    for event in io_events:
+        etype = event["EventType"]
+        res_path = (
+            event.get("ProgramOutput", "")
+            or event.get("ProgramInput", "")
+        )
+        text = resources.get(res_path, "")
+        if etype == "X-Run.Input":
+            for line in text.split("\n"):
+                parts.append(f"> {line}")
+        else:
+            parts.append(text)
+
+    return "\n".join(parts).rstrip()
+@
+
+\subsection{\LaTeX{} escaping}
+
+We need a minimal escaping function for text that
+appears in \LaTeX{} commands (section titles, script
+names).
+Full escaping of all special characters is needed
+to prevent compilation errors from underscores, ampersands,
+and similar characters in student names or filenames.
+
+<<progsnap2 functions>>=
+def _latex_escape(text):
+    """Escape LaTeX special characters in text."""
+    replacements = [
+        ("\\", "\\textbackslash{}"),
+        ("&", "\\&"),
+        ("%", "\\%"),
+        ("$", "\\$"),
+        ("#", "\\#"),
+        ("_", "\\_"),
+        ("{", "\\{"),
+        ("}", "\\}"),
+        ("~", "\\textasciitilde{}"),
+        ("^", "\\textasciicircum{}"),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+@
+
+Let's verify the \LaTeX{} generation produces correct
+output for both modes.
+
+<<progsnap2 test functions>>=
+def test_generate_analysis_latex_sequential():
+    """Sequential mode produces sections and minted blocks."""
+    from learnlog.progsnap2 import (
+        generate_analysis_latex,
+        group_edit_run_pairs,
+    )
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "2", "Order": "2",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ProgramResult": "Success",
+            "X-ExitCode": "0",
+            "X-Script": "hello.py",
+            "X-Arguments": "",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "X-Run.Output",
+            "EventID": "3", "Order": "3",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "2",
+            "X-Tag": "lab1",
+            "ProgramOutput": "Resources/io_3.txt",
+            "ProgramInput": "",
+        },
+    ]
+    dataset = {
+        "metadata": {},
+        "events": events,
+        "code_states": {
+            "0": {"hello.py": 'print("hello")\n'},
+        },
+        "resources": {
+            "Resources/io_3.txt": "hello",
+        },
+    }
+    grouped = group_edit_run_pairs(events)
+    latex = generate_analysis_latex(dataset, grouped)
+
+    assert "\\section{Alice}" in latex
+    assert "\\subsection{lab1}" in latex
+    assert "\\begin{minted}{python}" in latex
+    assert "\\paragraph{Edit 1}" in latex
+    assert "\\paragraph{Run 1}" in latex
+    assert "hello.py" in latex
+    assert "\\begin{minted}{text}" in latex
+
+def test_generate_analysis_latex_side_by_side():
+    """Side-by-side mode produces paracol environment."""
+    from learnlog.progsnap2 import (
+        generate_analysis_latex,
+        group_edit_run_pairs,
+    )
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "2", "Order": "2",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "",
+            "ProgramResult": "Success",
+            "X-ExitCode": "0",
+            "X-Script": "hello.py",
+            "X-Arguments": "",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+    ]
+    dataset = {
+        "metadata": {},
+        "events": events,
+        "code_states": {
+            "0": {"hello.py": 'print("hello")\n'},
+        },
+        "resources": {},
+    }
+    grouped = group_edit_run_pairs(events)
+    latex = generate_analysis_latex(
+        dataset, grouped, side_by_side=True,
+    )
+    assert "\\begin{paracol}{2}" in latex
+    assert "\\switchcolumn[0]" in latex
+    assert "\\switchcolumn[1]" in latex
+    assert "\\end{paracol}" in latex
+
+def test_generate_analysis_latex_standalone():
+    """Standalone mode wraps in documentclass."""
+    from learnlog.progsnap2 import (
+        generate_analysis_latex,
+    )
+    dataset = {
+        "metadata": {},
+        "events": [],
+        "code_states": {},
+        "resources": {},
+    }
+    latex = generate_analysis_latex(
+        dataset, {}, standalone=True,
+    )
+    assert "\\documentclass{article}" in latex
+    assert "\\usepackage{minted}" in latex
+    assert "\\usepackage{paracol}" in latex
+    assert "\\end{document}" in latex
+
+def test_format_edit_latex_first_edit():
+    """First edit shows full file content."""
+    from learnlog.progsnap2 import format_edit_latex
+    pair = {
+        "edit": {"EventID": "1"},
+        "run": None,
+        "io": [],
+        "code_state_id": "0",
+    }
+    code_states = {
+        "0": {"hello.py": 'print("hello")\n'},
+    }
+    result = format_edit_latex(pair, None, code_states)
+    assert "\\begin{minted}{python}" in result
+    assert 'print("hello")' in result
+
+def test_format_edit_latex_diff():
+    """Subsequent edit shows unified diff."""
+    from learnlog.progsnap2 import format_edit_latex
+    prev_pair = {
+        "edit": {"EventID": "1"},
+        "run": None,
+        "io": [],
+        "code_state_id": "0",
+    }
+    pair = {
+        "edit": {"EventID": "2"},
+        "run": None,
+        "io": [],
+        "code_state_id": "1",
+    }
+    code_states = {
+        "0": {"hello.py": 'print("hello")\n'},
+        "1": {"hello.py": 'print("world")\n'},
+    }
+    result = format_edit_latex(
+        pair, prev_pair, code_states,
+    )
+    assert "\\begin{minted}{diff}" in result
+    assert "-" in result
+    assert "+" in result
+
+def test_format_run_latex_with_io():
+    """Run with I/O shows script info and minted block."""
+    from learnlog.progsnap2 import format_run_latex
+    pair = {
+        "edit": None,
+        "run": {
+            "EventID": "2",
+            "X-Script": "hello.py",
+            "ProgramResult": "Success",
+            "X-ExitCode": "0",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+        },
+        "io": [
+            {
+                "EventType": "X-Run.Output",
+                "ProgramOutput": "Resources/io_3.txt",
+                "ProgramInput": "",
+            },
+            {
+                "EventType": "X-Run.Input",
+                "ProgramOutput": "",
+                "ProgramInput": "Resources/io_4.txt",
+            },
+        ],
+        "code_state_id": "0",
+    }
+    resources = {
+        "Resources/io_3.txt": "Enter name:",
+        "Resources/io_4.txt": "Alice",
+    }
+    result = format_run_latex(pair, resources)
+    assert "hello.py" in result
+    assert "Enter name:" in result
+    assert "> Alice" in result
 @

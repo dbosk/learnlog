@@ -25,8 +25,9 @@ arguments with minimal boilerplate, and the modern
 Provides the ``learnlog`` command with subcommands for running
 Git commands against the log, exporting it as a bundle or
 ProgSnap2 dataset, cloning from and synchronising with a remote
-repository, and playing back the development log stored in
-``.learnlog/``.
+repository, playing back the development log stored in
+``.learnlog/``, and analysing ProgSnap2 datasets to produce
+LaTeX reports of student edit--run cycles.
 """
 
 <<imports>>
@@ -72,6 +73,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import zipfile
 from typing import Annotated, Optional
 
 import typer
@@ -86,6 +88,9 @@ from learnlog.commits import (
 from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
     do_export_progsnap2,
+    read_progsnap2,
+    group_edit_run_pairs,
+    generate_analysis_latex,
 )
 from learnlog.viewer import PlaybackViewer, play_batch
 @
@@ -1557,4 +1562,234 @@ def test_play_invalid_ref(workdir, monkeypatch):
         app, ["play", "nonexistent"]
     )
     assert result.exit_code == 1
+@
+
+
+\subsection{The [[analyse]] command}
+
+The [[analyse]] command reads a ProgSnap2 dataset and
+generates \LaTeX{} output that presents the student's
+development process as a sequence of edit--run pairs.
+
+The source can be:
+\begin{description}
+\item[A [[.progsnap2]] file] Read directly.
+\item[A directory or bundle] Convert to ProgSnap2 on
+  the fly using [[do_export_progsnap2]], then read.
+\item[Nothing] Use the current directory's
+  [[.learnlog/]].
+\end{description}
+
+The [[--side-by-side]] flag switches from sequential
+(top to bottom) to a two-column layout where the left
+column shows the previous run result (cause) and the
+right column shows the current edit and run (effect).
+
+The [[--standalone]] flag wraps the output in a complete
+\LaTeX{} document with preamble.
+
+<<typer commands>>=
+@app.command()
+def analyse(
+    source: Annotated[
+        Optional[str],
+        typer.Argument(
+            help=(
+                "ProgSnap2 zip file, directory with "
+                ".learnlog/, or a .bundle file. "
+                "Defaults to current directory."
+            ),
+        ),
+    ] = None,
+    output: Annotated[
+        Optional[pathlib.Path],
+        typer.Option(
+            "--output", "-o",
+            help="Output LaTeX file (default: stdout).",
+        ),
+    ] = None,
+    side_by_side: Annotated[
+        bool,
+        typer.Option(
+            "--side-by-side", "-s",
+            help=(
+                "Show edit/run pairs in two columns: "
+                "cause on the left, effect on the "
+                "right."
+            ),
+        ),
+    ] = False,
+    standalone: Annotated[
+        bool,
+        typer.Option(
+            "--standalone",
+            help=(
+                "Produce a complete LaTeX document "
+                "instead of a fragment."
+            ),
+        ),
+    ] = False,
+):
+    """Analyse development sessions and generate LaTeX."""
+    <<resolve analyse source>>
+    <<generate and output latex>>
+@
+
+We detect whether the source is a ProgSnap2 zip by checking
+[[zipfile.is_zipfile]].
+This is more robust than checking the file extension, since
+the user might rename the file.
+For non-zip sources (directories, bundles), we export to a
+temporary file first.
+
+<<resolve analyse source>>=
+if source is not None and zipfile.is_zipfile(source):
+    dataset = read_progsnap2(source)
+else:
+    repo, tmpdir = resolve_source(source)
+    try:
+        ps2_path = tempfile.mktemp(
+            suffix=".progsnap2"
+        )
+        do_export_progsnap2(
+            repo, ps2_path,
+        )
+        dataset = read_progsnap2(ps2_path)
+    finally:
+        if tmpdir is not None:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            os.unlink(ps2_path)
+        except OSError:
+            pass
+@
+
+<<generate and output latex>>=
+grouped = group_edit_run_pairs(dataset["events"])
+latex = generate_analysis_latex(
+    dataset, grouped,
+    side_by_side=side_by_side,
+    standalone=standalone,
+)
+
+if output is not None:
+    output.write_text(latex, encoding="utf-8")
+else:
+    sys.stdout.write(latex)
+@
+
+We need [[zipfile]] and [[tempfile]] in the imports.
+These are already imported for the play command's bundle
+handling (via [[resolve_source]]).
+
+Let's verify that the [[analyse]] command produces \LaTeX{}
+output from a local repository.
+
+<<test functions>>=
+def test_analyse_from_learnlog_dir(workdir, monkeypatch):
+    """Analyse from a .learnlog/ directory produces LaTeX."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 0, 5
+        ),
+        exit_code=0,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["analyse"])
+    assert result.exit_code == 0
+    assert "\\section{" in result.output
+    assert "\\begin{minted}" in result.output
+
+def test_analyse_from_progsnap2_file(
+    workdir, monkeypatch
+):
+    """Analyse from a .progsnap2 file produces LaTeX."""
+    from learnlog.cli import app
+    from learnlog.progsnap2 import do_export_progsnap2
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 0, 5
+        ),
+        exit_code=0,
+    )
+    ps2 = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, ps2)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["analyse", str(ps2)]
+    )
+    assert result.exit_code == 0
+    assert "\\section{" in result.output
+
+def test_analyse_side_by_side(workdir, monkeypatch):
+    """Side-by-side flag produces paracol output."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 0, 5
+        ),
+        exit_code=0,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["analyse", "--side-by-side"]
+    )
+    assert result.exit_code == 0
+    assert "\\begin{paracol}" in result.output
+
+def test_analyse_output_file(workdir, monkeypatch):
+    """The -o flag writes to a file."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    out = workdir / "analysis.tex"
+    result = runner.invoke(
+        app, ["analyse", "-o", str(out)]
+    )
+    assert result.exit_code == 0
+    assert out.exists()
+    content = out.read_text()
+    assert "\\section{" in content
+
+def test_analyse_standalone(workdir, monkeypatch):
+    """The --standalone flag produces a full document."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["analyse", "--standalone"]
+    )
+    assert result.exit_code == 0
+    assert "\\documentclass" in result.output
+    assert "\\end{document}" in result.output
 @
