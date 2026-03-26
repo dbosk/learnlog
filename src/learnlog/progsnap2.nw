@@ -774,15 +774,15 @@ code_state_id, current_tree = get_code_state_id(
 
 A [[File.Edit]] event signals that the student changed their
 source code.
-We detect this by comparing the current tree hash to the
-previous commit's tree hash---if they differ, files were
-modified.
-We skip the first commit because there is no previous state
-to compare against (the initial commit creates the files,
-it does not edit them).
+We emit one whenever the current tree hash differs from the
+previous commit's tree hash.
+The initial commit also gets a [[File.Edit]] because writing
+code for the first time is an edit from nothing---and
+[[prev_tree]] starts as [[None]], which never equals a real
+tree hash.
 
 <<optionally emit File.Edit event>>=
-if prev_tree is not None and current_tree != prev_tree:
+if current_tree != prev_tree:
     order += 1
     events.append({
         "EventType": "File.Edit",
@@ -1166,7 +1166,8 @@ def test_progsnap2_file_edit_event(workdir):
         e for e in events
         if e["EventType"] == "File.Edit"
     ]
-    assert len(edit_events) >= 1
+    assert len(edit_events) == 2
+    assert edit_events[0]["CodeStateID"] == "0"
 @
 
 Let's verify that a run with interactive I/O produces chunked
