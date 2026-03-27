@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -1709,16 +1710,18 @@ else:
                 pass
 @
 
-When [[start]] or [[end]] is given, we narrow the dataset to
-the [[Order]] range delimited by matching events.
-The [[start]] boundary finds the minimum [[Order]] among
-events whose column value matches the regex; [[end]] finds
-the maximum.
-All events with [[Order]] values between these two
-boundaries (inclusive) are kept.
-This preserves I/O child events because they have
-contiguous [[Order]] values immediately following their
-parent [[Run.Program]].
+When [[start]] or [[end]] is given, we narrow the dataset
+to an [[Order]] range rather than keeping only individually
+matching events.
+A tag like [[lab1]] annotates a commit, but each commit
+produces several events (a [[File.Edit]], one or more
+[[Run.Program]] events, and their I/O children).
+Filtering by individual match would discard the
+[[Run.Program]] and I/O events that belong to the same
+session but do not carry the tag themselves.
+An [[Order]] range avoids this because the exporter assigns
+contiguous [[Order]] values to all events from the same
+commit.
 
 <<filter events by range>>=
 if start is not None or end is not None:
@@ -1742,13 +1745,22 @@ def filter_event_range(events, start=None, end=None):
     ``start`` and ``end`` are ``Column=Regex`` strings.
     Returns the filtered list of events.
     """
-    import re
-
     start_order = 0
     end_order = float("inf")
 
-    if start is not None:
-        col, pattern = start.split("=", 1)
+    for label, spec, pick in [
+        ("start", start, min),
+        ("end", end, max),
+    ]:
+        if spec is None:
+            continue
+        if "=" not in spec:
+            raise SystemExit(
+                f"Invalid {label} filter "
+                f"{spec!r}: expected "
+                f"Column=Regex"
+            )
+        col, pattern = spec.split("=", 1)
         rx = re.compile(pattern)
         matching = [
             int(e["Order"]) for e in events
@@ -1756,22 +1768,12 @@ def filter_event_range(events, start=None, end=None):
         ]
         if not matching:
             raise SystemExit(
-                f"No events match {start}"
+                f"No events match {spec}"
             )
-        start_order = min(matching)
-
-    if end is not None:
-        col, pattern = end.split("=", 1)
-        rx = re.compile(pattern)
-        matching = [
-            int(e["Order"]) for e in events
-            if rx.search(str(e.get(col, "")))
-        ]
-        if not matching:
-            raise SystemExit(
-                f"No events match {end}"
-            )
-        end_order = max(matching)
+        if label == "start":
+            start_order = pick(matching)
+        else:
+            end_order = pick(matching)
 
     return [
         e for e in events
@@ -1779,8 +1781,11 @@ def filter_event_range(events, start=None, end=None):
     ]
 @
 
-Let's verify that range filtering works with tag
-boundaries:
+Let's verify the three filtering scenarios: a two-sided
+range that excludes events before and after the boundaries,
+a one-sided range with only [[start]] (which includes
+everything from the first match onward), and a filter that
+matches nothing (which should exit with an error).
 
 <<test functions>>=
 def test_analyse_with_tag_range(workdir, monkeypatch):
