@@ -3,14 +3,17 @@
 
 The [[learnlog]] command lets teachers and teaching assistants
 review the development logs that students produce.
-It provides nine subcommands: [[list]] gives a compact overview
+It provides ten subcommands: [[list]] gives a compact overview
 of the recorded commits, [[export]] creates a portable bundle of
 the log (or a ProgSnap2 dataset for CS education analysis),
 [[set-remote]], [[push]], [[clone]], and [[pull]] manage
 synchronisation with a remote Git repository, [[git]] forwards
 Git commands to the log repository, [[tag]] manages named
-markers in the log (such as [[lab1]] or [[lab2]]), and [[play]]
-gives an interactive viewer for browsing the commit history.
+markers in the log (such as [[lab1]] or [[lab2]]), [[play]]
+gives an interactive viewer for browsing the commit history,
+and [[analyse]] generates \LaTeX{} reports of edit--run cycles
+from a ProgSnap2 dataset, optionally filtered by a
+[[Column=Regex]] range.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -27,7 +30,9 @@ Git commands against the log, exporting it as a bundle or
 ProgSnap2 dataset, cloning from and synchronising with a remote
 repository, playing back the development log stored in
 ``.learnlog/``, and analysing ProgSnap2 datasets to produce
-LaTeX reports of student edit--run cycles.
+LaTeX reports of student edit--run cycles.  The ``analyse``
+command accepts ``Column=Regex`` range boundaries to restrict
+analysis to a subset of events.
 """
 
 <<imports>>
@@ -1571,6 +1576,16 @@ The [[analyse]] command reads a ProgSnap2 dataset and
 generates \LaTeX{} output that presents the student's
 development process as a sequence of edit--run pairs.
 
+The source is specified with [[--from]]/[[-f]], matching
+the [[play]] command's interface.
+Two optional positional arguments [[start]] and [[end]]
+restrict the analysis to a range of events.
+Each takes the form [[Column=Regex]]---for example,
+[[X-Tag=lab1]] to match events tagged [[lab1]], or
+[[X-CommitHash=abc123]] to match by commit hash.
+The regex is matched with [[re.search]], so partial
+patterns work without anchoring.
+
 The source can be:
 \begin{description}
 \item[A [[.progsnap2]] file] Read directly.
@@ -1591,12 +1606,34 @@ The [[--standalone]] flag wraps the output in a complete
 <<typer commands>>=
 @app.command()
 def analyse(
-    source: Annotated[
+    start: Annotated[
         Optional[str],
         typer.Argument(
             help=(
-                "ProgSnap2 zip file, directory with "
-                ".learnlog/, or a .bundle file. "
+                "Start boundary as Column=Regex. "
+                "Events from the first match onward "
+                "are included."
+            ),
+        ),
+    ] = None,
+    end: Annotated[
+        Optional[str],
+        typer.Argument(
+            help=(
+                "End boundary as Column=Regex. "
+                "Events up to the last match "
+                "are included."
+            ),
+        ),
+    ] = None,
+    source: Annotated[
+        Optional[str],
+        typer.Option(
+            "--from", "-f",
+            help=(
+                "Source: ProgSnap2 zip file, "
+                "directory with .learnlog/, "
+                "or a .bundle file. "
                 "Defaults to current directory."
             ),
         ),
@@ -1632,6 +1669,7 @@ def analyse(
 ):
     """Analyse development sessions and generate LaTeX."""
     <<resolve analyse source>>
+    <<filter events by range>>
     <<generate and output latex>>
 @
 
@@ -1669,6 +1707,196 @@ else:
                 os.unlink(ps2_path)
             except OSError:
                 pass
+@
+
+When [[start]] or [[end]] is given, we narrow the dataset to
+the [[Order]] range delimited by matching events.
+The [[start]] boundary finds the minimum [[Order]] among
+events whose column value matches the regex; [[end]] finds
+the maximum.
+All events with [[Order]] values between these two
+boundaries (inclusive) are kept.
+This preserves I/O child events because they have
+contiguous [[Order]] values immediately following their
+parent [[Run.Program]].
+
+<<filter events by range>>=
+if start is not None or end is not None:
+    dataset["events"] = filter_event_range(
+        dataset["events"], start, end,
+    )
+@
+
+The [[filter_event_range]] function parses the
+[[Column=Regex]] format and applies [[re.search]] to find
+matching events.
+Using [[re.search]] rather than [[re.fullmatch]] means
+that [[X-Tag=lab1]] matches both [[lab1]] and
+[[lab1;lab2]], which is the natural expectation when tags
+are semicolon-delimited.
+
+<<helper functions>>=
+def filter_event_range(events, start=None, end=None):
+    """Filter events to the Order range [start, end].
+
+    ``start`` and ``end`` are ``Column=Regex`` strings.
+    Returns the filtered list of events.
+    """
+    import re
+
+    start_order = 0
+    end_order = float("inf")
+
+    if start is not None:
+        col, pattern = start.split("=", 1)
+        rx = re.compile(pattern)
+        matching = [
+            int(e["Order"]) for e in events
+            if rx.search(str(e.get(col, "")))
+        ]
+        if not matching:
+            raise SystemExit(
+                f"No events match {start}"
+            )
+        start_order = min(matching)
+
+    if end is not None:
+        col, pattern = end.split("=", 1)
+        rx = re.compile(pattern)
+        matching = [
+            int(e["Order"]) for e in events
+            if rx.search(str(e.get(col, "")))
+        ]
+        if not matching:
+            raise SystemExit(
+                f"No events match {end}"
+            )
+        end_order = max(matching)
+
+    return [
+        e for e in events
+        if start_order <= int(e["Order"]) <= end_order
+    ]
+@
+
+Let's verify that range filtering works with tag
+boundaries:
+
+<<test functions>>=
+def test_analyse_with_tag_range(workdir, monkeypatch):
+    """Column=Regex filters restrict the event range."""
+    from learnlog.cli import app
+    from learnlog.commits import get_commits
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: v1\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 0, 5
+        ),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    repo.git("tag", "lab1", commits[-1]["hash"])
+    (workdir / "hello.py").write_text(
+        'print("v2")\n'
+    )
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    repo.finalize_run(
+        io_log="stdout: v2\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 5, 5
+        ),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    repo.git("tag", "lab2", commits[-1]["hash"])
+    (workdir / "hello.py").write_text(
+        'print("v3")\n'
+    )
+    t3 = datetime.datetime(2026, 1, 1, 10, 10)
+    repo.begin_run("hello.py", [], t3)
+    repo.finalize_run(
+        io_log="stdout: v3\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 10, 5
+        ),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    repo.git("tag", "lab3", commits[-1]["hash"])
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["analyse", "X-Tag=lab2", "X-Tag=lab2"],
+    )
+    assert result.exit_code == 0
+    assert "v2" in result.output
+    assert "v1" not in result.output
+    assert "v3" not in result.output
+
+def test_analyse_start_only(workdir, monkeypatch):
+    """A start filter without end includes to the end."""
+    from learnlog.cli import app
+    from learnlog.commits import get_commits
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: v1\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 0, 5
+        ),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    repo.git("tag", "lab1", commits[-1]["hash"])
+    (workdir / "hello.py").write_text(
+        'print("v2")\n'
+    )
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    repo.finalize_run(
+        io_log="stdout: v2\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 5, 5
+        ),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    repo.git("tag", "lab2", commits[-1]["hash"])
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["analyse", "X-Tag=lab2"],
+    )
+    assert result.exit_code == 0
+    assert "v2" in result.output
+    assert "v1" not in result.output
+
+def test_analyse_invalid_filter(workdir, monkeypatch):
+    """A filter matching no events exits with an error."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["analyse", "X-Tag=nonexistent"],
+    )
+    assert result.exit_code != 0
 @
 
 <<generate and output latex>>=
@@ -1737,7 +1965,7 @@ def test_analyse_from_progsnap2_file(
     do_export_progsnap2(repo, ps2)
     runner = CliRunner()
     result = runner.invoke(
-        app, ["analyse", str(ps2)]
+        app, ["analyse", "--from", str(ps2)]
     )
     assert result.exit_code == 0
     assert "\\section{" in result.output

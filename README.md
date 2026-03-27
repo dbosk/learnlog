@@ -55,7 +55,13 @@ stored in a hidden local Git repository.
   ```bash
   learnlog clone git@gitlab.kth.se:dbosk/alice-log.git
   learnlog play
+  learnlog analyse X-Tag=lab1 X-Tag=lab2
   ```
+
+  The `analyse` command generates LaTeX reports of edit--run cycles.
+  The optional positional arguments filter events by `Column=Regex`
+  boundaries—here, only events between tags `lab1` and `lab2` are
+  included.
 
   Alternatively, the student can export the log as a bundle and submit it
   through the course platform:
