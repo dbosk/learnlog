@@ -814,6 +814,7 @@ if current_tree != prev_tree:
         "ProgramOutput": "",
         "ProgramInput": "",
         "X-Tag": commit_tags,
+        "X-CommitHash": commit_hash,
     })
 @
 
@@ -870,6 +871,7 @@ for run in runs:
         "ProgramOutput": "",
         "ProgramInput": "",
         "X-Tag": commit_tags,
+        "X-CommitHash": commit_hash,
     })
 
     <<emit I/O events for run>>
@@ -922,6 +924,7 @@ for evt_type, text in io_chunks:
         "ProgramOutput": "",
         "ProgramInput": "",
         "X-Tag": commit_tags,
+        "X-CommitHash": commit_hash,
     }
     resource_path = f"Resources/io_{order}.txt"
     if evt_type == "X-Run.Output":
@@ -1009,6 +1012,10 @@ the commit that produced the event, semicolon-delimited
 when a commit has multiple tags.
 This lets analysis tools segment the dataset by lab session
 or other user-defined milestones.
+The [[X-CommitHash]] column records the full Git commit hash
+that produced each event, enabling tools to filter events by
+commit range even after the dataset has been exported to a
+zip file.
 
 <<build main table csv string>>=
 main_columns = [
@@ -1022,6 +1029,7 @@ main_columns = [
     "ProgramOutput",
     "ProgramInput",
     "X-Tag",
+    "X-CommitHash",
 ]
 main_buf = io.StringIO()
 main_writer = csv.DictWriter(
