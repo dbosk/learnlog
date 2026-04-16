@@ -431,12 +431,14 @@ classifier here that the CLI can import without pulling in the
 exporter.
 
 A run is a success only when the exit code is zero \emph{and} no
-exception was recorded.  The exit code alone is not sufficient:
-uncaught exceptions that fire during interpreter shutdown (for
-example inside [[atexit]] handlers) can leave [[Exit-Code: 0]]
-behind while still signalling a real problem in the
-[[--- exception ---]] section.  Requiring both conditions avoids
-classifying such runs as successful.
+exception was recorded.  The recorder in \cref{learnlog} currently
+sets the exit code to [[1]] whenever an exception was captured, so
+in practice the two signals always agree---but we check both
+deliberately, so the classifier does not rely on that coupling.
+If the recorder ever distinguishes a clean exit that nonetheless
+logged a problem (warnings, partial failures, data imported from
+another tool), requiring both signals keeps the classifier correct
+without further changes.
 
 A block without an [[Exit-Code:]] line is classified as
 \emph{unknown} rather than \emph{failure}.  This happens when
@@ -479,9 +481,9 @@ def classify_run_block(block_text):
     return "failure"
 @
 
-Let's verify the three outcome categories.  A successful run
-has exit code zero and an explicit [[None]] in the exception
-section:
+Let's verify the classifier against the three outcome categories,
+covering both failure paths.  A successful run has exit code zero
+and an explicit [[None]] in the exception section:
 
 <<commits test functions>>=
 def test_classify_run_block_success():
@@ -516,7 +518,8 @@ def test_classify_run_block_nonzero_exit():
 @
 
 An exception logged alongside a zero exit still counts as a
-failure, for the shutdown-handler reason explained above:
+failure.  The current recorder never produces this combination,
+so this test pins down the defensive behaviour described above:
 
 <<commits test functions>>=
 def test_classify_run_block_exception_with_zero_exit():
