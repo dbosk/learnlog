@@ -135,9 +135,71 @@ class IOLog:
         self.lock = threading.Lock()
         self.buf = io.StringIO()
         self.size = 0
+        self.pending_prefix = None
+        self.pending_text = ""
         self.truncated = False
 
     <<iolog methods>>
+@
+
+
+\subsection{Pending fragments}
+
+Python does not guarantee that one logical line reaches us in one
+[[write]] call.  In particular, [[print()]] often emits the text first
+and the trailing newline in a later call.  If we prefixed each fragment
+independently, newline-only writes would become stray [[stdout:]] lines
+in the permanent log.
+
+We therefore keep at most one pending fragment together with its stream
+name.  A later write from the same stream extends that fragment; a write
+from another stream flushes it first so the interleaving remains in the
+order the student saw.
+
+<<iolog methods>>=
+def _entry(self, prefix, text):
+    return f"{prefix}: {text}"
+
+def _current_size_locked(self):
+    if not self.pending_text:
+        return self.size
+    return self.size + len(
+        self._entry(self.pending_prefix, self.pending_text)
+    )
+@
+
+
+\subsection{Internal flushing}
+
+We keep the actual writes to the shared buffer in small helpers.
+[[_flush_pending_locked]] moves a remembered fragment into the buffer
+without changing the total logical size, while [[_truncate_locked]]
+appends the truncation notice after flushing any already accepted
+fragment.
+
+<<iolog methods>>=
+def _write_entry_locked(self, prefix, text):
+    entry = self._entry(prefix, text)
+    self.buf.write(entry)
+    self.size += len(entry)
+
+def _flush_pending_locked(self):
+    if not self.pending_text:
+        return
+    prefix = self.pending_prefix
+    text = self.pending_text
+    self.pending_prefix = None
+    self.pending_text = ""
+    self._write_entry_locked(prefix, text)
+
+def _truncate_locked(self, flush_pending=False):
+    if flush_pending:
+        self._flush_pending_locked()
+    self.buf.write(
+        "\n[learnlog: I/O log truncated "
+        f"at {self.max_bytes} bytes]\n"
+    )
+    self.truncated = True
 @
 
 
@@ -150,37 +212,47 @@ This ensures the buffered log is clean plain text, while the student's
 terminal still shows colours since [[StreamCapture.write]] passes
 the original (unstripped) text to the real stream.
 
-We split each write into individual lines so that the prefix appears on
-every line, making the log easy to scan.
-The alternative---prefixing only the first line of a multi-line
-write---would produce confusing output when stdout and stderr writes
-interleave mid-block.
+Once fragmented writes have been reassembled, we still prefix every
+completed line separately so that multi-line output remains readable
+even when stdout, stderr, and stdin interleave mid-block.
 
 <<iolog methods>>=
 def log(self, prefix, text):
     """Log ``text`` with ``prefix`` (e.g. ``'stdout'``).
 
-    Each line of ``text`` gets its own prefixed entry.
+    Each completed line of ``text`` gets its own prefixed entry.
+    Incomplete trailing fragments stay pending until a later write,
+    another stream forces a flush, or :meth:`getvalue` snapshots them.
     ANSI escape sequences are stripped before buffering.
     If the buffer is full, further writes are silently dropped.
     """
     if not text:
         return
     text = strip_ansi(text)
+    if not text:
+        return
     with self.lock:
         if self.truncated:
             return
-        for line in text.splitlines(keepends=True):
-            entry = f"{prefix}: {line}"
-            if self.size + len(entry) > self.max_bytes:
-                self.buf.write(
-                    "\n[learnlog: I/O log truncated "
-                    f"at {self.max_bytes} bytes]\n"
-                )
-                self.truncated = True
+        if self.pending_text and self.pending_prefix != prefix:
+            self._flush_pending_locked()
+        if self.pending_text:
+            if self._current_size_locked() + len(text) > self.max_bytes:
+                self._truncate_locked(flush_pending=True)
                 return
-            self.buf.write(entry)
-            self.size += len(entry)
+            text = self.pending_text + text
+            self.pending_prefix = None
+            self.pending_text = ""
+        for line in text.splitlines(keepends=True):
+            entry = self._entry(prefix, line)
+            if self._current_size_locked() + len(entry) > self.max_bytes:
+                self._truncate_locked()
+                return
+            if line.endswith(("\n", "\r")):
+                self._write_entry_locked(prefix, line)
+            else:
+                self.pending_prefix = prefix
+                self.pending_text = line
 @
 
 Let's verify the basic logging behavior---single lines, interleaved
@@ -209,6 +281,17 @@ def test_iolog_multiline_write():
     assert "stderr: line1\n" in value
     assert "stderr: line2\n" in value
 
+def test_iolog_merges_fragmented_writes_from_same_stream():
+    log = IOLog()
+    log.log("stdout", "hello")
+    log.log("stdout", "\n")
+    assert log.getvalue() == "stdout: hello\n"
+
+def test_iolog_getvalue_includes_pending_fragment():
+    log = IOLog()
+    log.log("stdout", "prompt: ")
+    assert log.getvalue() == "stdout: prompt: "
+
 def test_iolog_empty_write_ignored():
     log = IOLog()
     log.log("stdout", "")
@@ -235,13 +318,17 @@ def test_iolog_truncation():
 \subsection{Retrieving the log}
 
 The [[getvalue]] method returns the full buffer contents.
-It acquires the lock to ensure a consistent snapshot.
+It acquires the lock to ensure a consistent snapshot, and includes any
+unfinished fragment so prompts without trailing newlines are not lost.
 
 <<iolog methods>>=
 def getvalue(self):
     """Return the full log contents as a string."""
     with self.lock:
-        return self.buf.getvalue()
+        value = self.buf.getvalue()
+        if not self.pending_text:
+            return value
+        return value + self._entry(self.pending_prefix, self.pending_text)
 @
 
 
@@ -337,6 +424,15 @@ def test_stream_capture_write_logs():
     cap = StreamCapture(original, "stderr", log)
     cap.write("error\n")
     assert "stderr: error\n" in log.getvalue()
+
+def test_stream_capture_merges_split_write_calls():
+    original = io.StringIO()
+    log = IOLog()
+    cap = StreamCapture(original, "stdout", log)
+    cap.write("hello")
+    cap.write("\n")
+    assert original.getvalue() == "hello\n"
+    assert log.getvalue() == "stdout: hello\n"
 @
 
 

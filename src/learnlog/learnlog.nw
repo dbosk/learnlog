@@ -538,6 +538,31 @@ class TestOnExit:
         assert "End-Time:" in msg
         assert "Exit-Code: 0" in msg
 
+    def test_commit_merges_split_stdout_writes(self, workdir, test_env):
+        script = workdir / "test_split_stdout.py"
+        script.write_text(
+            "import learnlog\n"
+            "import sys\n"
+            "sys.stdout.write('hello')\n"
+            "sys.stdout.write('\\n')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert "stdout: hello\n" in msg
+        assert "stdout: hello\nstdout:" not in msg
+
     def test_commit_has_run_metadata(self, workdir, test_env):
         script = workdir / "test_meta.py"
         script.write_text(
