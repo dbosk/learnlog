@@ -95,6 +95,7 @@ from learnlog.commits import (
 from learnlog.gitrepo import (
     LearnlogRepo,
     format_run_header,
+    format_run_trailer,
 )
 @
 
@@ -778,6 +779,11 @@ repository belongs to one student.
 For timestamps, we use both [[ServerTimestamp]] and
 [[ClientTimestamp]] set to the same value because learnlog
 timestamps come from the local clock.
+The run's finish time is a different kind of fact: it is not an
+alternative view of the event timestamp, but the other endpoint of the
+execution interval.
+We therefore preserve it in a custom [[X-EndTime]] column instead of
+overloading ProgSnap2's standard timestamp fields.
 
 <<get subject and code state for commit>>=
 author_result = repo.git(
@@ -869,6 +875,7 @@ for run in runs:
         "ServerTimestamp": timestamp,
         "ClientTimestamp": timestamp,
         "ProgramResult": program_result,
+        "X-EndTime": run["end_time"] or "",
         "X-ExitCode": run["exit_code"] or "",
         "X-Script": run["script"] or "",
         "X-Arguments": run["arguments"] or "",
@@ -922,6 +929,7 @@ for evt_type, text in io_chunks:
         "ServerTimestamp": "",
         "ClientTimestamp": "",
         "ProgramResult": "",
+        "X-EndTime": "",
         "X-ExitCode": "",
         "X-Script": "",
         "X-Arguments": "",
@@ -1022,6 +1030,11 @@ The [[X-CommitHash]] column records the full Git commit hash
 that produced each event, enabling tools to filter events by
 commit range even after the dataset has been exported to a
 zip file.
+The optional [[X-EndTime]] column preserves learnlog's run trailer end
+time without changing the meaning of [[ServerTimestamp]] and
+[[ClientTimestamp]].
+Older datasets remain valid because the reader keeps whatever columns
+the CSV provides.
 
 <<build main table csv string>>=
 main_columns = [
@@ -1030,6 +1043,7 @@ main_columns = [
     "ParentEventID",
     "ServerTimestamp", "ClientTimestamp",
     "ProgramResult",
+    "X-EndTime",
     "X-ExitCode", "X-Script", "X-Arguments",
     "X-ExceptionType", "X-ExceptionMessage",
     "ProgramOutput",
@@ -1152,6 +1166,26 @@ def test_progsnap2_main_table_has_events(workdir):
     assert len(run_events) >= 1
     assert run_events[0]["ProgramResult"] == "Success"
     assert run_events[0]["X-Script"] == "hello.py"
+    assert run_events[0]["X-EndTime"] == "2026-01-01T10:00:05"
+
+def test_progsnap2_unfinished_run_has_empty_end_time(workdir):
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    output = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+    run_events = [
+        e for e in events
+        if e["EventType"] == "Run.Program"
+    ]
+    assert len(run_events) >= 1
+    assert run_events[0]["X-EndTime"] == ""
 
 def test_progsnap2_filters_learnlog_runs(workdir):
     import csv as csv_mod
@@ -1558,6 +1592,7 @@ def test_read_progsnap2_roundtrip(workdir):
     ]
     assert len(run_evts) >= 1
     assert run_evts[0]["X-Script"] == "hello.py"
+    assert run_evts[0]["X-EndTime"] == "2026-01-01T10:00:05"
     assert len(dataset["code_states"]) >= 1
     assert "0" in dataset["code_states"]
     assert "hello.py" in dataset["code_states"]["0"]
@@ -1601,10 +1636,10 @@ First, [[LearnlogRepo(tmpdir / "repo")]] auto-creates an
 initial commit; the first reconstructed commit therefore amends
 that commit instead of adding an extra synthetic one.
 Second, ProgSnap2's I/O model merges [[stderr]] into output and
-does not currently carry an [[End-Time]] column, so the
-reconstructed commit message cannot recover those distinctions.
-We therefore rebuild the header faithfully, preserve exit code,
-exception, and I/O, but omit the trailer's original end time.
+still cannot recover that distinction.
+We therefore rebuild the header faithfully, preserve end time when
+[[X-EndTime]] is available, and keep the original exit code,
+exception, and merged I/O.
 
 The public entry point returns the reconstructed repository and
 the temporary directory that owns it.  The caller removes that
@@ -1778,10 +1813,10 @@ stored script, arguments, and start time, then reconstruct the
 I/O and exception sections from the child events and resource
 files.
 
-Because the dataset does not yet carry an explicit end time, the
-reconstructed message has no [[End-Time:]] line.  That means the
-run still shows the important behaviour for playback and
-analysis, but the textual trailer is intentionally incomplete.
+Datasets exported by current learnlog versions also carry
+[[X-EndTime]], so reconstruction can rebuild the original trailer.
+Older datasets remain readable because a missing [[X-EndTime]] simply
+means the rebuilt block omits the [[End-Time:]] line.
 
 <<progsnap2 functions>>=
 def build_reconstructed_commit_message(group, resources):
@@ -1809,9 +1844,12 @@ def build_reconstructed_commit_message(group, resources):
 @
 
 We reuse [[format_run_header]] so the first half of each block is
-identical to a native learnlog commit.  The trailer is rebuilt
-manually because ProgSnap2 does not currently preserve the
-original end time.
+identical to a native learnlog commit.
+When [[X-EndTime]] is present we also reuse [[format_run_trailer]],
+which keeps the reconstructed trailer aligned with a native learnlog
+run apart from the already-lost [[stderr]] split.
+For older datasets without [[X-EndTime]], we fall back to the older
+behaviour and omit the [[End-Time:]] line.
 
 <<progsnap2 functions>>=
 def build_reconstructed_run_block(event, io_log):
@@ -1825,9 +1863,20 @@ def build_reconstructed_run_block(event, io_log):
     header = format_run_header(script, args, start_time)
     exception_info = rebuild_exception_info(event)
     exit_code = event.get("X-ExitCode", "")
+    end_time_value = event.get("X-EndTime", "")
 
     if not exit_code and not io_log and not exception_info:
         return header
+
+    if end_time_value:
+        end_time = datetime.datetime.fromisoformat(end_time_value)
+        trailer = format_run_trailer(
+            io_log,
+            exception_info,
+            end_time,
+            int(exit_code) if exit_code else 0,
+        )
+        return f"{header}\n{trailer}"
 
     parts = [header]
     if exit_code:
@@ -2023,9 +2072,10 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
         assert "Run: hello.py --name Alice" in \
             first_message.stdout
         assert "Exit-Code: 1" in first_message.stdout
+        assert "End-Time: 2026-01-01T10:00:05" in \
+            first_message.stdout
         assert "stdout: warning" in first_message.stdout
         assert "ValueError: bad input" in first_message.stdout
-        assert "End-Time:" not in first_message.stdout
 
         status = reconstructed.git("show", "HEAD:main.py")
         assert status.returncode == 0
@@ -2033,6 +2083,28 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
         assert missing.returncode != 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+def test_build_reconstructed_run_block_without_end_time():
+    from learnlog.progsnap2 import build_reconstructed_run_block
+
+    event = {
+        "ServerTimestamp": "2026-01-01T10:00:00",
+        "X-EndTime": "",
+        "X-Script": "hello.py",
+        "X-Arguments": "",
+        "X-ExitCode": "1",
+        "X-ExceptionType": "ValueError",
+        "X-ExceptionMessage": "bad input",
+    }
+
+    block = build_reconstructed_run_block(
+        event,
+        "stdout: hello",
+    )
+
+    assert "Run: hello.py" in block
+    assert "Exit-Code: 1" in block
+    assert "End-Time:" not in block
 @
 
 
@@ -2233,6 +2305,7 @@ def test_group_edit_run_pairs_basic():
             "CodeStateID": "0",
             "ParentEventID": "",
             "X-Tag": "lab1",
+            "X-EndTime": "",
             "ProgramOutput": "", "ProgramInput": "",
         },
         {
@@ -2276,6 +2349,7 @@ def test_group_edit_run_pairs_multiple_tags():
             "CodeStateID": "0",
             "ParentEventID": "",
             "X-Tag": "lab1",
+            "X-EndTime": "",
             "ProgramOutput": "", "ProgramInput": "",
         },
         {
@@ -2294,6 +2368,7 @@ def test_group_edit_run_pairs_multiple_tags():
             "CodeStateID": "1",
             "ParentEventID": "",
             "X-Tag": "lab2",
+            "X-EndTime": "",
             "ProgramOutput": "", "ProgramInput": "",
         },
     ]
@@ -2323,6 +2398,7 @@ def test_group_edit_run_pairs_split_semicolon_tags():
             "CodeStateID": "0",
             "ParentEventID": "",
             "X-Tag": "lab1;lab2",
+            "X-EndTime": "",
             "ProgramOutput": "", "ProgramInput": "",
         },
     ]
@@ -2362,6 +2438,7 @@ def test_group_edit_run_pairs_run_without_edit():
             "CodeStateID": "0",
             "ParentEventID": "",
             "X-Tag": "",
+            "X-EndTime": "",
             "ProgramOutput": "", "ProgramInput": "",
         },
     ]
@@ -2961,6 +3038,7 @@ def test_generate_analysis_latex_sequential():
             "ParentEventID": "",
             "X-Tag": "lab1",
             "ProgramResult": "Success",
+            "X-EndTime": "",
             "X-ExitCode": "0",
             "X-Script": "hello.py",
             "X-Arguments": "",
@@ -3057,6 +3135,7 @@ def test_generate_analysis_latex_side_by_side():
             "ParentEventID": "",
             "X-Tag": "",
             "ProgramResult": "Success",
+            "X-EndTime": "",
             "X-ExitCode": "0",
             "X-Script": "hello.py",
             "X-Arguments": "",
@@ -3127,6 +3206,7 @@ def test_generate_analysis_latex_side_by_side_single():
             "ParentEventID": "",
             "X-Tag": "",
             "ProgramResult": "Success",
+            "X-EndTime": "",
             "X-ExitCode": "0",
             "X-Script": "hello.py",
             "X-Arguments": "",
@@ -3238,6 +3318,7 @@ def test_format_run_latex_with_io():
             "EventID": "2",
             "X-Script": "hello.py",
             "ProgramResult": "Success",
+            "X-EndTime": "",
             "X-ExitCode": "0",
             "X-ExceptionType": "",
             "X-ExceptionMessage": "",
