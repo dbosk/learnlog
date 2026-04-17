@@ -1806,9 +1806,14 @@ The source can be:
 \end{description}
 
 The [[--side-by-side]] flag switches from sequential
-(top to bottom) to a two-column layout where the left
-column shows the previous run result (cause) and the
-right column shows the current edit and run (effect).
+(top to bottom) to a causal-chain layout.
+The initial edit is rendered full width on its own,
+then every following pair is shown as two aligned
+rows: one pairing the previous run with the next
+edit, and one pairing that edit with the run it
+produced.
+This makes each cause-and-effect step explicit and
+visible on a single line.
 
 The [[--standalone]] flag wraps the output in a complete
 \LaTeX{} document with preamble.
@@ -1860,7 +1865,8 @@ def analyse(
         typer.Option(
             "--side-by-side", "-s",
             help=(
-                "Show edit/run pairs in two columns: "
+                "Render the causal chain of edits "
+                "and runs as side-by-side rows: "
                 "cause on the left, effect on the "
                 "right."
             ),
@@ -2185,7 +2191,14 @@ def test_analyse_from_progsnap2_file(
     assert "\\section{" in result.output
 
 def test_analyse_side_by_side(workdir, monkeypatch):
-    """Side-by-side flag produces paracol output."""
+    """Side-by-side renders without paracol.
+
+    With a single pair there is no chain, so both
+    halves are rendered full width.  We still run
+    under [[--side-by-side]] to confirm the flag is
+    honoured end-to-end and that no stale
+    [[paracol]] markup slips through.
+    """
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -2205,7 +2218,9 @@ def test_analyse_side_by_side(workdir, monkeypatch):
         app, ["analyse", "--side-by-side"]
     )
     assert result.exit_code == 0
-    assert "\\begin{paracol}" in result.output
+    assert "\\paragraph{Edit 1}" in result.output
+    assert "\\paragraph{Run 1}" in result.output
+    assert "\\begin{paracol}" not in result.output
 
 def test_analyse_output_file(workdir, monkeypatch):
     """The -o flag writes to a file."""

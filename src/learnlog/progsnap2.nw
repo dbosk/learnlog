@@ -1956,7 +1956,6 @@ def generate_analysis_latex(
 <<emit standalone preamble>>=
 lines.append("\\documentclass{article}")
 lines.append("\\usepackage{minted}")
-lines.append("\\usepackage{paracol}")
 lines.append("\\begin{document}")
 lines.append("")
 @
@@ -2033,59 +2032,206 @@ for i, pair in enumerate(pairs, 1):
 
 \subsection{Side-by-side mode}
 
-The side-by-side mode uses [[paracol]] to show the
-causal chain: the left column contains the previous
-run result (what the student observed), the right
-column contains the current edit and run (what the
-student did in response).
-For pair~$N$, the left column shows pair~$N{-}1$'s
-run result; the right column shows pair~$N$'s edit
-and run.
-The first pair has an empty left column.
+The side-by-side mode renders the causal chain of
+programming activity one transition at a time, as a
+sequence of aligned two-column rows.
+Reading down the left column tells the story of
+causes---what the student saw or wrote just before
+the next step.
+Reading down the right column tells the story of
+effects---what the student did or observed in
+response.
+
+The initial edit is special: it is the student's
+starting code, with no prior run to blame for it.
+We render it at full width on its own so it is not
+mistaken for one side of a pair.
+Every subsequent pair then contributes two rows:
+
+\begin{description}
+  \item[\enquote{run caused edit}]
+    the previous run on the left, the following
+    edit on the right---showing what program
+    behaviour prompted the change.
+  \item[\enquote{edit caused run}]
+    that same edit on the left, its own run on the
+    right---showing what behaviour the change
+    produced.
+\end{description}
+
+Every middle event therefore appears twice: once as
+an effect on the right of one row, once as the cause
+on the left of the next row.
+The repetition is deliberate.
+Seeing an edit next to \emph{both} the run that
+motivated it and the run it produced makes the
+before-and-after contrast explicit, which is
+awkward to express in a single-column log.
+
+We build each row from a pair of top-aligned
+[[minipage]]s rather than using the [[paracol]]
+package.
+[[minipage]] guarantees that the two halves of a row
+share a top baseline and that the next row starts
+below both halves; [[paracol]] lets the columns flow
+independently, which works for running text but lets
+a tall diff on one side drift its causal partner out
+of alignment on the other.
+The price is that an overlong run or diff cannot be
+broken across pages inside a row, but the analysis
+target (a single pair of short code states plus its
+captured I/O) is small enough that this rarely
+matters.
+
+The body has three cases: the opening edit, the
+singleton case where no chain is possible, and the
+general chain.
 
 <<emit pairs side by side>>=
-lines.append("\\begin{paracol}{2}")
-prev_pair = None
-for i, pair in enumerate(pairs, 1):
-    lines.append("\\switchcolumn[0]")
-    if prev_pair is not None:
-        prev_run = format_run_latex(
-            prev_pair, dataset["resources"],
-        )
-        if prev_run:
-            lines.append(
-                "\\paragraph{"
-                f"Run {i - 1} result"
-                "}"
-            )
-            lines.append(prev_run)
+<<emit first edit at full width>>
+if len(pairs) == 1:
+    <<emit only run at full width>>
+else:
+    <<emit causal chain rows>>
+@
+
+The first edit has no previous code state, so
+[[format_edit_latex]] falls through to its
+full-file-content branch.
+We place it at full width because it has nothing to
+be compared against on the left.
+
+<<emit first edit at full width>>=
+first_pair = pairs[0]
+first_edit = format_edit_latex(
+    first_pair, None, dataset["code_states"],
+)
+if first_edit:
+    lines.append("\\paragraph{Edit 1}")
+    lines.append(first_edit)
     lines.append("")
+@
 
-    lines.append("\\switchcolumn[1]")
-    edit_tex = format_edit_latex(
-        pair, prev_pair,
-        dataset["code_states"],
+When the student has only run the program once,
+there is no chain to draw.
+Rendering Run~1 inside a half-empty row would look
+like a rendering bug, so we emit it at full width
+beneath Edit~1 instead.
+
+<<emit only run at full width>>=
+only_run = format_run_latex(
+    pairs[0], dataset["resources"],
+)
+if only_run:
+    lines.append("\\paragraph{Run 1}")
+    lines.append(only_run)
+    lines.append("")
+@
+
+For the general chain we iterate by the index of the
+\emph{cause} pair.
+For each cause~$i$ with $1 \leq i < N$, the two rows
+connect pair~$i$ to pair~$i{+}1$: the first says
+\enquote{Run~$i$ led to Edit~$i{+}1$} and the second
+says \enquote{Edit~$i{+}1$ led to Run~$i{+}1$}.
+We compute the three fragments once per iteration
+and hand them to [[format_minipage_row]] twice,
+reusing [[effect_edit]] on both sides of the two
+rows so the repeated element is guaranteed to be
+byte-identical.
+
+<<emit causal chain rows>>=
+for i in range(len(pairs) - 1):
+    cause = pairs[i]
+    effect = pairs[i + 1]
+
+    cause_run = format_run_latex(
+        cause, dataset["resources"],
     )
-    if edit_tex:
-        lines.append(
-            f"\\paragraph{{Edit {i}}}"
-        )
-        lines.append(edit_tex)
-        lines.append("")
-
-    run_tex = format_run_latex(
-        pair, dataset["resources"],
+    effect_edit = format_edit_latex(
+        effect, cause, dataset["code_states"],
     )
-    if run_tex:
-        lines.append(
-            f"\\paragraph{{Run {i}}}"
-        )
-        lines.append(run_tex)
-        lines.append("")
+    effect_run = format_run_latex(
+        effect, dataset["resources"],
+    )
 
-    prev_pair = pair
-lines.append("\\end{paracol}")
-lines.append("")
+    lines.extend(format_minipage_row(
+        left_label=f"Run {i + 1}",
+        left_tex=cause_run,
+        right_label=f"Edit {i + 2}",
+        right_tex=effect_edit,
+    ))
+    lines.extend(format_minipage_row(
+        left_label=f"Edit {i + 2}",
+        left_tex=effect_edit,
+        right_label=f"Run {i + 2}",
+        right_tex=effect_run,
+    ))
+@
+
+\subsection{Formatting a side-by-side row}
+
+Each row of the causal chain is a pair of
+top-aligned [[minipage]] boxes separated by
+[[\hfill]].
+The [[[t]]] alignment flag is what guarantees row
+alignment: both boxes line up by their first line,
+so the two [[\paragraph]] headings sit on the same
+baseline regardless of whether one half contains a
+two-line diff and the other half a twenty-line run.
+Without [[[t]]], LaTeX centres the boxes on each
+other's midlines and the headings end up at
+different vertical positions.
+
+[[\noindent]] is needed because we emit the row at
+paragraph level: without it, the left [[minipage]]
+would be shifted right by [[\parindent]] and the
+row would lose its symmetry with neighbouring rows.
+[[\hfill]] between the boxes absorbs whatever
+horizontal space is left over so the right
+[[minipage]] reaches the right margin exactly.
+A small [[\vspace]] below the row separates it from
+the next one---without it, two consecutive rows
+would run together and obscure the chain structure.
+
+We keep the cell construction as a nested helper so
+that the left and right halves are emitted by the
+same code path and an empty half cannot accidentally
+omit its [[minipage]] wrapper (which would collapse
+the row and misalign the chain).
+
+<<progsnap2 functions>>=
+def format_minipage_row(
+    left_label, left_tex,
+    right_label, right_tex,
+    width="0.48\\linewidth",
+):
+    """Return LaTeX lines for one side-by-side row.
+
+    The row is a pair of top-aligned ``minipage``
+    boxes separated by ``\\hfill``.  An empty half
+    still renders as an empty ``minipage`` so the
+    surrounding rows stay aligned.
+    """
+    def cell(label, tex):
+        out = [
+            f"\\begin{{minipage}}[t]{{{width}}}"
+        ]
+        if tex:
+            out.append(f"\\paragraph{{{label}}}")
+            out.append(tex)
+        out.append("\\end{minipage}")
+        return out
+
+    return [
+        "\\noindent",
+        *cell(left_label, left_tex),
+        "\\hfill",
+        *cell(right_label, right_tex),
+        "",
+        "\\vspace{1em}",
+        "",
+    ]
 @
 
 \subsection{Formatting an edit}
@@ -2390,8 +2536,111 @@ def test_generate_analysis_latex_sequential():
     assert "hello.py" in latex
     assert "\\begin{minted}{text}" in latex
 
+@
+
+The side-by-side mode is the interesting one.
+With three pairs we get one full-width Edit~1, then
+two iterations of the chain loop---four rows, each
+pairing a cause with its immediate effect.
+The direct check that the chain is intact is a count
+on each event's occurrences: the two events at the
+ends of the chain (Run~1, Run~3) appear once, while
+the middle events (Edit~2, Run~2, Edit~3) each appear
+twice---once on the right of one row as an effect and
+once on the left of the next row as a cause.
+A mistake in the loop would show up as a missing or
+extra occurrence.
+
+<<progsnap2 test functions>>=
 def test_generate_analysis_latex_side_by_side():
-    """Side-by-side mode produces paracol environment."""
+    """Side-by-side mode renders a causal chain.
+
+    Edit 1 is full width; every subsequent pair
+    contributes two minipage rows, repeating each
+    middle event so it appears once as an effect and
+    once as the next cause.
+    """
+    from learnlog.progsnap2 import (
+        generate_analysis_latex,
+        group_edit_run_pairs,
+    )
+    events = []
+    code_states = {}
+    for i, code in enumerate([
+        'print("v1")\n',
+        'print("v2")\n',
+        'print("v3")\n',
+    ]):
+        state_id = str(i)
+        code_states[state_id] = {"hello.py": code}
+        events.append({
+            "EventType": "File.Edit",
+            "EventID": str(2 * i + 1),
+            "Order": str(2 * i + 1),
+            "SubjectID": "Alice",
+            "CodeStateID": state_id,
+            "ParentEventID": "",
+            "X-Tag": "",
+            "ProgramOutput": "",
+            "ProgramInput": "",
+        })
+        events.append({
+            "EventType": "Run.Program",
+            "EventID": str(2 * i + 2),
+            "Order": str(2 * i + 2),
+            "SubjectID": "Alice",
+            "CodeStateID": state_id,
+            "ParentEventID": "",
+            "X-Tag": "",
+            "ProgramResult": "Success",
+            "X-ExitCode": "0",
+            "X-Script": "hello.py",
+            "X-Arguments": "",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+            "ProgramOutput": "",
+            "ProgramInput": "",
+        })
+    dataset = {
+        "metadata": {},
+        "events": events,
+        "code_states": code_states,
+        "resources": {},
+    }
+    grouped = group_edit_run_pairs(events)
+    latex = generate_analysis_latex(
+        dataset, grouped, side_by_side=True,
+    )
+    assert "\\paragraph{Edit 1}" in latex
+    assert "\\begin{minipage}[t]" in latex
+    assert "\\hfill" in latex
+    assert "\\noindent" in latex
+    assert "\\begin{paracol}" not in latex
+    # Only the head (Run 1) and tail (Run 3) of the
+    # chain appear once; every middle event appears
+    # twice---once as an effect, once as the next
+    # cause.  Edit 1 is full-width and has no
+    # causal partner on the left.
+    assert latex.count("\\paragraph{Edit 1}") == 1
+    assert latex.count("\\paragraph{Run 1}") == 1
+    assert latex.count("\\paragraph{Edit 2}") == 2
+    assert latex.count("\\paragraph{Run 2}") == 2
+    assert latex.count("\\paragraph{Edit 3}") == 2
+    assert latex.count("\\paragraph{Run 3}") == 1
+@
+
+A single pair has no chain: there is no next edit to
+pair Run~1 with, and pairing Run~1 with an empty
+cell would look like a missing half rather than the
+end of a chain.
+In that case we fall back to full-width rendering
+for both halves, which the test checks by confirming
+that no [[minipage]] row is emitted at all.
+
+<<progsnap2 test functions>>=
+def test_generate_analysis_latex_side_by_side_single():
+    """With one pair, side-by-side falls back to
+    full-width rendering for both edit and run."""
     from learnlog.progsnap2 import (
         generate_analysis_latex,
         group_edit_run_pairs,
@@ -2434,11 +2683,19 @@ def test_generate_analysis_latex_side_by_side():
     latex = generate_analysis_latex(
         dataset, grouped, side_by_side=True,
     )
-    assert "\\begin{paracol}{2}" in latex
-    assert "\\switchcolumn[0]" in latex
-    assert "\\switchcolumn[1]" in latex
-    assert "\\end{paracol}" in latex
+    assert "\\paragraph{Edit 1}" in latex
+    assert "\\paragraph{Run 1}" in latex
+    assert "\\begin{minipage}" not in latex
+@
 
+The standalone test checks that the preamble still
+loads what the generator actually emits.
+[[paracol]] has been dropped from the preamble
+because the new layout no longer uses it, so we
+also assert its absence to catch accidental
+reintroduction.
+
+<<progsnap2 test functions>>=
 def test_generate_analysis_latex_standalone():
     """Standalone mode wraps in documentclass."""
     from learnlog.progsnap2 import (
@@ -2455,7 +2712,7 @@ def test_generate_analysis_latex_standalone():
     )
     assert "\\documentclass{article}" in latex
     assert "\\usepackage{minted}" in latex
-    assert "\\usepackage{paracol}" in latex
+    assert "\\usepackage{paracol}" not in latex
     assert "\\end{document}" in latex
 
 def test_format_edit_latex_first_edit():
