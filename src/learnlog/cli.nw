@@ -416,11 +416,11 @@ the start time and command instead of the commit message subject.
 This is useful for quickly finding a session to inspect with
 [[play]], or for checking what a student has been working on.
 
-For symmetry with [[play]] and [[analyse]], the source can be passed
-with [[--from]] / [[-f]].
-We keep the older positional source argument for compatibility, but
-reject using both forms at once so the command still has a single,
-unambiguous source.
+For symmetry with [[play]] and [[analyse]], the source is passed
+with [[--from]] / [[-f]].  This keeps the positional interface free
+for command-specific arguments and makes the source selection rule the
+same across the commands that can read directories, bundles, or
+ProgSnap2 exports.
 
 When a commit contains multiple runs (because the student ran the
 same code several times without editing), we show the first run's
@@ -442,17 +442,6 @@ code and broke it.
 <<typer commands>>=
 @app.command(name="list")
 def list_commits(
-    source_arg: Annotated[
-        Optional[str],
-        typer.Argument(
-            help=(
-                "Source: directory with .learnlog/ "
-                "a ProgSnap2 zip, or a .bundle file. "
-                "Retained for compatibility; "
-                "you can also use --from."
-            ),
-        ),
-    ] = None,
     source: Annotated[
         Optional[str],
         typer.Option(
@@ -498,7 +487,6 @@ def list_commits(
     """List commits with start time and command."""
     import shutil
 
-    <<resolve source passed to [[list]]>>
     repo, tmpdir = resolve_source(source)
     try:
         commits = get_commits(repo)
@@ -512,21 +500,6 @@ def list_commits(
     finally:
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
-@
-
-We accept either the new option form or the historical positional
-form, but not both at once.
-Normalising to a single [[source]] variable keeps the rest of the
-command unchanged.
-
-<<resolve source passed to [[list]]>>=
-if source is not None and source_arg is not None:
-    raise SystemExit(
-        "Pass the source either positionally or with --from, "
-        "not both."
-    )
-if source is None:
-    source = source_arg
 @
 
 The two outcome flags share a single representation: a set of
@@ -596,7 +569,7 @@ def test_list_command_via_cli(workdir):
     t1 = datetime.datetime(2026, 3, 20, 14, 30)
     repo.begin_run("hello.py", ["arg1"], t1)
     runner = CliRunner()
-    result = runner.invoke(app, ["list", str(workdir)])
+    result = runner.invoke(app, ["list", "--from", str(workdir)])
     assert result.exit_code == 0
     assert "hello.py arg1" in result.output
     assert "2026-03-20 14:30" in result.output
@@ -615,19 +588,6 @@ def test_list_command_via_from_option(workdir):
     assert result.exit_code == 0
     assert "hello.py arg1" in result.output
 
-def test_list_command_rejects_both_source_forms(workdir):
-    """The list command rejects ambiguous source input."""
-    from learnlog.cli import app
-    from typer.testing import CliRunner
-    repo = LearnlogRepo(workdir)
-    runner = CliRunner()
-    result = runner.invoke(
-        app,
-        ["list", str(workdir), "--from", str(workdir)],
-    )
-    assert result.exit_code == 1
-    assert "either positionally or with --from" in result.output
-
 def test_list_command_multiple_runs(workdir):
     """Multiple runs in one commit show run count."""
     from learnlog.cli import app
@@ -638,7 +598,9 @@ def test_list_command_multiple_runs(workdir):
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("hello.py", [], t2)
     runner = CliRunner()
-    result = runner.invoke(app, ["list", str(workdir)])
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
     assert result.exit_code == 0
     assert "(2 runs)" in result.output
 
@@ -651,7 +613,9 @@ def test_list_command_filters_learnlog(workdir):
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("learnlog", ["play"], t1)
     runner = CliRunner()
-    result = runner.invoke(app, ["list", str(workdir)])
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
     assert result.exit_code == 0
     assert "hello.py" in result.output
     assert "learnlog" not in result.output
@@ -667,12 +631,12 @@ def test_list_command_all_shows_learnlog(workdir):
     runner = CliRunner()
     # Without --all, the learnlog run is filtered out.
     filtered = runner.invoke(
-        app, ["list", str(workdir)]
+        app, ["list", "--from", str(workdir)]
     )
     assert "(2 runs)" not in filtered.output
     # With --all, both runs are counted.
     unfiltered = runner.invoke(
-        app, ["list", "--all", str(workdir)]
+        app, ["list", "--all", "--from", str(workdir)]
     )
     assert unfiltered.exit_code == 0
     assert "(2 runs)" in unfiltered.output
@@ -715,7 +679,7 @@ def test_list_success_filter(workdir):
     )
     runner = CliRunner()
     result = runner.invoke(
-        app, ["list", "--success", str(workdir)]
+        app, ["list", "--success", "--from", str(workdir)]
     )
     assert result.exit_code == 0
     assert "ok.py" in result.output
@@ -747,7 +711,7 @@ def test_list_failure_filter(workdir):
     )
     runner = CliRunner()
     result = runner.invoke(
-        app, ["list", "--failure", str(workdir)]
+        app, ["list", "--failure", "--from", str(workdir)]
     )
     assert result.exit_code == 0
     assert "bad.py" in result.output
@@ -780,7 +744,10 @@ def test_list_both_flags_show_either(workdir):
     runner = CliRunner()
     result = runner.invoke(
         app,
-        ["list", "--success", "--failure", str(workdir)],
+        [
+            "list", "--success", "--failure",
+            "--from", str(workdir),
+        ],
     )
     assert result.exit_code == 0
     assert "ok.py" in result.output
@@ -812,10 +779,10 @@ def test_list_mixed_commit_appears_in_both(workdir):
     )
     runner = CliRunner()
     success_result = runner.invoke(
-        app, ["list", "--success", str(workdir)]
+        app, ["list", "--success", "--from", str(workdir)]
     )
     failure_result = runner.invoke(
-        app, ["list", "--failure", str(workdir)]
+        app, ["list", "--failure", "--from", str(workdir)]
     )
     assert success_result.exit_code == 0
     assert failure_result.exit_code == 0
