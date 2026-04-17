@@ -174,10 +174,12 @@ For bundle files, we clone them into a temporary directory.
 The caller is responsible for cleanup---we return both the repo
 and the temporary directory (or [[None]] if no temp dir was created).
 
-We detect bundles by checking whether [[git bundle verify]]
-succeeds on the file, rather than relying on file extensions.
+We detect bundles by asking [[git bundle list-heads]] to parse
+the file, rather than relying on file extensions.
 This is more robust: a user might name their bundle
-[[student-log.bin]] instead of [[student.bundle]].
+[[student-log.bin]] instead of [[student.bundle]], and unlike
+[[git bundle verify]] this check still works when the current
+working directory is not itself a Git repository.
 
 <<helper functions>>=
 def resolve_source(source=None):
@@ -221,7 +223,7 @@ if not path.is_file():
     raise SystemExit(f"Not a file or directory: {path}")
 
 verify = subprocess.run(
-    ["git", "bundle", "verify", str(path)],
+    ["git", "bundle", "list-heads", str(path)],
     capture_output=True, text=True,
 )
 if verify.returncode != 0:
@@ -279,6 +281,29 @@ def test_resolve_source_bundle(workdir):
         assert result.returncode == 0
     finally:
         shutil.rmtree(tmpdir)
+
+def test_resolve_source_bundle_from_non_repo_cwd(
+    workdir, monkeypatch
+):
+    import shutil
+    from learnlog.cli import resolve_source
+
+    repo = LearnlogRepo(workdir)
+    bundle_path = workdir / "test.bundle"
+    repo.git(
+        "bundle", "create", str(bundle_path), "--all"
+    )
+    outside = workdir.parent / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    resolved, tmpdir = resolve_source(str(bundle_path))
+    try:
+        assert tmpdir is not None
+        result = resolved.git("log", "--oneline")
+        assert result.returncode == 0
+    finally:
+        shutil.rmtree(tmpdir)
 @
 
 
@@ -290,8 +315,8 @@ repository.
 A bundle is a single file that contains the complete history
 and can be cloned or passed to [[learnlog play]] for playback.
 This is the natural serialisation format for a Git repository---it
-handles pack files correctly and can be verified with
-[[git bundle verify]].
+handles pack files correctly and can be validated from any directory
+with [[git bundle list-heads]].
 
 The default output filename is [[learnlog.bundle]], placed in the
 current directory.
@@ -324,7 +349,7 @@ def test_do_export_creates_bundle(workdir):
     do_export(repo, bundle)
     assert bundle.exists()
     verify = subprocess.run(
-        ["git", "bundle", "verify", str(bundle)],
+        ["git", "bundle", "list-heads", str(bundle)],
         capture_output=True,
     )
     assert verify.returncode == 0
