@@ -90,6 +90,7 @@ from learnlog.commits import (
     get_commits,
     parse_run_summary,
     filter_learnlog_runs,
+    commit_outcomes,
 )
 from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
@@ -361,6 +362,18 @@ same code several times without editing), we show the first run's
 details and append [[(N runs)]] so the teacher knows there is more
 to explore.
 
+The [[--success]] and [[--failure]] flags narrow the listing to
+commits that contain at least one run of the requested outcome.
+A teacher chasing down where a student got stuck passes
+[[--failure]]; a student searching for a working version to
+revert to passes [[--success]] and uses the last line as the
+hash to check out.  Because a commit's outcomes form a set
+(\cref{sec:commit-outcomes}), a commit with both a successful
+and a failed run appears under both flags---this matters for the
+recovery workflow, where the student's most recent known-good
+commit must not be hidden just because they later re-ran the
+code and broke it.
+
 <<typer commands>>=
 @app.command(name="list")
 def list_commits(
@@ -384,6 +397,26 @@ def list_commits(
             ),
         ),
     ] = False,
+    success: Annotated[
+        bool,
+        typer.Option(
+            "--success",
+            help=(
+                "Show only commits with at least "
+                "one successful run."
+            ),
+        ),
+    ] = False,
+    failure: Annotated[
+        bool,
+        typer.Option(
+            "--failure",
+            help=(
+                "Show only commits with at least "
+                "one failed run."
+            ),
+        ),
+    ] = False,
 ):
     """List commits with start time and command."""
     import shutil
@@ -395,6 +428,7 @@ def list_commits(
             raise SystemExit("No commits found.")
 
         filter_lr = not show_all
+        <<build wanted outcome set>>
         for commit in commits:
             <<get and summarise commit>>
     finally:
@@ -402,8 +436,23 @@ def list_commits(
             shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
-For each commit we fetch the full message body, optionally filter
-out learnlog's own runs using [[filter_learnlog_runs]], and then
+The two outcome flags share a single representation: a set of
+outcome labels.  We build the set once before the commit loop
+rather than branching on the flags inside it, and we rely on an
+empty set meaning \enquote{no filter active} so the per-commit
+check can short-circuit cheaply.
+
+<<build wanted outcome set>>=
+wanted = set()
+if success:
+    wanted.add("success")
+if failure:
+    wanted.add("failure")
+@
+
+For each commit we fetch the full message body, optionally
+filter out learnlog's own runs using [[filter_learnlog_runs]],
+drop commits that do not match the outcome filter, and then
 extract the summary with [[parse_run_summary]].
 Commits whose runs are all filtered out (or that have no run
 blocks, like the initial commit) are silently skipped.
@@ -414,6 +463,7 @@ body = repo.git(
 ).stdout.rstrip("\n")
 if filter_lr:
     body = filter_learnlog_runs(body)
+<<skip commits that do not match the outcome filter>>
 summary = parse_run_summary(body)
 if summary is None:
     continue
@@ -425,6 +475,20 @@ suffix = (
 typer.echo(
     f"{short_hash} {start_time} {command}{suffix}"
 )
+@
+
+When at least one outcome flag is active (so [[wanted]] is
+non-empty), we intersect it with the commit's outcomes
+(\cref{sec:commit-outcomes}) and skip the commit if the
+intersection is empty.  Set intersection gives exactly the
+semantics we want: each flag contributes one outcome to
+[[wanted]], passing both flags matches any commit with at least
+one finalized run, and the [[unknown]] outcome from unfinalized
+runs never matches because we never add it to [[wanted]].
+
+<<skip commits that do not match the outcome filter>>=
+if wanted and not (commit_outcomes(body) & wanted):
+    continue
 @
 
 Let's verify that the command lists commits with the expected
@@ -492,6 +556,151 @@ def test_list_command_all_shows_learnlog(workdir):
     )
     assert unfiltered.exit_code == 0
     assert "(2 runs)" in unfiltered.output
+@
+
+Let's verify the outcome filters.  The first two tests use a
+two-commit sequence---one successful commit and one failed
+commit---to check each flag in isolation.  The third confirms
+that passing both flags combines them by union, not
+intersection (any finalized run matches).  The fourth is the
+headline test for the student recovery workflow: a single
+commit containing one successful and one failed run must appear
+under \emph{both} flags, so the student's most recent working
+state is not hidden by a later re-run that broke it.
+
+<<test functions>>=
+def test_list_success_filter(workdir):
+    """--success shows only commits with a successful run."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    end1 = datetime.datetime(2026, 1, 1, 10, 0, 1)
+    repo.begin_run("ok.py", [], t1)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end1,
+        exit_code=0,
+    )
+    (workdir / "work.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    end2 = datetime.datetime(2026, 1, 1, 10, 5, 1)
+    repo.begin_run("bad.py", [], t2)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end2,
+        exit_code=1,
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--success", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "ok.py" in result.output
+    assert "bad.py" not in result.output
+
+def test_list_failure_filter(workdir):
+    """--failure shows only commits with a failed run."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    end1 = datetime.datetime(2026, 1, 1, 10, 0, 1)
+    repo.begin_run("ok.py", [], t1)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end1,
+        exit_code=0,
+    )
+    (workdir / "work.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    end2 = datetime.datetime(2026, 1, 1, 10, 5, 1)
+    repo.begin_run("bad.py", [], t2)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end2,
+        exit_code=1,
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--failure", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "bad.py" in result.output
+    assert "ok.py" not in result.output
+
+def test_list_both_flags_show_either(workdir):
+    """Both flags together show commits of either outcome."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    end1 = datetime.datetime(2026, 1, 1, 10, 0, 1)
+    repo.begin_run("ok.py", [], t1)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end1,
+        exit_code=0,
+    )
+    (workdir / "work.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    end2 = datetime.datetime(2026, 1, 1, 10, 5, 1)
+    repo.begin_run("bad.py", [], t2)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end2,
+        exit_code=1,
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["list", "--success", "--failure", str(workdir)],
+    )
+    assert result.exit_code == 0
+    assert "ok.py" in result.output
+    assert "bad.py" in result.output
+
+def test_list_mixed_commit_appears_in_both(workdir):
+    """A commit with both outcomes shows under each flag."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    end1 = datetime.datetime(2026, 1, 1, 10, 0, 1)
+    repo.begin_run("mixed.py", [], t1)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end1,
+        exit_code=0,
+    )
+    # Same code re-run: amends the commit with a second block.
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    end2 = datetime.datetime(2026, 1, 1, 10, 5, 1)
+    repo.begin_run("mixed.py", [], t2)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=end2,
+        exit_code=1,
+    )
+    runner = CliRunner()
+    success_result = runner.invoke(
+        app, ["list", "--success", str(workdir)]
+    )
+    failure_result = runner.invoke(
+        app, ["list", "--failure", str(workdir)]
+    )
+    assert success_result.exit_code == 0
+    assert failure_result.exit_code == 0
+    assert "mixed.py" in success_result.output
+    assert "mixed.py" in failure_result.output
 @
 
 

@@ -410,6 +410,209 @@ def test_filter_learnlog_runs_preserves_io_separator():
 @
 
 
+\section{Classifying run outcomes}
+\label{sec:classify-run-outcomes}
+
+The [[list]] command can filter commits by outcome, which serves
+two concrete workflows.  A teacher reviewing a student's log
+passes [[--failure]] to jump straight to the runs that went
+wrong.  A student who has just broken working code passes
+[[--success]] to locate the most recent commit with a working
+run, which they can then check out to recover.
+
+Both workflows reduce to the same underlying question: does a
+given run block represent a successful run or a failed one?
+The [[progsnap2]] module (\cref{progsnap2}) has
+[[parse_run_block]] that extracts every field of a block, but
+filtering only needs the verdict, not the details---and reaching
+into the exporter from the CLI would invert the module layering
+established in \cref{commits}.  So we define a narrower
+classifier here that the CLI can import without pulling in the
+exporter.
+
+A run is a success only when the exit code is zero \emph{and} no
+exception was recorded.  The recorder in \cref{learnlog} currently
+sets the exit code to [[1]] whenever an exception was captured, so
+in practice the two signals always agree---but we check both
+deliberately, so the classifier does not rely on that coupling.
+If the recorder ever distinguishes a clean exit that nonetheless
+logged a problem (warnings, partial failures, data imported from
+another tool), requiring both signals keeps the classifier correct
+without further changes.
+
+A block without an [[Exit-Code:]] line is classified as
+\emph{unknown} rather than \emph{failure}.  This happens when
+learnlog is killed (SIGKILL, power loss) before it can amend the
+commit with the trailer; the run may well have been proceeding
+fine when the interruption occurred, so reporting it as a failure
+would be misleading.  Leaving such blocks out of both filters is
+the safer default---the teacher or student can still see them
+with no filter applied.
+
+<<commits functions>>=
+def classify_run_block(block_text):
+    """Classify a single run block.
+
+    Returns one of ``"success"``, ``"failure"``, or
+    ``"unknown"``.  Success requires ``Exit-Code: 0`` and no
+    recorded exception.  A missing ``Exit-Code`` line yields
+    ``"unknown"`` (the run was interrupted before
+    ``finalize_run`` wrote the trailer).
+    """
+    exit_code = None
+    exception_lines = []
+    in_exception = False
+    for line in block_text.split("\n"):
+        if line.startswith("Exit-Code:"):
+            exit_code = line.split(":", 1)[1].strip()
+        elif line.strip() == "--- exception ---":
+            in_exception = True
+        elif in_exception:
+            exception_lines.append(line)
+
+    if exit_code is None:
+        return "unknown"
+
+    exception = "\n".join(exception_lines).strip()
+    has_exception = exception and exception != "None"
+
+    if exit_code == "0" and not has_exception:
+        return "success"
+    return "failure"
+@
+
+Let's verify the classifier against the three outcome categories,
+covering both failure paths.  A successful run has exit code zero
+and an explicit [[None]] in the exception section:
+
+<<commits test functions>>=
+def test_classify_run_block_success():
+    from learnlog.commits import classify_run_block
+    block = (
+        "Run: hello.py\n\nScript: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "End-Time: 2026-01-01T10:00:01\n"
+        "Exit-Code: 0\n"
+        "--- I/O ---\n"
+        "stdout: hi\n"
+        "--- exception ---\n"
+        "None"
+    )
+    assert classify_run_block(block) == "success"
+@
+
+A non-zero exit code means the program failed, regardless of
+whether an exception was logged:
+
+<<commits test functions>>=
+def test_classify_run_block_nonzero_exit():
+    from learnlog.commits import classify_run_block
+    block = (
+        "Run: hello.py\n\nScript: hello.py\n"
+        "Exit-Code: 1\n"
+        "--- exception ---\n"
+        "None"
+    )
+    assert classify_run_block(block) == "failure"
+@
+
+An exception logged alongside a zero exit still counts as a
+failure.  The current recorder never produces this combination,
+so this test pins down the defensive behaviour described above:
+
+<<commits test functions>>=
+def test_classify_run_block_exception_with_zero_exit():
+    from learnlog.commits import classify_run_block
+    block = (
+        "Run: hello.py\n\nScript: hello.py\n"
+        "Exit-Code: 0\n"
+        "--- exception ---\n"
+        "ValueError: bad input"
+    )
+    assert classify_run_block(block) == "failure"
+@
+
+A block with only a header---no trailer, no exit code---is
+unknown.  This corresponds to a run that was interrupted before
+[[finalize_run]] could amend the commit:
+
+<<commits test functions>>=
+def test_classify_run_block_no_exit_code():
+    from learnlog.commits import classify_run_block
+    block = (
+        "Run: hello.py\n\nScript: hello.py\n"
+        "Start-Time: 2026-01-01T10:00:00"
+    )
+    assert classify_run_block(block) == "unknown"
+@
+
+
+\section{Aggregating outcomes across a commit}
+\label{sec:commit-outcomes}
+
+A single commit can contain several run blocks when the student
+ran unchanged code multiple times.  The [[list]] filter only
+needs to know \emph{which} outcomes appear in a commit, not the
+order or count---it intersects the commit's outcome set with the
+set of outcomes the user asked to see and includes the commit if
+the intersection is non-empty.
+
+Returning a set rather than a list captures this use case
+directly: a commit where the student got code working on one
+attempt and broke it on a re-run appears under both
+[[--success]] (the working attempt is still there) and
+[[--failure]] (the breakage is there too).  This is essential
+for the recovery workflow---the last [[--success]] line must
+still point at such a commit, because that is what the student
+would check out.
+
+<<commits functions>>=
+def commit_outcomes(message):
+    """Return the set of outcomes found in a commit message.
+
+    Splits ``message`` on ``BLOCK_SEP`` and classifies each run
+    block.  The returned set contains any of ``"success"``,
+    ``"failure"``, and ``"unknown"``.  Non-run blocks (e.g. the
+    initial commit's subject line) are ignored.
+    """
+    outcomes = set()
+    for block in message.split(BLOCK_SEP):
+        if not block.strip().startswith("Run:"):
+            continue
+        outcomes.add(classify_run_block(block))
+    return outcomes
+@
+
+Let's verify that a commit with both a successful and a failed
+run reports both outcomes:
+
+<<commits test functions>>=
+def test_commit_outcomes_mixed():
+    from learnlog.commits import commit_outcomes
+    msg = (
+        "Run: hello.py\n\nScript: hello.py\n"
+        "Exit-Code: 0\n--- exception ---\nNone"
+        "\n\n---\n\n"
+        "Run: hello.py\n\nScript: hello.py\n"
+        "Exit-Code: 1\n--- exception ---\nNone"
+    )
+    assert commit_outcomes(msg) == {"success", "failure"}
+@
+
+A message with no run blocks (for instance, the initial
+[[learnlog: initial commit]] or a message where all runs were
+filtered out) yields an empty set so the [[list]] filter
+silently skips it:
+
+<<commits test functions>>=
+def test_commit_outcomes_no_runs():
+    from learnlog.commits import commit_outcomes
+    assert commit_outcomes("learnlog: initial commit") == set()
+    assert commit_outcomes("") == set()
+@
+
+
 \section{Filtering [[git show]] output}
 
 We could fetch the raw commit message separately
