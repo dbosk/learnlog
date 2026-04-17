@@ -1915,10 +1915,13 @@ child events in order and reattaching the original [[stdout:]]/
 [[stdin:]] prefixes.
 The [[stderr]] distinction is already lost at export time, so all
 output is reconstructed as [[stdout:]].
-We use [[splitlines()]] rather than [[split("\n")]] when rebuilding a
-resource: exported output chunks can legitimately end with a newline to
-represent a final blank output line, and [[split("\n")]] would invent a
-second empty line that becomes a stray bare [[stdout:]] entry.
+
+Here we must preserve learnlog's line-oriented encoding exactly.
+The exporter records a blank output line as an empty output entry,
+which becomes a trailing newline in the resource text.
+Reconstruction therefore has to use [[split("\n")]] rather than
+[[splitlines()]]: the trailing empty element is not a stray artifact,
+but the representation of the student's actual blank line.
 
 <<progsnap2 functions>>=
 def rebuild_io_log(events, parent_event_id, resources):
@@ -1942,7 +1945,7 @@ def rebuild_io_log(events, parent_event_id, resources):
             continue
         text = resources.get(resource, "")
         lines.extend(
-            f"{prefix}{line}" for line in text.splitlines()
+            f"{prefix}{line}" for line in text.split("\n")
         )
     return "\n".join(lines).rstrip("\n")
 @
@@ -2013,12 +2016,12 @@ def test_rebuild_io_log_from_child_events():
     )
 @
 
-An output resource ending with a newline represents one trailing blank
-output line, not two.  The reconstruction step must therefore avoid
-synthesising an extra bare [[stdout:]] line.
+An output resource ending with a newline represents a real blank output
+line in learnlog's native format.  Reconstruction must preserve that
+line instead of silently collapsing it away.
 
 <<progsnap2 test functions>>=
-def test_rebuild_io_log_preserves_single_trailing_blank_line():
+def test_rebuild_io_log_preserves_trailing_blank_output_line():
     from learnlog.progsnap2 import rebuild_io_log
 
     events = [
@@ -2036,7 +2039,7 @@ def test_rebuild_io_log_preserves_single_trailing_blank_line():
     }
 
     io_log = rebuild_io_log(events, "1", resources)
-    assert io_log == "stdout: prompt"
+    assert io_log == "stdout: prompt\nstdout: "
 @
 
 Finally we round-trip a real repository through ProgSnap2,
