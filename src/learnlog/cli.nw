@@ -166,9 +166,9 @@ def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
 
 \section{Resolving the source}
 
-The [[play]] and [[list]] commands accept an optional source
-that can be a directory (containing [[.learnlog/]]), a bundle
-file, or a ProgSnap2 zip.
+The [[play]], [[list]], and [[analyse]] commands accept an
+optional source that can be a directory (containing
+[[.learnlog/]]), a bundle file, or a ProgSnap2 zip.
 We need a single function that resolves any of these into a
 [[LearnlogRepo]] ready for querying.
 
@@ -392,7 +392,7 @@ def test_do_export_creates_bundle(workdir):
 
 \section{Typer application}
 
-We define the Typer app at module level with eight commands.
+We define the Typer app at module level with ten commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
