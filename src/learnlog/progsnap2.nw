@@ -25,9 +25,10 @@ This chapter covers both \emph{writing} ProgSnap2 datasets
 (the export pipeline) and \emph{reading} them back for
 analysis.
 The reading side parses a zip file into structured Python
-data, groups events into edit--run pairs, and generates
-\LaTeX{} output that presents the student's development
-process.
+data, can reconstruct a temporary Git repository for
+[[play]]/[[list]], groups events into edit--run pairs,
+and generates \LaTeX{} output that presents the student's
+development process.
 
 
 \section{Code overview}
@@ -37,8 +38,9 @@ process.
 
 Converts the commit history into a ProgSnap2 zip file
 containing event tables and source code snapshots.
-Also provides reading, grouping, and LaTeX generation
-for analysing student development sessions.
+Also provides reading, temporary Git reconstruction,
+grouping, and LaTeX generation for analysing student
+development sessions.
 """
 
 <<progsnap2 imports>>
@@ -78,6 +80,7 @@ import datetime
 import difflib
 import io
 import pathlib
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -89,7 +92,10 @@ from learnlog.commits import (
     filter_learnlog_runs,
     BLOCK_SEP,
 )
-from learnlog.gitrepo import LearnlogRepo
+from learnlog.gitrepo import (
+    LearnlogRepo,
+    format_run_header,
+)
 @
 
 
@@ -1569,6 +1575,464 @@ def test_read_progsnap2_from_buffer(workdir):
     dataset = read_progsnap2(buf)
     assert "events" in dataset
     assert "metadata" in dataset
+@
+
+
+\section{Reconstructing a temporary repository}
+
+The [[analyse]] command can work directly from the flat event
+stream, but [[play]] and [[list]] already rely on Git commit
+queries, diffs, and tag resolution.
+Rather than build a second playback stack for ProgSnap2, we
+reconstruct a temporary [[LearnlogRepo]] from the dataset and
+reuse the existing Git-based code.
+
+The reconstruction groups events by [[X-CommitHash]], restores
+each commit's full code snapshot from [[CodeStates/]], rebuilds
+the run blocks from the [[Run.Program]] and child I/O events,
+and recreates any tags recorded in [[X-Tag]].
+Using full snapshots matters because ProgSnap2 stores complete
+code states, not incremental patches: if a file disappears from
+the next state, we must delete it from the temporary working
+tree too.
+
+Two details need explicit care.
+First, [[LearnlogRepo(tmpdir / "repo")]] auto-creates an
+initial commit; the first reconstructed commit therefore amends
+that commit instead of adding an extra synthetic one.
+Second, ProgSnap2's I/O model merges [[stderr]] into output and
+does not currently carry an [[End-Time]] column, so the
+reconstructed commit message cannot recover those distinctions.
+We therefore rebuild the header faithfully, preserve exit code,
+exception, and I/O, but omit the trailer's original end time.
+
+The public entry point returns the reconstructed repository and
+the temporary directory that owns it.  The caller removes that
+directory after playback or listing finishes.
+
+<<progsnap2 functions>>=
+def read_progsnap2_as_repo(source):
+    """Reconstruct a temporary ``LearnlogRepo`` from ProgSnap2.
+
+    Returns ``(repo, tmpdir)`` where ``tmpdir`` is a temporary
+    directory path that the caller should remove when done.
+    """
+    dataset = read_progsnap2(source)
+    commit_groups = group_events_by_commit(dataset["events"])
+    if not commit_groups:
+        raise SystemExit("No commits found in ProgSnap2 dataset.")
+
+    tmpdir = tempfile.mkdtemp(prefix="learnlog-ps2-play-")
+    repo_path = pathlib.Path(tmpdir) / "repo"
+    repo_path.mkdir()
+    repo = LearnlogRepo(repo_path)
+    subject_id = commit_groups[0]["events"][0].get(
+        "SubjectID", "learnlog"
+    ) or "learnlog"
+
+    <<configure reconstructed repository identity>>
+
+    try:
+        <<replay grouped commits into temporary repository>>
+    except Exception:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+    return repo, tmpdir
+@
+
+We preserve the student's identity in the temporary history so
+that [[git log]] and any later export still attribute the runs
+to the same [[SubjectID]].
+
+<<configure reconstructed repository identity>>=
+repo.git("config", "user.name", subject_id)
+repo.git(
+    "config", "user.email",
+    f"{subject_id.lower().replace(' ', '.')}@learnlog.invalid",
+)
+@
+
+Each commit group restores the corresponding snapshot, rebuilds
+the commit message, and either amends the auto-created initial
+commit or creates a new one.  After the commit exists, we add
+any tags that were exported for that group.
+
+<<replay grouped commits into temporary repository>>=
+for index, group in enumerate(commit_groups):
+    restore_code_state(
+        repo.workdir,
+        dataset["code_states"].get(group["code_state_id"], {}),
+    )
+    repo.git("add", ".")
+
+    message = build_reconstructed_commit_message(
+        group, dataset["resources"]
+    )
+
+    <<write reconstructed commit>>
+    <<recreate tags for reconstructed commit>>
+@
+
+The first group replaces the placeholder initial commit that
+[[LearnlogRepo]] created during setup.  Later groups become
+ordinary commits.
+
+<<write reconstructed commit>>=
+if index == 0:
+    repo.git(
+        "commit", "--amend", "--allow-empty",
+        "--reset-author",
+        "-m", message,
+    )
+else:
+    repo.git(
+        "commit", "--allow-empty",
+        "-m", message,
+    )
+@
+
+Tag recreation must happen after the commit is written because
+Git tags point at concrete commit objects.  The exporter stores
+multiple tags as a semicolon-delimited [[X-Tag]] value, so we
+reuse [[_iter_event_tags]] to split them consistently.
+
+<<recreate tags for reconstructed commit>>=
+for tag in _iter_event_tags(group["tags"]):
+    if tag:
+        repo.git("tag", tag)
+@
+
+We group events by [[X-CommitHash]] in their event order.
+Each group keeps the commit hash only as a stable key while we
+replay; the reconstructed Git repository will naturally assign
+new commit hashes.
+
+<<progsnap2 functions>>=
+def group_events_by_commit(events):
+    """Group ProgSnap2 events by their original commit hash."""
+    by_commit = {}
+    for event in sorted(
+        events, key=lambda e: int(e["Order"])
+    ):
+        commit_hash = event.get("X-CommitHash", "")
+        if not commit_hash:
+            continue
+        if commit_hash not in by_commit:
+            by_commit[commit_hash] = {
+                "hash": commit_hash,
+                "events": [],
+                "code_state_id": event.get(
+                    "CodeStateID", ""
+                ),
+                "tags": event.get("X-Tag", "") or "",
+            }
+        group = by_commit[commit_hash]
+        group["events"].append(event)
+        if event.get("CodeStateID"):
+            group["code_state_id"] = event[
+                "CodeStateID"
+            ]
+        if event.get("X-Tag"):
+            group["tags"] = event["X-Tag"]
+    return sorted(
+        by_commit.values(),
+        key=lambda group: int(group["events"][0]["Order"]),
+    )
+@
+
+\begin{description}
+\item[Snapshots] We treat the recorded code state as the whole
+  tree.  Files present in the working tree but absent from the
+  new snapshot are removed.
+\item[Directories] We create parent directories on demand so
+  nested files under [[CodeStates/]] restore cleanly.
+\end{description}
+
+<<progsnap2 functions>>=
+def restore_code_state(workdir, code_state):
+    """Replace ``workdir`` contents with a full code snapshot."""
+    expected = {pathlib.Path(name) for name in code_state}
+
+    for path in sorted(workdir.rglob("*"), reverse=True):
+        rel = path.relative_to(workdir)
+        if rel.parts and rel.parts[0] == ".learnlog":
+            continue
+        if path.is_dir():
+            if any(rel in item.parents for item in expected):
+                continue
+            path.rmdir()
+        elif rel not in expected:
+            path.unlink()
+
+    for name, content in code_state.items():
+        target = workdir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+@
+
+Rebuilding the commit message mirrors the original structure as
+closely as the dataset allows.
+We order events by [[Order]], start each run block from the
+stored script, arguments, and start time, then reconstruct the
+I/O and exception sections from the child events and resource
+files.
+
+Because the dataset does not yet carry an explicit end time, the
+reconstructed message has no [[End-Time:]] line.  That means the
+run still shows the important behaviour for playback and
+analysis, but the textual trailer is intentionally incomplete.
+
+<<progsnap2 functions>>=
+def build_reconstructed_commit_message(group, resources):
+    """Build a learnlog-style commit message from one group."""
+    blocks = []
+    events = sorted(
+        group["events"],
+        key=lambda event: int(event["Order"]),
+    )
+
+    for event in events:
+        if event["EventType"] != "Run.Program":
+            continue
+        io_log = rebuild_io_log(
+            group["events"], event["EventID"], resources
+        )
+        blocks.append(
+            build_reconstructed_run_block(event, io_log)
+        )
+
+    if not blocks:
+        return "learnlog: reconstructed commit"
+
+    return BLOCK_SEP.join(blocks)
+@
+
+We reuse [[format_run_header]] so the first half of each block is
+identical to a native learnlog commit.  The trailer is rebuilt
+manually because ProgSnap2 does not currently preserve the
+original end time.
+
+<<progsnap2 functions>>=
+def build_reconstructed_run_block(event, io_log):
+    """Rebuild one run block from a ProgSnap2 run event."""
+    script = event.get("X-Script", "") or "(unknown)"
+    args_value = event.get("X-Arguments", "")
+    args = [] if args_value in ("", "(none)") else args_value.split()
+    start_time = datetime.datetime.fromisoformat(
+        event["ServerTimestamp"]
+    )
+    header = format_run_header(script, args, start_time)
+    exception_info = rebuild_exception_info(event)
+    exit_code = event.get("X-ExitCode", "")
+
+    if not exit_code and not io_log and not exception_info:
+        return header
+
+    parts = [header]
+    if exit_code:
+        parts.append(f"Exit-Code: {exit_code}")
+    if io_log or exception_info:
+        parts.extend([
+            "",
+            "--- I/O ---",
+            io_log.rstrip("\n") if io_log else "(no I/O)",
+            "",
+            "--- exception ---",
+            exception_info or "None",
+        ])
+    return "\n".join(parts)
+@
+
+The exception text stored in ProgSnap2 is split into type and
+message columns.
+For playback we only need a readable final line, so we join them
+back into the conventional [[Type: message]] form when both are
+present.
+
+<<progsnap2 functions>>=
+def rebuild_exception_info(event):
+    """Reconstruct readable exception text from event columns."""
+    exc_type = event.get("X-ExceptionType", "")
+    exc_msg = event.get("X-ExceptionMessage", "")
+    if exc_type and exc_msg:
+        return f"{exc_type}: {exc_msg}"
+    return exc_type or exc_msg or None
+@
+
+ProgSnap2 stores child I/O events separately from the parent run.
+We rebuild learnlog's textual I/O log by walking the matching
+child events in order and reattaching the original [[stdout:]]/
+[[stdin:]] prefixes.
+The [[stderr]] distinction is already lost at export time, so all
+output is reconstructed as [[stdout:]].
+
+<<progsnap2 functions>>=
+def rebuild_io_log(events, parent_event_id, resources):
+    """Rebuild learnlog's line-oriented I/O log for one run."""
+    lines = []
+    children = sorted(
+        [
+            event for event in events
+            if event.get("ParentEventID") == parent_event_id
+        ],
+        key=lambda event: int(event["Order"]),
+    )
+    for event in children:
+        if event["EventType"] == "X-Run.Output":
+            resource = event.get("ProgramOutput", "")
+            prefix = "stdout: "
+        elif event["EventType"] == "X-Run.Input":
+            resource = event.get("ProgramInput", "")
+            prefix = "stdin: "
+        else:
+            continue
+        text = resources.get(resource, "")
+        lines.extend(
+            f"{prefix}{line}" for line in text.split("\n")
+        )
+    return "\n".join(lines).rstrip("\n")
+@
+
+Let's verify the helpers before testing the full CLI path.
+The first test checks snapshot restoration, including file
+deletion and nested directories:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_replaces_full_snapshot(tmp_path):
+    from learnlog.progsnap2 import restore_code_state
+
+    (tmp_path / "obsolete.py").write_text("old\n")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "old.py").write_text("old\n")
+    (tmp_path / ".learnlog").mkdir()
+
+    restore_code_state(tmp_path, {
+        "pkg/new.py": "print('new')\n",
+        "main.py": "print('main')\n",
+    })
+
+    assert not (tmp_path / "obsolete.py").exists()
+    assert not (tmp_path / "pkg" / "old.py").exists()
+    assert (tmp_path / "pkg" / "new.py").read_text() == \
+        "print('new')\n"
+    assert (tmp_path / "main.py").read_text() == \
+        "print('main')\n"
+    assert (tmp_path / ".learnlog").exists()
+@
+
+The next test checks that child I/O events rebuild a readable
+learnlog-style log, with output, input, and the expected loss of
+the original [[stderr]] distinction.
+
+<<progsnap2 test functions>>=
+def test_rebuild_io_log_from_child_events():
+    from learnlog.progsnap2 import rebuild_io_log
+
+    events = [
+        {
+            "EventType": "X-Run.Output",
+            "EventID": "2",
+            "Order": "2",
+            "ParentEventID": "1",
+            "ProgramOutput": "Resources/io_2.txt",
+            "ProgramInput": "",
+        },
+        {
+            "EventType": "X-Run.Input",
+            "EventID": "3",
+            "Order": "3",
+            "ParentEventID": "1",
+            "ProgramOutput": "",
+            "ProgramInput": "Resources/io_3.txt",
+        },
+    ]
+    resources = {
+        "Resources/io_2.txt": "prompt\nwarn",
+        "Resources/io_3.txt": "Alice",
+    }
+
+    io_log = rebuild_io_log(events, "1", resources)
+    assert io_log == (
+        "stdout: prompt\n"
+        "stdout: warn\n"
+        "stdin: Alice"
+    )
+@
+
+Finally we round-trip a real repository through ProgSnap2,
+reconstruct it, and verify that playback-oriented Git features
+still work: commit count, tags, commit messages, and deleted
+files.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_roundtrip(workdir):
+    import shutil
+    from learnlog.commits import get_commits
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", ["--name", "Alice"], t1)
+    repo.finalize_run(
+        io_log=(
+            "stdout: Enter name:\n"
+            "stdin: Alice\n"
+            "stderr: warning\n"
+            "stdout: Hello Alice\n"
+        ),
+        exception_info="ValueError: bad input",
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=1,
+    )
+    repo.git("tag", "lab1")
+
+    (workdir / "hello.py").unlink()
+    (workdir / "main.py").write_text("print('main')\n")
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("main.py", [], t2)
+    repo.finalize_run(
+        io_log="stdout: ok\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+
+    original_commits = get_commits(repo)
+    output = workdir / "roundtrip.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        rebuilt_commits = get_commits(reconstructed)
+        assert len(rebuilt_commits) == len(original_commits)
+
+        tag_target = reconstructed.git(
+            "rev-parse", "lab1"
+        )
+        assert tag_target.returncode == 0
+
+        first_message = reconstructed.git(
+            "log", "-1", "--format=%B",
+            rebuilt_commits[0]["hash"],
+        )
+        assert first_message.returncode == 0
+        assert "Run: hello.py --name Alice" in \
+            first_message.stdout
+        assert "Exit-Code: 1" in first_message.stdout
+        assert "stdout: warning" in first_message.stdout
+        assert "ValueError: bad input" in first_message.stdout
+        assert "End-Time:" not in first_message.stdout
+
+        status = reconstructed.git("show", "HEAD:main.py")
+        assert status.returncode == 0
+        missing = reconstructed.git("show", "HEAD:hello.py")
+        assert missing.returncode != 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
 

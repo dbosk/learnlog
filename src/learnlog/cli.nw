@@ -96,6 +96,7 @@ from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
     do_export_progsnap2,
     read_progsnap2,
+    read_progsnap2_as_repo,
     group_edit_run_pairs,
     generate_analysis_latex,
 )
@@ -165,30 +166,35 @@ def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
 
 \section{Resolving the source}
 
-The [[play]] command accepts an optional source that can be a
-directory (containing [[.learnlog/]]) or a bundle file.
+The [[play]] and [[list]] commands accept an optional source
+that can be a directory (containing [[.learnlog/]]), a bundle
+file, or a ProgSnap2 zip.
 We need a single function that resolves any of these into a
 [[LearnlogRepo]] ready for querying.
 
 For bundle files, we clone them into a temporary directory.
+For ProgSnap2 files, we reconstruct a temporary Git repository
+from the exported code states and run events.
 The caller is responsible for cleanup---we return both the repo
 and the temporary directory (or [[None]] if no temp dir was created).
 
-We detect bundles by asking [[git bundle list-heads]] to parse
-the file, rather than relying on file extensions.
-This is more robust: a user might name their bundle
-[[student-log.bin]] instead of [[student.bundle]], and unlike
-[[git bundle verify]] this check still works when the current
-working directory is not itself a Git repository.
+We detect ProgSnap2 sources with [[zipfile.is_zipfile]], then fall
+back to asking [[git bundle list-heads]] to parse the file rather
+than relying on file extensions.
+This stays robust even when the user renames a bundle to something
+like [[student-log.bin]], and it avoids [[git bundle verify]]'s
+requirement that the current working directory is itself a Git
+repository.
 
 <<helper functions>>=
 def resolve_source(source=None):
     """Resolve a source into a ``(LearnlogRepo, tmpdir)`` pair.
 
     ``source`` can be ``None`` (search current directory),
-    a directory path, or a bundle file.  When a bundle is used,
-    ``tmpdir`` is the temporary directory that should be cleaned
-    up by the caller; otherwise it is ``None``.
+    a directory path, a ProgSnap2 zip file, or a bundle file.
+    When a temporary repository is used, ``tmpdir`` is the
+    temporary directory that should be cleaned up by the caller;
+    otherwise it is ``None``.
     """
     if source is None:
         workdir = find_learnlog_dir()
@@ -207,6 +213,9 @@ def resolve_source(source=None):
                 f"No .learnlog/ directory in {path}"
             )
         return LearnlogRepo(path), None
+
+    if zipfile.is_zipfile(path):
+        return read_progsnap2_as_repo(path)
 
     <<resolve bundle file>>
 @
@@ -304,6 +313,31 @@ def test_resolve_source_bundle_from_non_repo_cwd(
         assert result.returncode == 0
     finally:
         shutil.rmtree(tmpdir)
+
+def test_resolve_source_progsnap2(workdir):
+    import shutil
+    from learnlog.cli import resolve_source
+    from learnlog.progsnap2 import do_export_progsnap2
+
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    output = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    resolved, tmpdir = resolve_source(str(output))
+    try:
+        assert tmpdir is not None
+        result = resolved.git("log", "--oneline")
+        assert result.returncode == 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
 
@@ -382,6 +416,12 @@ the start time and command instead of the commit message subject.
 This is useful for quickly finding a session to inspect with
 [[play]], or for checking what a student has been working on.
 
+For symmetry with [[play]] and [[analyse]], the source can be passed
+with [[--from]] / [[-f]].
+We keep the older positional source argument for compatibility, but
+reject using both forms at once so the command still has a single,
+unambiguous source.
+
 When a commit contains multiple runs (because the student ran the
 same code several times without editing), we show the first run's
 details and append [[(N runs)]] so the teacher knows there is more
@@ -402,12 +442,24 @@ code and broke it.
 <<typer commands>>=
 @app.command(name="list")
 def list_commits(
-    source: Annotated[
+    source_arg: Annotated[
         Optional[str],
         typer.Argument(
             help=(
                 "Source: directory with .learnlog/ "
-                "or a .bundle file. "
+                "a ProgSnap2 zip, or a .bundle file. "
+                "Retained for compatibility; "
+                "you can also use --from."
+            ),
+        ),
+    ] = None,
+    source: Annotated[
+        Optional[str],
+        typer.Option(
+            "--from", "-f",
+            help=(
+                "Source: directory with .learnlog/ "
+                "a ProgSnap2 zip, or a .bundle file. "
                 "Defaults to current directory."
             ),
         ),
@@ -446,6 +498,7 @@ def list_commits(
     """List commits with start time and command."""
     import shutil
 
+    <<resolve source passed to [[list]]>>
     repo, tmpdir = resolve_source(source)
     try:
         commits = get_commits(repo)
@@ -459,6 +512,21 @@ def list_commits(
     finally:
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+We accept either the new option form or the historical positional
+form, but not both at once.
+Normalising to a single [[source]] variable keeps the rest of the
+command unchanged.
+
+<<resolve source passed to [[list]]>>=
+if source is not None and source_arg is not None:
+    raise SystemExit(
+        "Pass the source either positionally or with --from, "
+        "not both."
+    )
+if source is None:
+    source = source_arg
 @
 
 The two outcome flags share a single representation: a set of
@@ -532,6 +600,33 @@ def test_list_command_via_cli(workdir):
     assert result.exit_code == 0
     assert "hello.py arg1" in result.output
     assert "2026-03-20 14:30" in result.output
+
+def test_list_command_via_from_option(workdir):
+    """The list command also accepts -f/--from."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 3, 20, 14, 30)
+    repo.begin_run("hello.py", ["arg1"], t1)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "-f", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "hello.py arg1" in result.output
+
+def test_list_command_rejects_both_source_forms(workdir):
+    """The list command rejects ambiguous source input."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["list", str(workdir), "--from", str(workdir)],
+    )
+    assert result.exit_code == 1
+    assert "either positionally or with --from" in result.output
 
 def test_list_command_multiple_runs(workdir):
     """Multiple runs in one commit show run count."""
@@ -1560,9 +1655,10 @@ commit tagged [[lab1]].
 Therefore the optional positional argument is a Git ref
 (tag name, branch, or commit hash), not the source
 directory.
-The source---a directory containing [[.learnlog/]] or a
-bundle file---is specified with [[--from]] / [[-f]] when
-needed; it defaults to the current directory.
+The source---a directory containing [[.learnlog/]], a
+bundle file, or a ProgSnap2 zip---is specified with
+[[--from]] / [[-f]] when needed; it defaults to the
+current directory.
 
 The [[-b]] / [[--batch]] flag selects batch mode
 (\cref{sec:play-batch}), which prints all commits to standard
@@ -1597,7 +1693,7 @@ def play(
             "--from", "-f",
             help=(
                 "Source: directory with .learnlog/ "
-                "or a .bundle file. "
+                "a ProgSnap2 zip, or a .bundle file. "
                 "Defaults to current directory."
             ),
         ),
@@ -1802,6 +1898,45 @@ def test_play_invalid_ref(workdir, monkeypatch):
         app, ["play", "nonexistent"]
     )
     assert result.exit_code == 1
+
+def test_play_from_progsnap2_start_tag(workdir):
+    """ProgSnap2 playback still resolves Git tags."""
+    from learnlog.cli import app
+    from learnlog.progsnap2 import do_export_progsnap2
+    from typer.testing import CliRunner
+
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: first\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+
+    (workdir / "hello.py").write_text('print("second")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    repo.finalize_run(
+        io_log="stdout: second\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+    repo.git("tag", "lab2")
+
+    output = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["play", "lab2", "--from", str(output)],
+    )
+    assert result.exit_code == 0
+    assert "stdout: second" in result.output
+    assert "stdout: first" not in result.output
 @
 
 
