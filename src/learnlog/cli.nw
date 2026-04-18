@@ -82,6 +82,7 @@ import enum
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -502,8 +503,6 @@ def resolve_target_python(explicit=None):
     tried first, then ``python``.  Raises ``SystemExit``
     with a clear message if nothing resolves.
     """
-    import shutil
-
     candidates = [explicit] if explicit else ["python3", "python"]
     for name in candidates:
         found = shutil.which(name)
@@ -671,44 +670,146 @@ def test_pip_in_venv_errors_when_absent(tmp_path):
 @
 
 
+\subsection{Activation hint for a fresh venv}
+\label{sec:setup-activation-hint}
+
+When [[init_python]] creates a venv, the student still has to
+activate it before running [[python]] or [[pytest]] in the
+same shell---[[init]] cannot do that for them, because a
+child process cannot mutate its parent shell's environment.
+A one-line hint printed after creation is therefore the best
+we can do.
+
+The hint differs by platform because the activation scripts
+do: POSIX shells expect [[source .venv/bin/activate]],
+whereas Windows venvs place the scripts in [[Scripts\]] and
+have no [[source]] builtin (the student types the path to the
+activator directly, and both [[cmd.exe]] and PowerShell pick
+up the right extension via [[PATHEXT]]).  This is the same
+POSIX/Windows layout split that [[pip_in_venv]] already
+branches on in \cref{sec:setup-pip-in-venv}, so factoring it
+into its own helper keeps the two concerns in sync---if
+Windows ever drops [[Scripts\]], both helpers fail together
+and the fix is localised.
+
+We branch on [[sys.platform]] rather than [[os.name]]
+because [[pathlib]] inspects [[os.name]] at [[Path]]
+construction time to pick POSIX vs. Windows semantics.
+A test that monkeypatched [[os.name]] to [[nt]] would
+silently switch every [[Path]] created afterwards---including
+paths pytest builds internally for its own error
+reporting---to Windows flavour, and the first backslash in a
+rendered path triggers a [[ValueError]] deep inside pytest's
+terminal writer.  [[sys.platform]] has no such side effect.
+
+<<helper functions>>=
+def venv_activation_hint(venv_dir):
+    """Return a shell-appropriate activation hint for ``venv_dir``.
+
+    Used by :func:`init_python` to nudge the student after a
+    fresh venv is created.  POSIX shells need ``source
+    .../bin/activate``; Windows shells run
+    ``...\\Scripts\\activate`` directly.
+    """
+    if sys.platform.startswith("win"):
+        return f"Next step: {venv_dir}\\Scripts\\activate"
+    return f"Next step: source {venv_dir}/bin/activate"
+@
+
+We verify both branches by monkeypatching [[sys.platform]] so
+the test is independent of the host platform and passes on
+every CI runner.
+
+<<test functions>>=
+def test_venv_activation_hint_posix(monkeypatch, tmp_path):
+    """POSIX hint uses ``source .../bin/activate``."""
+    from learnlog.cli import venv_activation_hint
+    monkeypatch.setattr("sys.platform", "linux")
+    venv = tmp_path / ".venv"
+    assert venv_activation_hint(venv) == (
+        f"Next step: source {venv}/bin/activate"
+    )
+
+def test_venv_activation_hint_windows(monkeypatch, tmp_path):
+    """Windows hint uses ``...\\Scripts\\activate``."""
+    from learnlog.cli import venv_activation_hint
+    monkeypatch.setattr("sys.platform", "win32")
+    venv = tmp_path / ".venv"
+    assert venv_activation_hint(venv) == (
+        f"Next step: {venv}\\Scripts\\activate"
+    )
+@
+
+
 \subsection{The Python setup pipeline}
 \label{sec:setup-pipeline}
 
-[[init_python]] chains the helpers together.  The branch
-structure encodes the three legitimate end states for a
-project: a venv that we just created and populated, a
-pre-existing venv that we just populated (the idempotent
-case), and a non-venv install for systems that do not
-need PEP 668 protection.
+[[init_python]] chains the helpers together.  There are
+four legitimate end states: install into an
+already-activated venv (the VS Code scenario, discussed
+next), install into a pre-existing [[workdir/.venv/]]
+(idempotent re-run of [[init]]), create a new
+[[workdir/.venv/]] and install there (fresh PEP 668
+system), or install with [[--user]] (unmanaged system, no
+venv).
 
-Idempotency is important because students will occasionally
-re-run [[init]]---after moving machines, after nuking a
-venv, or out of superstition.  We detect the existing
-[[.venv/]] by filesystem presence rather than by any
-sentinel we write, so manually-created venvs are also
-respected.  [[pip install]] itself is a no-op when the
-package is already up to date, so re-running the full
-pipeline is cheap.
+\paragraph{Honouring an active venv.}
+A very common way students meet [[init]] is through VS
+Code: opening the workspace auto-activates a venv inside
+the integrated terminal, the student runs
+[[pipx install learnlog]], and then [[learnlog init
+python]].  The student's expectation is \enquote{install
+into the environment I have active}---not
+\enquote{silently create a second venv alongside it}.
+All venv activation scripts (POSIX, fish, PowerShell,
+Poetry, Hatch, and VS Code's Python extension) set the
+[[VIRTUAL_ENV]] environment variable to the venv root.
+When it is set and [[--python]] was not given, we treat
+that venv as the install target.  [[--python]] still wins
+when explicitly passed, because someone who typed it knows
+what they want.
+
+\paragraph{Idempotency.}
+Students will occasionally re-run [[init]]---after moving
+machines, after nuking a venv, or out of superstition.
+Filesystem presence of [[workdir/.venv/]] is the
+idempotency signal (rather than a sentinel we write), so
+manually-created venvs are also respected.  [[pip
+install]] itself is a no-op when the package is already
+up to date, so re-running the full pipeline is cheap.
 
 <<helper functions>>=
 def init_python(workdir, python=None):
     """Set up a Python environment for learnlog in ``workdir``.
 
-    Creates ``workdir/.venv/`` if the target interpreter is
-    PEP 668-marked and no venv exists; otherwise installs
-    globally with ``--user``.  Then installs the ``learnlog``
-    package into the chosen location.
+    Priority order for the install target:
+
+    1. An active venv from ``$VIRTUAL_ENV`` (unless
+       ``python`` was given explicitly).
+    2. A pre-existing ``workdir/.venv/``.
+    3. A new ``workdir/.venv/`` created off the target
+       Python---but only on PEP 668-marked systems.
+    4. A ``pip install --user`` against the target Python.
     """
-    target = resolve_target_python(python)
-    venv_dir = workdir / ".venv"
+    active_venv = os.environ.get("VIRTUAL_ENV")
+    venv_dir = None
+    created_venv = False
 
-    if is_externally_managed(target) and not venv_dir.exists():
-        subprocess.run(
-            [str(target), "-m", "venv", str(venv_dir)],
-            check=True,
-        )
+    if python is None and active_venv:
+        venv_dir = pathlib.Path(active_venv)
+    elif (workdir / ".venv").exists():
+        venv_dir = workdir / ".venv"
+    else:
+        target = resolve_target_python(python)
+        if is_externally_managed(target):
+            venv_dir = workdir / ".venv"
+            subprocess.run(
+                [str(target), "-m", "venv", str(venv_dir)],
+                check=True,
+            )
+            created_venv = True
 
-    if venv_dir.exists():
+    if venv_dir is not None:
         installer = [
             str(pip_in_venv(venv_dir)),
             "install", "learnlog",
@@ -720,17 +821,23 @@ def init_python(workdir, python=None):
         ]
 
     subprocess.run(installer, check=True)
+
+    if created_venv:
+        typer.echo(venv_activation_hint(venv_dir))
 @
 
 The branch choices are worth verifying, and so is the
 invariant that no subprocess call ever uses
 [[sys.executable]]---that would mean the pipx trap from
 \cref{sec:setup-target-python} had reopened.  The tests
-stub out both [[resolve_target_python]] and
+stub out [[resolve_target_python]] and
 [[is_externally_managed]] so the pipeline is driven by
-explicit test inputs rather than host state, and stub
+explicit test inputs rather than host state, stub
 [[subprocess.run]] so no venv is actually created and no
-network traffic happens.
+network traffic happens, and always [[delenv
+VIRTUAL\_ENV]] before each scenario so that the test
+runner's own venv (pytest typically runs inside one) does
+not accidentally select the \enquote{active venv} branch.
 
 <<test functions>>=
 def test_init_python_creates_venv_when_managed(
@@ -738,6 +845,7 @@ def test_init_python_creates_venv_when_managed(
 ):
     """On PEP 668-marked Pythons, a venv is created and used."""
     from learnlog.cli import init_python
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     calls = []
 
     def fake_run(cmd, *args, **kwargs):
@@ -777,6 +885,7 @@ def test_init_python_uses_user_install_when_unmanaged(
 ):
     """Unmanaged Pythons get --user installs, no venv."""
     from learnlog.cli import init_python
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     calls = []
 
     def fake_run(cmd, *args, **kwargs):
@@ -811,6 +920,7 @@ def test_init_python_idempotent_with_existing_venv(
 ):
     """An existing .venv/ is reused instead of recreated."""
     from learnlog.cli import init_python
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     venv = tmp_path / ".venv"
     (venv / "bin").mkdir(parents=True)
     (venv / "bin" / "pip").write_text("")
@@ -840,6 +950,78 @@ def test_init_python_idempotent_with_existing_venv(
         c[1:3] == ["-m", "venv"] for c in calls
     )
     assert calls[0][1:] == ["install", "learnlog"]
+
+def test_init_python_honours_active_venv(
+    tmp_path, monkeypatch,
+):
+    """VIRTUAL_ENV selects the install target, no new venv."""
+    from learnlog.cli import init_python
+    active = tmp_path / "active-venv"
+    (active / "bin").mkdir(parents=True)
+    (active / "bin" / "pip").write_text("")
+    monkeypatch.setenv("VIRTUAL_ENV", str(active))
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    init_python(tmp_path)
+
+    assert calls == [[
+        str(active / "bin" / "pip"),
+        "install", "learnlog",
+    ]]
+    assert not (tmp_path / ".venv").exists()
+
+def test_init_python_explicit_python_overrides_active_venv(
+    tmp_path, monkeypatch,
+):
+    """An explicit --python is respected even if a venv is active."""
+    from learnlog.cli import init_python
+    active = tmp_path / "active-venv"
+    (active / "bin").mkdir(parents=True)
+    (active / "bin" / "pip").write_text("")
+    monkeypatch.setenv("VIRTUAL_ENV", str(active))
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1:3] == ["-m", "venv"]:
+            venv_path = pathlib.Path(cmd[3])
+            (venv_path / "bin").mkdir(parents=True)
+            (venv_path / "bin" / "pip").write_text("")
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(
+        "learnlog.cli.resolve_target_python",
+        lambda p: pathlib.Path("/opt/python3.12"),
+    )
+    monkeypatch.setattr(
+        "learnlog.cli.is_externally_managed",
+        lambda p: True,
+    )
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    init_python(tmp_path, python="/opt/python3.12")
+
+    assert calls[0] == [
+        "/opt/python3.12", "-m", "venv",
+        str(tmp_path / ".venv"),
+    ]
+    assert str(active / "bin" / "pip") not in {
+        c[0] for c in calls
+    }
 @
 
 
