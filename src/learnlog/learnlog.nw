@@ -232,6 +232,8 @@ Upload `mylog.bundle` through the course platform as instructed.
   `learnlog init` again; your own code is untouched.
 @
 
+\section{Code overview}
+
 The design is guided by two constraints:
 \begin{description}
 \item[Transparency] The student's program must behave identically
@@ -243,8 +245,6 @@ The design is guided by two constraints:
   program executes and amending it with results afterwards.
 \end{description}
 
-
-\section{Code overview}
 
 <<[[__init__.py]]>>=
 """Automatic logging of student code development.
