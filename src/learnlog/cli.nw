@@ -82,6 +82,7 @@ import enum
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -502,8 +503,6 @@ def resolve_target_python(explicit=None):
     tried first, then ``python``.  Raises ``SystemExit``
     with a clear message if nothing resolves.
     """
-    import shutil
-
     candidates = [explicit] if explicit else ["python3", "python"]
     for name in candidates:
         found = shutil.which(name)
@@ -671,6 +670,77 @@ def test_pip_in_venv_errors_when_absent(tmp_path):
 @
 
 
+\subsection{Activation hint for a fresh venv}
+\label{sec:setup-activation-hint}
+
+When [[init_python]] creates a venv, the student still has to
+activate it before running [[python]] or [[pytest]] in the
+same shell---[[init]] cannot do that for them, because a
+child process cannot mutate its parent shell's environment.
+A one-line hint printed after creation is therefore the best
+we can do.
+
+The hint differs by platform because the activation scripts
+do: POSIX shells expect [[source .venv/bin/activate]],
+whereas Windows venvs place the scripts in [[Scripts\]] and
+have no [[source]] builtin (the student types the path to the
+activator directly, and both [[cmd.exe]] and PowerShell pick
+up the right extension via [[PATHEXT]]).  This is the same
+POSIX/Windows layout split that [[pip_in_venv]] already
+branches on in \cref{sec:setup-pip-in-venv}, so factoring it
+into its own helper keeps the two concerns in sync---if
+Windows ever drops [[Scripts\]], both helpers fail together
+and the fix is localised.
+
+We branch on [[sys.platform]] rather than [[os.name]]
+because [[pathlib]] inspects [[os.name]] at [[Path]]
+construction time to pick POSIX vs. Windows semantics.
+A test that monkeypatched [[os.name]] to [[nt]] would
+silently switch every [[Path]] created afterwards---including
+paths pytest builds internally for its own error
+reporting---to Windows flavour, and the first backslash in a
+rendered path triggers a [[ValueError]] deep inside pytest's
+terminal writer.  [[sys.platform]] has no such side effect.
+
+<<helper functions>>=
+def venv_activation_hint(venv_dir):
+    """Return a shell-appropriate activation hint for ``venv_dir``.
+
+    Used by :func:`init_python` to nudge the student after a
+    fresh venv is created.  POSIX shells need ``source
+    .../bin/activate``; Windows shells run
+    ``...\\Scripts\\activate`` directly.
+    """
+    if sys.platform.startswith("win"):
+        return f"Next step: {venv_dir}\\Scripts\\activate"
+    return f"Next step: source {venv_dir}/bin/activate"
+@
+
+We verify both branches by monkeypatching [[sys.platform]] so
+the test is independent of the host platform and passes on
+every CI runner.
+
+<<test functions>>=
+def test_venv_activation_hint_posix(monkeypatch, tmp_path):
+    """POSIX hint uses ``source .../bin/activate``."""
+    from learnlog.cli import venv_activation_hint
+    monkeypatch.setattr("sys.platform", "linux")
+    venv = tmp_path / ".venv"
+    assert venv_activation_hint(venv) == (
+        f"Next step: source {venv}/bin/activate"
+    )
+
+def test_venv_activation_hint_windows(monkeypatch, tmp_path):
+    """Windows hint uses ``...\\Scripts\\activate``."""
+    from learnlog.cli import venv_activation_hint
+    monkeypatch.setattr("sys.platform", "win32")
+    venv = tmp_path / ".venv"
+    assert venv_activation_hint(venv) == (
+        f"Next step: {venv}\\Scripts\\activate"
+    )
+@
+
+
 \subsection{The Python setup pipeline}
 \label{sec:setup-pipeline}
 
@@ -753,9 +823,7 @@ def init_python(workdir, python=None):
     subprocess.run(installer, check=True)
 
     if created_venv:
-        typer.echo(
-            f"Next step: source {venv_dir}/bin/activate"
-        )
+        typer.echo(venv_activation_hint(venv_dir))
 @
 
 The branch choices are worth verifying, and so is the
