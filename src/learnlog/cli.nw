@@ -713,20 +713,13 @@ def init_python(workdir, python=None):
             str(pip_in_venv(venv_dir)),
             "install", "learnlog",
         ]
-        next_step = (
-            f"Next step: source {venv_dir}/bin/activate"
-        )
     else:
         installer = [
             str(target),
             "-m", "pip", "install", "--user", "learnlog",
         ]
-        next_step = None
 
     subprocess.run(installer, check=True)
-
-    if next_step:
-        typer.echo(next_step)
 @
 
 The branch choices are worth verifying, and so is the
