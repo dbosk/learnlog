@@ -566,7 +566,7 @@ PEP 668 specifies that a packager who does not want
 [[pip install]] to touch a Python installation marks it by
 dropping an empty [[EXTERNALLY-MANAGED]] file into the
 interpreter's standard-library directory.  The path is
-reported by [[sysconfig.get_path(\textquotesingle{}stdlib\textquotesingle{})]]
+reported by [[sysconfig.get_path('stdlib')]]
 \emph{for that interpreter}, which is the complication:
 [[sysconfig]] in our own process reports \emph{our} paths,
 not the target's.
@@ -860,7 +860,7 @@ The [[app]] object is the entry point referenced by
 <<typer app>>=
 app = typer.Typer(
     name="learnlog",
-    help="Review student development logs.",
+    help="Set up and review student development logs.",
     no_args_is_help=True,
 )
 
