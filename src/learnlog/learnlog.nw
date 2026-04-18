@@ -78,6 +78,160 @@ This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
 refine their debugging techniques.
 
+\paragraph{A student-facing onboarding page.}
+Both use cases above assume students have already installed the
+package, configured a virtual environment, and added
+\mintinline{python}{import learnlog} to their programs.
+For first-year students this is not routine, so teachers need
+onboarding material.
+Rather than leave each teacher to write their own, we ship a
+ready-to-publish Canvas page, [[students.md]], tangled from this
+chapter.
+Tangling ties the instructions to the documented behaviour: when a
+command or default changes here, the student page changes with it,
+eliminating the drift that plagues separately maintained onboarding
+documents.
+
+The page carries YAML frontmatter understood by the [[canvaslms]]
+command-line tool, so the teacher publishes it with a single
+command:
+\begin{minted}{bash}
+canvaslms pages edit --create -c COURSE \
+  -f src/learnlog/students.md
+\end{minted}
+We deliberately omit course-specific metadata---Canvas module
+assignment and stable-identification regex---because one tangled
+file must work unchanged across every course using learnlog.
+Teachers add those fields via the Canvas UI after publishing, or
+through a per-course deployment wrapper.
+
+<<[[students.md]]>>=
+---
+title: Using learnlog in VS Code
+url: using-learnlog-in-vs-code
+published: true
+front_page: false
+editing_roles: teachers
+---
+
+# Using learnlog in VS Code
+
+`learnlog` records your Python development — code changes, inputs,
+outputs, and errors — into a hidden Git repository. You can review
+your own work later, and when asked, share it with your teacher.
+
+This page walks through setup, use, and submission in VS Code.
+
+## What you need
+
+- **Python 3.10 or newer.** Check with `python3 --version` in a
+  terminal.
+- **Visual Studio Code** with the **Python** extension (by
+  Microsoft).
+- **Git** on your `PATH` (`git --version`).
+- A project folder for your course work, opened in VS Code.
+
+## One-time setup
+
+Open the integrated terminal in VS Code (menu **View → Terminal**)
+and run these commands from your project folder.
+
+### 1. Create and activate a virtual environment
+
+```bash
+python3 -m venv .venv
+# Linux / macOS:
+source .venv/bin/activate
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+```
+
+Make sure VS Code uses this interpreter: open the Command Palette
+(**Ctrl+Shift+P** or **Cmd+Shift+P**), run **Python: Select
+Interpreter**, and pick the one under `.venv`.
+
+### 2. Install learnlog
+
+```bash
+pip install learnlog
+```
+
+### 3. Initialise the log repository
+
+```bash
+learnlog init
+```
+
+This creates a hidden `.learnlog/` directory at the top of your
+project. The active virtual environment is remembered, so scripts
+you run later use the correct interpreter automatically.
+
+## Everyday use
+
+Add a single line as the **first line** of each Python file you
+want logged:
+
+```python
+import learnlog
+```
+
+Run the script however you normally do — the VS Code **Run**
+button, `python myscript.py` in the terminal, or **F5** for the
+debugger. Every run is recorded: source code, command-line
+arguments, stdin/stdout/stderr, and any exception traceback.
+
+`learnlog` never changes what your program prints or does. If
+logging fails for any reason, your program keeps running.
+
+## Review your own session
+
+To replay your recent runs interactively:
+
+```bash
+learnlog play
+```
+
+Use the arrow keys to step through events and **q** to quit.
+
+## Submit or share your log
+
+Your teacher will usually pick **one** of these two options. Use
+the one they ask for.
+
+### Option A: push to a shared Git remote
+
+If your teacher has given you a remote URL:
+
+```bash
+learnlog set-remote <remote-url>
+learnlog push
+```
+
+### Option B: export a bundle file
+
+If you submit via Canvas or email:
+
+```bash
+learnlog export -o mylog.bundle
+```
+
+Upload `mylog.bundle` through the course platform as instructed.
+
+## Troubleshooting
+
+- **`learnlog: command not found`** — the virtual environment
+  isn't active. Re-run the activation command for your platform,
+  or reopen VS Code's terminal after selecting the interpreter.
+- **Nothing appears in `.learnlog/` after running a script** —
+  make sure `import learnlog` is the first non-comment line of the
+  script you're actually running.
+- **You already had a project Git repository** — the `.learnlog/`
+  directory is independent; do **not** `git add .learnlog/` in
+  your project's own repository. It manages itself.
+- **Need to start over** — delete `.learnlog/` and run
+  `learnlog init` again; your own code is untouched.
+@
+
 The design is guided by two constraints:
 \begin{description}
 \item[Transparency] The student's program must behave identically

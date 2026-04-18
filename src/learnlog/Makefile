@@ -1,6 +1,6 @@
 NOTANGLEFLAGS.py=
 
-MODULES+=	__init__.py learnlog.tex
+MODULES+=	__init__.py learnlog.tex students.md
 MODULES+=	capture.py capture.tex
 MODULES+=	gitrepo.py gitrepo.tex
 MODULES+=	commits.py commits.tex
@@ -13,6 +13,9 @@ all: ${MODULES}
 
 __init__.py: learnlog.nw
 	${NOTANGLE.py}
+
+students.md: learnlog.nw
+	${NOTANGLE}
 
 capture.py: capture.nw
 gitrepo.py: gitrepo.nw
