@@ -1,19 +1,22 @@
 \chapter{Command-Line Interface}
 \label{cli}
 
-The [[learnlog]] command lets teachers and teaching assistants
-review the development logs that students produce.
-It provides ten subcommands: [[list]] gives a compact overview
-of the recorded commits, [[export]] creates a portable bundle of
-the log (or a ProgSnap2 dataset for CS education analysis),
-[[set-remote]], [[push]], [[clone]], and [[pull]] manage
-synchronisation with a remote Git repository, [[git]] forwards
-Git commands to the log repository, [[tag]] manages named
-markers in the log (such as [[lab1]] or [[lab2]]), [[play]]
-gives an interactive viewer for browsing the commit history,
-and [[analyse]] generates \LaTeX{} reports of edit--run cycles
-from a ProgSnap2 dataset, optionally filtered by a
-[[Column=Regex]] range.
+The [[learnlog]] command lets students prepare projects for
+logging and lets both students and teachers manage and review
+the development logs that are produced.
+It provides eleven subcommands: [[init]] prepares a project
+directory (creating [[.learnlog/]] and installing [[learnlog]]
+for the student's chosen language), [[list]] gives a compact
+overview of the recorded commits, [[export]] creates a portable
+bundle of the log (or a ProgSnap2 dataset for CS education
+analysis), [[set-remote]], [[push]], [[clone]], and [[pull]]
+manage synchronisation with a remote Git repository, [[git]]
+forwards Git commands to the log repository, [[tag]] manages
+named markers in the log (such as [[lab1]] or [[lab2]]),
+[[play]] gives an interactive viewer for browsing the commit
+history, and [[analyse]] generates \LaTeX{} reports of
+edit--run cycles from a ProgSnap2 dataset, optionally filtered
+by a [[Column=Regex]] range.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -25,8 +28,9 @@ arguments with minimal boilerplate, and the modern
 <<[[cli.py]]>>=
 """Command-line interface for learnlog.
 
-Provides the ``learnlog`` command with subcommands for running
-Git commands against the log, exporting it as a bundle or
+Provides the ``learnlog`` command with subcommands for setting
+up a project to record with learnlog (``init``), running Git
+commands against the log, exporting it as a bundle or
 ProgSnap2 dataset, cloning from and synchronising with a remote
 repository, playing back the development log stored in
 ``.learnlog/``, and analysing ProgSnap2 datasets to produce
@@ -51,6 +55,7 @@ import os
 import io
 import pathlib
 import subprocess
+import sys
 import datetime
 import zipfile
 import pytest
@@ -73,6 +78,7 @@ The interactive viewer lives in [[viewer]] (\cref{viewer}).
 <<imports>>=
 from __future__ import annotations
 
+import enum
 import os
 import pathlib
 import re
@@ -390,9 +396,464 @@ def test_do_export_creates_bundle(workdir):
 @
 
 
+\section{Setting up a project for learnlog}
+\label{sec:setup}
+
+The [[init]] command (\cref{sec:init}) is what a student
+runs once per project to turn an ordinary working directory
+into a learnlog-enabled one.  Two independent things need
+to happen for learnlog to record reliably, and [[init]]
+handles both: the [[.learnlog/]] repository must exist at
+the project \emph{root}, and a Python environment with
+[[learnlog]] installed must be available to run student
+code.
+
+The repository placement matters because [[learnlog]]
+initialises itself lazily on first import: if no
+[[.learnlog/]] is found walking upward from the current
+directory (\cref{learnlog}), a fresh one is created in
+whatever the current directory happens to be.  A student
+who runs their first script from a subdirectory therefore
+ends up with [[.learnlog/]] tangled into that
+subdirectory---tangled into [[src/]] or [[lab1/]] rather
+than the project root.  Creating the repository explicitly
+up front is the simplest way to eliminate that race.
+
+The Python-environment setup exists because modern Linux
+distributions no longer let [[pip install]] touch the
+system Python.  Debian and Ubuntu mark their system
+interpreter as \enquote{externally managed} (PEP 668),
+which rejects [[pip install --user]] unless overridden
+with [[--break-system-packages]].  On such systems
+[[init]] creates [[.venv/]] and installs [[learnlog]]
+inside it; on older or unmanaged systems, the [[--user]]
+install still works without surprises and we skip the
+extra directory.
+
+The helpers that support [[init]] are split across the
+following subsections by concern: choosing a language,
+finding the interpreter, probing the interpreter, locating
+[[pip]] once a venv exists, and finally the pipeline that
+wires them together.
+
+
+\subsection{Selecting a language}
+\label{sec:setup-language}
+
+The first positional argument of [[init]] picks a language
+toolchain.  The enum below currently has only one member,
+but the point of using an enum (rather than a plain string)
+is that Typer uses enum members as valid CLI choices
+automatically, so adding [[java]] or [[cpp]] later becomes
+a one-line change with no CLI-surface churn.
+Subclassing [[str]] makes Typer render the values as plain
+words in [[--help]] and lets the enum compare equal to
+ordinary strings in tests.
+
+<<constants>>=
+class Language(str, enum.Enum):
+    """Supported student-language toolchains.
+
+    Used as the positional argument of ``learnlog init``.
+    New members become new valid CLI choices automatically
+    via Typer's built-in enum support.
+    """
+
+    python = "python"
+@
+
+
+\subsection{Resolving the target Python}
+\label{sec:setup-target-python}
+
+Students most commonly install [[learnlog]] with
+[[pipx install learnlog]], which places the tool inside a
+private virtual environment under
+[[~/.local/share/pipx/venvs/learnlog/]].  By the time any
+[[init]] code runs, [[sys.executable]] already points at
+that private interpreter---\emph{not} at the Python the
+student will actually use for coursework.
+
+That distinction matters for two separate reasons.  First,
+using [[sys.executable]] to create [[.venv/]] would bind
+the student's project to pipx's hidden interpreter, which
+is not under the student's control and may be upgraded or
+removed when pipx is.  Second, asking pipx's interpreter
+about PEP 668 (\cref{sec:setup-pep668}) always reports
+\enquote{not managed} regardless of the host distro,
+because virtual environments never carry the
+[[EXTERNALLY-MANAGED]] marker; the student's system Python
+may be externally managed even when pipx's is not.
+
+Picking a target interpreter by name avoids both problems.
+The default [[python3]] matches what almost every student
+types to run scripts; the fallback to [[python]] covers
+older systems where [[python3]] is unlinked; the
+[[--python]] option lets a user pin to an exact version
+like [[python3.12]].
+
+<<helper functions>>=
+def resolve_target_python(explicit=None):
+    """Return the student's Python interpreter as a path.
+
+    If ``explicit`` is given (either a name on ``PATH``
+    like ``"python3.12"`` or a full path), it is resolved
+    via :func:`shutil.which`.  Otherwise ``python3`` is
+    tried first, then ``python``.  Raises ``SystemExit``
+    with a clear message if nothing resolves.
+    """
+    import shutil
+
+    candidates = [explicit] if explicit else ["python3", "python"]
+    for name in candidates:
+        found = shutil.which(name)
+        if found:
+            return pathlib.Path(found)
+    raise SystemExit(
+        f"Cannot find a Python interpreter (tried "
+        f"{', '.join(candidates)}).  Pass --python to "
+        f"specify one explicitly."
+    )
+@
+
+Let's verify the fallback order and the error path.  The
+tests patch [[shutil.which]] so they do not depend on what
+interpreters happen to be installed on the host.
+
+<<test functions>>=
+def test_resolve_target_python_uses_explicit(monkeypatch):
+    """An explicit value is resolved via shutil.which."""
+    from learnlog.cli import resolve_target_python
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: (
+            "/opt/py/python3.12"
+            if name == "python3.12"
+            else None
+        ),
+    )
+    result = resolve_target_python("python3.12")
+    assert result == pathlib.Path("/opt/py/python3.12")
+
+def test_resolve_target_python_prefers_python3(monkeypatch):
+    """With no argument, python3 is tried before python."""
+    from learnlog.cli import resolve_target_python
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: (
+            "/usr/bin/python3"
+            if name == "python3"
+            else None
+        ),
+    )
+    assert resolve_target_python() == pathlib.Path(
+        "/usr/bin/python3"
+    )
+
+def test_resolve_target_python_errors_when_missing(monkeypatch):
+    """SystemExit with a helpful message when nothing found."""
+    from learnlog.cli import resolve_target_python
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    with pytest.raises(SystemExit, match="Cannot find"):
+        resolve_target_python()
+@
+
+
+\subsection{Detecting PEP 668}
+\label{sec:setup-pep668}
+
+PEP 668 specifies that a packager who does not want
+[[pip install]] to touch a Python installation marks it by
+dropping an empty [[EXTERNALLY-MANAGED]] file into the
+interpreter's standard-library directory.  The path is
+reported by [[sysconfig.get_path(\textquotesingle{}stdlib\textquotesingle{})]]
+\emph{for that interpreter}, which is the complication:
+[[sysconfig]] in our own process reports \emph{our} paths,
+not the target's.
+
+The probe below shells out to the target Python and asks
+it to compute and check the path.  This works regardless
+of whether the target is a system Python, a pyenv shim, or
+some custom build, because the interpreter itself is
+authoritative about where its own stdlib lives.  The probe
+prints [[1]] or [[0]] rather than using an exit code so
+that errors in the probe itself (a broken interpreter)
+surface as [[CalledProcessError]] rather than silently
+looking like \enquote{not managed}.
+
+<<helper functions>>=
+def is_externally_managed(python_exe):
+    """Return True if the target Python is PEP 668-marked.
+
+    Shells out to ``python_exe`` to ask it about its own
+    standard-library path and check for the
+    ``EXTERNALLY-MANAGED`` marker file.  Raises
+    ``CalledProcessError`` if the probe itself fails.
+    """
+    probe = (
+        "import sysconfig, os, sys; "
+        "p = os.path.join("
+        "sysconfig.get_path('stdlib'), "
+        "'EXTERNALLY-MANAGED'); "
+        "sys.stdout.write('1' if os.path.exists(p) "
+        "else '0')"
+    )
+    result = subprocess.run(
+        [str(python_exe), "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    return result.stdout.strip() == "1"
+@
+
+The easiest way to verify the probe is to run it against
+the currently-executing interpreter and compare to a
+direct filesystem check---both answers must agree whatever
+the host distro happens to be.
+
+<<test functions>>=
+def test_is_externally_managed_matches_filesystem():
+    """Probe result agrees with a direct file check."""
+    import sysconfig
+    from learnlog.cli import is_externally_managed
+    marker = (
+        pathlib.Path(sysconfig.get_path("stdlib"))
+        / "EXTERNALLY-MANAGED"
+    )
+    assert is_externally_managed(sys.executable) is marker.exists()
+@
+
+
+\subsection{Finding pip inside a venv}
+\label{sec:setup-pip-in-venv}
+
+[[venv]] lays out its scripts differently on POSIX and
+Windows: [[bin/pip]] on the former, [[Scripts/pip.exe]] on
+the latter.  Rather than branching on [[os.name]] in every
+caller, a single helper picks the layout that actually
+exists.  Returning the path (not the string) keeps
+[[pathlib]] semantics in the callers.
+
+<<helper functions>>=
+def pip_in_venv(venv_dir):
+    """Return the path to ``pip`` inside a virtual environment.
+
+    Handles POSIX (``bin/pip``) and Windows
+    (``Scripts/pip.exe``) layouts.  Raises ``SystemExit``
+    if neither is present---which means the venv is
+    broken or incomplete.
+    """
+    for rel in ("bin/pip", "Scripts/pip.exe"):
+        candidate = venv_dir / rel
+        if candidate.exists():
+            return candidate
+    raise SystemExit(
+        f"No pip found inside venv at {venv_dir}"
+    )
+@
+
+<<test functions>>=
+def test_pip_in_venv_finds_posix_layout(tmp_path):
+    """The POSIX layout bin/pip is returned when present."""
+    from learnlog.cli import pip_in_venv
+    (tmp_path / "bin").mkdir()
+    pip = tmp_path / "bin" / "pip"
+    pip.write_text("")
+    assert pip_in_venv(tmp_path) == pip
+
+def test_pip_in_venv_errors_when_absent(tmp_path):
+    """A venv directory with no pip raises SystemExit."""
+    from learnlog.cli import pip_in_venv
+    with pytest.raises(SystemExit, match="No pip found"):
+        pip_in_venv(tmp_path)
+@
+
+
+\subsection{The Python setup pipeline}
+\label{sec:setup-pipeline}
+
+[[init_python]] chains the helpers together.  The branch
+structure encodes the three legitimate end states for a
+project: a venv that we just created and populated, a
+pre-existing venv that we just populated (the idempotent
+case), and a non-venv install for systems that do not
+need PEP 668 protection.
+
+Idempotency is important because students will occasionally
+re-run [[init]]---after moving machines, after nuking a
+venv, or out of superstition.  We detect the existing
+[[.venv/]] by filesystem presence rather than by any
+sentinel we write, so manually-created venvs are also
+respected.  [[pip install]] itself is a no-op when the
+package is already up to date, so re-running the full
+pipeline is cheap.
+
+<<helper functions>>=
+def init_python(workdir, python=None):
+    """Set up a Python environment for learnlog in ``workdir``.
+
+    Creates ``workdir/.venv/`` if the target interpreter is
+    PEP 668-marked and no venv exists; otherwise installs
+    globally with ``--user``.  Then installs the ``learnlog``
+    package into the chosen location.
+    """
+    target = resolve_target_python(python)
+    venv_dir = workdir / ".venv"
+
+    if is_externally_managed(target) and not venv_dir.exists():
+        subprocess.run(
+            [str(target), "-m", "venv", str(venv_dir)],
+            check=True,
+        )
+
+    if venv_dir.exists():
+        installer = [
+            str(pip_in_venv(venv_dir)),
+            "install", "learnlog",
+        ]
+        next_step = (
+            f"Next step: source {venv_dir}/bin/activate"
+        )
+    else:
+        installer = [
+            str(target),
+            "-m", "pip", "install", "--user", "learnlog",
+        ]
+        next_step = None
+
+    subprocess.run(installer, check=True)
+
+    if next_step:
+        typer.echo(next_step)
+@
+
+The branch choices are worth verifying, and so is the
+invariant that no subprocess call ever uses
+[[sys.executable]]---that would mean the pipx trap from
+\cref{sec:setup-target-python} had reopened.  The tests
+stub out both [[resolve_target_python]] and
+[[is_externally_managed]] so the pipeline is driven by
+explicit test inputs rather than host state, and stub
+[[subprocess.run]] so no venv is actually created and no
+network traffic happens.
+
+<<test functions>>=
+def test_init_python_creates_venv_when_managed(
+    tmp_path, monkeypatch,
+):
+    """On PEP 668-marked Pythons, a venv is created and used."""
+    from learnlog.cli import init_python
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1:3] == ["-m", "venv"]:
+            venv_path = pathlib.Path(cmd[3])
+            (venv_path / "bin").mkdir(parents=True)
+            (venv_path / "bin" / "pip").write_text("")
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(
+        "learnlog.cli.resolve_target_python",
+        lambda p: pathlib.Path("/opt/python3"),
+    )
+    monkeypatch.setattr(
+        "learnlog.cli.is_externally_managed",
+        lambda p: True,
+    )
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    init_python(tmp_path)
+
+    assert calls[0] == [
+        "/opt/python3", "-m", "venv",
+        str(tmp_path / ".venv"),
+    ]
+    assert calls[1][1:] == ["install", "learnlog"]
+    assert calls[1][0].endswith("/pip")
+    assert sys.executable not in {c[0] for c in calls}
+
+def test_init_python_uses_user_install_when_unmanaged(
+    tmp_path, monkeypatch,
+):
+    """Unmanaged Pythons get --user installs, no venv."""
+    from learnlog.cli import init_python
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(
+        "learnlog.cli.resolve_target_python",
+        lambda p: pathlib.Path("/opt/python3"),
+    )
+    monkeypatch.setattr(
+        "learnlog.cli.is_externally_managed",
+        lambda p: False,
+    )
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    init_python(tmp_path)
+
+    assert calls == [[
+        "/opt/python3", "-m", "pip",
+        "install", "--user", "learnlog",
+    ]]
+    assert not (tmp_path / ".venv").exists()
+    assert sys.executable not in {c[0] for c in calls}
+
+def test_init_python_idempotent_with_existing_venv(
+    tmp_path, monkeypatch,
+):
+    """An existing .venv/ is reused instead of recreated."""
+    from learnlog.cli import init_python
+    venv = tmp_path / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "pip").write_text("")
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(
+        "learnlog.cli.resolve_target_python",
+        lambda p: pathlib.Path("/opt/python3"),
+    )
+    monkeypatch.setattr(
+        "learnlog.cli.is_externally_managed",
+        lambda p: True,
+    )
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    init_python(tmp_path)
+
+    assert not any(
+        c[1:3] == ["-m", "venv"] for c in calls
+    )
+    assert calls[0][1:] == ["install", "learnlog"]
+@
+
+
 \section{Typer application}
 
-We define the Typer app at module level with ten commands.
+We define the Typer app at module level with eleven
+commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
@@ -404,6 +865,110 @@ app = typer.Typer(
 )
 
 <<typer commands>>
+@
+
+
+\subsection{The [[init]] command}
+\label{sec:init}
+
+The command itself is a thin wrapper over the setup
+pipeline from \cref{sec:setup}.  It anchors the repository
+at the chosen directory by constructing a [[LearnlogRepo]]
+(whose constructor is idempotent---see \cref{gitrepo}),
+then dispatches to the language-specific installer.  The
+language argument is typed as [[Language]] so Typer
+rejects unknown toolchains before we are ever called.
+
+The optional [[-C]] / [[--dir]] flag mirrors the pattern
+used by [[set-remote]] and [[push]] and makes [[init]]
+scriptable from a parent directory.  The [[--python]]
+option is the [[init]]-specific escape hatch discussed in
+\cref{sec:setup-target-python}.
+
+<<typer commands>>=
+@app.command(name="init")
+def init(
+    language: Annotated[
+        Language,
+        typer.Argument(
+            help="Language toolchain to set up.",
+        ),
+    ],
+    directory: Annotated[
+        Optional[str],
+        typer.Option(
+            "-C", "--dir",
+            help=(
+                "Project directory to set up. "
+                "Defaults to the current directory."
+            ),
+        ),
+    ] = None,
+    python: Annotated[
+        Optional[str],
+        typer.Option(
+            "--python",
+            help=(
+                "Target Python interpreter (name on "
+                "PATH or full path).  Defaults to "
+                "python3."
+            ),
+        ),
+    ] = None,
+):
+    """Set up a project to record with learnlog."""
+    workdir = (
+        pathlib.Path(directory).resolve()
+        if directory
+        else pathlib.Path.cwd()
+    )
+    LearnlogRepo(workdir)
+    if language is Language.python:
+        init_python(workdir, python)
+@
+
+The end-to-end tests go through Typer's [[CliRunner]] and
+confirm the two observable effects: the [[.learnlog/]]
+directory appears at the chosen root, and an unknown
+language is rejected by Typer before our code runs.  The
+Python pipeline is stubbed so the CLI tests do not touch
+the network or create real virtual environments.
+
+<<test functions>>=
+def test_init_creates_learnlog_repo(tmp_path, monkeypatch):
+    """Running `init python` creates .learnlog/ in cwd."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["init", "python"])
+    assert result.exit_code == 0
+    assert (tmp_path / ".learnlog").is_dir()
+
+def test_init_respects_dir_option(tmp_path, monkeypatch):
+    """The -C flag anchors .learnlog/ at the given directory."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    result = CliRunner().invoke(
+        app, ["init", "python", "-C", str(tmp_path)],
+    )
+    assert result.exit_code == 0
+    assert (tmp_path / ".learnlog").is_dir()
+
+def test_init_rejects_unknown_language(tmp_path, monkeypatch):
+    """Typer rejects a language not in the Language enum."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["init", "java"])
+    assert result.exit_code != 0
 @
 
 
