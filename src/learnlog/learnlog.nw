@@ -124,7 +124,7 @@ This page walks through setup, use, and submission in VS Code.
 
 ## What you need
 
-- **Python 3.10 or newer.** Check with `python3 --version` in a
+- **Python 3.9 or newer.** Check with `python3 --version` in a
   terminal.
 - **Visual Studio Code** with the **Python** extension (by
   Microsoft).
@@ -168,23 +168,26 @@ you run later use the correct interpreter automatically.
 
 ## Everyday use
 
-Add a single line as the **first line** of each Python file you
-want logged:
+Just run your Python scripts the way you normally would — the VS
+Code **Run** button, `python myscript.py` in the terminal, or
+**F5** for the debugger. You do not need to import or configure
+anything in your own code: `learnlog init` installed an autostart
+hook inside the virtual environment, so every run through the
+`.venv` interpreter is captured automatically.
 
-```python
-import learnlog
-```
-
-Run the script however you normally do — the VS Code **Run**
-button, `python myscript.py` in the terminal, or **F5** for the
-debugger. Every run is recorded: source code, command-line
-arguments, stdin/stdout/stderr, and any exception traceback.
-Even syntax errors that stop the script before it starts are
-recorded, because `learnlog init` installed an autostart hook
-inside the virtual environment.
+Every run is recorded: source code, command-line arguments,
+stdin/stdout/stderr, and any exception traceback. Even syntax
+errors that stop the script before it starts are recorded,
+because the autostart hook runs before Python compiles your
+script.
 
 `learnlog` never changes what your program prints or does. If
 logging fails for any reason, your program keeps running.
+
+If you sometimes run scripts with a different Python interpreter
+(outside the venv), add `import learnlog` as the first line of
+the script as an explicit opt-in. This only captures runs where
+`learnlog` is installed in that other interpreter.
 
 ## Review your own session
 
@@ -226,8 +229,9 @@ Upload `mylog.bundle` through the course platform as instructed.
   isn't active. Re-run the activation command for your platform,
   or reopen VS Code's terminal after selecting the interpreter.
 - **Nothing appears in `.learnlog/` after running a script** —
-  make sure `import learnlog` is the first non-comment line of the
-  script you're actually running.
+  check that VS Code (or your terminal) is actually using the
+  `.venv` interpreter. The autostart hook lives inside the venv,
+  so a script run with a different Python is not captured.
 - **You already had a project Git repository** — the `.learnlog/`
   directory is independent; do **not** `git add .learnlog/` in
   your project's own repository. It manages itself.
@@ -1426,7 +1430,7 @@ initialize()
 
 
 \section{Auto-starting without explicit import}
-\label{autostart}
+\label{sec:autostart}
 
 The mechanism described so far captures everything \emph{after} the
 interpreter reaches \mintinline{python}{import learnlog}.
@@ -1458,7 +1462,7 @@ The [[_autostart]] module is a \emph{gate}: it decides whether
 \emph{this} interpreter invocation should be logged and, if so,
 its explicit [[autostart()]] entry point imports [[learnlog]], reusing the ordinary
 \mintinline{python}{import learnlog} machinery
-(\cref{autostart on import}).
+(\cref{sec:autostart-on-import}).
 Rather than duplicate the repository-discovery path, the gate
 communicates the project root to [[initialize]] by setting
 [[LEARNLOG_PROJECT_ROOT]] in the environment.
@@ -1542,7 +1546,7 @@ still points at the old location.
 
 The \textbf{backup source} is [[Path(sys.prefix).parent]].
 With the conventional [[<project>/.venv/]] layout (produced by
-both [[learnlog init]] and VS Code's ``Create Environment''),
+both [[learnlog init]] and VS Code's \enquote{Create Environment}),
 this resolves to the project root even after the project is
 renamed or moved---because the venv moves with it.
 But the layout is a convention, not a guarantee: a venv at
@@ -1609,7 +1613,7 @@ deleted projects.
 def _read_marker(marker_path):
     """Return the path stored in ``marker_path`` if still valid.
 
-    ``Valid'' means the file exists, is readable, and points at a
+    "Valid" means the file exists, is readable, and points at a
     directory that still contains a ``.learnlog/`` subdirectory.
     Returns ``None`` otherwise.
     """
@@ -1759,7 +1763,7 @@ def _should_activate(
 
 
 \subsection{Startup entry point}
-\label{autostart on import}
+\label{sec:autostart-on-import}
 
 The last piece runs at interpreter startup---once, when the
 [[.pth]] line calls [[autostart()]].
@@ -1859,7 +1863,7 @@ from learnlog._autostart import _should_activate
 @
 
 A valid project has a [[.learnlog/]] directory; a valid marker
-holds the path to such a project; a ``no-backup'' [[sys.prefix]]
+holds the path to such a project; a \enquote{no-backup} [[sys.prefix]]
 points somewhere far from any [[.learnlog/]], so tests of the
 marker path are not secretly passing via the backup.
 

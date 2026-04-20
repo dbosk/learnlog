@@ -58,7 +58,7 @@ Five modules, all defined as `.nw` literate source in `src/learnlog/`:
 | `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the project root, skips `learnlog init`, and activates `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
 | `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; crash-resilient commit strategy (commit header before run, amend with results after) |
-| `cli.py` | `cli.nw` | Typer CLI with `export` (git bundle) and `play` (curses viewer + batch mode) commands |
+| `cli.py` | `cli.nw` | Typer CLI: `init` (project + venv + autostart), `list`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode) |
 
 ### Key design constraints
 

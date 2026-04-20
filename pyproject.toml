@@ -37,7 +37,7 @@ exclude = [
   "src/learnlog/Makefile",
   "src/learnlog/*.nw",
   "src/learnlog/*.tex",
-  "src/learnlog/CLAUDE.md",
+  "src/learnlog/*.md",
   "src/learnlog/ltxobj",
 ]
 
