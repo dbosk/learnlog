@@ -314,6 +314,8 @@ start_time = None
 main_script = None
 main_args = None
 repl_capture_restore = None
+repl_capture_flush = None
+repl_capture_skip_input = None
 @
 
 
@@ -477,7 +479,9 @@ second identical [[stdin:]] entry for the same line.
 def _wrap_input(original_input, iolog):
     """Return an ``input`` wrapper that records returned lines."""
     def logged_input(prompt=""):
+        _flush_pending_repl_capture()
         line = original_input(prompt)
+        _skip_repl_input_history(line)
         if not isinstance(sys.stdin, InputCapture):
             iolog.log("stdin", line + "\n")
         return line
@@ -532,47 +536,169 @@ def _wrap_pyrepl_input(original_input, iolog):
     return logged_input
 @
 
+Older CPython versions still expose one useful clue: once the stock
+REPL has accepted a top-level line, [[readline]] usually appends it to
+history.
+That does not tell us the exact instant the statement became complete,
+so this path is weaker than [[_pyrepl]]: a silent statement may remain
+pending until some later visible effect or until the session exits.
+It is still good enough to flush accepted statements before stdout or
+stderr output, before unhandled exceptions, and before nested
+[[input()]] replies.
+
+<<functions>>=
+def _install_readline_repl_capture(iolog, readline_module):
+    """Return fallback helpers based on readline history."""
+    try:
+        history_length = readline_module.get_current_history_length()
+    except Exception:
+        return None, None
+
+    def flush():
+        nonlocal history_length
+        try:
+            current = readline_module.get_current_history_length()
+        except Exception:
+            return
+        if current <= history_length:
+            return
+        for index in range(history_length + 1, current + 1):
+            try:
+                statement = readline_module.get_history_item(index)
+            except Exception:
+                statement = None
+            if statement is not None:
+                _log_repl_statement(iolog, statement)
+        history_length = current
+
+    def skip_input(line):
+        nonlocal history_length
+        try:
+            current = readline_module.get_current_history_length()
+        except Exception:
+            return
+        if current <= history_length:
+            return
+        new_items = []
+        for index in range(history_length + 1, current + 1):
+            try:
+                statement = readline_module.get_history_item(index)
+            except Exception:
+                statement = None
+            new_items.append(statement)
+        if new_items and new_items[-1] == line:
+            for statement in new_items[:-1]:
+                if statement is not None:
+                    _log_repl_statement(iolog, statement)
+            history_length = current
+            return
+        flush()
+
+    return flush, skip_input
+@
+
+We trigger those deferred flushes from the places where Python does hand
+control back to us: output writes, nested [[input()]] calls, unhandled
+exceptions, and exit cleanup.
+
+<<functions>>=
+def _flush_pending_repl_capture():
+    """Flush any deferred REPL capture state."""
+    if repl_capture_flush is None:
+        return
+    try:
+        repl_capture_flush()
+    except Exception:
+        pass
+
+
+def _skip_repl_input_history(line):
+    """Ignore a nested REPL ``input()`` reply already logged elsewhere."""
+    if repl_capture_skip_input is None:
+        return
+    try:
+        repl_capture_skip_input(line)
+    except Exception:
+        pass
+@
+
+Output is the most important synchronization point.
+If a fallback REPL statement such as [[print(value)]] produces text, the
+statement should reach the log before the resulting stdout or stderr
+entry.
+We therefore use a tiny output wrapper that flushes any deferred REPL
+history first.
+Outside REPL mode that hook is inert.
+
+<<functions>>=
+class ReplAwareStreamCapture(StreamCapture):
+    """StreamCapture that flushes deferred REPL input first."""
+
+    def write(self, text):
+        _flush_pending_repl_capture()
+        return super().write(text)
+@
+
 When [[_pyrepl]] is unavailable, or if its internal interface changes,
-we do nothing special here.
+we fall back to the weaker [[readline]] path.
+If neither mechanism is present, we do nothing special here.
 The ordinary [[builtins.input]] wrapper still covers interactive
 [[input()]] calls, including [[input()]] executed from REPL code.
 Pyrepl-equipped interpreters get the stronger guarantee of both inline
-top-level statement logging and REPL-time [[input()]] capture from the
-hooks below.
+top-level statement logging and REPL-time [[input()]] capture; older
+readline-based interpreters get best-effort top-level statement capture
+at those later synchronization points.
 
 <<functions>>=
 def _install_repl_capture(
-    script, iolog, pyrepl_readline=None, simple_interact=None,
+    script,
+    iolog,
+    pyrepl_readline=None,
+    simple_interact=None,
+    readline_module=None,
 ):
-    """Install inline REPL capture hooks and return a restore callback."""
+    """Install REPL capture and return restore/flush helpers."""
     if script != "<repl>":
-        return None
+        return None, None, None
     if pyrepl_readline is None or simple_interact is None:
         try:
             import _pyrepl.readline as pyrepl_readline
             import _pyrepl.simple_interact as simple_interact
         except Exception:
-            return None
+            pyrepl_readline = None
+            simple_interact = None
 
-    original_multiline_input = simple_interact.multiline_input
-    wrapper_type = type(pyrepl_readline._wrapper)
-    original_pyrepl_input = wrapper_type.input
+    if pyrepl_readline is not None and simple_interact is not None:
+        original_multiline_input = simple_interact.multiline_input
+        wrapper_type = type(pyrepl_readline._wrapper)
+        original_pyrepl_input = wrapper_type.input
 
-    def logged_multiline_input(more_lines, ps1, ps2):
-        statement = original_multiline_input(more_lines, ps1, ps2)
-        _log_repl_statement(iolog, statement)
-        return statement
+        def logged_multiline_input(more_lines, ps1, ps2):
+            statement = original_multiline_input(more_lines, ps1, ps2)
+            _log_repl_statement(iolog, statement)
+            return statement
 
-    simple_interact.multiline_input = logged_multiline_input
-    wrapper_type.input = _wrap_pyrepl_input(
-        original_pyrepl_input, iolog,
+        simple_interact.multiline_input = logged_multiline_input
+        wrapper_type.input = _wrap_pyrepl_input(
+            original_pyrepl_input, iolog,
+        )
+
+        def restore():
+            simple_interact.multiline_input = original_multiline_input
+            wrapper_type.input = original_pyrepl_input
+
+        return restore, None, None
+
+    if readline_module is None:
+        try:
+            import readline as readline_module
+        except Exception:
+            return None, None, None
+
+    flush, skip_input = _install_readline_repl_capture(
+        iolog, readline_module,
     )
-
-    def restore():
-        simple_interact.multiline_input = original_multiline_input
-        wrapper_type.input = original_pyrepl_input
-
-    return restore
+    return None, flush, skip_input
 @
 
 <<functions>>=
@@ -585,6 +711,7 @@ def initialize():
     global repo, iolog, start_time, main_script, main_args
     global original_stdout, original_stderr, original_stdin
     global original_input, repl_capture_restore
+    global repl_capture_flush, repl_capture_skip_input
 
     if repo is not None:
         return
@@ -629,15 +756,19 @@ original_stdout = sys.stdout
 original_stderr = sys.stderr
 original_stdin = sys.stdin
 original_input = builtins.input
-sys.stdout = StreamCapture(original_stdout, "stdout", iolog)
-sys.stderr = StreamCapture(original_stderr, "stderr", iolog)
+sys.stdout = ReplAwareStreamCapture(original_stdout, "stdout", iolog)
+sys.stderr = ReplAwareStreamCapture(original_stderr, "stderr", iolog)
 if not original_stdin.isatty():
     sys.stdin = InputCapture(original_stdin, iolog)
 builtins.input = _wrap_input(original_input, iolog)
 @
 
 <<install REPL capture>>=
-repl_capture_restore = _install_repl_capture(main_script, iolog)
+(
+    repl_capture_restore,
+    repl_capture_flush,
+    repl_capture_skip_input,
+) = _install_repl_capture(main_script, iolog)
 @
 
 Let's verify that initialisation creates the repository and wraps
@@ -831,6 +962,9 @@ Let's verify the helper pieces directly.
 The [[input()]] wrapper must add a line only when stdin is not already
 an [[InputCapture]], and the REPL helpers must format and install
 inline capture correctly.
+The older [[readline]] fallback is weaker, but it still needs to log
+accepted statements, keep nested [[input()]] replies from being doubled,
+and flush pending statements before visible output.
 
 <<test functions>>=
 def test_wrap_input_logs_when_stdin_is_not_wrapped(monkeypatch):
@@ -892,7 +1026,7 @@ def test_install_repl_capture_logs_inline_repl_events():
     simple_interact.multiline_input = lambda more_lines, ps1, ps2: "2+2"
 
     log = learnlog.IOLog()
-    restore = learnlog._install_repl_capture(
+    restore, flush, skip_input = learnlog._install_repl_capture(
         "<repl>",
         log,
         pyrepl_readline=FakePyreplReadline,
@@ -900,6 +1034,8 @@ def test_install_repl_capture_logs_inline_repl_events():
     )
 
     assert restore is not None
+    assert flush is None
+    assert skip_input is None
     assert simple_interact.multiline_input(None, ">>> ", "... ") == "2+2"
     assert FakePyreplReadline._wrapper.input("prompt") == "typed"
 
@@ -911,6 +1047,116 @@ def test_install_repl_capture_logs_inline_repl_events():
         "stdin: >>> 2+2\n"
         "stdin: typed\n"
     )
+
+
+def test_install_repl_capture_returns_no_hooks_without_support(
+    monkeypatch,
+):
+    import builtins
+    import learnlog
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("_pyrepl") or name == "readline":
+            raise ImportError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    log = learnlog.IOLog()
+    assert learnlog._install_repl_capture(
+        "<repl>",
+        log,
+        pyrepl_readline=None,
+        simple_interact=None,
+        readline_module=None,
+    ) == (None, None, None)
+
+
+def test_install_readline_repl_capture_logs_history_entries():
+    import learnlog
+
+    class FakeReadline:
+        history = ["old"]
+
+        @classmethod
+        def get_current_history_length(cls):
+            return len(cls.history)
+
+        @classmethod
+        def get_history_item(cls, index):
+            return cls.history[index - 1]
+
+    log = learnlog.IOLog()
+    flush, skip_input = learnlog._install_readline_repl_capture(
+        log, FakeReadline,
+    )
+
+    assert flush is not None
+    assert skip_input is not None
+
+    FakeReadline.history.extend([
+        "2+2",
+        "for i in range(2):\n    print(i)",
+    ])
+    flush()
+
+    assert log.getvalue() == (
+        "stdin: >>> 2+2\n"
+        "stdin: >>> for i in range(2):\n"
+        "stdin: ...     print(i)\n"
+    )
+
+
+def test_readline_repl_capture_skips_nested_input_history():
+    import learnlog
+
+    class FakeReadline:
+        history = []
+
+        @classmethod
+        def get_current_history_length(cls):
+            return len(cls.history)
+
+        @classmethod
+        def get_history_item(cls, index):
+            return cls.history[index - 1]
+
+    log = learnlog.IOLog()
+    flush, skip_input = learnlog._install_readline_repl_capture(
+        log, FakeReadline,
+    )
+
+    FakeReadline.history.extend(["value = input()", "typed"])
+    skip_input("typed")
+
+    assert log.getvalue() == "stdin: >>> value = input()\n"
+    flush()
+    assert log.getvalue() == "stdin: >>> value = input()\n"
+
+
+def test_repl_aware_stream_capture_flushes_pending_repl_history(
+    monkeypatch,
+):
+    import learnlog
+
+    flushed = []
+    monkeypatch.setattr(
+        learnlog,
+        "repl_capture_flush",
+        lambda: flushed.append("flushed"),
+    )
+
+    original = io.StringIO()
+    log = learnlog.IOLog()
+    capture = learnlog.ReplAwareStreamCapture(original, "stdout", log)
+
+    capture.write("hello\n")
+
+    assert flushed == ["flushed"]
+    assert original.getvalue() == "hello\n"
+    assert log.getvalue() == "stdout: hello\n"
 @
 
 
@@ -932,6 +1178,7 @@ original_excepthook = sys.excepthook
 
 def exception_hook(exc_type, exc_value, exc_tb):
     global exception_info
+    _flush_pending_repl_capture()
     exception_info = "".join(
         traceback.format_exception(
             exc_type, exc_value, exc_tb
@@ -993,6 +1240,7 @@ def on_exit():
     global repo, iolog, exception_info
     global original_stdout, original_stderr, original_stdin
     global original_input, repl_capture_restore
+    global repl_capture_flush, repl_capture_skip_input
 
     if repo is None:
         return
@@ -1017,8 +1265,12 @@ if original_input is not None:
 @
 
 <<restore REPL capture>>=
+_flush_pending_repl_capture()
 if repl_capture_restore is not None:
     repl_capture_restore()
+repl_capture_restore = None
+repl_capture_flush = None
+repl_capture_skip_input = None
 @
 
 <<finalise the run>>=
