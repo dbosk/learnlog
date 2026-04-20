@@ -488,12 +488,16 @@ def _wrap_input(original_input, iolog):
 REPL statements need a second supplement.
 Top-level lines such as [[2+2]] or [[raise RuntimeError('x')]] do not
 flow through [[input()]] at all.
-On current Python versions the interactive frontend asks
+On current CPython versions that ship the stdlib [[_pyrepl]] frontend
+(3.13+ at the time of writing), the interactive frontend asks
 [[_pyrepl.simple_interact.multiline_input]] for each completed
 statement, then executes it.
 By wrapping that function we can log the entered statement at the
 moment it becomes complete, which preserves the same chronological
 ordering as the live REPL without scraping terminal repaint bytes.
+This is a best-effort compatibility path rather than a universal REPL
+API: older CPython versions and non-CPython interpreters may not ship
+[[_pyrepl]] at all.
 
 <<functions>>=
 def _log_repl_statement(iolog, statement):
@@ -513,6 +517,9 @@ reader.
 That would bypass our ordinary [[_wrap_input]] logging for
 [[input()]] calls made from inside the REPL, so we wrap pyrepl's input
 method as well.
+Without that second hook we would capture [[value = input()]] as a
+statement, but miss the student's reply that the running code reads from
+the terminal.
 
 <<functions>>=
 def _wrap_pyrepl_input(original_input, iolog):
@@ -525,10 +532,13 @@ def _wrap_pyrepl_input(original_input, iolog):
     return logged_input
 @
 
-When [[_pyrepl]] is unavailable we do nothing special here.
-The ordinary [[builtins.input]] wrapper still covers the basic REPL,
-while pyrepl-equipped interpreters get inline statement logging and
-interactive [[input()]] capture from the hooks below.
+When [[_pyrepl]] is unavailable, or if its internal interface changes,
+we do nothing special here.
+The ordinary [[builtins.input]] wrapper still covers interactive
+[[input()]] calls, including [[input()]] executed from REPL code.
+Pyrepl-equipped interpreters get the stronger guarantee of both inline
+top-level statement logging and REPL-time [[input()]] capture from the
+hooks below.
 
 <<functions>>=
 def _install_repl_capture(
@@ -2115,9 +2125,46 @@ def test_autostart_captures_named_entry_points(tmp_path):
 @
 
 The REPL path is the remaining truly interactive case.
-CPython reads top-level statements through [[readline]] on the TTY,
-not through [[sys.stdin]], so the only way to verify the inline
-[[pyrepl]] hook is to drive a real REPL over a pseudoterminal.
+On the CPython 3.13+ builds we target today, top-level statements flow
+through [[pyrepl]] on the TTY, not through [[sys.stdin]], so the only
+way to verify the inline hook is to drive a real REPL over a
+pseudoterminal.
+The first smoke test covers the success path where a REPL statement
+calls [[input()]]: we must see both the entered statement and the
+student's reply in the log, in that order.
+Older interpreters fall back safely, but they do not exercise this
+stronger inline-statement path.
+
+<<autostart test functions>>=
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="pty is unavailable on Windows"
+)
+def test_autostart_captures_repl_input_calls(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    returncode, _ = _run_in_pty(
+        [str(_venv_binary(venv_dir, "python"))],
+        cwd=project,
+        env=_autostart_env(),
+        input_text=(
+            "value = input()\n"
+            "hello from repl\n"
+            "print(value)\n"
+            "exit()\n"
+        ),
+    )
+
+    assert returncode == 0
+
+    history = _git_history(project)
+    assert "Script: <repl>" in history
+    assert "stdin: >>> value = input()\n" in history
+    assert "stdin: hello from repl\n" in history
+    assert "stdin: >>> print(value)\n" in history
+    assert "stdout: hello from repl\n" in history
+    assert "stdin: >>> exit()\n" in history
+@
+
+A second REPL smoke test keeps the exception path covered.
 
 <<autostart test functions>>=
 @pytest.mark.skipif(
