@@ -3,20 +3,32 @@
 
 The [[learnlog]] package provides automatic logging of student code
 development.
-Students add \mintinline{python}{import learnlog} as the first line of
-their Python files.
-When the program runs, the import triggers a chain of actions: it
-detects which script is running, stages any source code changes into a
-hidden Git repository, wraps the standard streams to capture all I/O,
-and registers cleanup handlers that finalise the log entry when the
-program exits.
+A one-time \mintinline{bash}{pipx install learnlog} puts the tool on
+the student's [[PATH]]; running
+\mintinline{bash}{learnlog init python} in a project directory then
+creates a hidden Git repository alongside a virtual environment wired
+so that every subsequent Python run through that venv is captured
+automatically.
+When a script runs, the autostart hook triggers a chain of actions: it
+detects which script is running, stages any source code changes into
+the hidden Git repository, wraps the standard streams to capture all
+I/O, and registers cleanup handlers that finalise the log entry when
+the program exits.
+
+When no virtual environment is available---or when [[learnlog init]]
+cannot create one (restricted lab machines, ephemeral graders)---the
+student can still opt in explicitly by adding
+\mintinline{python}{import learnlog} as the first line of the Python
+file.
+The same capture machinery runs; it is just triggered by the import
+rather than by the autostart hook.
 
 These logs serve two main use cases.
 
 \paragraph{Sharing live-coding sessions.}
-A teacher adds \mintinline{python}{import learnlog} to the
-demonstration scripts used during a lecture or tutorial.
-Every run is recorded automatically.
+After \mintinline{bash}{learnlog init python} in the demo project,
+every run during a lecture or tutorial is recorded automatically---no
+code changes to the demonstration scripts are needed.
 After the session, the teacher points the log at a remote
 repository and pushes:
 \begin{minted}{bash}
@@ -39,15 +51,17 @@ learnlog export -o lecture01.bundle
 The teacher distributes the file (\eg via a course page) and
 students replay it directly:
 \begin{minted}{bash}
-learnlog play lecture01.bundle
+learnlog play -f lecture01.bundle
 \end{minted}
 
 \paragraph{Studying how students code.}
 A researcher (or teacher) creates an empty Git repository for each
 student---for instance, one repository per student on a shared
 server.
-Each student adds \mintinline{python}{import learnlog} to their
-programs and configures the remote:
+Each student follows the onboarding page below
+(\mintinline{bash}{pipx install learnlog} followed by
+\mintinline{bash}{learnlog init python} in the project directory) and
+then configures the remote:
 \begin{minted}{bash}
 learnlog set-remote git@gitlab.kth.se:dbosk/alice-log.git
 learnlog push
@@ -72,16 +86,16 @@ learnlog export -o alice-log.bundle
 \end{minted}
 The researcher then replays it directly:
 \begin{minted}{bash}
-learnlog play alice-log.bundle
+learnlog play -f alice-log.bundle
 \end{minted}
 This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
 refine their debugging techniques.
 
 \paragraph{A student-facing onboarding page.}
-Both use cases above assume students have already installed the
-package, configured a virtual environment, and added
-\mintinline{python}{import learnlog} to their programs.
+Both use cases above assume students have already installed
+[[learnlog]] with \mintinline{bash}{pipx} and run
+\mintinline{bash}{learnlog init python} in the project directory.
 For first-year students this is not routine, so teachers need
 onboarding material.
 Rather than leave each teacher to write their own, we ship a
@@ -129,51 +143,96 @@ This page walks through setup, use, and submission in VS Code.
 - **Visual Studio Code** with the **Python** extension (by
   Microsoft).
 - **Git** on your `PATH` (`git --version`).
-- A project folder for your course work, opened in VS Code.
 
 ## One-time setup
 
 Open the integrated terminal in VS Code (menu **View → Terminal**)
-and run these commands from your project folder.
+and work through the three steps below.
 
-### 1. Create and activate a virtual environment
+### 1. Install pipx
 
-```bash
-python3 -m venv .venv
-# Linux / macOS:
-source .venv/bin/activate
-# Windows (PowerShell):
-.venv\Scripts\Activate.ps1
-```
+`pipx` installs Python command-line tools into their own isolated
+environments and puts them on your `PATH`. Check whether you already
+have it with `pipx --version`; if the command is found, skip to
+step 2.
 
-Make sure VS Code uses this interpreter: open the Command Palette
-(**Ctrl+Shift+P** or **Cmd+Shift+P**), run **Python: Select
-Interpreter**, and pick the one under `.venv`.
+The official installation guide, with platform-specific notes, is at
+<https://pipx.pypa.io/stable/installation/>. Typical commands:
+
+- **Linux (Debian/Ubuntu 23.04+, recent Fedora, Arch, etc.):**
+
+  ```bash
+  sudo apt install pipx    # or: sudo dnf install pipx
+  pipx ensurepath
+  ```
+
+- **macOS (with Homebrew):**
+
+  ```bash
+  brew install pipx
+  pipx ensurepath
+  ```
+
+- **Windows (PowerShell):**
+
+  ```powershell
+  py -m pip install --user pipx
+  py -m pipx ensurepath
+  ```
+
+  If you use Scoop, `scoop install pipx` works too.
+
+- **Fallback (any OS with Python 3.9+):**
+
+  ```bash
+  python3 -m pip install --user pipx
+  python3 -m pipx ensurepath
+  ```
+
+After `pipx ensurepath`, **close and reopen the terminal** so your
+shell picks up the updated `PATH`. If `pipx --version` still fails,
+see <https://pipx.pypa.io/stable/> for troubleshooting.
 
 ### 2. Install learnlog
 
 ```bash
-pip install learnlog
+pipx install learnlog
 ```
 
-### 3. Initialise the log repository
+This puts the `learnlog` command on your `PATH` in its own isolated
+environment, separate from any project. Upgrade later with
+`pipx upgrade learnlog`.
+
+### 3. Set up the project
+
+Open a terminal in your project folder and run:
 
 ```bash
-learnlog init
+learnlog init python
 ```
 
-This creates a hidden `.learnlog/` directory at the top of your
-project. The active virtual environment is remembered, so scripts
-you run later use the correct interpreter automatically.
+This creates a hidden `.learnlog/` directory (the log repository)
+and a project `.venv/` wired so that every Python run through that
+venv is captured automatically. The command prints an activation
+hint when it finishes.
+
+Tell VS Code to use the project venv: open the Command Palette
+(**Ctrl+Shift+P** or **Cmd+Shift+P**), run **Python: Select
+Interpreter**, and pick the one under `.venv`. The integrated
+terminal and the **Run** button will then use the wired interpreter.
+
+Re-running `learnlog init python` later is safe: the command is
+idempotent and will reuse an existing `.venv/` rather than replace
+it.
 
 ## Everyday use
 
 Just run your Python scripts the way you normally would — the VS
 Code **Run** button, `python myscript.py` in the terminal, or
 **F5** for the debugger. You do not need to import or configure
-anything in your own code: `learnlog init` installed an autostart
-hook inside the virtual environment, so every run through the
-`.venv` interpreter is captured automatically.
+anything in your own code: `learnlog init python` installed an
+autostart hook inside the virtual environment, so every run through
+the `.venv` interpreter is captured automatically.
 
 Every run is recorded: source code, command-line arguments,
 stdin/stdout/stderr, and any exception traceback. Even syntax
@@ -184,10 +243,11 @@ script.
 `learnlog` never changes what your program prints or does. If
 logging fails for any reason, your program keeps running.
 
-If you sometimes run scripts with a different Python interpreter
-(outside the venv), add `import learnlog` as the first line of
-the script as an explicit opt-in. This only captures runs where
-`learnlog` is installed in that other interpreter.
+If a particular run will not go through the project `.venv` (for
+example, a grader on a different machine, or a quick script on a
+system without the venv), add `import learnlog` as the first line
+of the script as an explicit opt-in. This only captures runs where
+`learnlog` is installed in the interpreter being used.
 
 ## Review your own session
 
@@ -225,18 +285,22 @@ Upload `mylog.bundle` through the course platform as instructed.
 
 ## Troubleshooting
 
-- **`learnlog: command not found`** — the virtual environment
-  isn't active. Re-run the activation command for your platform,
-  or reopen VS Code's terminal after selecting the interpreter.
+- **`learnlog: command not found`** — `pipx`'s bin directory is
+  not on your `PATH`. Run `pipx ensurepath` and then close and
+  reopen your terminal. Platform-specific `PATH` guidance is at
+  <https://pipx.pypa.io/stable/installation/>.
 - **Nothing appears in `.learnlog/` after running a script** —
   check that VS Code (or your terminal) is actually using the
-  `.venv` interpreter. The autostart hook lives inside the venv,
-  so a script run with a different Python is not captured.
+  project `.venv` interpreter. The autostart hook lives inside
+  the venv, so a script run with a different Python is not
+  captured.
 - **You already had a project Git repository** — the `.learnlog/`
   directory is independent; do **not** `git add .learnlog/` in
   your project's own repository. It manages itself.
-- **Need to start over** — delete `.learnlog/` and run
-  `learnlog init` again; your own code is untouched.
+- **Need to start over** — re-run `learnlog init python`; it is
+  idempotent and reuses an existing `.venv/`. Only if you want
+  to erase your history, delete `.learnlog/` first; your own code
+  is untouched either way.
 @
 
 \section{Code overview}
