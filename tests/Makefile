@@ -5,15 +5,19 @@
 # discovers those chunks and tangles them to tests/unit/test_*.py files.
 
 # Auto-discover test chunks in .nw files
+# A single .nw file may define several "<<test [[X.py]]>>" chunks, one per
+# module it tests; emit one target per distinct chunk.
 # Output format: "unit/test_modulename.py:sourcefile.nw:test%20[[modulename.py]]"
 define find_tests
 ( \
 	find ../src -name '*.nw' | xargs grep -l '<<test \[\[.*\.py\]\]>>' | \
 		while read file; do \
-			chunk=$$(grep -o '<<test \[\[\([^]]*\)\.py\]\]>>' "$$file" | head -1 | \
-			         sed 's/<<test \[\[\(.*\)\.py\]\]>>/\1/'); \
-			chunk_safe=$$(echo "$$chunk" | sed 's/ /%20/g'); \
-			echo "unit/test_$${chunk_safe}.py:$$file:test%20[[$$chunk_safe.py]]"; \
+			grep -o '<<test \[\[\([^]]*\)\.py\]\]>>' "$$file" | sort -u | \
+			sed 's/<<test \[\[\(.*\)\.py\]\]>>/\1/' | \
+			while read chunk; do \
+				chunk_safe=$$(echo "$$chunk" | sed 's/ /%20/g'); \
+				echo "unit/test_$${chunk_safe}.py:$$file:test%20[[$$chunk_safe.py]]"; \
+			done; \
 		done; \
 ) | sort -u
 endef
