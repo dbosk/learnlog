@@ -414,6 +414,35 @@ We map those sentinel forms to labels that explain how Python was
 started while leaving ordinary filenames and entry-point basenames
 unchanged.
 
+The same bootstrap exclusion from the autostart gate also needs to be
+enforced here.
+The [[.pth]] hook skips [[learnlog init]] before importing the package,
+but the installed CLI entry point imports [[learnlog.cli]], which in turn
+imports [[learnlog]] through ordinary Python package loading.
+Without a second check in [[initialize]], [[learnlog init]] still logs
+itself whenever the CLI package is imported directly.
+
+We therefore keep the bootstrap detector in the shared runtime helpers,
+then reuse the same predicate from [[_autostart.py]].
+That avoids the drift that would come from maintaining two slightly
+different definitions of what counts as the bootstrap invocation.
+
+<<functions>>=
+def _is_learnlog_init(argv):
+    """True iff ``argv`` looks like a ``learnlog init`` invocation.
+
+    Recognises the installed ``learnlog`` entry-point script and
+    ``python -m learnlog`` (in which case ``argv[0]`` contains
+    ``learnlog`` as a path component).
+    """
+    if len(argv) < 2 or argv[1] != "init":
+        return False
+    basename = os.path.basename(argv[0])
+    if basename == "learnlog":
+        return True
+    return "learnlog" in pathlib.PurePath(argv[0]).parts
+@
+
 <<functions>>=
 def _normalize_main_invocation(argv):
     """Return a normalised ``(script, args)`` pair from ``argv``."""
@@ -562,6 +591,8 @@ def initialize():
 @
 
 <<detect main script>>=
+if _is_learnlog_init(sys.argv):
+    return
 main_script, main_args = _normalize_main_invocation(sys.argv)
 start_time = datetime.datetime.now()
 project_root = os.environ.get("LEARNLOG_PROJECT_ROOT")
@@ -729,6 +760,23 @@ class TestInitialize:
         )
         msg = git_result.stdout
         assert msg.count("stdin: hello\n") == 1
+
+    def test_skips_learnlog_init_bootstrap(self, tmp_path, test_env):
+        script = tmp_path / "learnlog"
+        script.write_text(
+            "import sys\n"
+            "sys.argv = ['/venv/bin/learnlog', 'init', 'python']\n"
+            "import learnlog\n"
+            "print(learnlog.repo)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(tmp_path), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "None"
+        assert not (tmp_path / ".learnlog").exists()
 
     def test_uses_existing_repo_from_subdirectory(
         self, workdir, test_env
@@ -1205,6 +1253,7 @@ filesystem wholesale.
 import os
 import sys
 import pathlib
+import sysconfig
 
 <<autostart marker location>>
 <<autostart gate helpers>>
@@ -1251,17 +1300,38 @@ marker.
 It was set deliberately; the backup's match is coincidental and
 the marker's project is what the student actually worked on.
 
-The marker path is fixed once the module is installed: the
-[[.pth]] file and the marker are both written into
-[[site-packages]] by [[learnlog init]], and the
-[[_autostart.py]] module lives one level down inside the
-[[learnlog]] package.
+The marker belongs to the current interpreter's [[purelib]]
+directory, not necessarily next to the imported module file.
+That distinction matters in editable and source-tree installs:
+the [[.pth]] hook still lives in [[site-packages]], but it can
+import [[learnlog._autostart]] from a checkout under [[src/]].
+So we ask [[sysconfig]] for this interpreter's [[purelib]] path
+and only fall back to a module-relative guess if that lookup
+fails.
 
 <<autostart marker location>>=
-_DEFAULT_MARKER_PATH = (
-    pathlib.Path(__file__).parent.parent
-    / "learnlog_project_root.txt"
-)
+def _default_marker_path(module_file=None, purelib_path=None):
+    """Return the marker path for this interpreter.
+
+    The marker is written into ``site-packages`` alongside the
+    autostart ``.pth`` file.  Editable installs may import
+    ``learnlog._autostart`` from a source tree instead, so the
+    module's own directory is only a fallback.
+    """
+    if purelib_path is None:
+        try:
+            purelib_path = pathlib.Path(
+                sysconfig.get_paths()["purelib"]
+            )
+        except Exception:
+            module_path = pathlib.Path(
+                module_file or __file__
+            ).resolve()
+            purelib_path = module_path.parent.parent
+    return pathlib.Path(purelib_path) / "learnlog_project_root.txt"
+
+
+_DEFAULT_MARKER_PATH = _default_marker_path()
 @
 
 Reading the marker is best-effort: the file may be absent
@@ -1387,19 +1457,7 @@ itself (installed in [[<venv>/bin/]]) or a path to the package's
 both contain [[learnlog]] as a path component.
 
 <<autostart gate helpers>>=
-def _is_learnlog_init(argv):
-    """True iff ``argv`` looks like a ``learnlog init`` invocation.
-
-    Recognises the installed ``learnlog`` entry-point script and
-    ``python -m learnlog`` (in which case ``argv[0]`` contains
-    ``learnlog`` as a path component).
-    """
-    if len(argv) < 2 or argv[1] != "init":
-        return False
-    basename = os.path.basename(argv[0])
-    if basename == "learnlog":
-        return True
-    return "learnlog" in pathlib.PurePath(argv[0]).parts
+from learnlog import _is_learnlog_init
 @
 
 
@@ -1494,6 +1552,12 @@ Without this separation, merely importing the helper module would leak
 [[LEARNLOG_PROJECT_ROOT]] into the parent pytest process and redirect
 later subprocesses into the wrong project.
 
+The development checkout adds one more regression worth freezing in a
+test: the default marker path must come from the current interpreter's
+[[site-packages]], not from the repository [[src/]] tree.
+Otherwise an editable install will self-heal the marker into the
+checkout and leave behind a misleading untracked file.
+
 <<autostart test functions>>=
 def test_importing_autostart_module_has_no_side_effects(monkeypatch):
     monkeypatch.delenv("LEARNLOG_PROJECT_ROOT", raising=False)
@@ -1503,6 +1567,17 @@ def test_importing_autostart_module_has_no_side_effects(monkeypatch):
     importlib.reload(autostart)
 
     assert "LEARNLOG_PROJECT_ROOT" not in os.environ
+
+
+def test_default_marker_path_uses_current_purelib():
+    import learnlog._autostart as autostart
+
+    expected = (
+        pathlib.Path(sysconfig.get_paths()["purelib"])
+        / "learnlog_project_root.txt"
+    )
+
+    assert autostart._DEFAULT_MARKER_PATH == expected
 @
 
 <<test [[_autostart.py]]>>=
@@ -1513,6 +1588,7 @@ import pytest
 import select
 import subprocess
 import sys
+import sysconfig
 
 from learnlog._autostart import _should_activate
 
@@ -1754,6 +1830,16 @@ tree.
 Naming that extra file [[000-learnlog-source.pth]] makes [[site.py]]
 add the source tree before it reaches [[learnlog-autostart.pth]], so the
 autostart import resolves to the code under test.
+For the one case that must look like the installed [[learnlog]] console
+script, we also drop a tiny launcher into the venv's [[bin/]] directory.
+It uses the venv's own [[python]] in its shebang, so the subprocess still
+exercises the same interpreter and [[site-packages]] that the rest of the
+autostart smoke tests use.
+The body stays deliberately minimal: it only imports [[learnlog]], because
+this test is about bootstrap exclusion inside [[initialize]], not about
+the CLI's dependency stack.
+That gives the gate the real [[argv[0] == learnlog]] shape without
+turning the test into a packaging/install exercise.
 
 <<autostart test helpers>>=
 def _repo_root():
@@ -1795,6 +1881,13 @@ def _prepare_autostart_project(tmp_path):
     source_pth = purelib / "000-learnlog-source.pth"
     source_pth.write_text(str((_repo_root() / "src").resolve()) + "\n")
     cli.write_autostart_files(venv_dir, project)
+    python = cli.find_in_venv(venv_dir, "python")
+    learnlog = python.parent / "learnlog"
+    learnlog.write_text(
+        f"#!{python}\n"
+        "import learnlog\n"
+    )
+    learnlog.chmod(0o755)
 
     return project, venv_dir
 
@@ -1811,6 +1904,20 @@ def _git_history(project):
     result = subprocess.run(
         ["git", "--git-dir=.learnlog", "--work-tree=.",
          "log", "--format=%B"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return result.stdout
+
+
+def _latest_commit_message(project):
+    """Return the latest commit body in the learnlog repo."""
+    result = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "log", "-1", "--format=%B"],
         cwd=str(project),
         capture_output=True,
         text=True,
@@ -1951,10 +2058,66 @@ def test_autostart_captures_common_invocations(tmp_path):
     assert "stdin: hello from tty\n" in history
 @
 
+The last naming-sensitive cases are console-style wrappers whose
+[[argv[0]]] is neither [[-c]] nor a [[.py]] file.
+We synthesise a tiny script named [[pytest]] and a tiny venv-local
+[[learnlog]] launcher so the real [[.pth]] hook sees the same basename
+shapes as the installed entry points.
+That keeps the test focused on autostart's gate and script-name
+normalisation without turning it into a second packaging test.
+
+<<autostart test functions>>=
+def test_autostart_captures_named_entry_points(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    env = _autostart_env()
+    python = _venv_binary(venv_dir, "python")
+    learnlog = _venv_binary(venv_dir, "learnlog")
+    pytest_script = tmp_path / "pytest"
+    learnlog_script = tmp_path / "learnlog"
+
+    pytest_script.write_text("print('pytest wrapper')\n")
+    learnlog_script.write_text("print('learnlog wrapper')\n")
+
+    subprocess.run(
+        [str(python), str(pytest_script), "--version"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert "Script: pytest" in _latest_commit_message(project)
+
+    subprocess.run(
+        [str(python), str(learnlog_script), "play"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    after_play = _latest_commit_message(project)
+    assert "Script: learnlog" in after_play
+    assert "Arguments: play" in after_play
+
+    subprocess.run(
+        [str(learnlog), "init", "python", "--help"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert _latest_commit_message(project) == after_play
+@
+
 The REPL path is the remaining truly interactive case.
 CPython reads top-level statements through [[readline]] on the TTY,
-not through [[sys.stdin]], so the only way to verify our history-diff
-approach is to drive a real REPL over a pseudoterminal.
+not through [[sys.stdin]], so the only way to verify the inline
+[[pyrepl]] hook is to drive a real REPL over a pseudoterminal.
 
 <<autostart test functions>>=
 @pytest.mark.skipif(
