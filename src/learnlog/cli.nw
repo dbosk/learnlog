@@ -503,11 +503,11 @@ using [[sys.executable]] to create [[.venv/]] would bind
 the student's project to pipx's hidden interpreter, which
 is not under the student's control and may be upgraded or
 removed when pipx is.  Second, asking pipx's interpreter
-about PEP 668 (\cref{sec:setup-pep668}) always reports
-\enquote{not managed} regardless of the host distro,
-because virtual environments never carry the
-[[EXTERNALLY-MANAGED]] marker; the student's system Python
-may be externally managed even when pipx's is not.
+about PEP 668 always reports \enquote{not managed}
+regardless of the host distro, because virtual environments
+never carry the [[EXTERNALLY-MANAGED]] marker; the student's
+system Python may be externally managed even when pipx's is
+not.
 
 Picking a target interpreter by name avoids both problems.
 The default [[python3]] matches what almost every student
