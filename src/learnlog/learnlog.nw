@@ -1,15 +1,36 @@
 \chapter{Overview}
 \label{learnlog}
 
-The [[learnlog]] package provides automatic logging of student code
+The [[learnlog]] package provides automatic logging of code
 development.
-A one-time \mintinline{bash}{pipx install learnlog} puts the tool on
-the student's [[PATH]]; running
-\mintinline{bash}{learnlog init python} in a project directory then
-creates a hidden Git repository alongside a virtual environment wired
+The aim is to be independent of any particular IDE or editor.
+We just need the core language constructs of the programming language, for 
+instance Python.
+So this should work seamlessly in Vim (and Emacs), VSCode, IDLE or even web 
+services like Repl.it.
+
+\section{Installation and setup}
+
+Installation is rather simple:
+\begin{minted}{bash}
+pipx install learnlog
+\end{minted}
+This one-time line puts the tool on the [[PATH]].
+In VSCode and Repl.it that have a built-in virtual environment automatically, 
+one can go for the per-project installation instead, with
+\mintinline{bash}{pip install learnlog} (no x in pip)
+in the project venv.
+
+Then we can use the [[learnlog]] tool to activate it in any project:
+\begin{minted}{bash}
+cd the-project-directory
+learnlog init python
+\end{minted}
+Running \mintinline{bash}{learnlog init python} in a project directory creates 
+a hidden Git repository alongside a virtual environment wired
 so that every subsequent Python run through that venv is captured
 automatically.
-When a script runs, the autostart hook triggers a chain of actions: it
+When a script runs, an autostart hook triggers a chain of actions: it
 detects which script is running, stages any source code changes into
 the hidden Git repository, wraps the standard streams to capture all
 I/O, and registers cleanup handlers that finalise the log entry when
@@ -22,39 +43,98 @@ student can still opt in explicitly by adding
 file.
 The same capture machinery runs; it is just triggered by the import
 rather than by the autostart hook.
+The limitation of this method is that it can't capture [[SyntaxError]]s that 
+occur in the same file as the import line.
 
-These logs serve two main use cases.
+\section{The use cases}
 
-\paragraph{Sharing live-coding sessions.}
+We see three main use cases:
+\begin{enumerate}
+\item Teachers tracking their live coding sessions to later share with 
+students, so that students can play back and check out different versions of 
+the code easily.
+\item Students logging their own work to review later.
+This will help them debug, see what they have tried---particularly, show a TA 
+what they've tried when asking for help.
+\item Researchers studying how students code, by asking students to share their 
+logs and then analysing the edit--run cycles.
+\end{enumerate}
+
+\subsection{Sharing live-coding sessions}
+
+The teacher will likely create some directory for code written live during the 
+lectures of the course.
+It will be the least work for having such a folder per course, not per 
+lecture---less likely to forget a recording too.
+\begin{minted}{bash}
+mkdir -p ~/teaching/prgi26
+cd ~/teaching/prgi26
+learnlog init python
+\end{minted}
+
 After \mintinline{bash}{learnlog init python} in the demo project,
 every run during a lecture or tutorial is recorded automatically---no
 code changes to the demonstration scripts are needed.
+However, this requires that the Python venv (virtual environment) is activated!
+Tools like VSCode automatically activates the venv.
+
+To publish the recoded sessions, we can simply push the hidden Git repository 
+to a shared remote.
 After the session, the teacher points the log at a remote
 repository and pushes:
 \begin{minted}{bash}
-learnlog set-remote git@gitlab.kth.se:dbosk/lecture01.git
+learnlog set-remote git@github.com:dbosk/prgi26.git
 learnlog push
 \end{minted}
 Students then clone the log and replay it step by step:
 \begin{minted}{bash}
-learnlog clone git@gitlab.kth.se:dbosk/lecture01.git
+learnlog clone git@github.com:dbosk/prgi26.git
+cd prgi26
 learnlog play
 \end{minted}
 They see the exact sequence of code changes, inputs, and outputs
 from the demonstration.
 
+At the start of the next class, the teacher runs
+\begin{minted}{bash}
+learnlog tag lecture02
+\end{minted}
+And at the end of the class, the teacher runs
+\begin{minted}{bash}
+learnlog push
+\end{minted}
+Then the students run
+\begin{minted}{bash}
+learnlog pull
+learnlog play lecture02
+\end{minted}
+The students can run
+\begin{minted}{bash}
+learnlog tag
+\end{minted}
+to see the available tags and check out the lecture they want to review.
+
 Alternatively, when a shared Git remote is not available, the
 teacher can export the log as a portable bundle file:
 \begin{minted}{bash}
-learnlog export -o lecture01.bundle
+learnlog export -o lecture01.learnlog
 \end{minted}
 The teacher distributes the file (\eg via a course page) and
 students replay it directly:
 \begin{minted}{bash}
-learnlog play -f lecture01.bundle
+learnlog play -f lecture01.learnlog
 \end{minted}
+When the teacher wants to publish the second lecture, they don't want to 
+include the first lecture again.
+They can export only the new commits since the last tag:
+\begin{minted}{bash}
+learnlog export -o lecture02.learnlog lecture02
+\end{minted}
+This only works if they ran \mintinline{bash}{learnlog tag lecture02} at the 
+start of the second lecture, as described above.
 
-\paragraph{Studying how students code.}
+\subsection{Studying how students code}
+
 A researcher (or teacher) creates an empty Git repository for each
 student---for instance, one repository per student on a shared
 server.
@@ -92,7 +172,8 @@ This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
 refine their debugging techniques.
 
-\paragraph{A student-facing onboarding page.}
+\subsection{A student-facing onboarding page.}
+
 Both use cases above assume students have already installed
 [[learnlog]] with \mintinline{bash}{pipx} and run
 \mintinline{bash}{learnlog init python} in the project directory.
