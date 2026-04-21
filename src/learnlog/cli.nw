@@ -4,19 +4,21 @@
 The [[learnlog]] command lets students prepare projects for
 logging and lets both students and teachers manage and review
 the development logs that are produced.
-It provides eleven subcommands: [[init]] prepares a project
+It provides thirteen subcommands: [[init]] prepares a project
 directory (creating [[.learnlog/]] and installing [[learnlog]]
-for the student's chosen language), [[list]] gives a compact
-overview of the recorded commits, [[export]] creates a portable
-bundle of the log (or a ProgSnap2 dataset for CS education
-analysis), [[set-remote]], [[push]], [[clone]], and [[pull]]
-manage synchronisation with a remote Git repository, [[git]]
-forwards Git commands to the log repository, [[tag]] manages
-named markers in the log (such as [[lab1]] or [[lab2]]),
-[[play]] gives an interactive viewer for browsing the commit
-history, and [[analyse]] generates \LaTeX{} reports of
-edit--run cycles from a ProgSnap2 dataset, optionally filtered
-by a [[Column=Regex]] range.
+for the student's chosen language), [[activate]] and
+[[deactivate]] emit shell code for entering or leaving the
+project [[.venv/]], [[list]] gives a compact overview of the
+recorded commits, [[export]] creates a portable bundle of the
+log (or a ProgSnap2 dataset for CS education analysis),
+[[set-remote]], [[push]], [[clone]], and [[pull]] manage
+synchronisation with a remote Git repository, [[git]] forwards
+Git commands to the log repository, [[tag]] manages named
+markers in the log (such as [[lab1]] or [[lab2]]), [[play]]
+gives an interactive viewer for browsing the commit history,
+and [[analyse]] generates \LaTeX{} reports of edit--run
+cycles from a ProgSnap2 dataset, optionally filtered by a
+[[Column=Regex]] range.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -30,13 +32,14 @@ arguments with minimal boilerplate, and the modern
 
 Provides the ``learnlog`` command with subcommands for setting
 up a project to record with learnlog (``init``), running Git
-commands against the log, exporting it as a bundle or
-ProgSnap2 dataset, cloning from and synchronising with a remote
-repository, playing back the development log stored in
-``.learnlog/``, and analysing ProgSnap2 datasets to produce
-LaTeX reports of student edit--run cycles.  The ``analyse``
-command accepts ``Column=Regex`` range boundaries to restrict
-analysis to a subset of events.
+commands against the log, emitting shell code to activate or
+deactivate the project ``.venv/``, exporting the log as a
+bundle or ProgSnap2 dataset, cloning from and synchronising
+with a remote repository, playing back the development log
+stored in ``.learnlog/``, and analysing ProgSnap2 datasets to
+produce LaTeX reports of student edit--run cycles.  The
+``analyse`` command accepts ``Column=Regex`` range boundaries
+to restrict analysis to a subset of events.
 """
 
 <<imports>>
@@ -54,6 +57,7 @@ import tempfile
 import os
 import io
 import pathlib
+import shlex
 import subprocess
 import sys
 import datetime
@@ -82,6 +86,7 @@ import enum
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -487,6 +492,36 @@ class Language(str, enum.Enum):
 @
 
 
+\subsection{Selecting shell syntax}
+\label{sec:shell-syntax}
+
+The new [[activate]] and [[deactivate]] commands do not mutate the
+parent shell directly; they print shell code for the caller to
+[[eval]].  We therefore model the output syntax as an enum in the
+same way as [[Language]] above: Typer turns enum members into
+validated [[--shell]] choices automatically, and adding [[zsh]],
+[[fish]], or PowerShell later becomes a local change rather than a
+stringly-typed special case.
+
+For now we keep the surface intentionally small and only support
+[[bash]].  That matches the documented usage pattern
+[[eval "$(learnlog activate)"]], and it keeps the first
+implementation honest about which shell semantics we actually emit.
+
+<<constants>>=
+class Shell(str, enum.Enum):
+    """Supported shell syntaxes for emitted activation code.
+
+    Used by ``learnlog activate`` and
+    ``learnlog deactivate``.  New members become valid
+    ``--shell`` choices automatically via Typer's built-in
+    enum support.
+    """
+
+    bash = "bash"
+@
+
+
 \subsection{Resolving the target Python}
 \label{sec:setup-target-python}
 
@@ -632,6 +667,198 @@ def test_find_in_venv_errors_when_absent(tmp_path):
     from learnlog.cli import find_in_venv
     with pytest.raises(SystemExit, match="No pip found"):
         find_in_venv(tmp_path, "pip")
+@
+
+
+\subsection{Resolving the project [[.venv/]]}
+\label{sec:project-venv}
+
+The new shell-emitting commands intentionally ignore any unrelated
+[[VIRTUAL_ENV]] in the caller.  Their job is narrower: find the
+enclosing learnlog project and talk about the project-local
+[[.venv/]] that lives next to [[.learnlog/]].  That makes the
+behavior predictable from any subdirectory and avoids accidentally
+deactivating or activating some other environment the user happened
+to have open.
+
+We therefore build on [[resolve_workdir()]] and then require a
+[[.venv/]] sibling.  A missing [[.venv/]] is not something the
+shell command can repair on its own, so we fail with a direct
+message that points back at [[learnlog init python]].
+
+<<helper functions>>=
+def resolve_project_venv(directory=None):
+    """Return the project-local ``.venv/`` for a learnlog project.
+
+    The project is resolved the same way as other commands: use the
+    explicit directory when provided, otherwise search upward from the
+    current working directory for ``.learnlog/``.  The returned path is
+    always ``<project>/.venv`` and must already exist.
+    """
+    workdir = resolve_workdir(directory)
+    venv_dir = (workdir / ".venv").resolve()
+    if not venv_dir.is_dir():
+        raise SystemExit(
+            f"No project .venv/ directory in {workdir}. "
+            "Run 'learnlog init python' first."
+        )
+    return venv_dir
+@
+
+Let's verify both the success path and the missing-venv error:
+
+<<test functions>>=
+def test_resolve_project_venv_returns_local_venv(workdir):
+    """The project-local .venv/ is returned."""
+    from learnlog.cli import resolve_project_venv
+    repo = LearnlogRepo(workdir)
+    venv_dir = workdir / ".venv"
+    venv_dir.mkdir()
+    assert resolve_project_venv(workdir) == venv_dir.resolve()
+
+def test_resolve_project_venv_errors_when_missing(workdir):
+    """A learnlog project without .venv/ is rejected."""
+    from learnlog.cli import resolve_project_venv
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(SystemExit, match="No project .venv/"):
+        resolve_project_venv(workdir)
+@
+
+
+\subsection{Quoting shell arguments safely}
+
+Because [[activate]] and [[deactivate]] print shell code to be
+evaluated later, every path we interpolate must already be quoted for
+the target shell.  For [[bash]] the right primitive is
+[[shlex.quote()]]: it produces a single shell word regardless of
+spaces or punctuation in the underlying path.
+
+<<helper functions>>=
+def shell_quote(text, shell):
+    """Return ``text`` quoted as one word for ``shell``."""
+    if shell is Shell.bash:
+        return shlex.quote(str(text))
+    raise AssertionError(f"Unsupported shell: {shell}")
+@
+
+<<test functions>>=
+def test_shell_quote_bash_handles_spaces():
+    """Bash quoting preserves spaces inside one shell word."""
+    from learnlog.cli import Shell, shell_quote
+    assert shell_quote("/tmp/project dir/.venv", Shell.bash) == (
+        "'/tmp/project dir/.venv'"
+    )
+@
+
+
+\subsection{Emitting activation code for [[bash]]}
+\label{sec:emit-activation}
+
+The shell commands cannot directly change the caller's environment, so
+they print the code the caller should evaluate.  For [[bash]],
+activation delegates to the venv's own [[activate]] script instead of
+re-implementing [[PATH]], [[PS1]], and shell functions ourselves.  The
+virtual environment already knows how to install its [[deactivate]]
+function and restore shell state correctly, so sourcing it is both the
+minimal and the most correct option.
+
+The emitted code is intentionally just one command: source the project
+[[activate]] script.  If the script is missing even though [[.venv/]]
+exists, the venv is incomplete and we fail early rather than emitting
+broken shell code.
+
+<<helper functions>>=
+def activation_script(venv_dir, shell):
+    """Return the activation script path for ``venv_dir`` and ``shell``."""
+    if shell is Shell.bash:
+        script = venv_dir / "bin" / "activate"
+    else:
+        raise AssertionError(f"Unsupported shell: {shell}")
+    if not script.is_file():
+        raise SystemExit(
+            f"No activation script found for {shell.value} in {venv_dir}"
+        )
+    return script
+
+
+def emit_activate_shell_code(venv_dir, shell):
+    """Return shell code that activates ``venv_dir``."""
+    script = activation_script(venv_dir, shell)
+    if shell is Shell.bash:
+        return f"source {shell_quote(script, shell)}"
+    raise AssertionError(f"Unsupported shell: {shell}")
+@
+
+<<test functions>>=
+def test_activation_script_returns_bash_activate(workdir):
+    """Bash activation uses .venv/bin/activate."""
+    from learnlog.cli import Shell, activation_script
+    repo = LearnlogRepo(workdir)
+    activate = workdir / ".venv" / "bin" / "activate"
+    activate.parent.mkdir(parents=True)
+    activate.write_text("")
+    assert activation_script(workdir / ".venv", Shell.bash) == activate
+
+def test_activation_script_errors_when_missing(workdir):
+    """A broken .venv/ without activate script is rejected."""
+    from learnlog.cli import Shell, activation_script
+    repo = LearnlogRepo(workdir)
+    (workdir / ".venv").mkdir()
+    with pytest.raises(SystemExit, match="No activation script"):
+        activation_script(workdir / ".venv", Shell.bash)
+
+def test_emit_activate_shell_code_bash_quotes_path(workdir):
+    """Bash activation code sources the quoted activate script."""
+    from learnlog.cli import Shell, emit_activate_shell_code
+    repo = LearnlogRepo(workdir)
+    venv_dir = workdir / ".venv with space"
+    activate = venv_dir / "bin" / "activate"
+    activate.parent.mkdir(parents=True)
+    activate.write_text("")
+    assert emit_activate_shell_code(venv_dir, Shell.bash) == (
+        f"source {shlex.quote(str(activate))}"
+    )
+@
+
+
+\subsection{Emitting deactivation code for [[bash]]}
+\label{sec:emit-deactivation}
+
+Deactivation is intentionally more conservative than activation.
+Calling [[deactivate]] blindly would tear down whichever venv happens
+to be active in the shell, even if it has nothing to do with the
+current learnlog project.  Instead we emit a guard that compares the
+current [[VIRTUAL_ENV]] against the resolved project [[.venv/]] and
+only then calls the shell function installed by venv activation.
+
+That means [[learnlog deactivate]] is meant to be used after
+[[learnlog activate]] (or after an equivalent manual activation of the
+same project [[.venv/]]).  If no matching venv is active, the emitted
+code becomes a no-op.
+
+<<helper functions>>=
+def emit_deactivate_shell_code(venv_dir, shell):
+    """Return shell code that deactivates ``venv_dir`` if active."""
+    quoted_venv = shell_quote(venv_dir, shell)
+    if shell is Shell.bash:
+        return (
+            f'if [ "${{VIRTUAL_ENV:-}}" = {quoted_venv} ] '
+            f'&& declare -F deactivate >/dev/null; then deactivate; fi'
+        )
+    raise AssertionError(f"Unsupported shell: {shell}")
+@
+
+<<test functions>>=
+def test_emit_deactivate_shell_code_bash_guards_venv(workdir):
+    """Bash deactivation only targets the matching project venv."""
+    from learnlog.cli import Shell, emit_deactivate_shell_code
+    repo = LearnlogRepo(workdir)
+    venv_dir = (workdir / ".venv").resolve()
+    assert emit_deactivate_shell_code(venv_dir, Shell.bash) == (
+        "if [ \"${VIRTUAL_ENV:-}\" = "
+        f"{shlex.quote(str(venv_dir))}"
+        " ] && declare -F deactivate >/dev/null; then deactivate; fi"
+    )
 @
 
 
@@ -1214,7 +1441,7 @@ def test_init_python_invokes_write_autostart_files(
 
 \section{Typer application}
 
-We define the Typer app at module level with eleven
+We define the Typer app at module level with thirteen
 commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
@@ -1331,6 +1558,232 @@ def test_init_rejects_unknown_language(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(app, ["init", "java"])
     assert result.exit_code != 0
+@
+
+
+\subsection{The [[activate]] command}
+\label{sec:activate-command}
+
+The command name is intentionally a little deceptive: it does not, and
+cannot, activate the parent shell directly.  Like any other subprocess,
+[[learnlog]] can only affect its own environment.  The correct interface
+is therefore to print shell code and let the caller evaluate it:
+[[eval "$(learnlog activate)"]].
+
+We make that usage explicit in the help text because a plain
+[[learnlog activate]] would only print the [[source .../bin/activate]]
+command instead of running it.  The optional [[--shell]] argument is an
+enum, currently with only [[bash]], so the surface is honest about the
+syntax we emit while still leaving a clean extension point for more
+shells later.
+
+<<typer commands>>=
+@app.command(
+    name="activate",
+    help=(
+        "Print shell code that activates the project .venv/. "
+        "Use it as: eval \"$(learnlog activate)\".  "
+        "Running 'learnlog activate' by itself only prints "
+        "the command because a subprocess cannot change the "
+        "parent shell environment."
+    ),
+)
+def activate(
+    shell: Annotated[
+        Shell,
+        typer.Option(
+            "--shell",
+            help=(
+                "Shell syntax to emit.  Use with eval, "
+                "for example: eval \"$(learnlog activate)\"."
+            ),
+        ),
+    ] = Shell.bash,
+):
+    """Print shell code for `eval "$(learnlog activate)"`.
+
+    This command does not mutate the current shell directly.
+    Instead it prints shell code that the caller should
+    evaluate, normally as ``eval "$(learnlog activate)"``.
+    """
+    typer.echo(
+        emit_activate_shell_code(
+            resolve_project_venv(), shell,
+        )
+    )
+@
+
+<<test functions>>=
+def test_activate_command_prints_bash_code(workdir, monkeypatch):
+    """The activate command prints shell code for the project .venv/."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    project = workdir / "course project"
+    project.mkdir()
+    LearnlogRepo(project)
+    activate = project / ".venv" / "bin" / "activate"
+    activate.parent.mkdir(parents=True)
+    activate.write_text("")
+    monkeypatch.chdir(project)
+    result = CliRunner().invoke(app, ["activate"])
+    assert result.exit_code == 0
+    assert result.output.strip() == (
+        f"source {shlex.quote(str(activate))}"
+    )
+
+def test_activate_command_finds_project_from_subdir(
+    workdir, monkeypatch,
+):
+    """Activation resolves the enclosing project from a subdirectory."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    activate = workdir / ".venv" / "bin" / "activate"
+    activate.parent.mkdir(parents=True)
+    activate.write_text("")
+    nested = workdir / "src" / "lab1"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    result = CliRunner().invoke(app, ["activate", "--shell", "bash"])
+    assert result.exit_code == 0
+    assert result.output.strip() == (
+        f"source {shlex.quote(str(activate))}"
+    )
+
+def test_activate_command_errors_without_project(tmp_path, monkeypatch):
+    """Activation fails clearly outside a learnlog project."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["activate"])
+    assert result.exit_code == 1
+    assert "No .learnlog/ directory found." in result.output
+
+def test_activate_command_errors_without_project_venv(
+    workdir, monkeypatch,
+):
+    """Activation requires the sibling project .venv/."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["activate"])
+    assert result.exit_code == 1
+    assert "Run 'learnlog init python' first." in result.output
+
+def test_activate_help_mentions_eval_pattern():
+    """The help text documents the intended eval-based usage."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    result = CliRunner().invoke(app, ["activate", "--help"])
+    assert result.exit_code == 0
+    assert 'eval "$(learnlog activate)"' in result.output
+    assert "--shell" in result.output
+    assert "bash" in result.output
+@
+
+
+\subsection{The [[deactivate]] command}
+\label{sec:deactivate-command}
+
+The dual command follows the same shell-emitting contract as
+[[activate]]: it prints code that the caller should run via
+[[eval "$(learnlog deactivate)"]].  The difference is that the code
+is guarded.  Deactivation should only happen when the active venv is
+the current project's [[.venv/]], otherwise a user standing inside a
+learnlog project but working in some other environment would lose that
+unrelated shell state unexpectedly.
+
+As with [[activate]], the help text states the [[eval]] pattern
+directly so the intended usage is visible in [[--help]].
+
+<<typer commands>>=
+@app.command(
+    name="deactivate",
+    help=(
+        "Print shell code that deactivates the project .venv/ "
+        "when it is the active venv.  Use it as: "
+        "eval \"$(learnlog deactivate)\".  Running "
+        "'learnlog deactivate' by itself only prints the "
+        "command because a subprocess cannot change the "
+        "parent shell environment."
+    ),
+)
+def deactivate(
+    shell: Annotated[
+        Shell,
+        typer.Option(
+            "--shell",
+            help=(
+                "Shell syntax to emit.  Use with eval, "
+                "for example: eval \"$(learnlog deactivate)\"."
+            ),
+        ),
+    ] = Shell.bash,
+):
+    """Print shell code for `eval "$(learnlog deactivate)"`.
+
+    The emitted code is a guarded no-op unless the active
+    ``$VIRTUAL_ENV`` matches the current project's
+    ``.venv/``.
+    """
+    typer.echo(
+        emit_deactivate_shell_code(
+            resolve_project_venv(), shell,
+        )
+    )
+@
+
+<<test functions>>=
+def test_deactivate_command_prints_guarded_bash_code(
+    workdir, monkeypatch,
+):
+    """The deactivate command only targets the project .venv/."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    venv_dir = workdir / ".venv"
+    venv_dir.mkdir()
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["deactivate"])
+    assert result.exit_code == 0
+    assert result.output.strip() == (
+        "if [ \"${VIRTUAL_ENV:-}\" = "
+        f"{shlex.quote(str(venv_dir.resolve()))}"
+        " ] && declare -F deactivate >/dev/null; then deactivate; fi"
+    )
+
+def test_deactivate_command_errors_without_project(tmp_path, monkeypatch):
+    """Deactivation fails clearly outside a learnlog project."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(app, ["deactivate"])
+    assert result.exit_code == 1
+    assert "No .learnlog/ directory found." in result.output
+
+def test_deactivate_command_errors_without_project_venv(
+    workdir, monkeypatch,
+):
+    """Deactivation requires the sibling project .venv/."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["deactivate"])
+    assert result.exit_code == 1
+    assert "Run 'learnlog init python' first." in result.output
+
+def test_deactivate_help_mentions_eval_pattern():
+    """The help text documents the intended eval-based usage."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    result = CliRunner().invoke(app, ["deactivate", "--help"])
+    assert result.exit_code == 0
+    assert 'eval "$(learnlog deactivate)"' in result.output
+    assert "--shell" in result.output
+    assert "bash" in result.output
 @
 
 

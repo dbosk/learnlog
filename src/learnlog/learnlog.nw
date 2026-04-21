@@ -16,20 +16,34 @@ Installation is rather simple:
 pipx install learnlog
 \end{minted}
 This one-time line puts the tool on the [[PATH]].
-In VSCode and Repl.it that have a built-in virtual environment automatically, 
-one can go for the per-project installation instead, with
-\mintinline{bash}{pip install learnlog} (no x in pip)
-in the project venv.
+In VSCode and Repl.it that manage a project virtual environment
+automatically, one can go for the per-project installation
+instead, with \mintinline{bash}{pip install learnlog}
+(no x in pip) in the project venv.
 
-Then we can use the [[learnlog]] tool to activate it in any project:
+Then we can use the [[learnlog]] tool to set up logging in
+any project:
 \begin{minted}{bash}
 cd the-project-directory
 learnlog init python
 \end{minted}
-Running \mintinline{bash}{learnlog init python} in a project directory creates 
-a hidden Git repository alongside a virtual environment wired
-so that every subsequent Python run through that venv is captured
-automatically.
+Running \mintinline{bash}{learnlog init python} in a
+project directory creates the hidden Git repository for the
+log. If a virtual environment is already active---as is
+often the case in VSCode's integrated terminal---[[init]]
+installs and wires [[learnlog]] into that active venv.
+Otherwise [[init]] reuses or creates a project [[.venv/]]
+and wires that one instead. In a plain shell where that
+venv is not active, enter it with
+\begin{minted}{bash}
+eval "$(learnlog activate)"
+\end{minted}
+and leave it again with
+\begin{minted}{bash}
+eval "$(learnlog deactivate)"
+\end{minted}
+Every subsequent Python run through the wired venv is
+captured automatically.
 When a script runs, an autostart hook triggers a chain of actions: it
 detects which script is running, stages any source code changes into
 the hidden Git repository, wraps the standard streams to capture all
@@ -75,8 +89,13 @@ learnlog init python
 After \mintinline{bash}{learnlog init python} in the demo project,
 every run during a lecture or tutorial is recorded automatically---no
 code changes to the demonstration scripts are needed.
-However, this requires that the Python venv (virtual environment) is activated!
-Tools like VSCode automatically activates the venv.
+In VSCode, the integrated terminal usually already has the
+project [[.venv/]] active, so there is nothing more to do.
+In a plain shell, if the project venv is not active, run
+\begin{minted}{bash}
+eval "$(learnlog activate)"
+\end{minted}
+before starting the session.
 
 To publish the recoded sessions, we can simply push the hidden Git repository 
 to a shared remote.
@@ -292,15 +311,31 @@ Open a terminal in your project folder and run:
 learnlog init python
 ```
 
-This creates a hidden `.learnlog/` directory (the log repository)
-and a project `.venv/` wired so that every Python run through that
-venv is captured automatically. The command prints an activation
-hint when it finishes.
+This creates a hidden `.learnlog/` directory (the log repository).
+If your terminal already has a virtual environment active,
+`learnlog init python` installs and wires `learnlog` into that
+venv. In VS Code's integrated terminal, that is often the
+workspace `.venv/`, so no extra activation step is needed.
 
-Tell VS Code to use the project venv: open the Command Palette
-(**Ctrl+Shift+P** or **Cmd+Shift+P**), run **Python: Select
-Interpreter**, and pick the one under `.venv`. The integrated
-terminal and the **Run** button will then use the wired interpreter.
+If no venv is active, `learnlog init python` reuses or creates
+the project `.venv/` and wires that one instead. If your shell
+does not activate it automatically, enter it with:
+
+```bash
+eval "$(learnlog activate)"
+```
+
+When you are done in that same shell, leave it with:
+
+```bash
+eval "$(learnlog deactivate)"
+```
+
+If VS Code did not already pick the project venv, open the
+Command Palette (**Ctrl+Shift+P** or **Cmd+Shift+P**), run
+**Python: Select Interpreter**, and pick the one under `.venv`.
+The integrated terminal and the **Run** button will then use the
+wired interpreter.
 
 Re-running `learnlog init python` later is safe: the command is
 idempotent and will reuse an existing `.venv/` rather than replace
@@ -372,9 +407,11 @@ Upload `mylog.bundle` through the course platform as instructed.
   <https://pipx.pypa.io/stable/installation/>.
 - **Nothing appears in `.learnlog/` after running a script** —
   check that VS Code (or your terminal) is actually using the
-  project `.venv` interpreter. The autostart hook lives inside
-  the venv, so a script run with a different Python is not
-  captured.
+  venv that `learnlog init python` wired. In VS Code, that is
+  often the workspace `.venv/`; in a plain shell, run
+  `eval "$(learnlog activate)"` if the project venv is not
+  already active. The autostart hook lives inside that venv,
+  so a script run with a different Python is not captured.
 - **You already had a project Git repository** — the `.learnlog/`
   directory is independent; do **not** `git add .learnlog/` in
   your project's own repository. It manages itself.
