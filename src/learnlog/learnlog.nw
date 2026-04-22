@@ -136,21 +136,34 @@ to see the available tags and check out the lecture they want to review.
 Alternatively, when a shared Git remote is not available, the
 teacher can export the log as a portable bundle file:
 \begin{minted}{bash}
-learnlog export -o lecture01.learnlog
+learnlog export -o prgi26.learnlog
 \end{minted}
 The teacher distributes the file (\eg via a course page) and
 students replay it directly:
 \begin{minted}{bash}
-learnlog play -f lecture01.learnlog
+learnlog play -f prgi26.learnlog
 \end{minted}
-When the teacher wants to publish the second lecture, they don't want to 
-include the first lecture again.
-They can export only the new commits since the last tag:
+At the start of each lecture the teacher runs
+\mintinline{bash}{learnlog tag lectureNN}, and at the end of the
+lecture they re-export and re-upload [[prgi26.learnlog]].
+The bundle always contains the full history, so a student who
+downloads the latest file sees every lecture to date.
+Students list what is available in the bundle and play the
+lecture they want:
 \begin{minted}{bash}
-learnlog export -o lecture02.learnlog lecture02
+learnlog list -f prgi26.learnlog
+learnlog play -f prgi26.learnlog
 \end{minted}
-This only works if they ran \mintinline{bash}{learnlog tag lecture02} at the 
-start of the second lecture, as described above.
+The [[list]] output shows each run's timestamp and command so a
+student can locate the most recent lecture's runs without
+separate release notes from the teacher.
+
+We deliberately export the whole log each time rather than just
+the new commits: Git bundles for a rev-range declare the earlier
+commits as prerequisites, and [[learnlog play -f]] unpacks by
+cloning, which cannot satisfy prerequisites.
+Re-exporting the full log keeps the consumption path as simple as
+\enquote{download the latest file, play it}.
 
 \subsection{Studying how students code}
 
@@ -181,11 +194,11 @@ tags [[lab1]] and [[lab2]] are included.
 Alternatively, the student can export the log as a bundle and
 submit it through the course platform:
 \begin{minted}{bash}
-learnlog export -o alice-log.bundle
+learnlog export -o alice-log.learnlog
 \end{minted}
 The researcher then replays it directly:
 \begin{minted}{bash}
-learnlog play -f alice-log.bundle
+learnlog play -f alice-log.learnlog
 \end{minted}
 This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
@@ -394,10 +407,10 @@ learnlog push
 If you submit via Canvas or email:
 
 ```bash
-learnlog export -o mylog.bundle
+learnlog export -o mylog.learnlog
 ```
 
-Upload `mylog.bundle` through the course platform as instructed.
+Upload `mylog.learnlog` through the course platform as instructed.
 
 ## Troubleshooting
 

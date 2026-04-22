@@ -364,11 +364,25 @@ This is the natural serialisation format for a Git repository---it
 handles pack files correctly and can be validated from any directory
 with [[git bundle list-heads]].
 
-The default output filename is [[learnlog.bundle]], placed in the
+The default output filename is [[learnlog.learnlog]], placed in the
 current directory.
+The [[.learnlog]] extension is the product's bundle extension: the
+file on disk is a Git bundle, but naming it [[.learnlog]] makes it
+obvious to students which tool produced it and which tool will
+consume it (via [[learnlog play -f <file>]]).
+
+The bundle always contains every commit on every branch ([[--all]]).
+We deliberately do not offer a rev-range option (\eg
+[[--since <tag>]]) even though [[git bundle create]] supports one:
+a partial bundle declares prerequisite commits that the receiver
+must already have, and [[learnlog play -f]] unpacks via
+[[git clone]] which cannot satisfy prerequisites.
+The teacher's incremental workflow is therefore \enquote{export
+the whole log every time and let the student pick a lecture with
+[[learnlog list]]}, not \enquote{export just the new commits}.
 
 <<constants>>=
-DEFAULT_BUNDLE_NAME = "learnlog.bundle"
+DEFAULT_BUNDLE_NAME = "learnlog.learnlog"
 @
 
 <<export functions>>=
@@ -391,7 +405,7 @@ def do_export(repo, output):
 def test_do_export_creates_bundle(workdir):
     from learnlog.cli import do_export
     repo = LearnlogRepo(workdir)
-    bundle = workdir / "test.bundle"
+    bundle = workdir / "test.learnlog"
     do_export(repo, bundle)
     assert bundle.exists()
     verify = subprocess.run(
@@ -1827,9 +1841,9 @@ def list_commits(
         typer.Option(
             "--from", "-f",
             help=(
-                "Source: directory with .learnlog/ "
-                "a ProgSnap2 zip, or a .bundle file. "
-                "Defaults to current directory."
+                "Source: directory with .learnlog/, "
+                "a ProgSnap2 zip, or a .learnlog bundle "
+                "file. Defaults to current directory."
             ),
         ),
     ] = None,
@@ -2181,7 +2195,7 @@ export does not need bundle support---we are \emph{creating}
 bundles, not reading them.
 
 When [[--progsnap2]] is set, the default output changes from
-[[learnlog.bundle]] to [[learnlog.progsnap2]].
+[[learnlog.learnlog]] to [[learnlog.progsnap2]].
 We detect this by checking whether the user explicitly passed
 [[-o]]---if the output still equals the bundle default, we
 substitute the ProgSnap2 default.
@@ -2214,7 +2228,7 @@ def export(
         ),
     ] = False,
 ):
-    """Export the learnlog repository."""
+    """Export the learnlog repository as a .learnlog bundle."""
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
@@ -2238,7 +2252,7 @@ def test_export_command(workdir, monkeypatch):
     repo = LearnlogRepo(workdir)
     monkeypatch.chdir(workdir)
     runner = CliRunner()
-    bundle = workdir / "out.bundle"
+    bundle = workdir / "out.learnlog"
     result = runner.invoke(
         app, ["export", "-o", str(bundle)]
     )
@@ -3039,9 +3053,9 @@ def play(
         typer.Option(
             "--from", "-f",
             help=(
-                "Source: directory with .learnlog/ "
-                "a ProgSnap2 zip, or a .bundle file. "
-                "Defaults to current directory."
+                "Source: directory with .learnlog/, "
+                "a ProgSnap2 zip, or a .learnlog bundle "
+                "file. Defaults to current directory."
             ),
         ),
     ] = None,
@@ -3354,8 +3368,8 @@ def analyse(
             "--from", "-f",
             help=(
                 "Source: ProgSnap2 zip file, "
-                "directory with .learnlog/, "
-                "or a .bundle file. "
+                "directory with .learnlog/, or a "
+                ".learnlog bundle file. "
                 "Defaults to current directory."
             ),
         ),
