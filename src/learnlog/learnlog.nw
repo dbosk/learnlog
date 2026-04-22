@@ -16,6 +16,9 @@ Installation is rather simple:
 pipx install learnlog
 \end{minted}
 This one-time line puts the tool on the [[PATH]].
+
+\paragraph{Python}
+
 In VSCode and Repl.it that manage a project virtual environment
 automatically, one can go for the per-project installation
 instead, with \mintinline{bash}{pip install learnlog}
@@ -182,6 +185,7 @@ The researcher then clones each student's repository to analyse
 the development data:
 \begin{minted}{bash}
 learnlog clone git@gitlab.kth.se:dbosk/alice-log.git
+cd alice-log
 learnlog play
 learnlog analyse X-Tag=lab1 X-Tag=lab2
 \end{minted}
