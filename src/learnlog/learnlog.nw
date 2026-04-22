@@ -586,6 +586,7 @@ class TestFindLearnlogDir:
 
 
 \section{Initialisation}
+\label{sec:initialize}
 
 The [[initialize]] function is called at import time.
 It detects the main script, creates (or opens) the learnlog repository,
@@ -1978,7 +1979,7 @@ unit tests must be able to import [[learnlog._autostart]] to reach
 environment.
 
 If the gate returns a project root, we stash it in
-[[LEARNLOG_PROJECT_ROOT]] so [[initialize]] (\cref{learnlog})
+[[LEARNLOG_PROJECT_ROOT]] so [[initialize]] (\cref{sec:initialize})
 will find the right [[.learnlog/]], then [[import learnlog]] to
 trigger the ordinary import-time initialisation path.
 If the gate returns [[None]], we silently do nothing and the
