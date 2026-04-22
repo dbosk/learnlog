@@ -2228,7 +2228,7 @@ def export(
         ),
     ] = False,
 ):
-    """Export the learnlog repository as a .learnlog bundle."""
+    """Export the learnlog repository as a learnlog or ProgSnap2 bundle."""
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
