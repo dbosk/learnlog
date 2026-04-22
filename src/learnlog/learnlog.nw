@@ -1,53 +1,179 @@
 \chapter{Overview}
 \label{learnlog}
 
-The [[learnlog]] package provides automatic logging of student code
+The [[learnlog]] package provides automatic logging of code
 development.
-Students add \mintinline{python}{import learnlog} as the first line of
-their Python files.
-When the program runs, the import triggers a chain of actions: it
-detects which script is running, stages any source code changes into a
-hidden Git repository, wraps the standard streams to capture all I/O,
-and registers cleanup handlers that finalise the log entry when the
-program exits.
+The aim is to be independent of any particular IDE or editor.
+We just need the core language constructs of the programming language, for 
+instance Python.
+So this should work seamlessly in Vim (and Emacs), VSCode, IDLE or even web 
+services like Repl.it.
 
-These logs serve two main use cases.
+\section{Installation and setup}
 
-\paragraph{Sharing live-coding sessions.}
-A teacher adds \mintinline{python}{import learnlog} to the
-demonstration scripts used during a lecture or tutorial.
-Every run is recorded automatically.
+Installation is rather simple:
+\begin{minted}{bash}
+pipx install learnlog
+\end{minted}
+This one-time line puts the tool on the [[PATH]].
+In VSCode and Repl.it that manage a project virtual environment
+automatically, one can go for the per-project installation
+instead, with \mintinline{bash}{pip install learnlog}
+(no x in pip) in the project venv.
+
+Then we can use the [[learnlog]] tool to set up logging in
+any project:
+\begin{minted}{bash}
+cd the-project-directory
+learnlog init python
+\end{minted}
+Running \mintinline{bash}{learnlog init python} in a
+project directory creates the hidden Git repository for the
+log. If a virtual environment is already active---as is
+often the case in VSCode's integrated terminal---[[init]]
+installs and wires [[learnlog]] into that active venv.
+Otherwise [[init]] reuses or creates a project [[.venv/]]
+and wires that one instead. In a plain shell where that
+venv is not active, enter it with
+\begin{minted}{bash}
+eval "$(learnlog activate)"
+\end{minted}
+and leave it again with
+\begin{minted}{bash}
+eval "$(learnlog deactivate)"
+\end{minted}
+Every subsequent Python run through the wired venv is
+captured automatically.
+When a script runs, an autostart hook triggers a chain of actions: it
+detects which script is running, stages any source code changes into
+the hidden Git repository, wraps the standard streams to capture all
+I/O, and registers cleanup handlers that finalise the log entry when
+the program exits.
+
+When no virtual environment is available---or when [[learnlog init]]
+cannot create one (restricted lab machines, ephemeral graders)---the
+student can still opt in explicitly by adding
+\mintinline{python}{import learnlog} as the first line of the Python
+file.
+The same capture machinery runs; it is just triggered by the import
+rather than by the autostart hook.
+The limitation of this method is that it can't capture [[SyntaxError]]s that 
+occur in the same file as the import line.
+
+\section{The use cases}
+
+We see three main use cases:
+\begin{enumerate}
+\item Teachers tracking their live coding sessions to later share with 
+students, so that students can play back and check out different versions of 
+the code easily.
+\item Students logging their own work to review later.
+This will help them debug, see what they have tried---particularly, show a TA 
+what they've tried when asking for help.
+\item Researchers studying how students code, by asking students to share their 
+logs and then analysing the edit--run cycles.
+\end{enumerate}
+
+\subsection{Sharing live-coding sessions}
+
+The teacher will likely create some directory for code written live during the 
+lectures of the course.
+It will be the least work for having such a folder per course, not per 
+lecture---less likely to forget a recording too.
+\begin{minted}{bash}
+mkdir -p ~/teaching/prgi26
+cd ~/teaching/prgi26
+learnlog init python
+\end{minted}
+
+After \mintinline{bash}{learnlog init python} in the demo project,
+every run during a lecture or tutorial is recorded automatically---no
+code changes to the demonstration scripts are needed.
+In VSCode, the integrated terminal usually already has the
+project [[.venv/]] active, so there is nothing more to do.
+In a plain shell, if the project venv is not active, run
+\begin{minted}{bash}
+eval "$(learnlog activate)"
+\end{minted}
+before starting the session.
+
+To publish the recorded sessions, we can simply push the hidden Git repository
+to a shared remote.
 After the session, the teacher points the log at a remote
 repository and pushes:
 \begin{minted}{bash}
-learnlog set-remote git@gitlab.kth.se:dbosk/lecture01.git
+learnlog set-remote git@github.com:dbosk/prgi26.git
 learnlog push
 \end{minted}
 Students then clone the log and replay it step by step:
 \begin{minted}{bash}
-learnlog clone git@gitlab.kth.se:dbosk/lecture01.git
+learnlog clone git@github.com:dbosk/prgi26.git
+cd prgi26
 learnlog play
 \end{minted}
 They see the exact sequence of code changes, inputs, and outputs
 from the demonstration.
 
+At the start of the next class, the teacher runs
+\begin{minted}{bash}
+learnlog tag lecture02
+\end{minted}
+And at the end of the class, the teacher runs
+\begin{minted}{bash}
+learnlog push
+\end{minted}
+Then the students run
+\begin{minted}{bash}
+learnlog pull
+learnlog play lecture02
+\end{minted}
+The students can run
+\begin{minted}{bash}
+learnlog tag
+\end{minted}
+to see the available tags and check out the lecture they want to review.
+
 Alternatively, when a shared Git remote is not available, the
 teacher can export the log as a portable bundle file:
 \begin{minted}{bash}
-learnlog export -o lecture01.bundle
+learnlog export -o prgi26.learnlog
 \end{minted}
 The teacher distributes the file (\eg via a course page) and
 students replay it directly:
 \begin{minted}{bash}
-learnlog play lecture01.bundle
+learnlog play -f prgi26.learnlog
 \end{minted}
+At the start of each lecture the teacher runs
+\mintinline{bash}{learnlog tag lectureNN}, and at the end of the
+lecture they re-export and re-upload [[prgi26.learnlog]].
+The bundle always contains the full history, so a student who
+downloads the latest file sees every lecture to date.
+Students list what is available in the bundle and play the
+lecture they want:
+\begin{minted}{bash}
+learnlog list -f prgi26.learnlog
+learnlog play -f prgi26.learnlog
+\end{minted}
+The [[list]] output shows each run's timestamp and command so a
+student can locate the most recent lecture's runs without
+separate release notes from the teacher.
 
-\paragraph{Studying how students code.}
+We deliberately export the whole log each time rather than just
+the new commits: Git bundles for a rev-range declare the earlier
+commits as prerequisites, and [[learnlog play -f]] unpacks by
+cloning, which cannot satisfy prerequisites.
+Re-exporting the full log keeps the consumption path as simple as
+\enquote{download the latest file, play it}.
+
+\subsection{Studying how students code}
+
 A researcher (or teacher) creates an empty Git repository for each
 student---for instance, one repository per student on a shared
 server.
-Each student adds \mintinline{python}{import learnlog} to their
-programs and configures the remote:
+Each student follows the onboarding page below
+(\mintinline{bash}{pipx install learnlog} followed by
+\mintinline{bash}{learnlog init python} in the project directory) and
+then configures the remote:
 \begin{minted}{bash}
 learnlog set-remote git@gitlab.kth.se:dbosk/alice-log.git
 learnlog push
@@ -68,15 +194,257 @@ tags [[lab1]] and [[lab2]] are included.
 Alternatively, the student can export the log as a bundle and
 submit it through the course platform:
 \begin{minted}{bash}
-learnlog export -o alice-log.bundle
+learnlog export -o alice-log.learnlog
 \end{minted}
 The researcher then replays it directly:
 \begin{minted}{bash}
-learnlog play alice-log.bundle
+learnlog play -f alice-log.learnlog
 \end{minted}
 This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
 refine their debugging techniques.
+
+\subsection{A student-facing onboarding page}
+
+Both use cases above assume students have already installed
+[[learnlog]] with \mintinline{bash}{pipx} and run
+\mintinline{bash}{learnlog init python} in the project directory.
+For first-year students this is not routine, so teachers need
+onboarding material.
+Rather than leave each teacher to write their own, we ship a
+ready-to-publish Canvas page, [[students.md]], tangled from this
+chapter.
+Tangling ties the instructions to the documented behaviour: when a
+command or default changes here, the student page changes with it,
+eliminating the drift that plagues separately maintained onboarding
+documents.
+
+The page carries YAML frontmatter understood by the [[canvaslms]]
+command-line tool, so the teacher publishes it with a single
+command:
+\begin{minted}{bash}
+canvaslms pages edit --create -c COURSE \
+  -f src/learnlog/students.md
+\end{minted}
+[[students.md]] is a tangled artefact excluded from the published
+wheel, so a teacher who installed via [[pipx install learnlog]]
+does not have this file on disk.  Publishing the page therefore
+requires a source checkout---\mintinline{bash}{git clone} the
+[[learnlog]] repository and run \mintinline{bash}{make} to tangle
+[[students.md]] from this chapter.  If course staff need a
+packaged route later, a [[learnlog canvaslms-onboarding]]
+subcommand that writes the file to a chosen path would be the
+natural next step.
+
+We deliberately omit course-specific metadata---Canvas module
+assignment and stable-identification regex---because one tangled
+file must work unchanged across every course using learnlog.
+Teachers add those fields via the Canvas UI after publishing, or
+through a per-course deployment wrapper.
+
+<<[[students.md]]>>=
+---
+title: Using learnlog in VS Code
+url: using-learnlog-in-vs-code
+published: true
+front_page: false
+editing_roles: teachers
+---
+
+# Using learnlog in VS Code
+
+`learnlog` records your Python development — code changes, inputs,
+outputs, and errors — into a hidden Git repository. You can review
+your own work later, and when asked, share it with your teacher.
+
+This page walks through setup, use, and submission in VS Code.
+
+## What you need
+
+- **Python 3.9 or newer.** Check with `python3 --version` in a
+  terminal.
+- **Visual Studio Code** with the **Python** extension (by
+  Microsoft).
+- **Git** on your `PATH` (`git --version`).
+
+## One-time setup
+
+Open the integrated terminal in VS Code (menu **View → Terminal**)
+and work through the three steps below.
+
+### 1. Install pipx
+
+`pipx` installs Python command-line tools into their own isolated
+environments and puts them on your `PATH`. Check whether you already
+have it with `pipx --version`; if the command is found, skip to
+step 2.
+
+The official installation guide, with platform-specific notes, is at
+<https://pipx.pypa.io/stable/installation/>. Typical commands:
+
+- **Linux (Debian/Ubuntu 23.04+, recent Fedora, Arch, etc.):**
+
+  ```bash
+  sudo apt install pipx    # or: sudo dnf install pipx
+  pipx ensurepath
+  ```
+
+- **macOS (with Homebrew):**
+
+  ```bash
+  brew install pipx
+  pipx ensurepath
+  ```
+
+- **Windows (PowerShell):**
+
+  ```powershell
+  py -m pip install --user pipx
+  py -m pipx ensurepath
+  ```
+
+  If you use Scoop, `scoop install pipx` works too.
+
+- **Fallback (any OS with Python 3.9+):**
+
+  ```bash
+  python3 -m pip install --user pipx
+  python3 -m pipx ensurepath
+  ```
+
+After `pipx ensurepath`, **close and reopen the terminal** so your
+shell picks up the updated `PATH`. If `pipx --version` still fails,
+see <https://pipx.pypa.io/stable/> for troubleshooting.
+
+### 2. Install learnlog
+
+```bash
+pipx install learnlog
+```
+
+This puts the `learnlog` command on your `PATH` in its own isolated
+environment, separate from any project. Upgrade later with
+`pipx upgrade learnlog`.
+
+### 3. Set up the project
+
+Open a terminal in your project folder and run:
+
+```bash
+learnlog init python
+```
+
+This creates a hidden `.learnlog/` directory (the log repository).
+If your terminal already has a virtual environment active,
+`learnlog init python` installs and wires `learnlog` into that
+venv. In VS Code's integrated terminal, that is often the
+workspace `.venv/`, so no extra activation step is needed.
+
+If no venv is active, `learnlog init python` reuses or creates
+the project `.venv/` and wires that one instead. If your shell
+does not activate it automatically, enter it with:
+
+```bash
+eval "$(learnlog activate)"
+```
+
+When you are done in that same shell, leave it with:
+
+```bash
+eval "$(learnlog deactivate)"
+```
+
+If VS Code did not already pick the project venv, open the
+Command Palette (**Ctrl+Shift+P** or **Cmd+Shift+P**), run
+**Python: Select Interpreter**, and pick the one under `.venv`.
+The integrated terminal and the **Run** button will then use the
+wired interpreter.
+
+Re-running `learnlog init python` later is safe: the command is
+idempotent and will reuse an existing `.venv/` rather than replace
+it.
+
+## Everyday use
+
+Just run your Python scripts the way you normally would — the VS
+Code **Run** button, `python myscript.py` in the terminal, or
+**F5** for the debugger. You do not need to import or configure
+anything in your own code: `learnlog init python` installed an
+autostart hook inside the virtual environment, so every run through
+the `.venv` interpreter is captured automatically.
+
+Every run is recorded: source code, command-line arguments,
+stdin/stdout/stderr, and any exception traceback. Even syntax
+errors that stop the script before it starts are recorded,
+because the autostart hook runs before Python compiles your
+script.
+
+`learnlog` never changes what your program prints or does. If
+logging fails for any reason, your program keeps running.
+
+If a particular run will not go through the project `.venv` (for
+example, a grader on a different machine, or a quick script on a
+system without the venv), add `import learnlog` as the first line
+of the script as an explicit opt-in. This only captures runs where
+`learnlog` is installed in the interpreter being used.
+
+## Review your own session
+
+To replay your recent runs interactively:
+
+```bash
+learnlog play
+```
+
+Use the arrow keys to step through events and **q** to quit.
+
+## Submit or share your log
+
+Your teacher will usually pick **one** of these two options. Use
+the one they ask for.
+
+### Option A: push to a shared Git remote
+
+If your teacher has given you a remote URL:
+
+```bash
+learnlog set-remote <remote-url>
+learnlog push
+```
+
+### Option B: export a bundle file
+
+If you submit via Canvas or email:
+
+```bash
+learnlog export -o mylog.learnlog
+```
+
+Upload `mylog.learnlog` through the course platform as instructed.
+
+## Troubleshooting
+
+- **`learnlog: command not found`** — `pipx`'s bin directory is
+  not on your `PATH`. Run `pipx ensurepath` and then close and
+  reopen your terminal. Platform-specific `PATH` guidance is at
+  <https://pipx.pypa.io/stable/installation/>.
+- **Nothing appears in `.learnlog/` after running a script** —
+  check that VS Code (or your terminal) is actually using the
+  venv that `learnlog init python` wired. In VS Code, that is
+  often the workspace `.venv/`; in a plain shell, run
+  `eval "$(learnlog activate)"` if the project venv is not
+  already active. The autostart hook lives inside that venv,
+  so a script run with a different Python is not captured.
+- **You already had a project Git repository** — the `.learnlog/`
+  directory is independent; do **not** `git add .learnlog/` in
+  your project's own repository. It manages itself.
+- **Need to start over** — re-run `learnlog init python`; it is
+  idempotent and reuses an existing `.venv/`. Only if you want
+  to erase your history, delete `.learnlog/` first; your own code
+  is untouched either way.
+@
+
+\section{Code overview}
 
 The design is guided by two constraints:
 \begin{description}
@@ -90,8 +458,6 @@ The design is guided by two constraints:
 \end{description}
 
 
-\section{Code overview}
-
 <<[[__init__.py]]>>=
 """Automatic logging of student code development.
 
@@ -102,6 +468,7 @@ stored in a hidden ``.learnlog/`` Git repository.
 
 import sys
 import os
+import builtins
 import pathlib
 import datetime
 import atexit
@@ -121,6 +488,7 @@ verifying the full pipeline from import to commit:
 
 <<test [[learnlog.py]]>>=
 """Integration tests for the learnlog package."""
+import io
 import tempfile
 import subprocess
 import os
@@ -149,10 +517,14 @@ iolog = None
 original_stdout = None
 original_stderr = None
 original_stdin = None
+original_input = None
 exception_info = None
 start_time = None
 main_script = None
 main_args = None
+repl_capture_restore = None
+repl_capture_flush = None
+repl_capture_skip_input = None
 @
 
 
@@ -214,6 +586,7 @@ class TestFindLearnlogDir:
 
 
 \section{Initialisation}
+\label{sec:initialize}
 
 The [[initialize]] function is called at import time.
 It detects the main script, creates (or opens) the learnlog repository,
@@ -230,6 +603,314 @@ The entire function is wrapped in a [[try]]/[[except]] that catches
 If learnlog fails for any reason---no Git installed, permission denied,
 disk full---the student's program must still work.
 
+Autostart widens the set of invocations that reach [[initialize]].
+Besides ordinary [[script.py]] runs we now see the bare REPL,
+[[python -c]], [[python -m]], and entry-point scripts such as
+[[pip]] or [[pytest]].
+Those forms need two normalisations before we write a run header:
+which repository to anchor to, and what human-readable name to give
+the invocation.
+
+The repository lookup now prefers [[LEARNLOG_PROJECT_ROOT]] when the
+autostart gate has already resolved the project root from the venv.
+That is what lets a script launched from [[/tmp]] still log into the
+course project's [[.learnlog/]].
+Without it, the fallback [[find_learnlog_dir() or os.getcwd()]] logic
+would anchor such runs to the caller's working directory instead.
+
+The invocation name is normalised rather than copied from
+[[sys.argv[0]]] verbatim.
+Raw values such as the empty string or [[-c]] are faithful to CPython,
+but poor commit headers for humans.
+We map those sentinel forms to labels that explain how Python was
+started while leaving ordinary filenames and entry-point basenames
+unchanged.
+
+The same bootstrap exclusion from the autostart gate also needs to be
+enforced here.
+The [[.pth]] hook skips [[learnlog init]] before importing the package,
+but the installed CLI entry point imports [[learnlog.cli]], which in turn
+imports [[learnlog]] through ordinary Python package loading.
+Without a second check in [[initialize]], [[learnlog init]] still logs
+itself whenever the CLI package is imported directly.
+
+We therefore keep the bootstrap detector in the shared runtime helpers,
+then reuse the same predicate from [[_autostart.py]].
+That avoids the drift that would come from maintaining two slightly
+different definitions of what counts as the bootstrap invocation.
+
+<<functions>>=
+def _is_learnlog_init(argv):
+    """True iff ``argv`` looks like a ``learnlog init`` invocation.
+
+    Recognises the installed ``learnlog`` entry-point script and
+    ``python -m learnlog`` (in which case ``argv[0]`` contains
+    ``learnlog`` as a path component).
+    """
+    if len(argv) < 2 or argv[1] != "init":
+        return False
+    basename = os.path.basename(argv[0])
+    if basename == "learnlog":
+        return True
+    return "learnlog" in pathlib.PurePath(argv[0]).parts
+@
+
+<<functions>>=
+def _normalize_main_invocation(argv):
+    """Return a normalised ``(script, args)`` pair from ``argv``."""
+    argv = list(argv) if argv else [""]
+    script = argv[0]
+    special = {
+        "": ("<repl>", lambda values: []),
+        "-c": (
+            "<python -c>",
+            lambda values: [values[1]] if len(values) > 1 else [],
+        ),
+        "-m": ("<python -m>", lambda values: values[1:]),
+    }
+    if script in special:
+        name, args_factory = special[script]
+        return name, args_factory(argv)
+    basename = os.path.basename(script)
+    if script.endswith(".py"):
+        return basename, argv[1:]
+    return basename, argv[1:]
+@
+
+[[InputCapture]] handles piped stdin because [[input()]] eventually
+reads from [[sys.stdin.readline()]].
+That is not enough for interactive terminals, where the REPL and line
+editing stack bypass our wrapper at the C level.
+We therefore also wrap [[builtins.input]], but only as a supplement:
+when [[sys.stdin]] is already an [[InputCapture]] we must not write a
+second identical [[stdin:]] entry for the same line.
+
+<<functions>>=
+def _wrap_input(original_input, iolog):
+    """Return an ``input`` wrapper that records returned lines."""
+    def logged_input(prompt=""):
+        _flush_pending_repl_capture()
+        line = original_input(prompt)
+        _skip_repl_input_history(line)
+        if not isinstance(sys.stdin, InputCapture):
+            iolog.log("stdin", line + "\n")
+        return line
+
+    return logged_input
+@
+
+REPL statements need a second supplement.
+Top-level lines such as [[2+2]] or [[raise RuntimeError('x')]] do not
+flow through [[input()]] at all.
+On current CPython versions that ship the stdlib [[_pyrepl]] frontend
+(3.13+ at the time of writing), the interactive frontend asks
+[[_pyrepl.simple_interact.multiline_input]] for each completed
+statement, then executes it.
+By wrapping that function we can log the entered statement at the
+moment it becomes complete, which preserves the same chronological
+ordering as the live REPL without scraping terminal repaint bytes.
+This is a best-effort compatibility path rather than a universal REPL
+API: older CPython versions and non-CPython interpreters may not ship
+[[_pyrepl]] at all.
+
+<<functions>>=
+def _log_repl_statement(iolog, statement):
+    """Append one completed REPL statement to ``iolog``."""
+    if not statement:
+        return
+    for index, line in enumerate(statement.splitlines(keepends=True)):
+        prompt = ">>> " if index == 0 else "... "
+        if line.endswith("\n"):
+            iolog.log("stdin", prompt + line)
+        else:
+            iolog.log("stdin", prompt + line + "\n")
+@
+
+The same frontend also replaces [[builtins.input]] with its own TTY
+reader.
+That would bypass our ordinary [[_wrap_input]] logging for
+[[input()]] calls made from inside the REPL, so we wrap pyrepl's input
+method as well.
+Without that second hook we would capture [[value = input()]] as a
+statement, but miss the student's reply that the running code reads from
+the terminal.
+
+<<functions>>=
+def _wrap_pyrepl_input(original_input, iolog):
+    """Return a pyrepl ``input`` wrapper that records returned lines."""
+    def logged_input(self, prompt=""):
+        line = original_input(self, prompt)
+        iolog.log("stdin", line + "\n")
+        return line
+
+    return logged_input
+@
+
+Older CPython versions still expose one useful clue: once the stock
+REPL has accepted a top-level line, [[readline]] usually appends it to
+history.
+That does not tell us the exact instant the statement became complete,
+so this path is weaker than [[_pyrepl]]: a silent statement may remain
+pending until some later visible effect or until the session exits.
+It is still good enough to flush accepted statements before stdout or
+stderr output, before unhandled exceptions, and before nested
+[[input()]] replies.
+
+<<functions>>=
+def _install_readline_repl_capture(iolog, readline_module):
+    """Return fallback helpers based on readline history."""
+    try:
+        history_length = readline_module.get_current_history_length()
+    except Exception:
+        return None, None
+
+    def flush():
+        nonlocal history_length
+        try:
+            current = readline_module.get_current_history_length()
+        except Exception:
+            return
+        if current <= history_length:
+            return
+        for index in range(history_length + 1, current + 1):
+            try:
+                statement = readline_module.get_history_item(index)
+            except Exception:
+                statement = None
+            if statement is not None:
+                _log_repl_statement(iolog, statement)
+        history_length = current
+
+    def skip_input(line):
+        nonlocal history_length
+        try:
+            current = readline_module.get_current_history_length()
+        except Exception:
+            return
+        if current <= history_length:
+            return
+        new_items = []
+        for index in range(history_length + 1, current + 1):
+            try:
+                statement = readline_module.get_history_item(index)
+            except Exception:
+                statement = None
+            new_items.append(statement)
+        if new_items and new_items[-1] == line:
+            for statement in new_items[:-1]:
+                if statement is not None:
+                    _log_repl_statement(iolog, statement)
+            history_length = current
+            return
+        flush()
+
+    return flush, skip_input
+@
+
+We trigger those deferred flushes from the places where Python does hand
+control back to us: output writes, nested [[input()]] calls, unhandled
+exceptions, and exit cleanup.
+
+<<functions>>=
+def _flush_pending_repl_capture():
+    """Flush any deferred REPL capture state."""
+    if repl_capture_flush is None:
+        return
+    try:
+        repl_capture_flush()
+    except Exception:
+        pass
+
+
+def _skip_repl_input_history(line):
+    """Ignore a nested REPL ``input()`` reply already logged elsewhere."""
+    if repl_capture_skip_input is None:
+        return
+    try:
+        repl_capture_skip_input(line)
+    except Exception:
+        pass
+@
+
+Output is the most important synchronization point.
+If a fallback REPL statement such as [[print(value)]] produces text, the
+statement should reach the log before the resulting stdout or stderr
+entry.
+We therefore use a tiny output wrapper that flushes any deferred REPL
+history first.
+Outside REPL mode that hook is inert.
+
+<<functions>>=
+class ReplAwareStreamCapture(StreamCapture):
+    """StreamCapture that flushes deferred REPL input first."""
+
+    def write(self, text):
+        _flush_pending_repl_capture()
+        return super().write(text)
+@
+
+When [[_pyrepl]] is unavailable, or if its internal interface changes,
+we fall back to the weaker [[readline]] path.
+If neither mechanism is present, we do nothing special here.
+The ordinary [[builtins.input]] wrapper still covers interactive
+[[input()]] calls, including [[input()]] executed from REPL code.
+Pyrepl-equipped interpreters get the stronger guarantee of both inline
+top-level statement logging and REPL-time [[input()]] capture; older
+readline-based interpreters get best-effort top-level statement capture
+at those later synchronization points.
+
+<<functions>>=
+def _install_repl_capture(
+    script,
+    iolog,
+    pyrepl_readline=None,
+    simple_interact=None,
+    readline_module=None,
+):
+    """Install REPL capture and return restore/flush helpers."""
+    if script != "<repl>":
+        return None, None, None
+    if pyrepl_readline is None or simple_interact is None:
+        try:
+            import _pyrepl.readline as pyrepl_readline
+            import _pyrepl.simple_interact as simple_interact
+        except Exception:
+            pyrepl_readline = None
+            simple_interact = None
+
+    if pyrepl_readline is not None and simple_interact is not None:
+        original_multiline_input = simple_interact.multiline_input
+        wrapper_type = type(pyrepl_readline._wrapper)
+        original_pyrepl_input = wrapper_type.input
+
+        def logged_multiline_input(more_lines, ps1, ps2):
+            statement = original_multiline_input(more_lines, ps1, ps2)
+            _log_repl_statement(iolog, statement)
+            return statement
+
+        simple_interact.multiline_input = logged_multiline_input
+        wrapper_type.input = _wrap_pyrepl_input(
+            original_pyrepl_input, iolog,
+        )
+
+        def restore():
+            simple_interact.multiline_input = original_multiline_input
+            wrapper_type.input = original_pyrepl_input
+
+        return restore, None, None
+
+    if readline_module is None:
+        try:
+            import readline as readline_module
+        except Exception:
+            return None, None, None
+
+    flush, skip_input = _install_readline_repl_capture(
+        iolog, readline_module,
+    )
+    return None, flush, skip_input
+@
+
 <<functions>>=
 def initialize():
     """Set up learnlog: detect script, init repo, wrap streams.
@@ -239,15 +920,17 @@ def initialize():
     """
     global repo, iolog, start_time, main_script, main_args
     global original_stdout, original_stderr, original_stdin
+    global original_input, repl_capture_restore
+    global repl_capture_flush, repl_capture_skip_input
 
     if repo is not None:
         return
 
     try:
         <<detect main script>>
-        <<skip if running as CLI tool>>
         <<create repository and begin run>>
         <<install I/O wrappers>>
+        <<install REPL capture>>
         <<install exception hook>>
         atexit.register(on_exit)
     except Exception:
@@ -255,26 +938,16 @@ def initialize():
 @
 
 <<detect main script>>=
-main_script = os.path.basename(sys.argv[0])
-main_args = sys.argv[1:]
-start_time = datetime.datetime.now()
-workdir = find_learnlog_dir() or os.getcwd()
-@
-
-When [[learnlog]] is invoked as a CLI tool (\eg [[learnlog play]] or
-[[learnlog export]]), we must not run initialisation.
-Without this guard, running [[learnlog play]] from the home directory
-would create a [[.learnlog/]] repository there---staging every file
-in [[\$HOME]] into Git.
-Even in a project directory, the CLI's own invocations would clutter
-the student's development log with tool usage rather than program runs.
-The entry point in [[pyproject.toml]] is [[learnlog.cli:app]], so
-[[sys.argv[0]]] resolves to the [[learnlog]] script.
-We detect this and skip initialisation entirely.
-
-<<skip if running as CLI tool>>=
-if main_script == "learnlog":
+if _is_learnlog_init(sys.argv):
     return
+main_script, main_args = _normalize_main_invocation(sys.argv)
+start_time = datetime.datetime.now()
+project_root = os.environ.get("LEARNLOG_PROJECT_ROOT")
+workdir = (
+    pathlib.Path(project_root)
+    if project_root is not None
+    else find_learnlog_dir() or os.getcwd()
+)
 @
 
 If [[find_learnlog_dir]] finds no existing repository, the fallback to
@@ -292,9 +965,20 @@ iolog = IOLog()
 original_stdout = sys.stdout
 original_stderr = sys.stderr
 original_stdin = sys.stdin
-sys.stdout = StreamCapture(original_stdout, "stdout", iolog)
-sys.stderr = StreamCapture(original_stderr, "stderr", iolog)
-sys.stdin = InputCapture(original_stdin, iolog)
+original_input = builtins.input
+sys.stdout = ReplAwareStreamCapture(original_stdout, "stdout", iolog)
+sys.stderr = ReplAwareStreamCapture(original_stderr, "stderr", iolog)
+if not original_stdin.isatty():
+    sys.stdin = InputCapture(original_stdin, iolog)
+builtins.input = _wrap_input(original_input, iolog)
+@
+
+<<install REPL capture>>=
+(
+    repl_capture_restore,
+    repl_capture_flush,
+    repl_capture_skip_input,
+) = _install_repl_capture(main_script, iolog)
 @
 
 Let's verify that initialisation creates the repository and wraps
@@ -344,14 +1028,48 @@ class TestInitialize:
         )
         assert "visible" in result.stdout
 
-    def test_skips_when_running_as_cli(self, workdir, test_env):
-        """Simulates sys.argv[0] being 'learnlog'."""
-        script = workdir / "test_cli_skip.py"
+    def test_honours_project_root_env_var(self, test_env, tmp_path):
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        subdir = project_root / "subdir"
+        subdir.mkdir()
+        script = subdir / "test_env_root.py"
+        script.write_text(
+            "import os\n"
+            "import sys\n"
+            f"os.environ['LEARNLOG_PROJECT_ROOT'] = {str(project_root)!r}\n"
+            "import learnlog\n"
+            "print(learnlog.repo.workdir)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(subdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == str(project_root)
+        assert (project_root / ".learnlog").is_dir()
+        assert not (subdir / ".learnlog").exists()
+
+    @pytest.mark.parametrize(
+        ("argv", "expected_script", "expected_args"),
+        [
+            ([""], "<repl>", "(none)"),
+            (["-c", "print(1)"], "<python -c>", "print(1)"),
+            (["-m", "pip", "--version"], "<python -m>",
+             "pip --version"),
+            (["/tmp/demo.py", "arg1"], "demo.py", "arg1"),
+            (["/tmp/.venv/bin/pytest", "-q"], "pytest", "-q"),
+        ],
+    )
+    def test_normalises_main_invocation(
+        self, workdir, test_env, argv, expected_script, expected_args,
+    ):
+        script = workdir / "test_main_invocation.py"
         script.write_text(
             "import sys\n"
-            "sys.argv = ['learnlog', 'play']\n"
+            f"sys.argv = {argv!r}\n"
             "import learnlog\n"
-            "assert learnlog.repo is None\n"
         )
         result = subprocess.run(
             [sys.executable, str(script)],
@@ -359,6 +1077,57 @@ class TestInitialize:
             capture_output=True, text=True, timeout=30,
         )
         assert result.returncode == 0
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert f"Script: {expected_script}" in msg
+        assert f"Arguments: {expected_args}" in msg
+
+    def test_input_calls_are_logged_once_for_piped_stdin(
+        self, workdir, test_env,
+    ):
+        script = workdir / "test_input_once.py"
+        script.write_text(
+            "import learnlog\n"
+            "value = input()\n"
+            "print(value)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(workdir), env=test_env,
+            input="hello\n",
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert msg.count("stdin: hello\n") == 1
+
+    def test_skips_learnlog_init_bootstrap(self, tmp_path, test_env):
+        script = tmp_path / "learnlog"
+        script.write_text(
+            "import sys\n"
+            "sys.argv = ['/venv/bin/learnlog', 'init', 'python']\n"
+            "import learnlog\n"
+            "print(learnlog.repo)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(tmp_path), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == "None"
+        assert not (tmp_path / ".learnlog").exists()
 
     def test_uses_existing_repo_from_subdirectory(
         self, workdir, test_env
@@ -399,6 +1168,207 @@ class TestInitialize:
         assert "hello.py" in git_result.stdout
 @
 
+Let's verify the helper pieces directly.
+The [[input()]] wrapper must add a line only when stdin is not already
+an [[InputCapture]], and the REPL helpers must format and install
+inline capture correctly.
+The older [[readline]] fallback is weaker, but it still needs to log
+accepted statements, keep nested [[input()]] replies from being doubled,
+and flush pending statements before visible output.
+
+<<test functions>>=
+def test_wrap_input_logs_when_stdin_is_not_wrapped(monkeypatch):
+    import learnlog
+
+    log = learnlog.IOLog()
+    monkeypatch.setattr(learnlog.sys, "stdin", io.StringIO())
+    wrapped = learnlog._wrap_input(lambda prompt="": "typed", log)
+
+    assert wrapped() == "typed"
+    assert "stdin: typed\n" in log.getvalue()
+
+
+def test_wrap_input_skips_duplicate_log_when_stdin_is_wrapped():
+    import learnlog
+
+    log = learnlog.IOLog()
+    wrapped_stdin = learnlog.InputCapture(io.StringIO("typed\n"), log)
+    original_stdin = learnlog.sys.stdin
+    learnlog.sys.stdin = wrapped_stdin
+    try:
+        wrapped = learnlog._wrap_input(lambda prompt="": "typed", log)
+        assert wrapped() == "typed"
+    finally:
+        learnlog.sys.stdin = original_stdin
+
+    assert log.getvalue() == ""
+
+
+def test_log_repl_statement_formats_multiline_input():
+    import learnlog
+
+    log = learnlog.IOLog()
+    learnlog._log_repl_statement(
+        log,
+        "for i in range(2):\n    print(i)",
+    )
+
+    assert log.getvalue() == (
+        "stdin: >>> for i in range(2):\n"
+        "stdin: ...     print(i)\n"
+    )
+
+
+def test_install_repl_capture_logs_inline_repl_events():
+    import learnlog
+
+    class FakePyreplWrapper:
+        def input(self, prompt=""):
+            return "typed"
+
+    class FakePyreplReadline:
+        _wrapper = FakePyreplWrapper()
+
+    class FakeSimpleInteract:
+        pass
+
+    simple_interact = FakeSimpleInteract()
+    simple_interact.multiline_input = lambda more_lines, ps1, ps2: "2+2"
+
+    log = learnlog.IOLog()
+    restore, flush, skip_input = learnlog._install_repl_capture(
+        "<repl>",
+        log,
+        pyrepl_readline=FakePyreplReadline,
+        simple_interact=simple_interact,
+    )
+
+    assert restore is not None
+    assert flush is None
+    assert skip_input is None
+    assert simple_interact.multiline_input(None, ">>> ", "... ") == "2+2"
+    assert FakePyreplReadline._wrapper.input("prompt") == "typed"
+
+    restore()
+    assert simple_interact.multiline_input(None, ">>> ", "... ") == "2+2"
+    assert FakePyreplReadline._wrapper.input("prompt") == "typed"
+
+    assert log.getvalue() == (
+        "stdin: >>> 2+2\n"
+        "stdin: typed\n"
+    )
+
+
+def test_install_repl_capture_returns_no_hooks_without_support(
+    monkeypatch,
+):
+    import builtins
+    import learnlog
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("_pyrepl") or name == "readline":
+            raise ImportError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    log = learnlog.IOLog()
+    assert learnlog._install_repl_capture(
+        "<repl>",
+        log,
+        pyrepl_readline=None,
+        simple_interact=None,
+        readline_module=None,
+    ) == (None, None, None)
+
+
+def test_install_readline_repl_capture_logs_history_entries():
+    import learnlog
+
+    class FakeReadline:
+        history = ["old"]
+
+        @classmethod
+        def get_current_history_length(cls):
+            return len(cls.history)
+
+        @classmethod
+        def get_history_item(cls, index):
+            return cls.history[index - 1]
+
+    log = learnlog.IOLog()
+    flush, skip_input = learnlog._install_readline_repl_capture(
+        log, FakeReadline,
+    )
+
+    assert flush is not None
+    assert skip_input is not None
+
+    FakeReadline.history.extend([
+        "2+2",
+        "for i in range(2):\n    print(i)",
+    ])
+    flush()
+
+    assert log.getvalue() == (
+        "stdin: >>> 2+2\n"
+        "stdin: >>> for i in range(2):\n"
+        "stdin: ...     print(i)\n"
+    )
+
+
+def test_readline_repl_capture_skips_nested_input_history():
+    import learnlog
+
+    class FakeReadline:
+        history = []
+
+        @classmethod
+        def get_current_history_length(cls):
+            return len(cls.history)
+
+        @classmethod
+        def get_history_item(cls, index):
+            return cls.history[index - 1]
+
+    log = learnlog.IOLog()
+    flush, skip_input = learnlog._install_readline_repl_capture(
+        log, FakeReadline,
+    )
+
+    FakeReadline.history.extend(["value = input()", "typed"])
+    skip_input("typed")
+
+    assert log.getvalue() == "stdin: >>> value = input()\n"
+    flush()
+    assert log.getvalue() == "stdin: >>> value = input()\n"
+
+
+def test_repl_aware_stream_capture_flushes_pending_repl_history(
+    monkeypatch,
+):
+    import learnlog
+
+    flushed = []
+    monkeypatch.setattr(
+        learnlog,
+        "repl_capture_flush",
+        lambda: flushed.append("flushed"),
+    )
+
+    original = io.StringIO()
+    log = learnlog.IOLog()
+    capture = learnlog.ReplAwareStreamCapture(original, "stdout", log)
+
+    capture.write("hello\n")
+
+    assert flushed == ["flushed"]
+    assert original.getvalue() == "hello\n"
+    assert log.getvalue() == "stdout: hello\n"
+@
+
 
 \section{Exception handling}
 
@@ -418,6 +1388,7 @@ original_excepthook = sys.excepthook
 
 def exception_hook(exc_type, exc_value, exc_tb):
     global exception_info
+    _flush_pending_repl_capture()
     exception_info = "".join(
         traceback.format_exception(
             exc_type, exc_value, exc_tb
@@ -478,12 +1449,15 @@ def on_exit():
     """
     global repo, iolog, exception_info
     global original_stdout, original_stderr, original_stdin
+    global original_input, repl_capture_restore
+    global repl_capture_flush, repl_capture_skip_input
 
     if repo is None:
         return
 
     try:
         <<restore original streams>>
+        <<restore REPL capture>>
         <<finalise the run>>
     except Exception:
         pass
@@ -496,6 +1470,17 @@ if original_stderr is not None:
     sys.stderr = original_stderr
 if original_stdin is not None:
     sys.stdin = original_stdin
+if original_input is not None:
+    builtins.input = original_input
+@
+
+<<restore REPL capture>>=
+_flush_pending_repl_capture()
+if repl_capture_restore is not None:
+    repl_capture_restore()
+repl_capture_restore = None
+repl_capture_flush = None
+repl_capture_skip_input = None
 @
 
 <<finalise the run>>=
@@ -647,4 +1632,1025 @@ explicit setup needed.
 
 <<auto-initialize on import>>=
 initialize()
+@
+
+
+\section{Auto-starting without explicit import}
+\label{sec:autostart}
+
+The mechanism described so far captures everything \emph{after} the
+interpreter reaches \mintinline{python}{import learnlog}.
+Everything \emph{before} that line is invisible to us---and for
+beginners, the commonest failure mode lives there.
+A [[SyntaxError]] in [[main.py]] (a stray colon, a missing paren,
+indentation that mixes tabs and spaces) aborts the interpreter
+during \emph{compilation} of the script, before a single top-level
+statement runs.
+No hooks, no capture, nothing in the log.
+Yet chasing syntax errors is a central debugging activity for
+first-year students; omitting those runs leaves a visible gap in
+both teaching and research data.
+
+We need to attach \emph{before} CPython compiles the main script,
+without changing how students launch their programs: [[python
+main.py]], the VS Code \textbf{Run} button, and \texttt{F5} must
+all keep working.
+Python's [[site.py]] evaluates any line beginning with [[import]]
+inside a [[.pth]] file at interpreter startup---ahead of the main
+script and therefore ahead of parse errors in it.
+So [[learnlog init]] installs a one-line
+[[learnlog-autostart.pth]] into the venv's [[site-packages]]:
+\begin{minted}{python}
+import learnlog._autostart; learnlog._autostart.autostart()
+\end{minted}
+
+The [[_autostart]] module is a \emph{gate}: it decides whether
+\emph{this} interpreter invocation should be logged and, if so,
+its explicit [[autostart()]] entry point imports [[learnlog]], reusing the ordinary
+\mintinline{python}{import learnlog} machinery
+(\cref{sec:autostart-on-import}).
+Rather than duplicate the repository-discovery path, the gate
+communicates the project root to [[initialize]] by setting
+[[LEARNLOG_PROJECT_ROOT]] in the environment.
+
+\paragraph{Why [[.pth]] rather than [[sitecustomize.py]].}
+The venv may already carry a [[sitecustomize.py]] written by
+another tool (Python loads only one).
+Multiple [[.pth]] files coexist, so we cannot collide.
+The same trick powers [[coverage.py]]'s subprocess auto-start
+([[coverage.pth]])---so the mechanism is proven at scale.
+
+\paragraph{Scope.}
+After [[learnlog init]] the venv is the unit of logging: every
+invocation of the venv's interpreter is captured.
+Scripts anywhere on disk (including [[/tmp]]), the REPL,
+[[python -c]], [[python -m foo]], [[pip]], [[pytest]], editor
+linters that shell out to this interpreter, and every [[learnlog]]
+subcommand \emph{except} [[learnlog init]] itself---all logged.
+Students who want to work untracked step outside the venv.
+
+\paragraph{What slips through.}
+Python launched with [[-S]] (skips [[site.py]] and therefore
+[[.pth]] files), embedded interpreters, other virtualenvs,
+and any invocation with [[LEARNLOG_SKIP_AUTOSTART=1]] in the
+environment.
+The opt-out variable is a deliberate escape hatch used by
+learnlog's own test suite: without it, running [[pytest]] inside
+the development venv would recursively log every test run.
+
+
+\subsection{Shape of the module}
+
+The module is a small script with one explicit startup entry point.
+The imports are ordinary; the body is a gate helper plus an
+[[autostart()]] function that the [[.pth]] line calls.
+The whole thing lives inside a bare [[try]]/[[except Exception:
+pass]]: [[.pth]] files execute on \emph{every} Python startup,
+including tools that have nothing to do with learnlog, so a
+traceback here would break unrelated programs.
+
+<<[[_autostart.py]]>>=
+"""Autostart hook installed by ``learnlog init``.
+
+A ``.pth`` file in the venv's ``site-packages`` imports this
+module and calls ``autostart()``, which decides whether
+``learnlog`` should activate for the current interpreter invocation
+and, if so, imports the package to trigger its own initialisation
+path.
+
+Test-friendly: each helper accepts optional overrides so unit tests
+can exercise the gate without monkeypatching ``sys`` or the
+filesystem wholesale.
+"""
+import os
+import sys
+import pathlib
+import sysconfig
+
+<<autostart marker location>>
+<<autostart gate helpers>>
+<<autostart entry point>>
+
+<<autostart module-level activation>>
+@
+
+
+\subsection{Locating the project root}
+
+The gate must answer a single question for every venv invocation:
+\emph{which [[.learnlog/]] repository should we anchor to?}
+Two sources are available, each with a different failure mode,
+and we combine them.
+
+The \textbf{primary source} is a marker file
+[[learnlog_project_root.txt]] written alongside the [[.pth]] file
+at [[learnlog init]] time.
+It is authoritative because a human ran [[learnlog init]] in the
+project root, so the path it holds is \emph{intentional}.
+But it goes stale: delete or move the project and the marker
+still points at the old location.
+
+The \textbf{backup source} is [[Path(sys.prefix).parent]].
+With the conventional [[<project>/.venv/]] layout (produced by
+both [[learnlog init]] and VS Code's \enquote{Create Environment}),
+this resolves to the project root even after the project is
+renamed or moved---because the venv moves with it.
+But the layout is a convention, not a guarantee: a venv at
+[[~/.venvs/foo]] sits nowhere near the project.
+
+We prefer the marker because it is intentional, and only fall
+through to the backup when the marker is missing or stale.
+When we do fall through, we \emph{rewrite} the marker with the
+backup's path so the next invocation takes the fast path.
+This is the self-healing step: a moved project re-anchors itself
+after one run with no user intervention.
+
+If marker and backup both resolve but point at \emph{different}
+valid project roots (\eg a shared [[~/.venvs/]] directory that
+happens to contain its own [[.learnlog/]]), we stick with the
+marker.
+It was set deliberately; the backup's match is coincidental and
+the marker's project is what the student actually worked on.
+
+The marker belongs to the current interpreter's [[purelib]]
+directory, not necessarily next to the imported module file.
+That distinction matters in editable and source-tree installs:
+the [[.pth]] hook still lives in [[site-packages]], but it can
+import [[learnlog._autostart]] from a checkout under [[src/]].
+So we ask [[sysconfig]] for this interpreter's [[purelib]] path
+and only fall back to a module-relative guess if that lookup
+fails.
+
+<<autostart marker location>>=
+def _default_marker_path(module_file=None, purelib_path=None):
+    """Return the marker path for this interpreter.
+
+    The marker is written into ``site-packages`` alongside the
+    autostart ``.pth`` file.  Editable installs may import
+    ``learnlog._autostart`` from a source tree instead, so the
+    module's own directory is only a fallback.
+    """
+    if purelib_path is None:
+        try:
+            purelib_path = pathlib.Path(
+                sysconfig.get_paths()["purelib"]
+            )
+        except Exception:
+            module_path = pathlib.Path(
+                module_file or __file__
+            ).resolve()
+            purelib_path = module_path.parent.parent
+    return pathlib.Path(purelib_path) / "learnlog_project_root.txt"
+
+
+_DEFAULT_MARKER_PATH = _default_marker_path()
+@
+
+Reading the marker is best-effort: the file may be absent
+(first-ever run before init ran), unreadable (permission), or
+stale (points at a path that no longer has a [[.learnlog/]]).
+All three cases collapse to the same answer, [[None]], so the
+caller can try the backup.
+A path with no [[.learnlog/]] subdirectory is treated as stale
+rather than valid-but-empty; this is how we detect moved or
+deleted projects.
+
+<<autostart gate helpers>>=
+def _read_marker(marker_path):
+    """Return the path stored in ``marker_path`` if still valid.
+
+    "Valid" means the file exists, is readable, and points at a
+    directory that still contains a ``.learnlog/`` subdirectory.
+    Returns ``None`` otherwise.
+    """
+    try:
+        if not marker_path.exists():
+            return None
+        candidate = pathlib.Path(marker_path.read_text().strip())
+        if (candidate / ".learnlog").is_dir():
+            return candidate
+    except Exception:
+        pass
+    return None
+@
+
+The backup check is simpler: does the venv's parent contain a
+[[.learnlog/]]?
+[[sys.prefix]] is always the venv root when running inside a
+venv, so [[sys.prefix.parent]] is the directory that holds the
+venv.
+
+<<autostart gate helpers>>=
+def _compute_backup_root(sys_prefix):
+    """Return ``sys_prefix``'s parent if it holds ``.learnlog/``.
+
+    Covers the common ``<project>/.venv/`` layout and survives
+    project moves.  Returns ``None`` when the layout does not
+    match.
+    """
+    try:
+        candidate = pathlib.Path(sys_prefix).parent
+        if (candidate / ".learnlog").is_dir():
+            return candidate
+    except Exception:
+        pass
+    return None
+@
+
+Self-healing writes the backup's path back into the marker.
+We swallow write failures silently: on a read-only site-packages
+(unusual but possible), logging still works via the backup path
+every invocation---the self-heal is a performance optimisation,
+not a correctness requirement.
+
+<<autostart gate helpers>>=
+def _self_heal_marker(marker_path, project_root):
+    """Rewrite ``marker_path`` with ``project_root``'s path.
+
+    Best-effort: a read-only ``site-packages`` simply means every
+    invocation falls through to the backup check, which still
+    produces correct logging.
+    """
+    try:
+        marker_path.write_text(
+            str(project_root.resolve()) + "\n"
+        )
+    except Exception:
+        pass
+@
+
+Combining the three pieces: try the marker; on success, stop.
+On failure, try the backup; on success, self-heal and return it.
+If both fail, the interpreter is not running inside a learnlog
+project and we skip activation.
+
+<<autostart gate helpers>>=
+def _resolve_project_root(marker_path=None, sys_prefix=None):
+    """Find the project root, preferring marker over backup.
+
+    On a successful fallback to the backup, rewrites the marker so
+    subsequent invocations take the fast path.  Returns ``None``
+    when neither source is valid.
+    """
+    if marker_path is None:
+        marker_path = _DEFAULT_MARKER_PATH
+    if sys_prefix is None:
+        sys_prefix = sys.prefix
+
+    marker_root = _read_marker(marker_path)
+    if marker_root is not None:
+        return marker_root
+
+    backup_root = _compute_backup_root(sys_prefix)
+    if backup_root is not None:
+        _self_heal_marker(marker_path, backup_root)
+        return backup_root
+
+    return None
+@
+
+
+\subsection{Excluding the bootstrap invocation}
+
+[[learnlog init]] is the one command that must \emph{not} be
+logged: it is creating the repository, so it has no repository
+to commit into yet (or, on re-init, it is changing the repository
+from under itself).
+Every \emph{other} [[learnlog]] subcommand is research-valuable
+data about how the student interacts with their own log and must
+be captured like any other program.
+
+We detect [[learnlog init]] by matching [[argv[0]]] against the
+script name and [[argv[1]]] against the literal [[init]].
+[[argv[0]]] can be either the [[learnlog]] entry-point script
+itself (installed in [[<venv>/bin/]]) or a path to the package's
+[[__main__.py]] when invoked as [[python -m learnlog]];
+both contain [[learnlog]] as a path component.
+
+<<autostart gate helpers>>=
+from learnlog import _is_learnlog_init
+@
+
+
+\subsection{The activation gate}
+
+The gate combines three skip conditions: the explicit opt-out
+environment variable, the [[learnlog init]] self-exclusion, and
+the absence of any resolvable project root.
+Order does not matter for correctness, only for cost: we check
+the env var first because it is the cheapest, and the root
+resolution last because it may touch the filesystem.
+
+All four parameters default to their real-world values but accept
+overrides; this is what lets the unit tests exercise the gate
+without installing a venv per test.
+
+<<autostart entry point>>=
+def _should_activate(
+    marker_path=None, sys_prefix=None, argv=None, env=None,
+):
+    """Return the project root if learnlog should activate.
+
+    Parameters default to ``sys`` / ``os.environ`` values; tests
+    override them.  Returns ``None`` when the current invocation
+    must be skipped.
+    """
+    if env is None:
+        env = os.environ
+    if argv is None:
+        argv = sys.argv
+    if env.get("LEARNLOG_SKIP_AUTOSTART"):
+        return None
+    if _is_learnlog_init(argv):
+        return None
+    return _resolve_project_root(marker_path, sys_prefix)
+@
+
+
+\subsection{Startup entry point}
+\label{sec:autostart-on-import}
+
+The last piece runs at interpreter startup---once, when the
+[[.pth]] line calls [[autostart()]].
+Keeping it as an explicit function instead of unconditional
+module-level side effect matters for tests and helper imports:
+unit tests must be able to import [[learnlog._autostart]] to reach
+[[_should_activate]] without mutating the parent process
+environment.
+
+If the gate returns a project root, we stash it in
+[[LEARNLOG_PROJECT_ROOT]] so [[initialize]] (\cref{sec:initialize})
+will find the right [[.learnlog/]], then [[import learnlog]] to
+trigger the ordinary import-time initialisation path.
+If the gate returns [[None]], we silently do nothing and the
+interpreter continues as if we were not installed.
+
+The outer [[try]]/[[except]] is non-negotiable.
+A [[.pth]] module runs before user code on every Python
+invocation in the venv---including [[python -m pip install
+something-unrelated]].
+A traceback from this module would spam [[stderr]] and, worse,
+could be confused with an error from the user's command.
+We swallow everything and let the interpreter proceed.
+
+<<autostart module-level activation>>=
+def autostart():
+    """Activate learnlog for this interpreter startup if eligible."""
+    try:
+        _root = _should_activate()
+        if _root is not None:
+            os.environ["LEARNLOG_PROJECT_ROOT"] = str(_root)
+            import learnlog  # noqa: F401 -- triggers initialize()
+    except Exception:
+        pass
+@
+
+
+\subsection{Tests for the gate}
+
+The gate is pure logic over four inputs (marker file, sys.prefix,
+argv, env) and one side effect (marker rewrite on self-heal).
+The fixtures below build a minimal filesystem fixture and then
+drive [[_should_activate]] with explicit overrides---no subprocess,
+no real venv, no patching of [[sys]].
+End-to-end verification that the [[.pth]] hook is actually picked
+up by CPython lives in \cref{subsec:end-to-end-autostart-tests}.
+
+Importing the module itself must stay side-effect free.
+The actual startup action now lives in [[autostart()]], because test
+modules import [[_should_activate]] directly.
+Without this separation, merely importing the helper module would leak
+[[LEARNLOG_PROJECT_ROOT]] into the parent pytest process and redirect
+later subprocesses into the wrong project.
+
+The development checkout adds one more regression worth freezing in a
+test: the default marker path must come from the current interpreter's
+[[site-packages]], not from the repository [[src/]] tree.
+Otherwise an editable install will self-heal the marker into the
+checkout and leave behind a misleading untracked file.
+
+<<autostart test functions>>=
+def test_importing_autostart_module_has_no_side_effects(monkeypatch):
+    monkeypatch.delenv("LEARNLOG_PROJECT_ROOT", raising=False)
+    import importlib
+    import learnlog._autostart as autostart
+
+    importlib.reload(autostart)
+
+    assert "LEARNLOG_PROJECT_ROOT" not in os.environ
+
+
+def test_default_marker_path_uses_current_purelib():
+    import learnlog._autostart as autostart
+
+    expected = (
+        pathlib.Path(sysconfig.get_paths()["purelib"])
+        / "learnlog_project_root.txt"
+    )
+
+    assert autostart._DEFAULT_MARKER_PATH == expected
+@
+
+<<test [[_autostart.py]]>>=
+"""Unit tests for the learnlog._autostart gate."""
+import os
+import pathlib
+import pytest
+import select
+import subprocess
+import sys
+import sysconfig
+
+from learnlog._autostart import _should_activate
+
+<<autostart test helpers>>
+<<autostart test functions>>
+@
+
+A valid project has a [[.learnlog/]] directory; a valid marker
+holds the path to such a project; a \enquote{no-backup} [[sys.prefix]]
+points somewhere far from any [[.learnlog/]], so tests of the
+marker path are not secretly passing via the backup.
+
+<<autostart test helpers>>=
+@pytest.fixture
+def project(tmp_path):
+    """A directory that looks like a learnlog project."""
+    p = tmp_path / "project"
+    (p / ".learnlog").mkdir(parents=True)
+    return p
+
+
+@pytest.fixture
+def marker(tmp_path, project):
+    """A marker file pointing at ``project``."""
+    m = tmp_path / "marker.txt"
+    m.write_text(str(project) + "\n")
+    return m
+
+
+@pytest.fixture
+def no_backup_prefix(tmp_path):
+    """A ``sys.prefix`` whose parent holds no ``.learnlog/``.
+
+    Isolates marker-based tests from accidentally activating via
+    the backup anchor.
+    """
+    p = tmp_path / "unrelated" / ".venv"
+    p.mkdir(parents=True)
+    return str(p)
+@
+
+The six happy-path invocation shapes exercise the argv parser: a
+normal script, a bare REPL ([[argv[0]]] is the empty string),
+[[python -c]], [[python -m foo]], [[pip]], and [[pytest]].
+Non-init [[learnlog]] subcommands ([[play]], [[export]]) belong
+in the same group: they are research-valuable data and must
+activate.
+One parametrised test covers all eight cases because the gate's
+only argv-dependent decision is the [[learnlog init]] exclusion.
+
+<<autostart test functions>>=
+class TestShouldActivate:
+    @pytest.mark.parametrize("argv", [
+        ["script.py"],
+        [""],
+        ["-c", "1+1"],
+        ["-m", "foo"],
+        ["/venv/bin/pip", "install", "foo"],
+        ["/venv/bin/pytest", "--version"],
+        ["learnlog", "play"],
+        ["learnlog", "export"],
+    ])
+    def test_activates_for_ordinary_invocations(
+        self, project, marker, no_backup_prefix, argv,
+    ):
+        result = _should_activate(
+            marker_path=marker,
+            sys_prefix=no_backup_prefix,
+            argv=argv,
+            env={},
+        )
+        assert result == project
+@
+
+The opt-out env var short-circuits the gate before any filesystem
+probe; a valid marker and backup should both be ignored.
+
+<<autostart test functions>>=
+    def test_skip_env_var_disables_activation(
+        self, marker, no_backup_prefix,
+    ):
+        result = _should_activate(
+            marker_path=marker,
+            sys_prefix=no_backup_prefix,
+            argv=["script.py"],
+            env={"LEARNLOG_SKIP_AUTOSTART": "1"},
+        )
+        assert result is None
+@
+
+Neither marker nor backup resolves means the interpreter is not
+inside a learnlog project; the gate must silently return
+[[None]] rather than raising or synthesising a root.
+
+<<autostart test functions>>=
+    def test_no_anchor_returns_none(
+        self, tmp_path, no_backup_prefix,
+    ):
+        missing_marker = tmp_path / "nonexistent.txt"
+        result = _should_activate(
+            marker_path=missing_marker,
+            sys_prefix=no_backup_prefix,
+            argv=["script.py"],
+            env={},
+        )
+        assert result is None
+@
+
+The [[learnlog init]] self-exclusion must trigger both for the
+installed entry-point script (basename [[learnlog]]) and for
+[[python -m learnlog init]] (argv[0] is a path to
+[[__main__.py]] under a [[learnlog]] directory).
+We split them into two tests because the detection logic has
+two independent branches.
+
+<<autostart test functions>>=
+    def test_learnlog_init_is_skipped(
+        self, marker, no_backup_prefix,
+    ):
+        result = _should_activate(
+            marker_path=marker,
+            sys_prefix=no_backup_prefix,
+            argv=["/venv/bin/learnlog", "init"],
+            env={},
+        )
+        assert result is None
+
+    def test_python_m_learnlog_init_is_skipped(
+        self, marker, no_backup_prefix,
+    ):
+        argv = [
+            "/venv/lib/python3.10/site-packages"
+            "/learnlog/__main__.py",
+            "init",
+        ]
+        result = _should_activate(
+            marker_path=marker,
+            sys_prefix=no_backup_prefix,
+            argv=argv,
+            env={},
+        )
+        assert result is None
+@
+
+When the marker is absent, the backup anchor takes over.
+The self-heal side effect should write the backup's project root
+into the marker file so the next invocation short-circuits to
+the marker.
+
+<<autostart test functions>>=
+    def test_backup_anchor_activates_and_self_heals(
+        self, tmp_path, project,
+    ):
+        missing_marker = tmp_path / "missing.txt"
+        venv = project / ".venv"
+        venv.mkdir()
+        result = _should_activate(
+            marker_path=missing_marker,
+            sys_prefix=str(venv),
+            argv=["script.py"],
+            env={},
+        )
+        assert result == project
+        assert missing_marker.exists()
+        written = pathlib.Path(
+            missing_marker.read_text().strip()
+        )
+        assert written == project.resolve()
+@
+
+A stale marker (points at a deleted project) should be treated
+the same as a missing one: fall through to the backup, and
+rewrite so the project re-anchors itself.
+
+<<autostart test functions>>=
+    def test_stale_marker_falls_through_and_heals(
+        self, tmp_path, project,
+    ):
+        marker = tmp_path / "marker.txt"
+        deleted = tmp_path / "gone"
+        marker.write_text(str(deleted) + "\n")
+        venv = project / ".venv"
+        venv.mkdir()
+        result = _should_activate(
+            marker_path=marker,
+            sys_prefix=str(venv),
+            argv=["script.py"],
+            env={},
+        )
+        assert result == project
+        written = pathlib.Path(marker.read_text().strip())
+        assert written == project.resolve()
+@
+
+If both the marker and the backup resolve but disagree, the
+marker wins deterministically.
+We construct the disagreement by giving the marker and the
+backup different valid projects; the marker's project is what
+[[_should_activate]] must return.
+
+<<autostart test functions>>=
+    def test_marker_wins_when_both_valid_but_differ(
+        self, tmp_path, project,
+    ):
+        alt = tmp_path / "alt_project"
+        (alt / ".learnlog").mkdir(parents=True)
+        marker = tmp_path / "marker.txt"
+        marker.write_text(str(project) + "\n")
+        venv = alt / ".venv"
+        venv.mkdir()
+        result = _should_activate(
+            marker_path=marker,
+            sys_prefix=str(venv),
+            argv=["script.py"],
+            env={},
+        )
+        assert result == project
+@
+
+
+\subsection{End-to-end autostart tests}
+\label{subsec:end-to-end-autostart-tests}
+
+The gate tests above prove the decision logic in isolation.
+They do not prove that CPython actually executes the [[.pth]] hook
+early enough, nor that the TTY-only paths work in a real child
+interpreter.
+For that we build a scratch project, wire a scratch venv for
+autostart, and drive the venv's own [[python]] in subprocesses.
+
+We keep these helpers in the autostart section because they verify the
+same feature from the outside.
+The CLI pipeline that writes the marker and hook already has its own
+tests near [[write_autostart_files]] in [[cli.nw]].
+Repeating [[learnlog init]] here would also force these tests to fetch
+[[learnlog]] from [[pip]].
+Instead we write the same two autostart files into a temporary venv and
+add one extra [[.pth]] file that points at this checkout's [[src/]]
+tree.
+Naming that extra file [[000-learnlog-source.pth]] makes [[site.py]]
+add the source tree before it reaches [[learnlog-autostart.pth]], so the
+autostart import resolves to the code under test.
+For the one case that must look like the installed [[learnlog]] console
+script, we also drop a tiny launcher into the venv's [[bin/]] directory.
+It uses the venv's own [[python]] in its shebang, so the subprocess still
+exercises the same interpreter and [[site-packages]] that the rest of the
+autostart smoke tests use.
+The body stays deliberately minimal: it only imports [[learnlog]], because
+this test is about bootstrap exclusion inside [[initialize]], not about
+the CLI's dependency stack.
+That gives the gate the real [[argv[0] == learnlog]] shape without
+turning the test into a packaging/install exercise.
+
+<<autostart test helpers>>=
+def _repo_root():
+    """Return the repository root for this checkout."""
+    return pathlib.Path(__file__).resolve().parents[2]
+
+
+def _autostart_env():
+    """Return an environment that permits autostarted commits."""
+    env = os.environ.copy()
+    env.pop("LEARNLOG_SKIP_AUTOSTART", None)
+    env.pop("LEARNLOG_PROJECT_ROOT", None)
+    env["GIT_AUTHOR_NAME"] = "Test"
+    env["GIT_AUTHOR_EMAIL"] = "test@test"
+    env["GIT_COMMITTER_NAME"] = "Test"
+    env["GIT_COMMITTER_EMAIL"] = "test@test"
+    return env
+
+
+def _prepare_autostart_project(tmp_path):
+    """Create a project root and a venv wired for autostart."""
+    from learnlog import cli
+    from learnlog.gitrepo import LearnlogRepo
+
+    project = tmp_path / "project"
+    project.mkdir()
+    LearnlogRepo(project)
+
+    venv_dir = project / ".venv"
+    subprocess.run(
+        [sys.executable, "-m", "virtualenv", str(venv_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    purelib = cli.venv_purelib(venv_dir)
+    source_pth = purelib / "000-learnlog-source.pth"
+    source_pth.write_text(str((_repo_root() / "src").resolve()) + "\n")
+    cli.write_autostart_files(venv_dir, project)
+    python = cli.find_in_venv(venv_dir, "python")
+    learnlog = python.parent / "learnlog"
+    learnlog.write_text(
+        f"#!{python}\n"
+        "import learnlog\n"
+    )
+    learnlog.chmod(0o755)
+
+    return project, venv_dir
+
+
+def _venv_binary(venv_dir, name):
+    """Return ``name`` from ``venv_dir`` using the real helper."""
+    from learnlog import cli
+
+    return cli.find_in_venv(venv_dir, name)
+
+
+def _git_history(project):
+    """Return the full commit bodies in the learnlog repo."""
+    result = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "log", "--format=%B"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return result.stdout
+
+
+def _latest_commit_message(project):
+    """Return the latest commit body in the learnlog repo."""
+    result = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "log", "-1", "--format=%B"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return result.stdout
+
+
+def _run_in_pty(command, *, cwd, env, input_text):
+    """Run ``command`` with a TTY-backed stdin/stdout/stderr."""
+    import pty
+
+    master_fd, slave_fd = pty.openpty()
+    output = bytearray()
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+        )
+    finally:
+        os.close(slave_fd)
+
+    try:
+        os.write(master_fd, input_text.encode())
+        while True:
+            chunk = b""
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    output.extend(chunk)
+            if proc.poll() is not None and not chunk:
+                break
+    finally:
+        os.close(master_fd)
+
+    return proc.wait(timeout=30), output.decode(errors="replace")
+@
+
+The first integration test proves the central motivation for autostart:
+the hook runs before the main script is compiled, so a top-level
+[[SyntaxError]] is still recorded in the learnlog history.
+
+<<autostart test functions>>=
+def test_autostart_captures_syntax_error_end_to_end(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    main = project / "main.py"
+    main.write_text("def f(:\n    pass\n")
+
+    result = subprocess.run(
+        [str(_venv_binary(venv_dir, "python")), str(main)],
+        cwd=str(project),
+        env=_autostart_env(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "SyntaxError" in result.stderr
+
+    history = _git_history(project)
+    assert "Script: main.py" in history
+    assert "SyntaxError" in history
+@
+
+The second test covers the widened invocation scope through the real
+[[.pth]] hook: [[python -c]], a non-project script, the [[pip]] entry
+point, and a TTY-backed [[input()]] call.
+These are the places where explicit [[import learnlog]] never helped,
+yet autostart is supposed to make them all visible in the same
+repository.
+
+<<autostart test functions>>=
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="TTY integration uses pty"
+)
+def test_autostart_captures_common_invocations(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    env = _autostart_env()
+    python = _venv_binary(venv_dir, "python")
+    pip = _venv_binary(venv_dir, "pip")
+    quick = tmp_path / "quick.py"
+    ask = tmp_path / "ask.py"
+
+    quick.write_text("print('quick')\n")
+    ask.write_text("value = input()\nprint(value)\n")
+
+    subprocess.run(
+        [str(python), "-c", "print(1)"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    subprocess.run(
+        [str(pip), "--version"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    subprocess.run(
+        [str(python), str(quick)],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    returncode, _ = _run_in_pty(
+        [str(python), str(ask)],
+        cwd=project,
+        env=env,
+        input_text="hello from tty\n",
+    )
+
+    assert returncode == 0
+
+    history = _git_history(project)
+    assert "Script: <python -c>" in history
+    assert "Script: pip" in history
+    assert "Script: quick.py" in history
+    assert "stdin: hello from tty\n" in history
+@
+
+The last naming-sensitive cases are console-style wrappers whose
+[[argv[0]]] is neither [[-c]] nor a [[.py]] file.
+We synthesise a tiny script named [[pytest]] and a tiny venv-local
+[[learnlog]] launcher so the real [[.pth]] hook sees the same basename
+shapes as the installed entry points.
+That keeps the test focused on autostart's gate and script-name
+normalisation without turning it into a second packaging test.
+
+<<autostart test functions>>=
+def test_autostart_captures_named_entry_points(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    env = _autostart_env()
+    python = _venv_binary(venv_dir, "python")
+    learnlog = _venv_binary(venv_dir, "learnlog")
+    pytest_script = tmp_path / "pytest"
+    learnlog_script = tmp_path / "learnlog"
+
+    pytest_script.write_text("print('pytest wrapper')\n")
+    learnlog_script.write_text("print('learnlog wrapper')\n")
+
+    subprocess.run(
+        [str(python), str(pytest_script), "--version"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert "Script: pytest" in _latest_commit_message(project)
+
+    subprocess.run(
+        [str(python), str(learnlog_script), "play"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    after_play = _latest_commit_message(project)
+    assert "Script: learnlog" in after_play
+    assert "Arguments: play" in after_play
+
+    subprocess.run(
+        [str(learnlog), "init", "python", "--help"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert _latest_commit_message(project) == after_play
+@
+
+The REPL path is the remaining truly interactive case.
+On the CPython 3.13+ builds we target today, top-level statements flow
+through [[pyrepl]] on the TTY, not through [[sys.stdin]], so the only
+way to verify the inline hook is to drive a real REPL over a
+pseudoterminal.
+The first smoke test covers the success path where a REPL statement
+calls [[input()]]: we must see both the entered statement and the
+student's reply in the log, in that order.
+Older interpreters fall back safely, but they do not exercise this
+stronger inline-statement path.
+
+<<autostart test functions>>=
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="pty is unavailable on Windows"
+)
+def test_autostart_captures_repl_input_calls(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    returncode, _ = _run_in_pty(
+        [str(_venv_binary(venv_dir, "python"))],
+        cwd=project,
+        env=_autostart_env(),
+        input_text=(
+            "value = input()\n"
+            "hello from repl\n"
+            "print(value)\n"
+            "exit()\n"
+        ),
+    )
+
+    assert returncode == 0
+
+    history = _git_history(project)
+    assert "Script: <repl>" in history
+    assert "stdin: >>> value = input()\n" in history
+    assert "stdin: hello from repl\n" in history
+    assert "stdin: >>> print(value)\n" in history
+    assert "stdout: hello from repl\n" in history
+    assert "stdin: >>> exit()\n" in history
+@
+
+A second REPL smoke test keeps the exception path covered.
+
+<<autostart test functions>>=
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="pty is unavailable on Windows"
+)
+def test_autostart_captures_repl_history_and_traceback(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    returncode, _ = _run_in_pty(
+        [str(_venv_binary(venv_dir, "python"))],
+        cwd=project,
+        env=_autostart_env(),
+        input_text=(
+            "2+2\n"
+            "raise RuntimeError('x')\n"
+            "exit()\n"
+        ),
+    )
+
+    assert returncode == 0
+
+    history = _git_history(project)
+    assert "Script: <repl>" in history
+    assert "stdin: >>> 2+2\n" in history
+    assert "stdin: >>> raise RuntimeError('x')\n" in history
+    assert "stdin: >>> exit()\n" in history
+    assert "RuntimeError" in history
 @

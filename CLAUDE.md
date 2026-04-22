@@ -50,14 +50,15 @@ make clean
 
 ## Architecture
 
-Four modules, all defined as `.nw` literate source in `src/learnlog/`:
+Five modules, all defined as `.nw` literate source in `src/learnlog/`:
 
 | Module | File | Purpose |
 |--------|------|---------|
 | `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup |
+| `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the project root, skips `learnlog init`, and activates `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
 | `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; crash-resilient commit strategy (commit header before run, amend with results after) |
-| `cli.py` | `cli.nw` | Typer CLI with `export` (git bundle) and `play` (curses viewer + batch mode) commands |
+| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), and `analyse` |
 
 ### Key design constraints
 
@@ -65,7 +66,9 @@ Four modules, all defined as `.nw` literate source in `src/learnlog/`:
 - **Crash resilience**: `begin_run()` commits before execution, `finalize_run()` amends after
 - `.learnlog/` in the working directory is the *product's* data (student log repo), not project config
 - Git operations use `subprocess.run` (no GitPython dependency)
-- Only runtime dependency: `typer>=0.9.0`
+- Runtime dependencies: `typer>=0.9.0` (CLI) and `virtualenv>=20` (used by
+  `learnlog init` to create project venvs reliably on PEP 668 / split-
+  `python3-venv` systems)
 
 ## Testing
 
