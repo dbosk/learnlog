@@ -97,7 +97,7 @@ eval "$(learnlog activate)"
 \end{minted}
 before starting the session.
 
-To publish the recoded sessions, we can simply push the hidden Git repository 
+To publish the recorded sessions, we can simply push the hidden Git repository
 to a shared remote.
 After the session, the teacher points the log at a remote
 repository and pushes:
@@ -204,7 +204,7 @@ This gives a complete timeline of how students develop and debug
 their code---useful for research purposes or to help students
 refine their debugging techniques.
 
-\subsection{A student-facing onboarding page.}
+\subsection{A student-facing onboarding page}
 
 Both use cases above assume students have already installed
 [[learnlog]] with \mintinline{bash}{pipx} and run
@@ -226,6 +226,16 @@ command:
 canvaslms pages edit --create -c COURSE \
   -f src/learnlog/students.md
 \end{minted}
+[[students.md]] is a tangled artefact excluded from the published
+wheel, so a teacher who installed via [[pipx install learnlog]]
+does not have this file on disk.  Publishing the page therefore
+requires a source checkout---\mintinline{bash}{git clone} the
+[[learnlog]] repository and run \mintinline{bash}{make} to tangle
+[[students.md]] from this chapter.  If course staff need a
+packaged route later, a [[learnlog canvaslms-onboarding]]
+subcommand that writes the file to a chosen path would be the
+natural next step.
+
 We deliberately omit course-specific metadata---Canvas module
 assignment and stable-identification regex---because one tangled
 file must work unchanged across every course using learnlog.
@@ -1662,7 +1672,7 @@ Rather than duplicate the repository-discovery path, the gate
 communicates the project root to [[initialize]] by setting
 [[LEARNLOG_PROJECT_ROOT]] in the environment.
 
-\paragraph{Why \texttt{.pth} rather than \texttt{sitecustomize.py}.}
+\paragraph{Why [[.pth]] rather than [[sitecustomize.py]].}
 The venv may already carry a [[sitecustomize.py]] written by
 another tool (Python loads only one).
 Multiple [[.pth]] files coexist, so we cannot collide.
@@ -1905,16 +1915,15 @@ def _resolve_project_root(marker_path=None, sys_prefix=None):
 logged: it is creating the repository, so it has no repository
 to commit into yet (or, on re-init, it is changing the repository
 from under itself).
-Every \emph{other} [[learnlog]] subcommand---[[play]], [[export]],
-[[tag]], [[list]], [[analyse]]---is research-valuable data about
-how the student interacts with their own log and must be captured
-like any other program.
+Every \emph{other} [[learnlog]] subcommand is research-valuable
+data about how the student interacts with their own log and must
+be captured like any other program.
 
 We detect [[learnlog init]] by matching [[argv[0]]] against the
 script name and [[argv[1]]] against the literal [[init]].
 [[argv[0]]] can be either the [[learnlog]] entry-point script
 itself (installed in [[<venv>/bin/]]) or a path to the package's
-[[\_\_main\_\_.py]] when invoked as [[python -m learnlog]];
+[[__main__.py]] when invoked as [[python -m learnlog]];
 both contain [[learnlog]] as a path component.
 
 <<autostart gate helpers>>=
@@ -1969,8 +1978,8 @@ unit tests must be able to import [[learnlog._autostart]] to reach
 environment.
 
 If the gate returns a project root, we stash it in
-[[LEARNLOG_PROJECT_ROOT]] so [[initialize]] will find the right
-[[.learnlog/]] (see task~\#4), then [[import learnlog]] to
+[[LEARNLOG_PROJECT_ROOT]] so [[initialize]] (\cref{learnlog})
+will find the right [[.learnlog/]], then [[import learnlog]] to
 trigger the ordinary import-time initialisation path.
 If the gate returns [[None]], we silently do nothing and the
 interpreter continues as if we were not installed.
@@ -2004,7 +2013,7 @@ The fixtures below build a minimal filesystem fixture and then
 drive [[_should_activate]] with explicit overrides---no subprocess,
 no real venv, no patching of [[sys]].
 End-to-end verification that the [[.pth]] hook is actually picked
-up by CPython lives in task~\#6's integration tests.
+up by CPython lives in \cref{subsec:end-to-end-autostart-tests}.
 
 Importing the module itself must stay side-effect free.
 The actual startup action now lives in [[autostart()]], because test
@@ -2271,6 +2280,7 @@ backup different valid projects; the marker's project is what
 
 
 \subsection{End-to-end autostart tests}
+\label{subsec:end-to-end-autostart-tests}
 
 The gate tests above prove the decision logic in isolation.
 They do not prove that CPython actually executes the [[.pth]] hook
