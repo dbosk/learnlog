@@ -1681,7 +1681,7 @@ Python's [[site.py]] evaluates any line beginning with [[import]]
 inside a [[.pth]] file at interpreter startup---ahead of the main
 script and therefore ahead of parse errors in it.
 So [[learnlog init]] installs a one-line
-[[learnlog-autostart.pth]] into the venv's [[site-packages]]:
+[[zzz-learnlog-autostart.pth]] into the venv's [[site-packages]]:
 \begin{minted}{python}
 import learnlog._autostart; learnlog._autostart.autostart()
 \end{minted}
@@ -1701,6 +1701,10 @@ another tool (Python loads only one).
 Multiple [[.pth]] files coexist, so we cannot collide.
 The same trick powers [[coverage.py]]'s subprocess auto-start
 ([[coverage.pth]])---so the mechanism is proven at scale.
+We also sort our hook late on purpose: editable installs often
+drop a separate [[learnlog.pth]] that adds the source tree to
+[[sys.path]], and that path must be visible before the hook tries
+to import [[learnlog]].
 
 \paragraph{Scope.}
 After [[learnlog init]] the venv is the unit of logging: every
@@ -2322,8 +2326,9 @@ Instead we write the same two autostart files into a temporary venv and
 add one extra [[.pth]] file that points at this checkout's [[src/]]
 tree.
 Naming that extra file [[000-learnlog-source.pth]] makes [[site.py]]
-add the source tree before it reaches [[learnlog-autostart.pth]], so the
-autostart import resolves to the code under test.
+add the source tree before it reaches
+[[zzz-learnlog-autostart.pth]], so the autostart import
+resolves to the code under test.
 For the one case that must look like the installed [[learnlog]] console
 script, we also drop a tiny launcher into the venv's [[bin/]] directory.
 It uses the venv's own [[python]] in its shebang, so the subprocess still

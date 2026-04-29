@@ -963,14 +963,19 @@ def test_venv_activation_hint_windows(monkeypatch, tmp_path):
 After the venv exists, we wire it for autostart.  Two
 files are placed inside the venv's [[site-packages]]:
 \begin{description}
-\item[[[learnlog-autostart.pth]]] contains the single line
+\item[ [[zzz-learnlog-autostart.pth]] ] contains the single
+    line
     [[import learnlog._autostart; learnlog._autostart.autostart()]].
     Python's [[site.py]]
     processes [[.pth]] files at interpreter startup and
     executes any line that begins with [[import]]
     verbatim---\emph{before} the main script is compiled,
     which is what lets us catch a top-level
-    [[SyntaxError]].  A [[.pth]] file is preferred over
+    [[SyntaxError]].  We deliberately sort this file late:
+    editable installs from tools such as [[poetry]] often add
+    a separate [[learnlog.pth]] that inserts the source tree
+    into [[sys.path]], and that path must land before the hook
+    tries to import [[learnlog]].  A [[.pth]] file is preferred over
     [[sitecustomize.py]] because the venv may already have
     a [[sitecustomize.py]] from some other tool (there can
     be only one), whereas multiple [[.pth]] files coexist
@@ -1024,6 +1029,12 @@ re-running [[init]] after a manual tweak does not clobber
 it, and more importantly does not stamp a new mtime that
 confuses build systems watching the venv.
 
+We also remove the old [[learnlog-autostart.pth]] filename.
+That migration matters for development environments that were
+initialised before the rename: if the legacy file is left in
+place, [[site.py]] still reaches it first and the editable
+install problem remains.
+
 The whole body runs inside a [[try/except OSError]]: an
 autostart hook that fails to install is a missed feature,
 not a broken install.  The student can still use
@@ -1037,7 +1048,7 @@ def write_autostart_files(venv_dir, project_root):
 
     Writes two files into the venv's ``site-packages``:
 
-    * ``learnlog-autostart.pth`` --- a one-line
+    * ``zzz-learnlog-autostart.pth`` --- a one-line
       ``import learnlog._autostart;``
       ``learnlog._autostart.autostart()``, processed by
       ``site.py`` at interpreter startup before the main
@@ -1052,9 +1063,10 @@ def write_autostart_files(venv_dir, project_root):
     alone).  Filesystem errors are reported as warnings
     but do not abort ``init``.
     """
+    legacy_path = None
     files = [
         (
-            "learnlog-autostart.pth",
+            "zzz-learnlog-autostart.pth",
             "import learnlog._autostart; "
             "learnlog._autostart.autostart()\n",
         ),
@@ -1066,6 +1078,9 @@ def write_autostart_files(venv_dir, project_root):
     ]
     try:
         purelib = venv_purelib(venv_dir)
+        legacy_path = purelib / "learnlog-autostart.pth"
+        if legacy_path.exists():
+            legacy_path.unlink()
         for name, content in files:
             path = purelib / name
             if path.exists() and path.read_text() == content:
@@ -1099,13 +1114,36 @@ def test_write_autostart_files_creates_both_files(
         cli, "venv_purelib", lambda d: purelib,
     )
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
-    pth = purelib / "learnlog-autostart.pth"
+    pth = purelib / "zzz-learnlog-autostart.pth"
     marker = purelib / "learnlog_project_root.txt"
     assert pth.read_text() == (
         "import learnlog._autostart; "
         "learnlog._autostart.autostart()\n"
     )
     assert marker.read_text() == str(tmp_path.resolve()) + "\n"
+
+def test_write_autostart_files_removes_legacy_hook(
+    tmp_path, monkeypatch,
+):
+    """Re-running init removes the old hook filename."""
+    from learnlog import cli
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    legacy = purelib / "learnlog-autostart.pth"
+    legacy.write_text("old hook\n")
+    monkeypatch.setattr(
+        cli, "venv_purelib", lambda d: purelib,
+    )
+
+    cli.write_autostart_files(tmp_path / ".venv", tmp_path)
+
+    assert not legacy.exists()
+    assert (
+        purelib / "zzz-learnlog-autostart.pth"
+    ).read_text() == (
+        "import learnlog._autostart; "
+        "learnlog._autostart.autostart()\n"
+    )
 
 def test_write_autostart_files_is_idempotent(
     tmp_path, monkeypatch,
@@ -1118,7 +1156,7 @@ def test_write_autostart_files_is_idempotent(
         cli, "venv_purelib", lambda d: purelib,
     )
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
-    pth = purelib / "learnlog-autostart.pth"
+    pth = purelib / "zzz-learnlog-autostart.pth"
     mtime_before = pth.stat().st_mtime_ns
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
     assert pth.stat().st_mtime_ns == mtime_before
