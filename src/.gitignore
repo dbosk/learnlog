@@ -1,3 +1,4 @@
 *.py
 *.tex
 learnlog/students.md
+learnlog/tutorials/*.md

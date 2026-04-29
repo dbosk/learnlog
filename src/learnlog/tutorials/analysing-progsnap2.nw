@@ -1,0 +1,87 @@
+\chapter{Tutorial: Analysing ProgSnap2}
+\label{tut:analysing-progsnap2}
+
+The previous tutorial ended with ProgSnap2 export; this one turns that
+dataset into a report.
+The learner first generates a complete report, then narrows it with
+[[Column=Regex]] boundaries so the effect of the filter syntax becomes
+visible against a stable dataset.
+
+\ltnote{%
+  This chapter uses contrast between whole-dataset analysis and
+  range-restricted analysis.
+  The critical aspect is that [[learnlog analyse]] filters by event
+  ranges, not isolated matching events, which is why the boundary syntax
+  is introduced only after the learner has seen the unfiltered report.
+}
+
+<<[[analysing-progsnap2.md]]>>=
+---
+id: analysing-progsnap2
+title: Analyse a ProgSnap2 dataset
+summary: Generate LaTeX reports and narrow them with Column=Regex ranges.
+---
+
+# Start from a ProgSnap2 export
+
+```tutorial-step
+required_patterns:
+  - learnlog export --progsnap2
+hint: Reuse an earlier export or create a fresh `.progsnap2` file.
+```
+
+If you do not already have a ProgSnap2 zip, create one from a learnlog
+project with `learnlog export --progsnap2`.
+
+# Generate a LaTeX analysis report
+
+```tutorial-step
+required_patterns:
+  - learnlog analyse
+  - -f
+  - -o
+hint: A typical command is `learnlog analyse -f course.progsnap2 -o report.tex`.
+```
+
+Generate a report from the dataset and save it to a `.tex` file.
+The report groups edits and runs into the edit--run cycles that the
+analysis command reconstructs.
+
+# Produce a standalone document
+
+```tutorial-step
+required_patterns:
+  - --standalone
+hint: Add `--standalone` when you want a complete LaTeX document.
+```
+
+Repeat the analysis with `--standalone` if you want a complete document
+that can be compiled directly, rather than a fragment for inclusion.
+
+# Filter from a tagged start point
+
+```tutorial-step
+required_patterns:
+  - X-Tag=lab1
+hint: Quote the boundary so the shell keeps it as one argument.
+```
+
+Use a start boundary such as `X-Tag=lab1` to keep only the events from
+the first matching tag onward.
+
+# Filter a tagged range
+
+```tutorial-step
+required_patterns:
+  - X-Tag=lab1
+  - X-Tag=lab2
+hint: Pass two `Column=Regex` boundaries to restrict the analysis window.
+```
+
+Add an end boundary as well, for example:
+
+`learnlog analyse 'X-Tag=lab1' 'X-Tag=lab2' -f course.progsnap2 -o range.tex`
+
+This keeps the analysis focused on the sessions between the two tagged
+regions.
+@

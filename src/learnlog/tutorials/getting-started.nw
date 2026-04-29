@@ -1,0 +1,89 @@
+\chapter{Tutorial: Getting Started}
+\label{tut:getting-started}
+
+This tutorial gives a student's first end-to-end pass through
+[[learnlog]]: initialise a project, activate the project-local
+environment, run a program, and inspect the recorded commit in batch
+mode.
+
+\ltnote{%
+  The object of learning is the basic learnlog workflow as a connected
+  whole.
+  We use contrast between an ordinary directory and an initialised
+  learnlog project, and we delay the explanation of playback until the
+  learner has first produced a run to inspect.
+  The critical aspects are that [[learnlog init]] anchors the project at
+  the root, [[learnlog activate]] selects the project [[.venv/]], and
+  [[learnlog play -b]] reveals the resulting commit history.
+}
+
+The woven chapter records the teaching rationale; the tangled Markdown
+below is the student-facing tutorial consumed by [[pytorial]].
+
+<<[[getting-started.md]]>>=
+---
+id: getting-started
+title: Getting started with learnlog
+summary: Set up a project, run a script, and inspect the commit it logs.
+---
+
+# Create a fresh project
+
+```tutorial-step
+required_patterns:
+  - learnlog init python
+hint: Run `learnlog init python` in an empty project directory.
+```
+
+Start in a new directory for a throwaway practice project and initialise
+it with `learnlog init python`.
+
+This creates the hidden `.learnlog/` repository and prepares a local
+`.venv/` for the project.
+
+# Activate the project environment
+
+```tutorial-step
+required_patterns:
+  - learnlog activate
+hint: Use `eval "$(learnlog activate)"` to enter the project `.venv/`.
+```
+
+Run `eval "$(learnlog activate)"` so that the project's own Python and
+packages are the ones you use in the next steps.
+
+# Create a small program
+
+```tutorial-step
+edit_file: hello.py
+required_patterns:
+  - print("Hello, learnlog!")
+hint: Create `hello.py` with one `print(...)` call.
+```
+
+Create a file named `hello.py` that prints a short message.
+
+# Run the program
+
+```tutorial-step
+required_patterns:
+  - python hello.py
+hint: Run the script with the Python from the activated `.venv/`.
+```
+
+Run `python hello.py`.
+You should see your message on screen, and learnlog should record the
+run automatically.
+
+# Inspect the recorded run
+
+```tutorial-step
+required_patterns:
+  - learnlog play -b
+hint: Use batch mode first so the whole recorded commit is printed.
+```
+
+Use `learnlog play -b` to print the recorded commit to the terminal.
+Look for the command, the output from `hello.py`, and the diff showing
+the file you created.
+@

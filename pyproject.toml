@@ -18,7 +18,7 @@ classifiers = [
   "Topic :: Education"
 ]
 requires-python = ">=3.10"
-dependencies = ["typer>=0.9.0", "virtualenv>=20"]
+dependencies = ["typer>=0.9.0", "virtualenv>=20", "pytorial (>=0.3,<0.4)"]
 
 [project.scripts]
 learnlog = "learnlog.cli:app"
@@ -31,13 +31,16 @@ repository = "https://github.com/dbosk/learnlog"
 packages = [{include = "learnlog", from = "src"}]
 include = [
   {path = "src/**/*.py", format = "wheel"},
+  {path = "src/learnlog/tutorials/*.md", format = "wheel"},
 ]
 exclude = [
   "src/learnlog/.gitignore",
   "src/learnlog/Makefile",
   "src/learnlog/*.nw",
   "src/learnlog/*.tex",
-  "src/learnlog/*.md",
+  "src/learnlog/students.md",
+  "src/learnlog/tutorials/*.nw",
+  "src/learnlog/tutorials/*.tex",
   "src/learnlog/ltxobj",
 ]
 

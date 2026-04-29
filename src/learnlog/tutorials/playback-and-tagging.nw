@@ -1,0 +1,79 @@
+\chapter{Tutorial: Playback and Tagging}
+\label{tut:playback-and-tagging}
+
+This tutorial focuses on two related reading tools: playback for
+reviewing the log and tags for naming important commits.
+The learner already has a recorded project, so the new contrast is not
+between \enquote{before and after learnlog}, but between browsing the
+entire history and jumping directly to a named checkpoint.
+
+\ltnote{%
+  We use contrast on the starting point of playback: first the whole
+  log, then playback from a tag.
+  The invariant is the same recorded project.
+  This helps the learner discern that tags are not extra metadata on the
+  side; they are navigation anchors into the existing commit history.
+}
+
+<<[[playback-and-tagging.md]]>>=
+---
+id: playback-and-tagging
+title: Playback and tagging
+summary: Review a log in batch and interactive mode, then jump to tags.
+---
+
+# Review the whole log in batch mode
+
+```tutorial-step
+required_patterns:
+  - learnlog play -b
+hint: Start with `learnlog play -b` so you can read the whole log.
+```
+
+Use a learnlog project that already contains a few runs.
+Begin with `learnlog play -b` to see the full history as plain terminal
+output.
+
+# Add a memorable tag
+
+```tutorial-step
+required_patterns:
+  - learnlog tag lab1
+hint: Tag the current commit with a short name such as `lab1`.
+```
+
+Pick the current commit as a checkpoint and create a tag for it, for
+example with `learnlog tag lab1`.
+
+# List the available tags
+
+```tutorial-step
+required_patterns:
+  - learnlog tag -l
+hint: Run `learnlog tag -l` to list the tags in the `.learnlog/` repository.
+```
+
+List the tags so you can confirm that your new marker exists.
+
+# Start playback from the tag in batch mode
+
+```tutorial-step
+required_patterns:
+  - learnlog play -b lab1
+hint: Pass the tag name after `learnlog play -b`.
+```
+
+Use `learnlog play -b lab1` to start playback from the tagged commit
+instead of from the beginning of the history.
+
+# Open the interactive viewer from the tag
+
+```tutorial-step
+required_patterns:
+  - learnlog play lab1
+hint: Launch the interactive viewer and quit with `q` when you are done.
+```
+
+Run `learnlog play lab1` to open the curses viewer at the tagged commit.
+Move around a little, then quit with `q`.
+@
