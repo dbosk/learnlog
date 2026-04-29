@@ -1520,6 +1520,13 @@ TTY-free [[list]] subcommand.
 That is enough to verify the host-side wiring and that the shipped
 tutorial resources are visible to pytorial.
 
+The getting-started tutorial intentionally keeps the first editing task
+outside pytorial's editor integration.
+Students should be able to use their own editor, save [[hello.py]], and
+continue by confirming with [[done]].
+We lock that in with a regression test against the generated tutorial
+resource.
+
 <<test functions>>=
 def test_tutorial_list_lists_builtin_tutorials():
     """`learnlog tutorial list` includes our shipped tutorials."""
@@ -1533,6 +1540,29 @@ def test_tutorial_list_lists_builtin_tutorials():
     assert "playback-and-tagging" in result.stdout
     assert "export-and-share" in result.stdout
     assert "analysing-progsnap2" in result.stdout
+
+def test_getting_started_uses_confirmation_for_editing_step():
+    """Step 3 asks for confirmation instead of forcing editor mode."""
+    from importlib import resources
+
+    from pytorial.catalog import parse_tutorial_text
+
+    tutorial_path = resources.files("learnlog") / "tutorials"
+    tutorial_path = tutorial_path / "getting-started.md"
+    tutorial = parse_tutorial_text(
+        tutorial_path.read_text(),
+        source_path=tutorial_path,
+    )
+
+    step = tutorial.steps[2]
+
+    assert step.title == "Create a small program"
+    assert step.kind == "input"
+    assert len(step.answers) == 1
+    assert step.answers[0].pattern == "done"
+    assert step.answers[0].mode == "contains"
+    assert step.edit_file is None
+    assert "Use your own editor" in step.instructions
 @
 
 

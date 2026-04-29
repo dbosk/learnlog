@@ -55,13 +55,16 @@ packages are the ones you use in the next steps.
 # Create a small program
 
 ```tutorial-step
-edit_file: hello.py
-required_patterns:
-  - print("Hello, learnlog!")
-hint: Create `hello.py` with one `print(...)` call.
+kind: input
+answers:
+  - done
+hint: Use your editor to create `hello.py`, save it, then type `done`.
 ```
 
 Create a file named `hello.py` that prints a short message.
+Use your own editor for this step.
+For example, if you use VS Code, run `code hello.py`, save a file such
+as `print("Hello, world!")`, and then type `done` to continue.
 
 # Run the program
 
