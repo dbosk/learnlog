@@ -16,6 +16,18 @@ Installation is rather simple:
 pipx install learnlog
 \end{minted}
 This one-time line puts the tool on the [[PATH]].
+
+If the machine only has Python~3.9 available but [[uv]] is
+installed, use:
+\begin{minted}{bash}
+uv tool install --python 3.10 learnlog
+\end{minted}
+That asks [[uv]] to provision a Python~3.10-managed tool
+environment instead of trying to install the tool under the
+system's 3.9 interpreter.
+
+\paragraph{Python}
+
 In VSCode and Repl.it that manage a project virtual environment
 automatically, one can go for the per-project installation
 instead, with \mintinline{bash}{pip install learnlog}
@@ -171,7 +183,9 @@ A researcher (or teacher) creates an empty Git repository for each
 student---for instance, one repository per student on a shared
 server.
 Each student follows the onboarding page below
-(\mintinline{bash}{pipx install learnlog} followed by
+(\mintinline{bash}{pipx install learnlog} or, on systems still
+on Python~3.9, \mintinline{bash}{uv tool install --python 3.10
+learnlog}, followed by
 \mintinline{bash}{learnlog init python} in the project directory) and
 then configures the remote:
 \begin{minted}{bash}
@@ -182,6 +196,7 @@ The researcher then clones each student's repository to analyse
 the development data:
 \begin{minted}{bash}
 learnlog clone git@gitlab.kth.se:dbosk/alice-log.git
+cd alice-log
 learnlog play
 learnlog analyse X-Tag=lab1 X-Tag=lab2
 \end{minted}
@@ -261,7 +276,7 @@ This page walks through setup, use, and submission in VS Code.
 
 ## What you need
 
-- **Python 3.9 or newer.** Check with `python3 --version` in a
+- **Python 3.10 or newer.** Check with `python3 --version` in a
   terminal.
 - **Visual Studio Code** with the **Python** extension (by
   Microsoft).
@@ -305,7 +320,7 @@ The official installation guide, with platform-specific notes, is at
 
   If you use Scoop, `scoop install pipx` works too.
 
-- **Fallback (any OS with Python 3.9+):**
+- **Fallback (any OS with Python 3.10+):**
 
   ```bash
   python3 -m pip install --user pipx
@@ -320,6 +335,13 @@ see <https://pipx.pypa.io/stable/> for troubleshooting.
 
 ```bash
 pipx install learnlog
+```
+
+If your machine still only has Python 3.9 available, and you use
+`uv`, install learnlog with:
+
+```bash
+uv tool install --python 3.10 learnlog
 ```
 
 This puts the `learnlog` command on your `PATH` in its own isolated

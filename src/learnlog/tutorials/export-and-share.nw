@@ -1,0 +1,90 @@
+\chapter{Tutorial: Export and Share}
+\label{tut:export-and-share}
+
+Sharing a log comes in two main forms: as a portable file you hand to
+someone, or as a remote repository that multiple machines can push to
+and pull from.
+This tutorial keeps the project constant and varies only the delivery
+mechanism so the learner can discern when each workflow fits.
+
+\ltnote{%
+  The critical aspect here is the sharing method.
+  We first contrast bundle export with ProgSnap2 export, then contrast
+  file handoff with remote synchronisation through [[set-remote]],
+  [[push]], [[clone]], and [[pull]].
+  Keeping the same project across all steps avoids incidental variation
+  in names and lets the transport choice stand out.
+}
+
+<<[[export-and-share.md]]>>=
+---
+id: export-and-share
+title: Export and share a learnlog
+summary: Export bundles, make ProgSnap2 data, and sync through a remote.
+---
+
+# Export a portable learnlog bundle
+
+```tutorial-step
+required_patterns:
+  - learnlog export -o course.learnlog
+hint: Pick an output name ending in `.learnlog`.
+```
+
+Create a portable bundle file with `learnlog export -o course.learnlog`.
+This is the easiest format to hand to someone for playback.
+
+# Export a ProgSnap2 dataset
+
+```tutorial-step
+required_patterns:
+  - learnlog export --progsnap2 -o course.progsnap2
+hint: Use `--progsnap2` when the goal is analysis rather than playback.
+```
+
+Export the same log as a ProgSnap2 zip so it can be used for CS
+education analysis workflows.
+
+# Configure a remote repository
+
+```tutorial-step
+required_patterns:
+  - learnlog set-remote
+hint: Point `origin` at a Git repository URL or local bare repo path.
+```
+
+Choose a remote repository and configure it with `learnlog set-remote`.
+For local practice, a path such as `../course-log.git` works well.
+
+# Push the log to the remote
+
+```tutorial-step
+required_patterns:
+  - learnlog push
+hint: Push after `set-remote` so the remote receives all branches.
+```
+
+Run `learnlog push` to send the whole recorded history to `origin`.
+
+# Clone the log somewhere else
+
+```tutorial-step
+required_patterns:
+  - learnlog clone
+hint: Try cloning into a second directory to simulate another machine.
+```
+
+In another empty directory, use `learnlog clone <remote>` to retrieve
+the shared `.learnlog/` repository.
+
+# Pull later updates
+
+```tutorial-step
+required_patterns:
+  - learnlog pull
+hint: After new commits are pushed, run `learnlog pull` in the clone.
+```
+
+When the original project has received more recorded runs and pushed
+them, update the clone with `learnlog pull`.
+@

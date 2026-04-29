@@ -4,21 +4,22 @@
 The [[learnlog]] command lets students prepare projects for
 logging and lets both students and teachers manage and review
 the development logs that are produced.
-It provides thirteen subcommands: [[init]] prepares a project
+It provides fourteen subcommands: [[init]] prepares a project
 directory (creating [[.learnlog/]] and installing [[learnlog]]
 for the student's chosen language), [[activate]] and
 [[deactivate]] emit shell code for entering or leaving the
-project [[.venv/]], [[list]] gives a compact overview of the
-recorded commits, [[export]] creates a portable bundle of the
-log (or a ProgSnap2 dataset for CS education analysis),
-[[set-remote]], [[push]], [[clone]], and [[pull]] manage
-synchronisation with a remote Git repository, [[git]] forwards
-Git commands to the log repository, [[tag]] manages named
-markers in the log (such as [[lab1]] or [[lab2]]), [[play]]
-gives an interactive viewer for browsing the commit history,
-and [[analyse]] generates \LaTeX{} reports of edit--run
-cycles from a ProgSnap2 dataset, optionally filtered by a
-[[Column=Regex]] range.
+project [[.venv/]], [[tutorial]] embeds guided walkthroughs
+for common learnlog workflows, [[list]] gives a compact
+overview of the recorded commits, [[export]] creates a
+portable bundle of the log (or a ProgSnap2 dataset for CS
+education analysis), [[set-remote]], [[push]], [[clone]], and
+[[pull]] manage synchronisation with a remote Git repository,
+[[git]] forwards Git commands to the log repository, [[tag]]
+manages named markers in the log (such as [[lab1]] or
+[[lab2]]), [[play]] gives an interactive viewer for browsing
+the commit history, and [[analyse]] generates \LaTeX{} reports
+of edit--run cycles from a ProgSnap2 dataset, optionally
+filtered by a [[Column=Regex]] range.
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -31,9 +32,10 @@ arguments with minimal boilerplate, and the modern
 """Command-line interface for learnlog.
 
 Provides the ``learnlog`` command with subcommands for setting
-up a project to record with learnlog (``init``), running Git
-commands against the log, emitting shell code to activate or
-deactivate the project ``.venv/``, exporting the log as a
+up a project to record with learnlog (``init``), emitting
+shell code to activate or deactivate the project ``.venv/``,
+running guided tutorials through pytorial (``tutorial``),
+running Git commands against the log, exporting the log as a
 bundle or ProgSnap2 dataset, cloning from and synchronising
 with a remote repository, playing back the development log
 stored in ``.learnlog/``, and analysing ProgSnap2 datasets to
@@ -92,8 +94,10 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from typing import Annotated, Optional
+from importlib import resources
+from typing import Annotated
 
+import pytorial
 import typer
 
 from learnlog import find_learnlog_dir
@@ -546,6 +550,12 @@ private virtual environment under
 [[init]] code runs, [[sys.executable]] already points at
 that private interpreter---\emph{not} at the Python the
 student will actually use for coursework.
+
+The same separation applies to [[uv tool install]] when the
+tool lives in uv's managed tools directory.  In particular,
+[[uv tool install --python 3.10 learnlog]] is the supported
+escape hatch for machines whose system Python is still 3.9
+after [[learnlog]] itself moves to Python~3.10.
 
 That distinction matters for two separate reasons.  First,
 using [[sys.executable]] to create [[.venv/]] would bind
@@ -1146,8 +1156,10 @@ there.  In every case, the final step is
 A very common way students meet [[init]] is through VS
 Code: opening the workspace auto-activates a venv inside
 the integrated terminal, the student runs
-[[pipx install learnlog]], and then [[learnlog init
-python]].  The student's expectation is \enquote{install
+[[pipx install learnlog]] or, on machines still stuck on
+system Python~3.9, [[uv tool install --python 3.10
+learnlog]], and then [[learnlog init python]].  The
+student's expectation is \enquote{install
 into the environment I have active}---not
 \enquote{silently create a second venv alongside it}.
 All venv activation scripts (POSIX, fish, PowerShell,
@@ -1455,7 +1467,7 @@ def test_init_python_invokes_write_autostart_files(
 
 \section{Typer application}
 
-We define the Typer app at module level with thirteen
+We define the Typer app at module level with fourteen
 commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
@@ -1468,6 +1480,59 @@ app = typer.Typer(
 )
 
 <<typer commands>>
+@
+
+
+\subsection{The [[tutorial]] command}
+\label{sec:tutorial}
+
+The tutorial subcommand delegates to [[pytorial]] rather than
+reimplementing a second step engine inside [[learnlog]].
+That keeps the host CLI focused on learnlog's own behavior while
+still letting us ship guided walkthroughs for common tasks such as
+project setup, playback, sharing, and ProgSnap2 analysis.
+
+We mount pytorial's embedded command tree under [[learnlog
+tutorial]], which gives us [[list]], [[run]], and [[review]]
+without the standalone [[install]] command that only makes sense
+for pytorial's top-level CLI.
+Passing [[namespace="learnlog"]] keeps pytorial's persisted state
+isolated under a learnlog-specific directory instead of mixing it
+with other embedded hosts on the same machine.
+The builtin [[using-tutorials]] self-tour is prepended
+automatically, and the rest of the catalog comes from the Markdown
+tutorials we ship as package data under [[learnlog/tutorials/]].
+
+<<typer commands>>=
+_builtin_tutorials_dir = resources.files("learnlog") / "tutorials"
+
+pytorial.add_typer_subcommand(
+    app,
+    name="tutorial",
+    namespace="learnlog",
+    tutorial_paths=(str(_builtin_tutorials_dir),),
+)
+@
+
+Like [[play]] in \cref{sec:play}, the interactive execution path
+needs a real terminal, so our CLI regression test stays on the
+TTY-free [[list]] subcommand.
+That is enough to verify the host-side wiring and that the shipped
+tutorial resources are visible to pytorial.
+
+<<test functions>>=
+def test_tutorial_list_lists_builtin_tutorials():
+    """`learnlog tutorial list` includes our shipped tutorials."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(app, ["tutorial", "list"])
+
+    assert result.exit_code == 0
+    assert "getting-started" in result.stdout
+    assert "playback-and-tagging" in result.stdout
+    assert "export-and-share" in result.stdout
+    assert "analysing-progsnap2" in result.stdout
 @
 
 
@@ -1498,7 +1563,7 @@ def init(
         ),
     ],
     directory: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "-C", "--dir",
             help=(
@@ -1508,7 +1573,7 @@ def init(
         ),
     ] = None,
     python: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--python",
             help=(
@@ -1837,7 +1902,7 @@ code and broke it.
 @app.command(name="list")
 def list_commits(
     source: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--from", "-f",
             help=(
@@ -2211,7 +2276,7 @@ def export(
         ),
     ] = pathlib.Path(DEFAULT_BUNDLE_NAME),
     directory: Annotated[
-        Optional[pathlib.Path],
+        pathlib.Path | None,
         typer.Option(
             "--dir", "-C",
             help="Directory containing .learnlog/.",
@@ -2228,7 +2293,7 @@ def export(
         ),
     ] = False,
 ):
-    """Export the learnlog repository as a .learnlog bundle."""
+    """Export the learnlog repository as a learnlog or ProgSnap2 bundle."""
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
@@ -2327,7 +2392,7 @@ def set_remote(
         ),
     ],
     directory: Annotated[
-        Optional[pathlib.Path],
+        pathlib.Path | None,
         typer.Option(
             "--dir", "-C",
             help="Directory containing .learnlog/.",
@@ -2430,7 +2495,7 @@ def push(
         ),
     ] = False,
     directory: Annotated[
-        Optional[pathlib.Path],
+        pathlib.Path | None,
         typer.Option(
             "--dir", "-C",
             help="Directory containing .learnlog/.",
@@ -2581,7 +2646,7 @@ def clone(
         ),
     ],
     directory: Annotated[
-        Optional[pathlib.Path],
+        pathlib.Path | None,
         typer.Option(
             "--dir", "-C",
             help=(
@@ -2730,7 +2795,7 @@ progress and credential prompts.
 @app.command()
 def pull(
     directory: Annotated[
-        Optional[pathlib.Path],
+        pathlib.Path | None,
         typer.Option(
             "--dir", "-C",
             help="Directory containing .learnlog/.",
@@ -3040,7 +3105,7 @@ run block including those from [[learnlog play]] and
 @app.command()
 def play(
     start: Annotated[
-        Optional[str],
+        str | None,
         typer.Argument(
             help=(
                 "Tag, commit hash, or branch to start "
@@ -3049,7 +3114,7 @@ def play(
         ),
     ] = None,
     source: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--from", "-f",
             help=(
@@ -3060,7 +3125,7 @@ def play(
         ),
     ] = None,
     batch: Annotated[
-        Optional[bool],
+        bool | None,
         typer.Option(
             "--batch", "-b",
             help=(
@@ -3343,7 +3408,7 @@ The [[--standalone]] flag wraps the output in a complete
 @app.command()
 def analyse(
     start: Annotated[
-        Optional[str],
+        str | None,
         typer.Argument(
             help=(
                 "Start boundary as Column=Regex. "
@@ -3353,7 +3418,7 @@ def analyse(
         ),
     ] = None,
     end: Annotated[
-        Optional[str],
+        str | None,
         typer.Argument(
             help=(
                 "End boundary as Column=Regex. "
@@ -3363,7 +3428,7 @@ def analyse(
         ),
     ] = None,
     source: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--from", "-f",
             help=(
@@ -3375,7 +3440,7 @@ def analyse(
         ),
     ] = None,
     output: Annotated[
-        Optional[pathlib.Path],
+        pathlib.Path | None,
         typer.Option(
             "--output", "-o",
             help="Output LaTeX file (default: stdout).",

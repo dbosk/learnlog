@@ -7,6 +7,12 @@ MODULES+=	commits.py commits.tex
 MODULES+=	progsnap2.py progsnap2.tex
 MODULES+=	viewer.py viewer.tex
 MODULES+=	cli.py cli.tex
+TUTORIAL_IDS=	getting-started playback-and-tagging \
+		export-and-share analysing-progsnap2
+TUTORIAL_MD=	$(TUTORIAL_IDS:%=tutorials/%.md)
+TUTORIAL_TEX=	$(TUTORIAL_IDS:%=tutorials/%.tex)
+
+MODULES+=	$(TUTORIAL_MD) $(TUTORIAL_TEX)
 
 .PHONY: all
 all: ${MODULES}
@@ -26,6 +32,10 @@ commits.py: commits.nw
 progsnap2.py: progsnap2.nw
 viewer.py: viewer.nw
 cli.py: cli.nw
+
+tutorials/%.md: tutorials/%.nw
+	@mkdir -p $(dir $@)
+	notangle -R"[[$(notdir $@)]]" $< | ${CPIF} $@ && noroots $<
 
 
 .PHONY: clean

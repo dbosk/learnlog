@@ -12,7 +12,7 @@ make all
 git submodule update --init
 
 # Tangle and build package only
-cd src/learnlog && make compile
+cd src/learnlog && make
 
 # Run tests (tangles test chunks from .nw files automatically)
 cd tests && make test
@@ -34,6 +34,10 @@ make clean
 ## Literate Programming (Critical)
 
 **The `.nw` files are the source of truth.** Never edit generated `.py` files directly — always edit the corresponding `.nw` file in `src/learnlog/` and tangle.
+
+Tutorials follow the same rule: the sources live in
+`src/learnlog/tutorials/*.nw`, tangle to runtime `.md` resources, and weave to
+`.tex` chapters for the PDF.
 
 - `notangle -R"[[filename.py]]" file.nw` extracts Python code
 - `noweave` extracts LaTeX documentation
@@ -58,7 +62,13 @@ Five modules, all defined as `.nw` literate source in `src/learnlog/`:
 | `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the project root, skips `learnlog init`, and activates `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
 | `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; crash-resilient commit strategy (commit header before run, amend with results after) |
-| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), and `analyse` |
+| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), and `analyse` |
+
+Tutorial sources in `src/learnlog/tutorials/`:
+- `getting-started.nw` — first-run setup, activation, running code, and batch playback
+- `playback-and-tagging.nw` — batch and interactive playback plus tagging workflows
+- `export-and-share.nw` — bundle export, ProgSnap2 export, and remote sharing workflows
+- `analysing-progsnap2.nw` — `learnlog analyse` reports and `Column=Regex` range filtering
 
 ### Key design constraints
 
@@ -66,9 +76,10 @@ Five modules, all defined as `.nw` literate source in `src/learnlog/`:
 - **Crash resilience**: `begin_run()` commits before execution, `finalize_run()` amends after
 - `.learnlog/` in the working directory is the *product's* data (student log repo), not project config
 - Git operations use `subprocess.run` (no GitPython dependency)
-- Runtime dependencies: `typer>=0.9.0` (CLI) and `virtualenv>=20` (used by
+- Runtime dependencies: `typer>=0.9.0` (CLI), `virtualenv>=20` (used by
   `learnlog init` to create project venvs reliably on PEP 668 / split-
-  `python3-venv` systems)
+  `python3-venv` systems), and `pytorial>=0.2` (embedded interactive
+  tutorials)
 
 ## Testing
 
