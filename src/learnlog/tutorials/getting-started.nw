@@ -55,26 +55,29 @@ packages are the ones you use in the next steps.
 # Create a small program
 
 ```tutorial-step
-kind: input
-answers:
-  - done
-hint: Use your editor to create `hello.py`, save it, then type `done`.
+hint: Create `hello.py` in the terminal with your preferred editor, then return.
 ```
 
 Create a file named `hello.py` that prints a short message.
-Use your own editor for this step.
-For example, if you use VS Code, run `code hello.py`, save a file such
-as `print("Hello, world!")`, and then type `done` to continue.
+In this step the tutorial should drop to a terminal so you can run
+your preferred editor yourself.
+For example, you might run `code hello.py`, `vim hello.py`, or
+`nano hello.py`.
+Save `print("Hello, world!")` before returning.
 
 # Run the program
 
 ```tutorial-step
 required_patterns:
+  - learnlog activate
   - python hello.py
-hint: Run the script with the Python from the activated `.venv/`.
+  - Hello, world!
+hint: "Fresh shell: run `eval \"$(learnlog activate)\"`, then `python hello.py`."
 ```
 
-Run `python hello.py`.
+Run `eval "$(learnlog activate)"` again because this step starts in a
+fresh shell.
+Then run `python hello.py`.
 You should see your message on screen, and learnlog should record the
 run automatically.
 
@@ -83,10 +86,13 @@ run automatically.
 ```tutorial-step
 required_patterns:
   - learnlog play -b
-hint: Use batch mode first so the whole recorded commit is printed.
+  - "Script: hello.py"
+  - "stdout: Hello, world!"
+  - diff --git
+hint: Use `learnlog play -b` and confirm the recorded `hello.py` run appears.
 ```
 
 Use `learnlog play -b` to print the recorded commit to the terminal.
-Look for the command, the output from `hello.py`, and the diff showing
-the file you created.
+Look for `Script: hello.py`, `stdout: Hello, world!`, and the diff
+showing the file you created.
 @

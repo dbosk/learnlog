@@ -1558,12 +1558,20 @@ TTY-free [[list]] subcommand.
 That is enough to verify the host-side wiring and that the shipped
 tutorial resources are visible to pytorial.
 
-The getting-started tutorial intentionally keeps the first editing task
-outside pytorial's editor integration.
-Students should be able to use their own editor, save [[hello.py]], and
-continue by confirming with [[done]].
-We lock that in with a regression test against the generated tutorial
-resource.
+The getting-started tutorial should still hand the learner over to a
+normal shell step for the first file creation task, so the student opens
+[[hello.py]] in a preferred editor from the terminal.
+We deliberately avoid a shell-side validation command there, because the
+embedded tutorial runner does not trust authored shell checks by
+default.
+Instead, the later run step acknowledges that each tutorial shell step
+starts fresh: it repeats [[eval "$(learnlog activate)"]] before
+[[python hello.py]] and requires the expected [[Hello, world!]] output.
+The final playback step then looks for [[Script: hello.py]], the
+recorded output, and the diff in [[learnlog play -b]], so the tutorial
+only passes after a real learnlog-managed run.
+We lock those constraints in with regression tests against the generated
+tutorial resource.
 
 <<test functions>>=
 def test_tutorial_list_lists_builtin_tutorials():
@@ -1579,8 +1587,8 @@ def test_tutorial_list_lists_builtin_tutorials():
     assert "export-and-share" in result.stdout
     assert "analysing-progsnap2" in result.stdout
 
-def test_getting_started_uses_confirmation_for_editing_step():
-    """Step 3 asks for confirmation instead of forcing editor mode."""
+def test_getting_started_uses_shell_step_for_file_creation():
+    """Step 3 stays in the shell without shell-side validation."""
     from importlib import resources
 
     from pytorial.catalog import parse_tutorial_text
@@ -1595,12 +1603,65 @@ def test_getting_started_uses_confirmation_for_editing_step():
     step = tutorial.steps[2]
 
     assert step.title == "Create a small program"
-    assert step.kind == "input"
-    assert len(step.answers) == 1
-    assert step.answers[0].pattern == "done"
-    assert step.answers[0].mode == "contains"
+    assert step.kind is None
     assert step.edit_file is None
-    assert "Use your own editor" in step.instructions
+    assert step.required_patterns == ()
+    assert step.check_command is None
+    assert "vim hello.py" in step.instructions
+    assert "nano hello.py" in step.instructions
+    assert "drop to a terminal" in step.instructions
+    assert 'print("Hello, world!")' in step.instructions
+
+def test_getting_started_reactivates_and_checks_playback():
+    """Later steps cope with fresh shells and require a recorded run."""
+    from importlib import resources
+
+    from pytorial.catalog import parse_tutorial_text
+
+    tutorial_path = resources.files("learnlog") / "tutorials"
+    tutorial_path = tutorial_path / "getting-started.md"
+    tutorial = parse_tutorial_text(
+        tutorial_path.read_text(),
+        source_path=tutorial_path,
+    )
+
+    run_step = tutorial.steps[3]
+    play_step = tutorial.steps[4]
+
+    assert run_step.title == "Run the program"
+    assert run_step.kind is None
+    assert run_step.edit_file is None
+    assert tuple(
+        pattern.pattern for pattern in run_step.required_patterns
+    ) == (
+        "learnlog activate",
+        "python hello.py",
+        "Hello, world!",
+    )
+    assert all(
+        pattern.mode == "contains"
+        for pattern in run_step.required_patterns
+    )
+    assert run_step.check_command is None
+    assert 'eval "$(learnlog activate)"' in run_step.instructions
+    assert "fresh shell" in run_step.instructions
+
+    assert play_step.title == "Inspect the recorded run"
+    assert tuple(
+        pattern.pattern for pattern in play_step.required_patterns
+    ) == (
+        "learnlog play -b",
+        "Script: hello.py",
+        "stdout: Hello, world!",
+        "diff --git",
+    )
+    assert all(
+        pattern.mode == "contains"
+        for pattern in play_step.required_patterns
+    )
+    assert play_step.check_command is None
+    assert "Script: hello.py" in play_step.instructions
+    assert "diff" in play_step.instructions
 @
 
 
