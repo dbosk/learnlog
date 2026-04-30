@@ -1006,19 +1006,73 @@ builtins.input = _wrap_input(original_input, iolog)
 Let's verify that initialisation creates the repository and wraps
 streams.
 We run a script in a subprocess to avoid polluting the test process.
-The [[test_env]] fixture provides a Git identity so tests work even
-in CI environments without a global Git config:
+Those subprocesses import [[learnlog]] explicitly inside the test
+script, so they must not also inherit the venv's startup hook: a
+[[.pth]] autostart import would run before the script can override
+[[sys.argv]] or [[LEARNLOG_PROJECT_ROOT]], turning these tests into
+order-of-import accidents instead of checks of [[initialize()]].
+The [[test_env]] fixture therefore disables autostart while still
+providing a Git identity so tests work even in CI environments
+without a global Git config:
 
 <<test helpers>>=
 @pytest.fixture
 def test_env():
-    """Environment with a test Git identity for isolation."""
+    """Environment for explicit-import tests.
+
+    These subprocess tests import ``learnlog`` from the script body, so
+    they disable the startup hook and clear any leaked project-root
+    override from the parent pytest process.
+    """
     env = os.environ.copy()
+    env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    env.pop("LEARNLOG_PROJECT_ROOT", None)
     env["GIT_AUTHOR_NAME"] = "Test"
     env["GIT_AUTHOR_EMAIL"] = "test@test"
     env["GIT_COMMITTER_NAME"] = "Test"
     env["GIT_COMMITTER_EMAIL"] = "test@test"
     return env
+@
+
+Some initialisation tests need stricter control than a normal
+[[python script.py]] run can provide.
+They must set [[sys.argv]] or [[LEARNLOG_PROJECT_ROOT]] before
+the first [[import learnlog]], and the installed [[.pth]] hook in the
+Poetry venv would otherwise import the package during interpreter
+startup.
+For those cases we launch [[python -S -c ...]] and add the checkout's
+[[src/]] directory to [[PYTHONPATH]] ourselves.
+Skipping [[site.py]] avoids all [[.pth]] processing, while the explicit
+[[PYTHONPATH]] keeps the package importable from the working tree.
+
+<<test helpers>>=
+def run_explicit_import(code, *, cwd, env, argv=None):
+    """Run ``code`` with the first ``learnlog`` import under test control."""
+    run_env = env.copy()
+    source_root = pathlib.Path(__file__).resolve().parents[2] / "src"
+    pythonpath = str(source_root)
+    existing_pythonpath = run_env.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath = pythonpath + os.pathsep + existing_pythonpath
+    run_env["PYTHONPATH"] = pythonpath
+
+    prelude = []
+    if argv is not None:
+        prelude.append(f"sys.argv = {argv!r}")
+    command = [
+        sys.executable,
+        "-S",
+        "-c",
+        "\n".join(["import sys", *prelude, code]),
+    ]
+    return subprocess.run(
+        command,
+        cwd=str(cwd),
+        env=run_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 @
 
 <<test functions>>=
@@ -1055,18 +1109,13 @@ class TestInitialize:
         project_root.mkdir()
         subdir = project_root / "subdir"
         subdir.mkdir()
-        script = subdir / "test_env_root.py"
-        script.write_text(
-            "import os\n"
-            "import sys\n"
-            f"os.environ['LEARNLOG_PROJECT_ROOT'] = {str(project_root)!r}\n"
+        env = test_env.copy()
+        env["LEARNLOG_PROJECT_ROOT"] = str(project_root)
+        result = run_explicit_import(
             "import learnlog\n"
-            "print(learnlog.repo.workdir)\n"
-        )
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(subdir), env=test_env,
-            capture_output=True, text=True, timeout=30,
+            "print(learnlog.repo.workdir)",
+            cwd=subdir,
+            env=env,
         )
         assert result.returncode == 0
         assert result.stdout.strip() == str(project_root)
@@ -1087,16 +1136,11 @@ class TestInitialize:
     def test_normalises_main_invocation(
         self, workdir, test_env, argv, expected_script, expected_args,
     ):
-        script = workdir / "test_main_invocation.py"
-        script.write_text(
-            "import sys\n"
-            f"sys.argv = {argv!r}\n"
-            "import learnlog\n"
-        )
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(workdir), env=test_env,
-            capture_output=True, text=True, timeout=30,
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=argv,
         )
         assert result.returncode == 0
         git_result = subprocess.run(
@@ -1135,17 +1179,12 @@ class TestInitialize:
         assert msg.count("stdin: hello\n") == 1
 
     def test_skips_learnlog_init_bootstrap(self, tmp_path, test_env):
-        script = tmp_path / "learnlog"
-        script.write_text(
-            "import sys\n"
-            "sys.argv = ['/venv/bin/learnlog', 'init', 'python']\n"
+        result = run_explicit_import(
             "import learnlog\n"
-            "print(learnlog.repo)\n"
-        )
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            cwd=str(tmp_path), env=test_env,
-            capture_output=True, text=True, timeout=30,
+            "print(learnlog.repo)",
+            cwd=tmp_path,
+            env=test_env,
+            argv=['/venv/bin/learnlog', 'init', 'python'],
         )
         assert result.returncode == 0
         assert result.stdout.strip() == "None"
@@ -1681,7 +1720,7 @@ Python's [[site.py]] evaluates any line beginning with [[import]]
 inside a [[.pth]] file at interpreter startup---ahead of the main
 script and therefore ahead of parse errors in it.
 So [[learnlog init]] installs a one-line
-[[learnlog-autostart.pth]] into the venv's [[site-packages]]:
+[[zzz-learnlog-autostart.pth]] into the venv's [[site-packages]]:
 \begin{minted}{python}
 import learnlog._autostart; learnlog._autostart.autostart()
 \end{minted}
@@ -1701,6 +1740,10 @@ another tool (Python loads only one).
 Multiple [[.pth]] files coexist, so we cannot collide.
 The same trick powers [[coverage.py]]'s subprocess auto-start
 ([[coverage.pth]])---so the mechanism is proven at scale.
+We also sort our hook late on purpose: editable installs often
+drop a separate [[learnlog.pth]] that adds the source tree to
+[[sys.path]], and that path must be visible before the hook tries
+to import [[learnlog]].
 
 \paragraph{Scope.}
 After [[learnlog init]] the venv is the unit of logging: every
@@ -2322,8 +2365,9 @@ Instead we write the same two autostart files into a temporary venv and
 add one extra [[.pth]] file that points at this checkout's [[src/]]
 tree.
 Naming that extra file [[000-learnlog-source.pth]] makes [[site.py]]
-add the source tree before it reaches [[learnlog-autostart.pth]], so the
-autostart import resolves to the code under test.
+add the source tree before it reaches
+[[zzz-learnlog-autostart.pth]], so the autostart import
+resolves to the code under test.
 For the one case that must look like the installed [[learnlog]] console
 script, we also drop a tiny launcher into the venv's [[bin/]] directory.
 It uses the venv's own [[python]] in its shebang, so the subprocess still

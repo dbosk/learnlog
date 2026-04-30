@@ -963,14 +963,19 @@ def test_venv_activation_hint_windows(monkeypatch, tmp_path):
 After the venv exists, we wire it for autostart.  Two
 files are placed inside the venv's [[site-packages]]:
 \begin{description}
-\item[[[learnlog-autostart.pth]]] contains the single line
+\item[ [[zzz-learnlog-autostart.pth]] ] contains the single
+    line
     [[import learnlog._autostart; learnlog._autostart.autostart()]].
     Python's [[site.py]]
     processes [[.pth]] files at interpreter startup and
     executes any line that begins with [[import]]
     verbatim---\emph{before} the main script is compiled,
     which is what lets us catch a top-level
-    [[SyntaxError]].  A [[.pth]] file is preferred over
+    [[SyntaxError]].  We deliberately sort this file late:
+    editable installs from tools such as [[poetry]] often add
+    a separate [[learnlog.pth]] that inserts the source tree
+    into [[sys.path]], and that path must land before the hook
+    tries to import [[learnlog]].  A [[.pth]] file is preferred over
     [[sitecustomize.py]] because the venv may already have
     a [[sitecustomize.py]] from some other tool (there can
     be only one), whereas multiple [[.pth]] files coexist
@@ -1024,6 +1029,12 @@ re-running [[init]] after a manual tweak does not clobber
 it, and more importantly does not stamp a new mtime that
 confuses build systems watching the venv.
 
+We also remove the old [[learnlog-autostart.pth]] filename.
+That migration matters for development environments that were
+initialised before the rename: if the legacy file is left in
+place, [[site.py]] still reaches it first and the editable
+install problem remains.
+
 The whole body runs inside a [[try/except OSError]]: an
 autostart hook that fails to install is a missed feature,
 not a broken install.  The student can still use
@@ -1037,7 +1048,7 @@ def write_autostart_files(venv_dir, project_root):
 
     Writes two files into the venv's ``site-packages``:
 
-    * ``learnlog-autostart.pth`` --- a one-line
+    * ``zzz-learnlog-autostart.pth`` --- a one-line
       ``import learnlog._autostart;``
       ``learnlog._autostart.autostart()``, processed by
       ``site.py`` at interpreter startup before the main
@@ -1052,9 +1063,10 @@ def write_autostart_files(venv_dir, project_root):
     alone).  Filesystem errors are reported as warnings
     but do not abort ``init``.
     """
+    legacy_path = None
     files = [
         (
-            "learnlog-autostart.pth",
+            "zzz-learnlog-autostart.pth",
             "import learnlog._autostart; "
             "learnlog._autostart.autostart()\n",
         ),
@@ -1066,6 +1078,9 @@ def write_autostart_files(venv_dir, project_root):
     ]
     try:
         purelib = venv_purelib(venv_dir)
+        legacy_path = purelib / "learnlog-autostart.pth"
+        if legacy_path.exists():
+            legacy_path.unlink()
         for name, content in files:
             path = purelib / name
             if path.exists() and path.read_text() == content:
@@ -1099,13 +1114,36 @@ def test_write_autostart_files_creates_both_files(
         cli, "venv_purelib", lambda d: purelib,
     )
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
-    pth = purelib / "learnlog-autostart.pth"
+    pth = purelib / "zzz-learnlog-autostart.pth"
     marker = purelib / "learnlog_project_root.txt"
     assert pth.read_text() == (
         "import learnlog._autostart; "
         "learnlog._autostart.autostart()\n"
     )
     assert marker.read_text() == str(tmp_path.resolve()) + "\n"
+
+def test_write_autostart_files_removes_legacy_hook(
+    tmp_path, monkeypatch,
+):
+    """Re-running init removes the old hook filename."""
+    from learnlog import cli
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    legacy = purelib / "learnlog-autostart.pth"
+    legacy.write_text("old hook\n")
+    monkeypatch.setattr(
+        cli, "venv_purelib", lambda d: purelib,
+    )
+
+    cli.write_autostart_files(tmp_path / ".venv", tmp_path)
+
+    assert not legacy.exists()
+    assert (
+        purelib / "zzz-learnlog-autostart.pth"
+    ).read_text() == (
+        "import learnlog._autostart; "
+        "learnlog._autostart.autostart()\n"
+    )
 
 def test_write_autostart_files_is_idempotent(
     tmp_path, monkeypatch,
@@ -1118,7 +1156,7 @@ def test_write_autostart_files_is_idempotent(
         cli, "venv_purelib", lambda d: purelib,
     )
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
-    pth = purelib / "learnlog-autostart.pth"
+    pth = purelib / "zzz-learnlog-autostart.pth"
     mtime_before = pth.stat().st_mtime_ns
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
     assert pth.stat().st_mtime_ns == mtime_before
@@ -1520,6 +1558,23 @@ TTY-free [[list]] subcommand.
 That is enough to verify the host-side wiring and that the shipped
 tutorial resources are visible to pytorial.
 
+The getting-started tutorial should still hand the learner over to a
+normal shell step for the first file creation task, so the student opens
+[[hello.py]] in a preferred editor from the terminal.
+With pytorial's shell hooks available for integrated tutorials, every
+shell step after the explicit activation lesson installs
+[[eval "$(learnlog activate)"]] as a [[pre_command]].
+That keeps the tutorial honest about fresh shells while still making the
+project environment available for any extra commands the student tries
+before returning from the step.
+The run step therefore only needs to require [[python hello.py]] and the
+expected [[Hello, world!]] output.
+The final playback step still looks for [[Script: hello.py]], the
+recorded output, and the diff in [[learnlog play -b]], so the tutorial
+only passes after a real learnlog-managed run.
+We lock those constraints in with regression tests against the generated
+tutorial resource.
+
 <<test functions>>=
 def test_tutorial_list_lists_builtin_tutorials():
     """`learnlog tutorial list` includes our shipped tutorials."""
@@ -1533,6 +1588,85 @@ def test_tutorial_list_lists_builtin_tutorials():
     assert "playback-and-tagging" in result.stdout
     assert "export-and-share" in result.stdout
     assert "analysing-progsnap2" in result.stdout
+
+def test_getting_started_uses_shell_step_for_file_creation():
+    """Step 3 stays in the shell with pre-activated project Python."""
+    from importlib import resources
+
+    from pytorial.catalog import parse_tutorial_text
+
+    tutorial_path = resources.files("learnlog") / "tutorials"
+    tutorial_path = tutorial_path / "getting-started.md"
+    tutorial = parse_tutorial_text(
+        tutorial_path.read_text(),
+        source_path=tutorial_path,
+    )
+
+    step = tutorial.steps[2]
+
+    assert step.title == "Create a small program"
+    assert step.kind is None
+    assert step.edit_file is None
+    assert step.required_patterns == ()
+    assert step.pre_command == 'eval "$(learnlog activate)"\n'
+    assert step.check_command is None
+    assert "vim hello.py" in step.instructions
+    assert "nano hello.py" in step.instructions
+    assert "drop to a terminal" in step.instructions
+    assert "re-activates the project environment" in step.instructions
+    assert 'print("Hello, world!")' in step.instructions
+
+def test_getting_started_reactivates_and_checks_playback():
+    """Later shell steps pre-activate the venv and require playback."""
+    from importlib import resources
+
+    from pytorial.catalog import parse_tutorial_text
+
+    tutorial_path = resources.files("learnlog") / "tutorials"
+    tutorial_path = tutorial_path / "getting-started.md"
+    tutorial = parse_tutorial_text(
+        tutorial_path.read_text(),
+        source_path=tutorial_path,
+    )
+
+    run_step = tutorial.steps[3]
+    play_step = tutorial.steps[4]
+
+    assert run_step.title == "Run the program"
+    assert run_step.kind is None
+    assert run_step.edit_file is None
+    assert run_step.pre_command == 'eval "$(learnlog activate)"\n'
+    assert tuple(
+        pattern.pattern for pattern in run_step.required_patterns
+    ) == (
+        "python hello.py",
+        "Hello, world!",
+    )
+    assert all(
+        pattern.mode == "contains"
+        for pattern in run_step.required_patterns
+    )
+    assert run_step.check_command is None
+    assert "fresh shell" in run_step.instructions
+    assert "re-activated the project environment" in run_step.instructions
+
+    assert play_step.title == "Inspect the recorded run"
+    assert play_step.pre_command == 'eval "$(learnlog activate)"\n'
+    assert tuple(
+        pattern.pattern for pattern in play_step.required_patterns
+    ) == (
+        "learnlog play -b",
+        "Script: hello.py",
+        "stdout: Hello, world!",
+        "diff --git",
+    )
+    assert all(
+        pattern.mode == "contains"
+        for pattern in play_step.required_patterns
+    )
+    assert play_step.check_command is None
+    assert "Script: hello.py" in play_step.instructions
+    assert "diff" in play_step.instructions
 @
 
 

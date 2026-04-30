@@ -55,22 +55,34 @@ packages are the ones you use in the next steps.
 # Create a small program
 
 ```tutorial-step
-edit_file: hello.py
-required_patterns:
-  - print("Hello, learnlog!")
-hint: Create `hello.py` with one `print(...)` call.
+pre_command: |
+  eval "$(learnlog activate)"
+hint: Create `hello.py` in the terminal with your preferred editor, then return.
 ```
 
 Create a file named `hello.py` that prints a short message.
+In this step the tutorial should drop to a terminal so you can run
+your preferred editor yourself.
+The tutorial re-activates the project environment before opening this
+terminal, so extra commands you try here still use the project's own
+Python.
+For example, you might run `code hello.py`, `vim hello.py`, or
+`nano hello.py`.
+Save `print("Hello, world!")` before returning.
 
 # Run the program
 
 ```tutorial-step
+pre_command: |
+  eval "$(learnlog activate)"
 required_patterns:
   - python hello.py
-hint: Run the script with the Python from the activated `.venv/`.
+  - Hello, world!
+hint: The tutorial already re-activated the project environment; run `python hello.py`.
 ```
 
+This step also starts in a fresh shell, and the tutorial has already
+re-activated the project environment for you.
 Run `python hello.py`.
 You should see your message on screen, and learnlog should record the
 run automatically.
@@ -78,12 +90,19 @@ run automatically.
 # Inspect the recorded run
 
 ```tutorial-step
+pre_command: |
+  eval "$(learnlog activate)"
 required_patterns:
   - learnlog play -b
-hint: Use batch mode first so the whole recorded commit is printed.
+  - "Script: hello.py"
+  - "stdout: Hello, world!"
+  - diff --git
+hint: The tutorial already re-activated the project environment; use `learnlog play -b` and confirm the recorded `hello.py` run appears.
 ```
 
+This step also opens in a fresh shell, and the tutorial has already
+re-activated the project environment for you.
 Use `learnlog play -b` to print the recorded commit to the terminal.
-Look for the command, the output from `hello.py`, and the diff showing
-the file you created.
+Look for `Script: hello.py`, `stdout: Hello, world!`, and the diff
+showing the file you created.
 @
