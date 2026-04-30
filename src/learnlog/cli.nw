@@ -1561,13 +1561,15 @@ tutorial resources are visible to pytorial.
 The getting-started tutorial should still hand the learner over to a
 normal shell step for the first file creation task, so the student opens
 [[hello.py]] in a preferred editor from the terminal.
-We deliberately avoid a shell-side validation command there, because the
-embedded tutorial runner does not trust authored shell checks by
-default.
-Instead, the later run step acknowledges that each tutorial shell step
-starts fresh: it repeats [[eval "$(learnlog activate)"]] before
-[[python hello.py]] and requires the expected [[Hello, world!]] output.
-The final playback step then looks for [[Script: hello.py]], the
+With pytorial's shell hooks available for integrated tutorials, every
+shell step after the explicit activation lesson installs
+[[eval "$(learnlog activate)"]] as a [[pre_command]].
+That keeps the tutorial honest about fresh shells while still making the
+project environment available for any extra commands the student tries
+before returning from the step.
+The run step therefore only needs to require [[python hello.py]] and the
+expected [[Hello, world!]] output.
+The final playback step still looks for [[Script: hello.py]], the
 recorded output, and the diff in [[learnlog play -b]], so the tutorial
 only passes after a real learnlog-managed run.
 We lock those constraints in with regression tests against the generated
@@ -1588,7 +1590,7 @@ def test_tutorial_list_lists_builtin_tutorials():
     assert "analysing-progsnap2" in result.stdout
 
 def test_getting_started_uses_shell_step_for_file_creation():
-    """Step 3 stays in the shell without shell-side validation."""
+    """Step 3 stays in the shell with pre-activated project Python."""
     from importlib import resources
 
     from pytorial.catalog import parse_tutorial_text
@@ -1606,14 +1608,16 @@ def test_getting_started_uses_shell_step_for_file_creation():
     assert step.kind is None
     assert step.edit_file is None
     assert step.required_patterns == ()
+    assert step.pre_command == 'eval "$(learnlog activate)"\n'
     assert step.check_command is None
     assert "vim hello.py" in step.instructions
     assert "nano hello.py" in step.instructions
     assert "drop to a terminal" in step.instructions
+    assert "re-activates the project environment" in step.instructions
     assert 'print("Hello, world!")' in step.instructions
 
 def test_getting_started_reactivates_and_checks_playback():
-    """Later steps cope with fresh shells and require a recorded run."""
+    """Later shell steps pre-activate the venv and require playback."""
     from importlib import resources
 
     from pytorial.catalog import parse_tutorial_text
@@ -1631,10 +1635,10 @@ def test_getting_started_reactivates_and_checks_playback():
     assert run_step.title == "Run the program"
     assert run_step.kind is None
     assert run_step.edit_file is None
+    assert run_step.pre_command == 'eval "$(learnlog activate)"\n'
     assert tuple(
         pattern.pattern for pattern in run_step.required_patterns
     ) == (
-        "learnlog activate",
         "python hello.py",
         "Hello, world!",
     )
@@ -1643,10 +1647,11 @@ def test_getting_started_reactivates_and_checks_playback():
         for pattern in run_step.required_patterns
     )
     assert run_step.check_command is None
-    assert 'eval "$(learnlog activate)"' in run_step.instructions
     assert "fresh shell" in run_step.instructions
+    assert "re-activated the project environment" in run_step.instructions
 
     assert play_step.title == "Inspect the recorded run"
+    assert play_step.pre_command == 'eval "$(learnlog activate)"\n'
     assert tuple(
         pattern.pattern for pattern in play_step.required_patterns
     ) == (
