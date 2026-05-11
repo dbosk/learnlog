@@ -654,9 +654,15 @@ At runtime [[sys.argv]] starts with [[-c]] and then contains only the
 student's extra arguments, while [[sys.orig_argv]] still remembers the
 full interpreter command line including the source string.
 If we only inspect [[sys.argv]], explicit-import tests can pass while the
-real autostart path still records [[Arguments: (none)]].
-We therefore let the normaliser consult [[sys.orig_argv]] when it needs
-to recover the source for [[python -c]].
+real autostart path still records [[Arguments: (none)]]---and, worse,
+[[python -c "code" extra]] would record [[extra]] as if it were the
+source.
+We therefore let the normaliser consult [[sys.orig_argv]] first when it
+recognises the [[-c]] sentinel: that path recovers the real source from
+[[sys.orig_argv[2]]] and preserves the student's extra arguments from
+[[sys.argv[1:]]].
+The bare [[sys.argv]] fast path remains only as a fallback for callers
+that do not supply [[sys.orig_argv]].
 
 The same bootstrap exclusion from the autostart gate also needs to be
 enforced here.
@@ -698,10 +704,10 @@ def _normalize_main_invocation(argv, orig_argv=None):
         "-m": ("<python -m>", lambda values: values[1:]),
     }
     if script == "-c":
-        if len(argv) > 1:
-            return "<python -c>", [argv[1]]
         if len(orig_argv) > 2 and orig_argv[1] == "-c":
             return "<python -c>", [orig_argv[2], *argv[1:]]
+        if len(argv) > 1:
+            return "<python -c>", [argv[1]]
         return "<python -c>", []
     if script in special:
         name, args_factory = special[script]
@@ -1193,7 +1199,7 @@ class TestInitialize:
         ("argv", "expected_script", "expected_args"),
         [
             ([""], "<repl>", "(none)"),
-            (["-c", "print(1)"], "<python -c>", "print(1)"),
+            (["-c"], "<python -c>", "print(1)"),
             (["-m", "pip", "--version"], "<python -m>",
              "pip --version"),
             (["/tmp/demo.py", "arg1"], "demo.py", "arg1"),
@@ -1203,12 +1209,18 @@ class TestInitialize:
     def test_normalises_main_invocation(
         self, workdir, test_env, argv, expected_script, expected_args,
     ):
+        if argv == ["-c"]:
+            orig_argv = [sys.executable, "-c", "print(1)"]
+        elif argv is not None:
+            orig_argv = [sys.executable, *argv]
+        else:
+            orig_argv = None
         result = run_explicit_import(
             "import learnlog",
             cwd=workdir,
             env=test_env,
             argv=argv,
-            orig_argv=[sys.executable, *argv] if argv is not None else None,
+            orig_argv=orig_argv,
         )
         assert result.returncode == 0
         git_result = subprocess.run(
@@ -1220,7 +1232,7 @@ class TestInitialize:
         msg = git_result.stdout
         assert f"Script: {expected_script}" in msg
         assert f"Arguments: {expected_args}" in msg
-        if argv == ["-c", "print(1)"]:
+        if expected_script == "<python -c>":
             source_file = workdir / "python_c_invocation.py"
             assert source_file.read_text() == "print(1)"
             ls_result = subprocess.run(
@@ -1241,7 +1253,7 @@ class TestInitialize:
             "import learnlog",
             cwd=workdir,
             env=test_env,
-            argv=["-c", source],
+            argv=["-c"],
             orig_argv=[sys.executable, "-c", source],
         )
         assert result.returncode == 0
@@ -1270,6 +1282,33 @@ class TestInitialize:
         msg = git_result.stdout
         assert "Script: <python -c>" in msg
         assert f"Arguments: {source}" in msg
+        assert (
+            workdir / "python_c_invocation.py"
+        ).read_text() == source
+
+    def test_python_c_preserves_extras_after_source(
+        self, workdir, test_env,
+    ):
+        source = "import sys; print(sys.argv[1:])"
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c", "alpha", "beta"],
+            orig_argv=[
+                sys.executable, "-c", source, "alpha", "beta",
+            ],
+        )
+        assert result.returncode == 0
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert "Script: <python -c>" in msg
+        assert f"Arguments: {source} alpha beta" in msg
         assert (
             workdir / "python_c_invocation.py"
         ).read_text() == source
