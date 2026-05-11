@@ -1540,6 +1540,9 @@ with other embedded hosts on the same machine.
 The builtin [[using-tutorials]] self-tour is prepended
 automatically, and the rest of the catalog comes from the Markdown
 tutorials we ship as package data under [[learnlog/tutorials/]].
+We list those tutorial files explicitly so [[learnlog tutorial
+list]] follows the intended student-to-researcher progression
+instead of an incidental alphabetical order.
 
 <<typer commands>>=
 _builtin_tutorials_dir = resources.files("learnlog") / "tutorials"
@@ -1548,7 +1551,12 @@ pytorial.add_typer_subcommand(
     app,
     name="tutorial",
     namespace="learnlog",
-    tutorial_paths=(str(_builtin_tutorials_dir),),
+    tutorial_paths=(
+        str(_builtin_tutorials_dir / "getting-started.md"),
+        str(_builtin_tutorials_dir / "playback-and-tagging.md"),
+        str(_builtin_tutorials_dir / "export-and-share.md"),
+        str(_builtin_tutorials_dir / "analysing-progsnap2.md"),
+    ),
 )
 @
 
@@ -1582,12 +1590,19 @@ def test_tutorial_list_lists_builtin_tutorials():
     from typer.testing import CliRunner
 
     result = CliRunner().invoke(app, ["tutorial", "list"])
+    out = result.stdout
 
     assert result.exit_code == 0
-    assert "getting-started" in result.stdout
-    assert "playback-and-tagging" in result.stdout
-    assert "export-and-share" in result.stdout
-    assert "analysing-progsnap2" in result.stdout
+    assert "getting-started" in out
+    assert "playback-and-tagging" in out
+    assert "export-and-share" in out
+    assert "analysing-progsnap2" in out
+    assert (
+        out.index("getting-started")
+        < out.index("playback-and-tagging")
+        < out.index("export-and-share")
+        < out.index("analysing-progsnap2")
+    )
 
 def test_getting_started_uses_shell_step_for_file_creation():
     """Step 3 stays in the shell with pre-activated project Python."""
