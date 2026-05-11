@@ -648,6 +648,22 @@ We map those sentinel forms to labels that explain how Python was
 started while leaving ordinary filenames and entry-point basenames
 unchanged.
 
+For [[python -c]] there is a second wrinkle: real interpreters do not
+keep the source in [[sys.argv]].
+At runtime [[sys.argv]] starts with [[-c]] and then contains only the
+student's extra arguments, while [[sys.orig_argv]] still remembers the
+full interpreter command line including the source string.
+If we only inspect [[sys.argv]], explicit-import tests can pass while the
+real autostart path still records [[Arguments: (none)]]---and, worse,
+[[python -c "code" extra]] would record [[extra]] as if it were the
+source.
+We therefore let the normaliser consult [[sys.orig_argv]] first when it
+recognises the [[-c]] sentinel: that path recovers the real source from
+[[sys.orig_argv[2]]] and preserves the student's extra arguments from
+[[sys.argv[1:]]].
+The bare [[sys.argv]] fast path remains only as a fallback for callers
+that do not supply [[sys.orig_argv]].
+
 The same bootstrap exclusion from the autostart gate also needs to be
 enforced here.
 The [[.pth]] hook skips [[learnlog init]] before importing the package,
@@ -678,18 +694,21 @@ def _is_learnlog_init(argv):
 @
 
 <<functions>>=
-def _normalize_main_invocation(argv):
+def _normalize_main_invocation(argv, orig_argv=None):
     """Return a normalised ``(script, args)`` pair from ``argv``."""
     argv = list(argv) if argv else [""]
+    orig_argv = list(orig_argv) if orig_argv else []
     script = argv[0]
     special = {
         "": ("<repl>", lambda values: []),
-        "-c": (
-            "<python -c>",
-            lambda values: [values[1]] if len(values) > 1 else [],
-        ),
         "-m": ("<python -m>", lambda values: values[1:]),
     }
+    if script == "-c":
+        if len(orig_argv) > 2 and orig_argv[1] == "-c":
+            return "<python -c>", [orig_argv[2], *argv[1:]]
+        if len(argv) > 1:
+            return "<python -c>", [argv[1]]
+        return "<python -c>", []
     if script in special:
         name, args_factory = special[script]
         return name, args_factory(argv)
@@ -697,6 +716,41 @@ def _normalize_main_invocation(argv):
     if script.endswith(".py"):
         return basename, argv[1:]
     return basename, argv[1:]
+@
+
+A [[python -c]] run differs from a normal script run in one important
+way: the source exists only in the command-line argument.
+If we keep that string only in the commit body, the run has no code diff
+and downstream consumers such as the viewer or ProgSnap2 [[CodeState]]
+exports cannot recover an authoritative program text.
+We therefore materialise the source as a regular worktree file before
+[[begin_run]] stages the tree.
+
+The worktree is the right place for that file.
+Writing inside [[.learnlog/]] would keep it out of the tracked project
+tree, while adding more commit-message metadata would still leave
+[[git log -p]] and checked-out code states empty.
+This helper also belongs in [[learnlog.nw]] rather than [[gitrepo.nw]]:
+only the Python-facing initialisation code knows that
+[[<python -c>]] means [[args[0]]] is source code, whereas
+[[LearnlogRepo]] should stay a generic Git wrapper.
+
+The trade-off is that [[python_c_invocation.py]] is visible in [[ls]]
+after such a run.
+That is acceptable because it serves as a discoverable record of the
+most recent [[python -c]] source, and any failure to write it must not
+stop the student's program.
+
+<<functions>>=
+def _persist_c_invocation(workdir, script, args):
+    """Persist ``python -c`` source as a worktree file."""
+    if script != "<python -c>" or not args:
+        return
+    try:
+        target = pathlib.Path(workdir) / "python_c_invocation.py"
+        target.write_text(args[0])
+    except Exception:
+        pass
 @
 
 [[InputCapture]] handles piped stdin because [[input()]] eventually
@@ -962,7 +1016,9 @@ def initialize():
 <<detect main script>>=
 if _is_learnlog_init(sys.argv):
     return
-main_script, main_args = _normalize_main_invocation(sys.argv)
+main_script, main_args = _normalize_main_invocation(
+    sys.argv, getattr(sys, "orig_argv", None)
+)
 start_time = datetime.datetime.now()
 project_root = os.environ.get("LEARNLOG_PROJECT_ROOT")
 workdir = (
@@ -977,9 +1033,19 @@ If [[find_learnlog_dir]] finds no existing repository, the fallback to
 current working directory---so the very first run still works without
 any manual setup.
 
+At this point we already know which worktree the run belongs to.
+If the invocation was [[python -c]], we must write the synthetic source
+file before [[begin_run]], because [[begin_run]] is the step that stages
+the current worktree into the run commit.
+
 <<create repository and begin run>>=
 repo = LearnlogRepo(workdir)
+<<persist -c source>>
 repo.begin_run(main_script, main_args, start_time)
+@
+
+<<persist -c source>>=
+_persist_c_invocation(workdir, main_script, main_args)
 @
 
 <<install I/O wrappers>>=
@@ -1036,17 +1102,22 @@ def test_env():
 
 Some initialisation tests need stricter control than a normal
 [[python script.py]] run can provide.
-They must set [[sys.argv]] or [[LEARNLOG_PROJECT_ROOT]] before
-the first [[import learnlog]], and the installed [[.pth]] hook in the
-Poetry venv would otherwise import the package during interpreter
-startup.
+They must set [[sys.argv]], sometimes [[sys.orig_argv]], or
+[[LEARNLOG_PROJECT_ROOT]] before the first [[import learnlog]], and the
+installed [[.pth]] hook in the Poetry venv would otherwise import the
+package during interpreter startup.
 For those cases we launch [[python -S -c ...]] and add the checkout's
 [[src/]] directory to [[PYTHONPATH]] ourselves.
 Skipping [[site.py]] avoids all [[.pth]] processing, while the explicit
 [[PYTHONPATH]] keeps the package importable from the working tree.
 
+The helper also mirrors CPython's split view of [[python -c]].
+Real interpreters expose the source via [[sys.orig_argv]] but not via
+[[sys.argv]], so tests that want to simulate the actual startup path must
+be able to override both independently.
+
 <<test helpers>>=
-def run_explicit_import(code, *, cwd, env, argv=None):
+def run_explicit_import(code, *, cwd, env, argv=None, orig_argv=None):
     """Run ``code`` with the first ``learnlog`` import under test control."""
     run_env = env.copy()
     source_root = pathlib.Path(__file__).resolve().parents[2] / "src"
@@ -1059,6 +1130,8 @@ def run_explicit_import(code, *, cwd, env, argv=None):
     prelude = []
     if argv is not None:
         prelude.append(f"sys.argv = {argv!r}")
+    if orig_argv is not None:
+        prelude.append(f"sys.orig_argv = {orig_argv!r}")
     command = [
         sys.executable,
         "-S",
@@ -1126,7 +1199,7 @@ class TestInitialize:
         ("argv", "expected_script", "expected_args"),
         [
             ([""], "<repl>", "(none)"),
-            (["-c", "print(1)"], "<python -c>", "print(1)"),
+            (["-c"], "<python -c>", "print(1)"),
             (["-m", "pip", "--version"], "<python -m>",
              "pip --version"),
             (["/tmp/demo.py", "arg1"], "demo.py", "arg1"),
@@ -1136,11 +1209,18 @@ class TestInitialize:
     def test_normalises_main_invocation(
         self, workdir, test_env, argv, expected_script, expected_args,
     ):
+        if argv == ["-c"]:
+            orig_argv = [sys.executable, "-c", "print(1)"]
+        elif argv is not None:
+            orig_argv = [sys.executable, *argv]
+        else:
+            orig_argv = None
         result = run_explicit_import(
             "import learnlog",
             cwd=workdir,
             env=test_env,
             argv=argv,
+            orig_argv=orig_argv,
         )
         assert result.returncode == 0
         git_result = subprocess.run(
@@ -1152,6 +1232,86 @@ class TestInitialize:
         msg = git_result.stdout
         assert f"Script: {expected_script}" in msg
         assert f"Arguments: {expected_args}" in msg
+        if expected_script == "<python -c>":
+            source_file = workdir / "python_c_invocation.py"
+            assert source_file.read_text() == "print(1)"
+            ls_result = subprocess.run(
+                ["git", "--git-dir=.learnlog",
+                 "--work-tree=.", "ls-files",
+                 "python_c_invocation.py"],
+                cwd=str(workdir),
+                capture_output=True, text=True,
+            )
+            assert ls_result.returncode == 0
+            assert ls_result.stdout.strip() == "python_c_invocation.py"
+
+    def test_persists_multiline_python_c_source(
+        self, workdir, test_env,
+    ):
+        source = 'import sys\nprint("hi")'
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", source],
+        )
+        assert result.returncode == 0
+        assert (
+            workdir / "python_c_invocation.py"
+        ).read_text() == source
+
+    def test_recovers_python_c_source_from_orig_argv(
+        self, workdir, test_env,
+    ):
+        source = 'print("from orig argv")'
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", source],
+        )
+        assert result.returncode == 0
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert "Script: <python -c>" in msg
+        assert f"Arguments: {source}" in msg
+        assert (
+            workdir / "python_c_invocation.py"
+        ).read_text() == source
+
+    def test_python_c_preserves_extras_after_source(
+        self, workdir, test_env,
+    ):
+        source = "import sys; print(sys.argv[1:])"
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c", "alpha", "beta"],
+            orig_argv=[
+                sys.executable, "-c", source, "alpha", "beta",
+            ],
+        )
+        assert result.returncode == 0
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "-1", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        msg = git_result.stdout
+        assert "Script: <python -c>" in msg
+        assert f"Arguments: {source} alpha beta" in msg
+        assert (
+            workdir / "python_c_invocation.py"
+        ).read_text() == source
 
     def test_input_calls_are_logged_once_for_piped_stdin(
         self, workdir, test_env,
@@ -2591,9 +2751,11 @@ def test_autostart_captures_common_invocations(tmp_path):
 
     history = _git_history(project)
     assert "Script: <python -c>" in history
+    assert "Arguments: print(1)" in history
     assert "Script: pip" in history
     assert "Script: quick.py" in history
     assert "stdin: hello from tty\n" in history
+    assert (project / "python_c_invocation.py").read_text() == "print(1)"
 @
 
 The last naming-sensitive cases are console-style wrappers whose
