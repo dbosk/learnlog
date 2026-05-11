@@ -2505,6 +2505,7 @@ It returns a string of \LaTeX{} source.
 def generate_analysis_latex(
     dataset, grouped,
     side_by_side=False, standalone=False,
+    title=None,
 ):
     """Generate LaTeX analysis of edit--run pairs.
 
@@ -2512,6 +2513,11 @@ def generate_analysis_latex(
     ``standalone`` is true, the output is a complete
     document; otherwise it is a fragment suitable for
     ``\\input{}``.
+
+    When ``title`` is given, it is used verbatim as
+    the heading of each ``\\section`` instead of the
+    subject ID.  The caller is responsible for any
+    LaTeX escaping it may require.
     """
     lines = []
 
@@ -2527,10 +2533,69 @@ def generate_analysis_latex(
     return "\n".join(lines) + "\n"
 @
 
+\subsection{Standalone preamble}
+
+When the user passes [[--standalone]], the fragment alone is
+not enough: the document needs a preamble that loads
+[[minted]], chooses a monospace font that can render student
+code (which routinely contains non-ASCII characters), and
+provides the [[fullwidth]] environment that side-by-side
+rows expand into.
+
+The font choice is the most fragile piece.  LaTeX's default
+Computer Modern Typewriter has no glyphs for the accented and
+non-Latin characters that appear in everyday student source,
+so a UTF-8 Python file with Swedish identifiers or Greek
+mathematical symbols produces a wall of missing-glyph
+warnings under pdfLaTeX.  We detect XeTeX with [[iftex]] and,
+when available, swap in [[FreeMono]] via [[fontspec]];
+FreeMono has broad Unicode coverage and is bundled with most
+TeX distributions.  Under pdfLaTeX the [[\ifXeTeX]] block is
+skipped, so the document still builds---non-ASCII characters
+may render as boxes, but compilation does not fail.
+
+The [[\setminted]] block establishes the typography used in
+the reference document at
+[[doc/learnlog-experiment/learnlog.tex]]: small font so long
+lines fit, [[breaklines]] so they wrap rather than overflow,
+[[autogobble]] so leading whitespace from the surrounding
+\LaTeX{} indentation is stripped, and a thin frame to mark
+code regions visually.
+
+[[didactic]] is loaded for its [[fullwidth]] environment.
+[[format_minipage_row]] wraps each paired row in
+[[\begin{fullwidth}...\end{fullwidth}]] so the
+two-[[minipage]] row breaks out of the article body width
+and spans the full page---without it, two
+[[0.48\linewidth]] columns inside a narrow body produce
+cramped diffs and runs.  Standalone documents thus get the
+wide layout for free; fragments inherit the same convention
+on the assumption that the parent document also loads
+[[didactic]].
+
+A long analysis can produce many sections (one per
+[[SubjectID]] and tag), so we emit [[\tableofcontents]]
+immediately after [[\begin{document}]].
+
 <<emit standalone preamble>>=
 lines.append("\\documentclass{article}")
+lines.append("\\usepackage{iftex}")
+lines.append("\\ifXeTeX")
+lines.append("\\usepackage{fontspec}")
+lines.append("\\setmonofont{FreeMono}")
+lines.append("\\fi")
 lines.append("\\usepackage{minted}")
+lines.append("\\setminted{")
+lines.append("    fontsize=\\small,")
+lines.append("    breaklines=true,")
+lines.append("    linenos=false,")
+lines.append("    autogobble=true,")
+lines.append("    frame=single,")
+lines.append("    framesep=10pt")
+lines.append("}")
+lines.append("\\usepackage{didactic}")
 lines.append("\\begin{document}")
+lines.append("\\tableofcontents")
 lines.append("")
 @
 
@@ -2542,10 +2607,22 @@ When all events for a subject are untagged (single
 empty-string key), we skip the [[\\subsection]] level
 to avoid a pointless heading.
 
+A subject ID like [[anonymous]] or a hashed
+identifier makes a poor reading heading, so the
+caller may pass [[title]] to replace the heading
+text.  We use it verbatim---the [[--title]] CLI
+option lets users type real-world titles like
+\enquote{Daniel's debug session}, which already
+satisfy \LaTeX{} syntax; escaping them as if they
+were raw data would mangle that intent.
+
 <<emit subject section>>=
-lines.append(
-    f"\\section{{{_latex_escape(subject_id)}}}"
+heading = (
+    title
+    if title is not None
+    else _latex_escape(subject_id)
 )
+lines.append(f"\\section{{{heading}}}")
 lines.append("")
 tags = grouped[subject_id]
 only_untagged = (
@@ -2714,6 +2791,17 @@ reusing [[effect_edit]] on both sides of the two
 rows so the repeated element is guaranteed to be
 byte-identical.
 
+Both calls pass [[fullwidth=True]] because the
+narrative information density is highest here: two
+code or transcript fragments need to share a single
+line, and the body text width does not accommodate
+that without breaking the visual contrast.  The first
+edit and singleton run, by contrast, leave
+[[fullwidth]] at its default so they stay in the
+normal text column---they have nothing to compare
+against on the left, so the extra horizontal space
+would not pay for itself.
+
 <<emit causal chain rows>>=
 for i in range(len(pairs) - 1):
     cause = pairs[i]
@@ -2734,12 +2822,14 @@ for i in range(len(pairs) - 1):
         left_tex=cause_run,
         right_label=f"Edit {i + 2}",
         right_tex=effect_edit,
+        fullwidth=True,
     ))
     lines.extend(format_minipage_row(
         left_label=f"Edit {i + 2}",
         left_tex=effect_edit,
         right_label=f"Run {i + 2}",
         right_tex=effect_run,
+        fullwidth=True,
     ))
 @
 
@@ -2774,11 +2864,28 @@ same code path and an empty half cannot accidentally
 omit its [[minipage]] wrapper (which would collapse
 the row and misalign the chain).
 
+The [[fullwidth]] flag controls whether the row sits
+at the surrounding body text width or breaks out to
+the full page width via the [[fullwidth]] environment
+from the [[didactic]] package.  Without it, two
+[[0.48\linewidth]] minipages share the article body's
+text block---about 12--13\,cm on A4---which is too
+narrow for the typical diff-plus-stdout pair: long
+identifiers wrap mid-token and tracebacks lose their
+column alignment.  Wrapping just the paired rows
+keeps the surrounding prose (variation-theory notes,
+section headings) at the comfortable body width while
+giving the code its breathing room.  Callers that
+render the first edit or an unpaired run leave
+[[fullwidth]] at [[False]], so unpaired content stays
+in the normal text column.
+
 <<progsnap2 functions>>=
 def format_minipage_row(
     left_label, left_tex,
     right_label, right_tex,
     width="0.48\\linewidth",
+    fullwidth=False,
 ):
     """Return LaTeX lines for one side-by-side row.
 
@@ -2786,6 +2893,11 @@ def format_minipage_row(
     boxes separated by ``\\hfill``.  An empty half
     still renders as an empty ``minipage`` so the
     surrounding rows stay aligned.
+
+    When ``fullwidth`` is true, the row is wrapped in
+    a ``fullwidth`` environment (from the ``didactic``
+    package) so the paired minipages span the full
+    page width instead of the article body width.
     """
     def cell(label, tex):
         out = [
@@ -2797,15 +2909,19 @@ def format_minipage_row(
         out.append("\\end{minipage}")
         return out
 
-    return [
+    row = [
         "\\noindent",
         *cell(left_label, left_tex),
         "\\hfill",
         *cell(right_label, right_tex),
-        "",
-        "\\vspace{1em}",
-        "",
     ]
+    if fullwidth:
+        row = (
+            ["\\begin{fullwidth}"]
+            + row
+            + ["\\end{fullwidth}"]
+        )
+    return row + ["", "\\vspace{1em}", ""]
 @
 
 \subsection{Formatting an edit}
@@ -3203,6 +3319,13 @@ def test_generate_analysis_latex_side_by_side():
     assert latex.count("\\paragraph{Run 2}") == 2
     assert latex.count("\\paragraph{Edit 3}") == 2
     assert latex.count("\\paragraph{Run 3}") == 1
+    # Every paired row is wrapped in a fullwidth
+    # environment so it breaks out of the article
+    # body width.  With three pairs the chain has
+    # two transitions, each contributing two rows,
+    # so we expect four wrappers.
+    assert latex.count("\\begin{fullwidth}") == 4
+    assert latex.count("\\end{fullwidth}") == 4
 @
 
 A single pair has no chain: there is no next edit to
@@ -3274,7 +3397,17 @@ reintroduction.
 
 <<progsnap2 test functions>>=
 def test_generate_analysis_latex_standalone():
-    """Standalone mode wraps in documentclass."""
+    """Standalone mode wraps in a full preamble.
+
+    Beyond the [[\\documentclass]] / [[\\end{document}]]
+    envelope, we assert the preamble pieces that make
+    the document publish-ready: the XeTeX font block,
+    the [[\\setminted]] options, [[didactic]] (for
+    [[fullwidth]]), and the [[\\tableofcontents]] at
+    the top of the body.  [[paracol]] is asserted
+    absent to catch accidental reintroduction of the
+    old layout.
+    """
     from learnlog.progsnap2 import (
         generate_analysis_latex,
     )
@@ -3288,9 +3421,56 @@ def test_generate_analysis_latex_standalone():
         dataset, {}, standalone=True,
     )
     assert "\\documentclass{article}" in latex
+    assert "\\usepackage{iftex}" in latex
+    assert "\\ifXeTeX" in latex
+    assert "\\setmonofont{FreeMono}" in latex
     assert "\\usepackage{minted}" in latex
+    assert "\\setminted{" in latex
+    assert "\\usepackage{didactic}" in latex
+    assert "\\tableofcontents" in latex
     assert "\\usepackage{paracol}" not in latex
     assert "\\end{document}" in latex
+
+def test_generate_analysis_latex_title_override():
+    """The title parameter replaces the section heading.
+
+    Empty SubjectID would normally produce
+    [[\\section{}]]; we pass a real title and check
+    that it ends up in the heading verbatim, including
+    its apostrophe and spaces.
+    """
+    from learnlog.progsnap2 import (
+        generate_analysis_latex,
+        group_edit_run_pairs,
+    )
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "anon-1234",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "",
+            "ProgramOutput": "",
+            "ProgramInput": "",
+        },
+    ]
+    dataset = {
+        "metadata": {},
+        "events": events,
+        "code_states": {"0": {"h.py": "x = 1\n"}},
+        "resources": {},
+    }
+    grouped = group_edit_run_pairs(events)
+    latex = generate_analysis_latex(
+        dataset, grouped,
+        title="Daniel's debug session",
+    )
+    assert (
+        "\\section{Daniel's debug session}"
+        in latex
+    )
+    assert "\\section{anon-1234}" not in latex
 
 def test_format_edit_latex_first_edit():
     """First edit shows full file content."""

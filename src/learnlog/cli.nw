@@ -3552,6 +3552,10 @@ visible on a single line.
 
 The [[--standalone]] flag wraps the output in a complete
 \LaTeX{} document with preamble.
+With [[--title]], the caller overrides the per-subject
+[[\section]] heading---useful when the SubjectID is a
+hash or [[anonymous]] and the output is destined for a
+report where a human-readable title is preferred.
 
 <<typer commands>>=
 @app.command()
@@ -3617,6 +3621,17 @@ def analyse(
             ),
         ),
     ] = False,
+    title: Annotated[
+        str | None,
+        typer.Option(
+            "--title",
+            help=(
+                "Section heading (default: SubjectID). "
+                "Used verbatim, so it may contain LaTeX "
+                "markup."
+            ),
+        ),
+    ] = None,
 ):
     """Analyse development sessions and generate LaTeX."""
     <<resolve analyse source>>
@@ -3860,6 +3875,7 @@ latex = generate_analysis_latex(
     dataset, grouped,
     side_by_side=side_by_side,
     standalone=standalone,
+    title=title,
 )
 
 if output is not None:
@@ -3976,7 +3992,14 @@ def test_analyse_output_file(workdir, monkeypatch):
     assert "\\section{" in content
 
 def test_analyse_standalone(workdir, monkeypatch):
-    """The --standalone flag produces a full document."""
+    """The --standalone flag produces a full document.
+
+    We assert the preamble pieces that distinguish the
+    publish-ready document from the minimal stub: the
+    XeTeX font block, the [[\\setminted]] options, the
+    [[didactic]] package for [[fullwidth]], and the
+    [[\\tableofcontents]] at the top of the body.
+    """
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -3989,5 +4012,97 @@ def test_analyse_standalone(workdir, monkeypatch):
     )
     assert result.exit_code == 0
     assert "\\documentclass" in result.output
+    assert "\\ifXeTeX" in result.output
+    assert "\\setmonofont{FreeMono}" in result.output
+    assert "\\setminted{" in result.output
+    assert "\\usepackage{didactic}" in result.output
+    assert "\\tableofcontents" in result.output
     assert "\\end{document}" in result.output
+@
+
+The [[--side-by-side]] flag wraps each paired row in
+[[\begin{fullwidth}...\end{fullwidth}]] so the row
+expands beyond the article body width.  We run with two
+edit-run pairs so the causal chain has at least one
+transition---a single pair takes the [[only_run]]
+branch, which is rendered at body width without
+[[fullwidth]].
+
+<<test functions>>=
+def test_analyse_side_by_side_fullwidth(
+    workdir, monkeypatch,
+):
+    """Side-by-side paired rows use the fullwidth env."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: v1\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 0, 5
+        ),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text(
+        'print("v2")\n'
+    )
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    repo.finalize_run(
+        io_log="stdout: v2\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 5, 5
+        ),
+        exit_code=0,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["analyse", "--side-by-side"],
+    )
+    assert result.exit_code == 0
+    assert "\\begin{fullwidth}" in result.output
+    assert "\\end{fullwidth}" in result.output
+@
+
+The [[--title]] flag replaces the per-subject
+[[\\section]] heading.  We pass a literal title with
+spaces and an apostrophe to confirm the value reaches
+the heading verbatim, without escaping or quoting.
+
+<<test functions>>=
+def test_analyse_title_override(workdir, monkeypatch):
+    """--title replaces the section heading."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(
+            2026, 1, 1, 10, 0, 5
+        ),
+        exit_code=0,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "analyse",
+            "--title",
+            "Daniel's debug session",
+        ],
+    )
+    assert result.exit_code == 0
+    assert (
+        "\\section{Daniel's debug session}"
+        in result.output
+    )
 @
