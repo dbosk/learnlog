@@ -1,0 +1,734 @@
+\documentclass{article}
+\usepackage{geometry}
+\geometry{a4paper, margin=1cm}
+\usepackage{iftex}
+\ifXeTeX
+\usepackage{fontspec}
+\setmonofont{FreeMono}
+\fi
+\usepackage{minted}
+\setminted{
+    fontsize=\small,
+    breaklines=true,
+    linenos=false,
+    autogobble=true,
+    frame=single,
+    framesep=10pt
+}
+\begin{document}
+\tableofcontents
+
+\section{Daniel's debug and development session}
+
+\paragraph{Edit 1}
+\textbf{File: \texttt{contacts.py}}
+
+\begin{minted}{python}
+"""
+En modul som experimenterar med klasser.
+
+Vi vill göra detta genom att skriva ihop en kontaktbok.
+"""
+
+import learnlog
+
+class Contact:
+    """
+    Representerar en kontakt i kontaktboken.
+    Håller koll på alla data som rör den personen.
+    """
+    def __init__(self, name, phone=None, email=None, address=None):
+        """
+        Tar alla attribut som kontakten ska ha.
+        """
+        self.name = name
+        self.phone = phone # contact.phone = value
+        self.email = email
+        self.address = address
+
+    # a = contact.phone
+    @property
+    def phone(self):
+        ''' method that returns the phone number when contact.phone is used '''
+        return self.__phone
+
+    # contact.phone = '070187237'
+    @phone.setter
+    def phone(self, value):
+        '''  sets phone number to a new value if it's a number'''
+
+        # TODO: edit so value can be set to None
+        if  value is not None or not value.isdigit():
+            raise ValueError("Telefonnummret får bara innehålla siffror")
+        self.__phone = value
+
+    @property
+    def email(self):
+        ''' method that returns the email when contact.email is used'''
+        return self.__email
+
+    @email.setter
+    def email(self, value):
+        if '@' not in value:
+            raise ValueError("E-postadressesn måste innehålla @")
+        self.__email = value
+
+
+    def __lt__(self, other):
+        ''' Om self < other returnerar vi True annars False'''
+        if self.name < other.name:
+            return True
+        elif self.name == other.name and self.email < other.email:
+            return True
+        elif self.name == other.name and self.email == other.email \
+                and self.address < other.address:
+            return True
+        elif self.name == other.name and self.email == other.email \
+                and self.address == other.address and self.phone < other.phone:
+            return True
+        return False
+
+class ContactBook:
+    ''' klass som innehåller kontaker, representerar en vanlig kontaktbok'''
+    def __init__(self):
+        ''' metod som skapar en lista med kontakter när ett kontaktboksobjekt skapas'''
+        self.__contacts = []
+
+    @property
+    def contacts(self):
+        ''' returnerar en kopia av kontaktlistan contacts när contactbook.contacts används'''
+        return self.__contacts.copy()
+
+    def add_contact(self, contact):
+        ''' lägger till en kontakt till kontaktlistan om den ät av typ Contact'''
+        if not isinstance(contact, Contact):
+            raise TypeError("Kontakten måste vara av typen Contact")
+        self.__contacts.append(contact)
+
+    def find_contact(self, search_terms):
+        ''' '''
+        num_matches = {}
+        for contact in self.__contacts:
+            for search_term in search_terms.split():
+                if match_contact(search_term, contact):
+                    # räkna upp antal matchningar
+                    if contact not in num_matches:
+                        num_matches[contact] = 1
+                    else:
+                        num_matches[contact] += 1
+
+        #print(num_matches)
+        # sortera kontakterna i num_matches efter antal matchningar.
+        # num_matches = {kontakten: antalet, kontakten: antalet, ...}
+        # num_match_tuples = [(antalet, kontakten), (antalet, kontakten), ...]
+        num_match_tuples = []
+        for contact, num in num_matches.items():
+            num_match_tuples.append(Match(num, contact))
+
+        return num_match_tuples
+
+def add_contact(contactbook):
+    """
+    Hanterar menydelen att lägga till en kontakt.
+    contacts är en lista med kontakter.
+    """
+    name = input("Ange fullständigt namn för ny kontakt: ")
+    contact = Contact(name)
+    while phone := input("Ange telefonnummer för ny kontakt: "):
+        try:
+            contact.phone = phone
+            break
+        except ValueError as err:
+            print(f"{err}: Försök igen!")
+
+    while email := input("Ange email för ny kontakt: "):
+        try:
+            contact.email = email
+            break
+        except ValueError as err:
+            print(f"{err}: Försök igen!")
+
+    address = input("Ange adress för ny kontakt: ")
+    contact.address = address
+
+    contactbook.add_contact(contact)
+
+def find_contact(contactbook):
+    """
+    Hanterar menydelen för att söka efter kontakter.
+    """
+    while True:
+        search_terms = input("Ange sökterm: ").strip()
+
+        num_match_tuples = contactbook.find_contact(search_terms)
+
+        sorted_matches = sorted(num_match_tuples)
+        # loopa igenom den sorterade listan och skriv ut varje kontakt.
+        for match in sorted_matches:
+            print_contact(match.contact)
+            print()
+
+class Match:
+    ''' Ett sökresultat/ en matchning, där num är antalet matchade söktermer i 
+    en kontakt och conatct är kontakten det gäller'''
+    def __init__(self, num, contact):
+        self.num = num
+        self.contact = contact
+
+    def __lt__(self, other):
+        '''a och be är tuplar (num, contact), returnerar sant om num i a är större än num i b, 
+        om båda är lika returnerar vi sant om contact i a är mindre än contact i b'''
+        # self < other
+
+        if self.num > other.num:
+            return True
+        elif self.num == other.num and self.contact < other.contact:
+            return True
+        return False
+
+def match_contact(search_term, contact):
+    """
+    Returnerar True om något av attributen hos contact
+    matchar söktermen (search_term).
+
+    Med matchar menar vi att search_term är en delsträng.
+    Telefonnummer använder dock exakt jämförelse.
+    """
+    if search_term.casefold() in contact.name.casefold():
+        return True
+    elif search_term.casefold() == contact.phone:
+        return True
+    elif search_term.casefold() in contact.email.casefold():
+        return True
+    elif search_term.casefold() in contact.address.casefold():
+        return True
+
+    return False
+
+
+def print_contact(contact):
+    """
+    Skriver ut datat för en kontakt.
+    """
+    print(f"  Namn: {contact.name}")
+    print(f"  Tele: {contact.phone}")
+    print(f"  Mail: {contact.email}")
+    print(f"  Adr : {contact.address}")
+
+def main():
+    """
+    Huvudprogram
+    """
+    # vi vill kunna lägga till kontakter (kombinera med input)
+    #               söka efter kontakter
+    #               ändra kontakter
+    #               skriva ut alla kontakter
+    contactbook = ContactBook()
+    contactbook.add_contact(Contact("Daniel", "0701233455", "dbosk@kth.se", "Någonannanstans"))
+    contactbook.add_contact(Contact("Kawsar", "070", "kiaa@kth.se", "Någonstans"))
+
+    while True:
+        print()
+        print("Välj ett alternativ (heltal):")
+        print("1. Lägg till kontakt.")
+        print("2. Sök efter kontakt.")
+        print("3. Ändra en kontakt.")
+        print("4. Skriv ut alla kontakter")
+        print("5. Avsluta")
+        choice = int(input("Mata in ditt alternativ: "))
+        print()
+        if choice == 1:
+            add_contact(contactbook)
+        elif choice == 2:
+            find_contact(contactbook)
+        elif choice == 3:
+            pass
+        elif choice == 4:
+            pass
+        elif choice == 5:
+            return
+        else:
+            raise NotImplementedError("Inga andra alternativ är implementerade.")
+
+if __name__ == "__main__":
+    main()
+\end{minted}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 1}
+Script: \texttt{contacts.py} \\
+Result: Error \\
+Exit code: 1
+
+\begin{minted}{pytb}
+ValueError: Telefonnummret får bara innehålla siffror
+\end{minted}
+
+\begin{minted}{text}
+Traceback (most recent call last):
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 228, in <module>
+    main()
+    ~~~~^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 201, in main
+    contactbook.add_contact(Contact("Daniel", "0701233455", "dbosk@kth.se", "Någonannanstans"))
+                            ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 19, in __init__
+    self.phone = phone # contact.phone = value
+    ^^^^^^^^^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 36, in phone
+    raise ValueError("Telefonnummret får bara innehålla siffror")
+ValueError: Telefonnummret får bara innehålla siffror
+\end{minted}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Edit 2}
+\begin{minted}{diff}
+--- a/contacts.py
++++ b/contacts.py
+@@ -32,7 +32,7 @@
+         '''  sets phone number to a new value if it's a number'''
+ 
+         # TODO: edit so value can be set to None
+-        if  value is not None or not value.isdigit():
++        if value is not None and not value.isdigit():
+             raise ValueError("Telefonnummret får bara innehålla siffror")
+         self.__phone = value
+\end{minted}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+\textit{Critical aspect}: the boolean operator joining
+\verb|value is not None| and \verb|not value.isdigit()|.
+\textit{What varies}: only the operator (\verb|or|~$\to$~\verb|and|);
+the sub-conditions, the message, and the surrounding control flow are
+invariant, isolating the operator as the cause.
+\textit{Discerned}: the traceback chain
+\verb|__init__| $\to$ setter $\to$ \verb|raise| exposes the property
+mechanism; with \verb|"0701233455"| (digit, non-\verb|None|), the
+\verb|or| is forced true regardless of \verb|isdigit()|.
+\textit{Not yet discernible}: behaviour for \verb|value=None| (the
+TODO's stated goal) and for non-digit strings --- only one of three
+telling input values is tried.
+
+\vspace{1em}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Edit 2}
+\begin{minted}{diff}
+--- a/contacts.py
++++ b/contacts.py
+@@ -32,7 +32,7 @@
+         '''  sets phone number to a new value if it's a number'''
+ 
+         # TODO: edit so value can be set to None
+-        if  value is not None or not value.isdigit():
++        if value is not None and not value.isdigit():
+             raise ValueError("Telefonnummret får bara innehålla siffror")
+         self.__phone = value
+\end{minted}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 2}
+Script: \texttt{contacts.py} \\
+Result: Error \\
+Exit code: 1
+
+\begin{minted}{pytb}
+KeyboardInterrupt
+\end{minted}
+
+\begin{minted}{text}
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+  Namn: Kawsar
+  Tele: 070
+  Mail: kiaa@kth.se
+  Adr : Någonstans
+Traceback (most recent call last):
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 228, in <module>
+    main()
+    ~~~~^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 217, in main
+    find_contact(contactbook)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 135, in find_contact
+    search_terms = input("Ange sökterm: ").strip()
+                   ~~~~~^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+\end{minted}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+\textit{Reading the juxtaposition}: with the setter unblocked, execution
+now reaches further and surfaces a \emph{different} defect --- a
+\verb|while True| in \verb|find_contact| with no break condition,
+escaped here only by \verb|KeyboardInterrupt|.
+\textit{Discerned} (by contrast with Run 1): Edit 2's fix held; the
+constructor no longer raises, and the new failure point lies elsewhere.
+\textit{Not yet discernible}: whether the search results are correct.
+The transcript captures stdout but not stdin, so the queries that
+produced the listed matches are invisible.
+
+\vspace{1em}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 2}
+Script: \texttt{contacts.py} \\
+Result: Error \\
+Exit code: 1
+
+\begin{minted}{pytb}
+KeyboardInterrupt
+\end{minted}
+
+\begin{minted}{text}
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+  Namn: Kawsar
+  Tele: 070
+  Mail: kiaa@kth.se
+  Adr : Någonstans
+Traceback (most recent call last):
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 228, in <module>
+    main()
+    ~~~~^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 217, in main
+    find_contact(contactbook)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 135, in find_contact
+    search_terms = input("Ange sökterm: ").strip()
+                   ~~~~~^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+\end{minted}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Edit 3}
+\begin{minted}{diff}
+--- a/contacts.py
++++ b/contacts.py
+@@ -132,7 +132,11 @@
+     Hanterar menydelen för att söka efter kontakter.
+     """
+     while True:
+-        search_terms = input("Ange sökterm: ").strip()
++        search_terms = input("Ange sökterm: ")
++        if not search_terms:
++            break
++        else:
++            search_terms = search_terms.strip()
+ 
+         num_match_tuples = contactbook.find_contact(search_terms)
+\end{minted}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+\textit{Critical aspect}: how an interactive \verb|while True| returns
+control to its caller.
+\textit{What varies}: the input handling --- a single \verb|.strip()|
+chain becomes a branch on emptiness with \verb|break|.
+\textit{Discerned}: empty input is now a recognised exit signal; the
+inner loop becomes escapable without \verb|Ctrl-C|.
+\textit{Not yet discernible}: whether \verb|__lt__| orders ties
+correctly (only two contacts exist), whether multi-term queries
+accumulate match counts as intended, and whether
+\verb|match_contact|'s exact-equality branch for phone numbers behaves
+differently from the substring branches --- none of those dimensions
+varies.
+
+\vspace{1em}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Edit 3}
+\begin{minted}{diff}
+--- a/contacts.py
++++ b/contacts.py
+@@ -132,7 +132,11 @@
+     Hanterar menydelen för att söka efter kontakter.
+     """
+     while True:
+-        search_terms = input("Ange sökterm: ").strip()
++        search_terms = input("Ange sökterm: ")
++        if not search_terms:
++            break
++        else:
++            search_terms = search_terms.strip()
+ 
+         num_match_tuples = contactbook.find_contact(search_terms)
+\end{minted}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 3}
+Script: \texttt{contacts.py} \\
+Result: Success \\
+Exit code: 0
+
+\begin{minted}{text}
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+\end{minted}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+\textit{Reading the juxtaposition}: the contrast Run~2~$\to$~Run~3
+(with Edit 3 between) is exactly the contrast pattern variation
+theory recommends --- same invocation, only the loop-exit logic
+differs.
+\textit{Discerned}: the menu now reaches \verb|Exit code: 0|; option 5
+ends the program cleanly.
+\textit{Not yet discernible}: the search returned only \emph{Daniel},
+but the query is unrecorded --- a ``one expected match'' reading is
+indistinguishable from a ``should have been two, returned one''
+reading.
+
+\vspace{1em}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 3}
+Script: \texttt{contacts.py} \\
+Result: Success \\
+Exit code: 0
+
+\begin{minted}{text}
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+\end{minted}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+This row has no contrasting partner: the right column is empty and the
+left column repeats Run 3 unchanged. With nothing varying, no new
+aspect can be discerned --- a useful reminder that
+\emph{repetition is not variation}.
+
+\vspace{1em}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 4}
+Script: \texttt{contacts.py} \\
+Result: Success \\
+Exit code: 0
+
+\begin{minted}{text}
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+\end{minted}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+Run 4 is identical to Run 3 in both inputs and outputs. Repeating a
+successful run with the same inputs adds no new variation, hence no
+new discernment. To learn more about the search and sort, one would
+need to vary either the query (different terms, multi-term, exact
+phone), the contact set (more rows, ties on different attributes), or
+both.
+
+\vspace{1em}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 4}
+Script: \texttt{contacts.py} \\
+Result: Success \\
+Exit code: 0
+
+\begin{minted}{text}
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+  Namn: Daniel
+  Tele: 0701233455
+  Mail: dbosk@kth.se
+  Adr : Någonannanstans
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+\end{minted}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Edit 5}
+\begin{minted}{diff}
+--- a/contacts.py
++++ b/contacts.py
+@@ -226,7 +226,9 @@
+         elif choice == 5:
+             return
+         else:
+-            raise NotImplementedError("Inga andra alternativ är implementerade.")
++            raise NotImplementedError(
++                "Inga andra alternativ är implementerade."
++            )
+ 
+ if __name__ == "__main__":
+     main()
+\end{minted}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+\textit{Reading the juxtaposition}: a deliberate \emph{non-variation}.
+Edit 5 changes only whitespace inside the \verb|NotImplementedError|
+call; no semantic dimension varies. If Run 5 differs from Run 4, the
+cause must lie elsewhere (in the input choice). Formatting edits
+paired with behavioural runs serve as invariance checks --- they
+should leave behaviour unchanged.
+
+\vspace{1em}
+
+\noindent
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Edit 5}
+\begin{minted}{diff}
+--- a/contacts.py
++++ b/contacts.py
+@@ -226,7 +226,9 @@
+         elif choice == 5:
+             return
+         else:
+-            raise NotImplementedError("Inga andra alternativ är implementerade.")
++            raise NotImplementedError(
++                "Inga andra alternativ är implementerade."
++            )
+ 
+ if __name__ == "__main__":
+     main()
+\end{minted}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\linewidth}
+\paragraph{Run 5}
+Script: \texttt{contacts.py} \\
+Result: Error \\
+Exit code: 1
+
+\begin{minted}{pytb}
+NotImplementedError: Inga andra alternativ är implementerade.
+\end{minted}
+
+\begin{minted}{text}
+Välj ett alternativ (heltal):
+1. Lägg till kontakt.
+2. Sök efter kontakt.
+3. Ändra en kontakt.
+4. Skriv ut alla kontakter
+5. Avsluta
+Traceback (most recent call last):
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 234, in <module>
+    main()
+    ~~~~^^
+  File "/home/dbosk/teaching/prgi25/övn-2025-11-07/contacts.py", line 229, in main
+    raise NotImplementedError(
+        "Inga andra alternativ är implementerade."
+    )
+NotImplementedError: Inga andra alternativ är implementerade.
+\end{minted}
+\end{minipage}
+
+\paragraph*{Variation-theory note}
+\textit{Critical aspect}: the \verb|else| arm of the menu dispatcher.
+\textit{What varies} (vs.\ earlier runs): the menu choice --- an
+unrecognised option. With Edit 5 invariant on semantics, the new
+failure must come from the input dimension.
+\textit{Discerned}: the catch-all correctly raises
+\verb|NotImplementedError|.
+\textit{Not yet discernible}: options 3 and 4 (\verb|pass| placeholders)
+silently return to the menu --- behaviour distinct from option 5
+(clean return) and from the catch-all (raise); none of the runs
+separates these three outcomes. Likewise, non-numeric input (which
+would raise \verb|ValueError| from \verb|int(...)|) is never tried.
+
+\vspace{1em}
+
+
+\section{How Dan-Claude did the variation theoretic analysis}
+
+\inputminted{text}{opus-session.txt}
+
+\end{document}
