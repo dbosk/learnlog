@@ -1788,6 +1788,13 @@ def test_init_rejects_unknown_language(tmp_path, monkeypatch):
     assert result.exit_code != 0
 @
 
+These tests verify the Typer surface: that an unknown language is
+rejected before any setup runs, and that a valid one produces the
+expected [[.learnlog/]] directory.  We stub the Python pipeline rather
+than exercise it here because its behaviour is checked separately, which
+also keeps these tests independent of the network and the local Python
+toolchain.
+
 
 \subsection{The [[activate]] command}
 \label{sec:activate-command}
