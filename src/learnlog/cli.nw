@@ -1280,7 +1280,7 @@ driven by explicit test inputs, stub [[virtualenv.cli_run]]
 so no real venv is created, stub [[subprocess.run]] so no
 network traffic happens, stub [[write_autostart_files]] so
 the autostart concern is tested separately, and always
-[[delenv VIRTUAL\_ENV]] before each scenario so that the
+[[delenv VIRTUAL_ENV]] before each scenario so that the
 test runner's own venv (pytest typically runs inside one)
 does not accidentally select the \enquote{active venv}
 branch.

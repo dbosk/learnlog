@@ -455,10 +455,10 @@ output chunk.
 
 Each chunk is a tuple of [[(event_type, text)]]:
 \begin{description}
-\item[[[X-Run.Output]]] contains the joined output
+\item[ [[X-Run.Output]] ] contains the joined output
   lines (with [[stderr]] merged into output, since
   ProgSnap2 does not distinguish them).
-\item[[[X-Run.Input]]] contains the text of a single
+\item[ [[X-Run.Input]] ] contains the text of a single
   [[stdin]] line.
 \end{description}
 
@@ -1463,14 +1463,14 @@ tools that follow the ProgSnap2 specification.
 
 The reader returns a dict with four keys:
 \begin{description}
-\item[[[metadata]]] The [[DatasetMetadata.csv]] key--value
+\item[ [[metadata]] ] The [[DatasetMetadata.csv]] key--value
   pairs as a dict.
-\item[[[events]]] The [[MainTable.csv]] rows as a list of
+\item[ [[events]] ] The [[MainTable.csv]] rows as a list of
   dicts, preserving the CSV column names as keys.
-\item[[[code_states]]] A nested dict mapping each
+\item[ [[code_states]] ] A nested dict mapping each
   [[CodeStateID]] to a dict of
   \{filename: file content\} pairs.
-\item[[[resources]]] A dict mapping resource paths
+\item[ [[resources]] ] A dict mapping resource paths
   (e.g.\ [[Resources/io_3.txt]]) to their text content.
 \end{description}
 
