@@ -66,8 +66,10 @@ required_patterns:
 hint: Quote the boundary so the shell keeps it as one argument.
 ```
 
-Use a start boundary such as `X-Tag=lab1` to keep only the events from
-the first matching tag onward.
+Pass a start boundary so the report keeps only the events from the
+first matching tag onward, for example:
+
+`learnlog analyse 'X-Tag=lab1' -f course.progsnap2 -o report.tex`
 
 # Filter a tagged range
 

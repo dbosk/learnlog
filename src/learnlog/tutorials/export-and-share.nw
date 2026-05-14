@@ -53,8 +53,10 @@ required_patterns:
 hint: Point `origin` at a Git repository URL or local bare repo path.
 ```
 
-Choose a remote repository and configure it with `learnlog set-remote`.
-For local practice, a path such as `../course-log.git` works well.
+Choose a remote repository and configure it with
+`learnlog set-remote ../course.git`.
+For local practice, a bare repository path such as `../course.git`
+works well; for sharing across machines, pass a real URL instead.
 
 # Push the log to the remote
 
