@@ -238,6 +238,10 @@ def resolve_source(source=None):
 
 To unbundle, we create a temporary directory and use
 [[git clone]] with the bundle as the remote.
+A temporary directory is required because cloning directly into the
+caller's working tree would write a [[remote.origin.url]] pointing at
+the bundle path into [[.learnlog/config]], leaving the user with a
+remote they did not configure.
 We point [[GIT_DIR]] at the cloned repo's [[.git/]] so that
 [[LearnlogRepo.git()]] can query it.
 However, [[LearnlogRepo]] expects the git directory to be named
