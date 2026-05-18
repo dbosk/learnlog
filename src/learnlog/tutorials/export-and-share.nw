@@ -27,7 +27,8 @@ summary: Export bundles, make ProgSnap2 data, and sync through a remote.
 
 ```tutorial-step
 required_patterns:
-  - learnlog export -o course.learnlog
+  - mode: regex
+    pattern: 'learnlog\s+export\b[^\n]*(?<!\S)(?:-o|--output)\b\s+\S+\.learnlog\b'
 hint: Pick an output name ending in `.learnlog`.
 ```
 
@@ -38,7 +39,10 @@ This is the easiest format to hand to someone for playback.
 
 ```tutorial-step
 required_patterns:
-  - learnlog export --progsnap2 -o course.progsnap2
+  - mode: regex
+    pattern: 'learnlog\s+export\b[^\n]*--progsnap2\b'
+  - mode: regex
+    pattern: 'learnlog\s+export\b[^\n]*(?<!\S)(?:-o|--output)\b\s+\S+\.progsnap2\b'
 hint: Use `--progsnap2` when the goal is analysis rather than playback.
 ```
 
@@ -49,7 +53,8 @@ education analysis workflows.
 
 ```tutorial-step
 required_patterns:
-  - learnlog set-remote
+  - mode: regex
+    pattern: 'learnlog\s+set-remote\s+\S+'
 hint: Point `origin` at a Git repository URL or local bare repo path.
 ```
 
@@ -72,7 +77,8 @@ Run `learnlog push` to send the whole recorded history to `origin`.
 
 ```tutorial-step
 required_patterns:
-  - learnlog clone
+  - mode: regex
+    pattern: 'learnlog\s+clone\s+\S+'
 hint: Try cloning into a second directory to simulate another machine.
 ```
 
