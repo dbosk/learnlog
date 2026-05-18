@@ -27,6 +27,8 @@ navigation and ``play_batch`` for non-interactive output.
 
 <<viewer imports>>
 
+<<viewer constants>>
+
 <<viewer classes>>
 <<viewer functions>>
 @
@@ -54,6 +56,23 @@ from __future__ import annotations
 import sys
 
 from learnlog.commits import get_commit_detail
+@
+
+
+\section{Layout constants}
+
+The header occupies row~0 and the footer the last row, leaving the
+content area in between.  We name those offsets so the draw chunks
+read as layout statements rather than arithmetic.
+[[SHORT_HASH_LEN]] follows Git's own default for short hash
+abbreviation, which lets readers recognise hashes at a glance
+without losing uniqueness on lab-sized repositories.
+
+<<viewer constants>>=
+SHORT_HASH_LEN = 7
+HEADER_ROW = 0
+CONTENT_START_ROW = 1
+FOOTER_OFFSET_FROM_BOTTOM = 2
 @
 
 
@@ -178,15 +197,15 @@ We truncate to the terminal width to avoid curses errors.
 <<draw header>>=
 header = (
     f"[{self.index + 1}/{len(self.commits)}] "
-    f"{commit['hash'][:7]} "
+    f"{commit['hash'][:SHORT_HASH_LEN]} "
     f"\u2014 {commit['subject']}"
 )
 header = header[:width - 1]
 try:
     import curses
-    stdscr.addstr(0, 0, header, curses.A_REVERSE)
+    stdscr.addstr(HEADER_ROW, 0, header, curses.A_REVERSE)
     stdscr.addstr(
-        0, len(header),
+        HEADER_ROW, len(header),
         " " * (width - len(header) - 1),
         curses.A_REVERSE,
     )
@@ -208,8 +227,8 @@ the area between the header (row~0) and the footer
 (last row).
 
 <<draw content area>>=
-content_start = 1
-content_end = height - 2
+content_start = CONTENT_START_ROW
+content_end = height - FOOTER_OFFSET_FROM_BOTTOM
 visible = content_end - content_start
 
 self.scroll = max(

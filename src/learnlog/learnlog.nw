@@ -1874,7 +1874,7 @@ both teaching and research data.
 
 We need to attach \emph{before} CPython compiles the main script,
 without changing how students launch their programs: [[python
-main.py]], the VS Code \textbf{Run} button, and \texttt{F5} must
+main.py]], the VS Code \textbf{Run} button, and [[F5]] must
 all keep working.
 Python's [[site.py]] evaluates any line beginning with [[import]]
 inside a [[.pth]] file at interpreter startup---ahead of the main

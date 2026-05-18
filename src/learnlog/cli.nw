@@ -238,6 +238,10 @@ def resolve_source(source=None):
 
 To unbundle, we create a temporary directory and use
 [[git clone]] with the bundle as the remote.
+A temporary directory is required because cloning directly into the
+caller's working tree would write a [[remote.origin.url]] pointing at
+the bundle path into [[.learnlog/config]], leaving the user with a
+remote they did not configure.
 We point [[GIT_DIR]] at the cloned repo's [[.git/]] so that
 [[LearnlogRepo.git()]] can query it.
 However, [[LearnlogRepo]] expects the git directory to be named
@@ -1280,7 +1284,7 @@ driven by explicit test inputs, stub [[virtualenv.cli_run]]
 so no real venv is created, stub [[subprocess.run]] so no
 network traffic happens, stub [[write_autostart_files]] so
 the autostart concern is tested separately, and always
-[[delenv VIRTUAL\_ENV]] before each scenario so that the
+[[delenv VIRTUAL_ENV]] before each scenario so that the
 test runner's own venv (pytest typically runs inside one)
 does not accidentally select the \enquote{active venv}
 branch.
