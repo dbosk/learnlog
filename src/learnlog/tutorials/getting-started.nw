@@ -76,8 +76,10 @@ Save `print("Hello, world!")` before returning.
 pre_command: |
   eval "$(learnlog activate)"
 required_patterns:
-  - python hello.py
-  - Hello, world!
+  - mode: regex
+    pattern: 'python3?\s+(?:\./)?hello\.py'
+  - mode: regex
+    pattern: '(?i)hello[,!\s]*world'
 hint: The tutorial already re-activated the project environment; run `python hello.py`.
 ```
 
@@ -93,9 +95,11 @@ run automatically.
 pre_command: |
   eval "$(learnlog activate)"
 required_patterns:
-  - learnlog play -b
-  - "Script: hello.py"
-  - "stdout: Hello, world!"
+  - mode: regex
+    pattern: 'learnlog\s+play\b[^\n]*(?:-b\b|--batch\b)'
+  - hello.py
+  - mode: regex
+    pattern: '(?i)hello[,!\s]*world'
   - diff --git
 hint: The tutorial already re-activated the project environment; use `learnlog play -b` and confirm the recorded `hello.py` run appears.
 ```

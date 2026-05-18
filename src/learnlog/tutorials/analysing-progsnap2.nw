@@ -37,9 +37,12 @@ project with `learnlog export --progsnap2`.
 
 ```tutorial-step
 required_patterns:
-  - learnlog analyse
-  - -f
-  - -o
+  - mode: regex
+    pattern: 'learnlog\s+analyse\b'
+  - mode: regex
+    pattern: '(?<!\S)(?:-f|--from)\b\s+\S+'
+  - mode: regex
+    pattern: '(?<!\S)(?:-o|--output)\b\s+\S+'
 hint: A typical command is `learnlog analyse -f course.progsnap2 -o report.tex`.
 ```
 
@@ -62,7 +65,8 @@ that can be compiled directly, rather than a fragment for inclusion.
 
 ```tutorial-step
 required_patterns:
-  - X-Tag=lab1
+  - mode: regex
+    pattern: 'X-Tag=\S+'
 hint: Quote the boundary so the shell keeps it as one argument.
 ```
 
@@ -75,8 +79,8 @@ first matching tag onward, for example:
 
 ```tutorial-step
 required_patterns:
-  - X-Tag=lab1
-  - X-Tag=lab2
+  - mode: regex
+    pattern: 'X-Tag=\S+[^\n]*X-Tag=\S+'
 hint: Pass two `Column=Regex` boundaries to restrict the analysis window.
 ```
 

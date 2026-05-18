@@ -26,7 +26,8 @@ summary: Review a log in batch and interactive mode, then jump to tags.
 
 ```tutorial-step
 required_patterns:
-  - learnlog play -b
+  - mode: regex
+    pattern: 'learnlog\s+play\b[^\n]*(?:-b\b|--batch\b)'
 hint: Start with `learnlog play -b` so you can read the whole log.
 ```
 
@@ -38,7 +39,8 @@ output.
 
 ```tutorial-step
 required_patterns:
-  - learnlog tag lab1
+  - mode: regex
+    pattern: 'learnlog\s+tag\s+(?!-)\S+'
 hint: Tag the current commit with a short name such as `lab1`.
 ```
 
@@ -49,7 +51,8 @@ example with `learnlog tag lab1`.
 
 ```tutorial-step
 required_patterns:
-  - learnlog tag -l
+  - mode: regex
+    pattern: 'learnlog\s+tag\b[^\n]*(?:-l\b|--list\b)'
 hint: Run `learnlog tag -l` to list the tags in the `.learnlog/` repository.
 ```
 
@@ -59,7 +62,8 @@ List the tags so you can confirm that your new marker exists.
 
 ```tutorial-step
 required_patterns:
-  - learnlog play -b lab1
+  - mode: regex
+    pattern: 'learnlog\s+play\b(?:[^\n]*(?:-b\b|--batch\b)[^\n]*\s+(?!-)\S+|\s+(?!-)\S+[^\n]*(?:-b\b|--batch\b))'
 hint: Pass the tag name after `learnlog play -b`.
 ```
 
@@ -70,7 +74,8 @@ instead of from the beginning of the history.
 
 ```tutorial-step
 required_patterns:
-  - learnlog play lab1
+  - mode: regex
+    pattern: 'learnlog\s+play\s+(?!-)\S+'
 hint: Launch the interactive viewer and quit with `q` when you are done.
 ```
 

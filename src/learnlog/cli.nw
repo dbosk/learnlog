@@ -1579,13 +1579,25 @@ shell step after the explicit activation lesson installs
 That keeps the tutorial honest about fresh shells while still making the
 project environment available for any extra commands the student tries
 before returning from the step.
-The run step therefore only needs to require [[python hello.py]] and the
-expected [[Hello, world!]] output.
-The final playback step still looks for [[Script: hello.py]], the
-recorded output, and the diff in [[learnlog play -b]], so the tutorial
-only passes after a real learnlog-managed run.
-We lock those constraints in with regression tests against the generated
-tutorial resource.
+The run step requires a [[python hello.py]] invocation and a greeting on
+stdout.
+We express both with [[pytorial]] regex matches rather than plain
+[[contains]] strings so that equally valid solutions are not rejected:
+the command tolerates [[python3]] and a leading [[./]], and the greeting
+tolerates case and punctuation variation around [[hello]] and [[world]].
+The final playback step looks for [[learnlog play -b]] (accepting the
+long [[--batch]] alternative through a regex), then verifies the
+recorded run by matching [[hello.py]] and the same lenient greeting,
+plus the stable [[diff --git]] header that proves a real diff was
+rendered.
+We deliberately drop the [[Script: hello.py]] and
+[[stdout: Hello, world!]] line prefixes from the validation: those
+strings are an internal output format of [[learnlog play -b]], not
+anything the student types, and pinning the tutorial to that exact
+format would make it fragile to future viewer changes without
+strengthening the learning signal.
+We lock the resulting mixed-mode pattern list in with regression tests
+against the generated tutorial resource.
 
 <<test functions>>=
 def test_tutorial_list_lists_builtin_tutorials():
@@ -1656,14 +1668,11 @@ def test_getting_started_reactivates_and_checks_playback():
     assert run_step.edit_file is None
     assert run_step.pre_command == 'eval "$(learnlog activate)"\n'
     assert tuple(
-        pattern.pattern for pattern in run_step.required_patterns
-    ) == (
-        "python hello.py",
-        "Hello, world!",
-    )
-    assert all(
-        pattern.mode == "contains"
+        (pattern.pattern, pattern.mode)
         for pattern in run_step.required_patterns
+    ) == (
+        (r"python3?\s+(?:\./)?hello\.py", "regex"),
+        (r"(?i)hello[,!\s]*world", "regex"),
     )
     assert run_step.check_command is None
     assert "fresh shell" in run_step.instructions
@@ -1672,16 +1681,13 @@ def test_getting_started_reactivates_and_checks_playback():
     assert play_step.title == "Inspect the recorded run"
     assert play_step.pre_command == 'eval "$(learnlog activate)"\n'
     assert tuple(
-        pattern.pattern for pattern in play_step.required_patterns
-    ) == (
-        "learnlog play -b",
-        "Script: hello.py",
-        "stdout: Hello, world!",
-        "diff --git",
-    )
-    assert all(
-        pattern.mode == "contains"
+        (pattern.pattern, pattern.mode)
         for pattern in play_step.required_patterns
+    ) == (
+        (r"learnlog\s+play\b[^\n]*(?:-b\b|--batch\b)", "regex"),
+        ("hello.py", "contains"),
+        (r"(?i)hello[,!\s]*world", "regex"),
+        ("diff --git", "contains"),
     )
     assert play_step.check_command is None
     assert "Script: hello.py" in play_step.instructions
