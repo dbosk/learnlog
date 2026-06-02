@@ -34,6 +34,8 @@ hint: Start with `learnlog play -b` so you can read the whole log.
 Use a learnlog project that already contains a few runs.
 Begin with `learnlog play -b` to see the full history as plain terminal
 output.
+Each run after the first also shows `Time since last run`, which makes quick
+retries and longer pauses visible during playback.
 
 # Add a memorable tag
 

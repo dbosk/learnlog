@@ -49,6 +49,16 @@ hint: A typical command is `learnlog analyse -f course.progsnap2 -o report.tex`.
 Generate a report from the dataset and save it to a `.tex` file.
 The report groups edits and runs into the edit--run cycles that the
 analysis command reconstructs.
+When a tag contains several runs, the report also shows `Time since last
+run` before the later runs; that timer resets at the next tag.
+
+\ltnote{%
+  The new elapsed-time line gives the teacher a visible think-time signal
+  without requiring them to infer it from raw timestamps.
+  Resetting at tag boundaries keeps the cue aligned with tagged sessions
+  rather than counting overnight or between-lab gaps as deliberate pause
+  inside one session.
+}
 
 # Produce a standalone document
 

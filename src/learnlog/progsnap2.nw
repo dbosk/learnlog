@@ -87,6 +87,8 @@ import tempfile
 import zipfile
 
 from learnlog.commits import (
+    _parse_iso,
+    format_elapsed,
     get_commits,
     get_tag_map,
     filter_learnlog_runs,
@@ -2494,6 +2496,93 @@ We generate a fragment by default (sections and
 subsections that the user [[\\input]]s into their own
 document) and optionally a standalone document.
 
+
+\subsection{Computing run gaps within a tag}
+
+The replay view only knows commit dates, but the analysis report already has
+the run's start and end timestamps.
+That lets us measure the more precise interval that matters pedagogically:
+the time from the \emph{end} of the previous run to the \emph{start} of the
+current one.
+
+We compute this over the already grouped [[pairs]] list for one
+[[SubjectID]] and one tag.
+That means the timer resets automatically at tag boundaries, which matches the
+intended interpretation of tags as session breaks rather than ordinary pauses
+inside one working session.
+
+If a previous run has no recorded end time, we fall back to its start time.
+That preserves a useful estimate for interrupted runs without pretending we
+know more than the data records.
+
+<<progsnap2 functions>>=
+def compute_run_gaps(pairs):
+    """Return per-run end-to-start gaps for one pair list.
+
+    The returned dict maps each run ``EventID`` to seconds
+    since the previous run in ``pairs``.  The first run maps
+    to ``None``.  Edit-only pairs are skipped.
+    """
+    gaps = {}
+    prev_end = None
+
+    for pair in pairs:
+        run = pair.get("run")
+        if run is None:
+            continue
+
+        start = _parse_iso(run.get("ServerTimestamp"))
+        if start is not None and prev_end is not None:
+            gap = (start - prev_end).total_seconds()
+        else:
+            gap = None
+        gaps[run["EventID"]] = gap
+
+        prev_end = _parse_iso(run.get("X-EndTime")) or start
+
+    return gaps
+@
+
+Let's verify both the end-to-start subtraction and the fact that edit-only
+pairs do not become synthetic timer anchors:
+
+<<progsnap2 test functions>>=
+def test_compute_run_gaps_uses_previous_end_time():
+    from learnlog.progsnap2 import compute_run_gaps
+    pairs = [
+        {
+            "edit": None,
+            "run": {
+                "EventID": "run-1",
+                "ServerTimestamp": "2026-01-01T10:00:00",
+                "X-EndTime": "2026-01-01T10:00:45",
+            },
+            "io": [],
+            "code_state_id": "0",
+        },
+        {
+            "edit": {"EventID": "edit-only"},
+            "run": None,
+            "io": [],
+            "code_state_id": "0",
+        },
+        {
+            "edit": None,
+            "run": {
+                "EventID": "run-2",
+                "ServerTimestamp": "2026-01-01T10:03:00",
+                "X-EndTime": "2026-01-01T10:03:10",
+            },
+            "io": [],
+            "code_state_id": "0",
+        },
+    ]
+    gaps = compute_run_gaps(pairs)
+    assert gaps["run-1"] is None
+    assert gaps["run-2"] == 135
+    assert "edit-only" not in gaps
+@
+
 \subsection{Main generation function}
 
 The entry point takes the dataset (from
@@ -2631,6 +2720,7 @@ only_untagged = (
 
 for tag in sorted(tags.keys()):
     pairs = tags[tag]
+    gaps = compute_run_gaps(pairs)
     if not only_untagged:
         tag_label = tag if tag else "(untagged)"
         lines.append(
@@ -2669,7 +2759,7 @@ for i, pair in enumerate(pairs, 1):
         lines.append("")
 
     run_tex = format_run_latex(
-        pair, dataset["resources"],
+        pair, dataset["resources"], gaps,
     )
     if run_tex:
         lines.append(
@@ -2771,7 +2861,7 @@ beneath Edit~1 instead.
 
 <<emit only run at full width>>=
 only_run = format_run_latex(
-    pairs[0], dataset["resources"],
+    pairs[0], dataset["resources"], gaps,
 )
 if only_run:
     lines.append("\\paragraph{Run 1}")
@@ -2808,13 +2898,13 @@ for i in range(len(pairs) - 1):
     effect = pairs[i + 1]
 
     cause_run = format_run_latex(
-        cause, dataset["resources"],
+        cause, dataset["resources"], gaps,
     )
     effect_edit = format_edit_latex(
         effect, cause, dataset["code_states"],
     )
     effect_run = format_run_latex(
-        effect, dataset["resources"],
+        effect, dataset["resources"], gaps,
     )
 
     lines.extend(format_minipage_row(
@@ -3031,7 +3121,7 @@ If the pair has no run ([[run=None]]), we return an
 empty string.
 
 <<progsnap2 functions>>=
-def format_run_latex(pair, resources):
+def format_run_latex(pair, resources, gaps=None):
     """Format the run part of a pair as LaTeX.
 
     Returns a string with script info and I/O in a
@@ -3046,8 +3136,14 @@ def format_run_latex(pair, resources):
     script = run.get("X-Script", "")
     result = run.get("ProgramResult", "")
     exit_code = run.get("X-ExitCode", "")
+    gap = gaps.get(run["EventID"]) if gaps else None
 
     info_parts = []
+    elapsed = format_elapsed(gap)
+    if elapsed:
+        info_parts.append(
+            f"Time since last run: {elapsed}"
+        )
     if script:
         info_parts.append(
             f"Script: \\texttt{{{_latex_escape(script)}}}"
@@ -3227,6 +3323,101 @@ def test_generate_analysis_latex_sequential():
     assert "hello.py" in latex
     assert "\\begin{minted}{text}" in latex
 
+@
+
+The elapsed-time line should appear only from the second run onward within one
+tag, and it should disappear again when a new tag starts a new session:
+
+<<progsnap2 test functions>>=
+def test_generate_analysis_latex_shows_gap_once_per_tag_session():
+    from learnlog.progsnap2 import (
+        generate_analysis_latex,
+        group_edit_run_pairs,
+    )
+    events = [
+        {
+            "EventType": "File.Edit",
+            "EventID": "1", "Order": "1",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "2", "Order": "2",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ServerTimestamp": "2026-01-01T10:00:00",
+            "ProgramResult": "Success",
+            "X-EndTime": "2026-01-01T10:00:45",
+            "X-ExitCode": "0",
+            "X-Script": "hello.py",
+            "X-Arguments": "",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "3", "Order": "3",
+            "SubjectID": "Alice",
+            "CodeStateID": "0",
+            "ParentEventID": "",
+            "X-Tag": "lab1",
+            "ServerTimestamp": "2026-01-01T10:03:00",
+            "ProgramResult": "Success",
+            "X-EndTime": "2026-01-01T10:03:10",
+            "X-ExitCode": "0",
+            "X-Script": "hello.py",
+            "X-Arguments": "",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "File.Edit",
+            "EventID": "4", "Order": "4",
+            "SubjectID": "Alice",
+            "CodeStateID": "1",
+            "ParentEventID": "",
+            "X-Tag": "lab2",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+        {
+            "EventType": "Run.Program",
+            "EventID": "5", "Order": "5",
+            "SubjectID": "Alice",
+            "CodeStateID": "1",
+            "ParentEventID": "",
+            "X-Tag": "lab2",
+            "ServerTimestamp": "2026-01-01T11:00:00",
+            "ProgramResult": "Success",
+            "X-EndTime": "2026-01-01T11:00:05",
+            "X-ExitCode": "0",
+            "X-Script": "hello.py",
+            "X-Arguments": "",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+            "ProgramOutput": "", "ProgramInput": "",
+        },
+    ]
+    dataset = {
+        "metadata": {},
+        "events": events,
+        "code_states": {
+            "0": {"hello.py": 'print("v1")\n'},
+            "1": {"hello.py": 'print("v2")\n'},
+        },
+        "resources": {},
+    }
+    grouped = group_edit_run_pairs(events)
+    latex = generate_analysis_latex(dataset, grouped)
+    assert latex.count("Time since last run:") == 1
+    assert "Time since last run: 2 min 15 s" in latex
 @
 
 The side-by-side mode is the interesting one.
@@ -3558,4 +3749,27 @@ def test_format_run_latex_with_io():
     assert "hello.py" in result
     assert "Enter name:" in result
     assert "> Alice" in result
+
+def test_format_run_latex_includes_gap_line():
+    """A provided gap is rendered before the script line."""
+    from learnlog.progsnap2 import format_run_latex
+    pair = {
+        "edit": None,
+        "run": {
+            "EventID": "2",
+            "X-Script": "hello.py",
+            "ProgramResult": "Success",
+            "X-EndTime": "",
+            "X-ExitCode": "0",
+            "X-ExceptionType": "",
+            "X-ExceptionMessage": "",
+        },
+        "io": [],
+        "code_state_id": "0",
+    }
+    result = format_run_latex(
+        pair, {}, {"2": 135},
+    )
+    assert "Time since last run: 2 min 15 s" in result
+    assert result.index("Time since last run:") < result.index("Script:")
 @
