@@ -74,16 +74,29 @@ occur in the same file as the import line.
 
 \section{The use cases}
 
-We see three main use cases:
+We see five main use cases:
 \begin{enumerate}
 \item Teachers tracking their live coding sessions to later share with 
 students, so that students can play back and check out different versions of 
 the code easily.
+Old recordings of authentic problems can also be reused as instruction 
+material for teaching debugging.
 \item Students logging their own work to review later.
-This will help them debug, see what they have tried---particularly, show a TA 
-what they've tried when asking for help.
-\item Researchers studying how students code, by asking students to share their 
-logs and then analysing the edit--run cycles.
+This helps them debug, see what they have tried, and show a TA what they have 
+already tried before asking for help.
+\item TAs and teachers reviewing student recordings to support office hours 
+and lab sessions, to inspect the student's development path during assessment 
+moderation, and to train TAs on authentic debugging patterns and recurring 
+student difficulties.
+\item Researchers and course staff studying how students code, by asking 
+students to share their logs and then analysing the edit--run cycles.
+Across many recordings this can reveal patterns of difficulty, support 
+comparisons between cohorts or pedagogical interventions, and guide 
+assignment and curriculum improvement.
+\item Course staff using the recorded development path as evidence in 
+reproducible bug reports and in authorship review, including cases where the 
+final submission appears inconsistent with the recorded process or suggests 
+substantial AI-assisted or externally authored work.
 \end{enumerate}
 
 \subsection{Sharing live-coding sessions}
@@ -216,8 +229,19 @@ The researcher then replays it directly:
 learnlog play -f alice-log.learnlog
 \end{minted}
 This gives a complete timeline of how students develop and debug
-their code---useful for research purposes or to help students
-refine their debugging techniques.
+their code.
+That is useful not only for research, but also for student self-review and 
+for staff workflows around teaching and support.
+A student can share the log with a TA before asking for help so the TA can 
+see what has already been tried.
+Old recordings of authentic problems can be reused as debugging instruction 
+material for later students.
+Across many recordings, teachers can identify recurring difficulty patterns, 
+train TAs how to respond to particular misconceptions or failure modes, 
+compare cohorts and interventions, and improve assignments or curricula.
+For individual cases, the log also supports assessment moderation, 
+reproducible bug reports, and authorship review when a final submission 
+appears inconsistent with the recorded development path.
 
 \subsection{A student-facing onboarding page}
 
@@ -421,6 +445,10 @@ learnlog play
 Use the arrow keys to step through events and **q** to quit.
 
 ## Submit or share your log
+
+These same sharing routes are also useful before asking a TA for
+help: share the log so the TA can see what you already tried, what
+outputs you saw, and where things started to go wrong.
 
 Your teacher will usually pick **one** of these two options. Use
 the one they ask for.

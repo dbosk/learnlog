@@ -40,7 +40,10 @@ stored in a hidden local Git repository.
   learnlog play lecture01.bundle
   ```
 
-- **Studying how students code.**
+  Older recordings can also be reused as debugging case studies for later
+  students.
+
+- **Studying, supporting, and reviewing how students code.**
   A researcher creates an empty Git repository for each student. Each student
   adds `import learnlog` to their programs and pushes the log:
 
@@ -77,5 +80,12 @@ stored in a hidden local Git repository.
   ```
 
   This gives a complete timeline of how students develop and debug their
-  code — for research purposes or to help students refine their debugging
-  techniques.
+  code. Students can use it for self-review, or show a TA what they already
+  tried before asking for help. Teachers can reuse old recordings of
+  authentic problems as debugging instruction material, train TAs on common
+  difficulty patterns and authentic debugging traces, inspect development
+  paths during assessment moderation, improve assignments and curricula, and
+  compare cohorts or interventions. The same recordings also support
+  reproducible bug reports, research on programming process, and authorship
+  review, including possible AI-assisted or externally authored work when the
+  final submission does not match the recorded development path.
