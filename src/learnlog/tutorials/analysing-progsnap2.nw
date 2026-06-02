@@ -15,6 +15,16 @@ visible against a stable dataset.
   is introduced only after the learner has seen the unfiltered report.
 }
 
+\ltnote{%
+  The report also surfaces a \enquote{Time since last run} line before
+  the second and later runs within a tag.
+  This gives the teacher a visible think-time signal without requiring
+  them to infer it from raw timestamps.
+  Resetting the timer at tag boundaries keeps the cue aligned with
+  tagged sessions rather than counting overnight or between-lab gaps as
+  a deliberate pause inside one session.
+}
+
 <<[[analysing-progsnap2.md]]>>=
 ---
 id: analysing-progsnap2
@@ -49,6 +59,8 @@ hint: A typical command is `learnlog analyse -f course.progsnap2 -o report.tex`.
 Generate a report from the dataset and save it to a `.tex` file.
 The report groups edits and runs into the edit--run cycles that the
 analysis command reconstructs.
+When a tag contains several runs, the report also shows `Time since last
+run` before the later runs; that timer resets at the next tag.
 
 # Produce a standalone document
 

@@ -72,6 +72,245 @@ BLOCK_SEP = "\n\n---\n\n"
 @
 
 
+\section{Elapsed time between runs}
+
+Teachers often care not only about \emph{what} a student ran, but also
+about how long they paused before the next attempt.
+The playback viewer only needs a lightweight approximation, so we use the
+commit author date that [[begin_run]] records at run start.
+
+That approximation is good enough for a quick \enquote{instant retry vs.
+deliberate pause} signal, but it is still slightly noisy.
+Interrupted runs may never record an end time, and playback works from Git
+commit summaries rather than full run blocks.
+The helper here therefore measures the interval from the previous displayed
+student commit to the current one, while the ProgSnap2 analyser computes the
+more precise end-to-start interval from the run data itself.
+
+\subsection{Parsing ISO timestamps defensively}
+
+The run logs and Git commit dates both use ISO timestamps.
+We treat empty or malformed strings as missing data rather than raising, so
+the viewer can simply omit the elapsed-time line when the underlying data is
+incomplete.
+
+<<commits functions>>=
+def _parse_iso(value):
+    """Return ``datetime.fromisoformat(value)`` or ``None``.
+
+    Empty or invalid timestamps are treated as missing.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+@
+
+Let's verify that valid timestamps parse and invalid ones quietly disappear:
+
+<<commits test functions>>=
+def test_parse_iso_valid_and_invalid():
+    from learnlog.commits import _parse_iso
+    assert _parse_iso("2026-01-01T10:00:00") == \
+        datetime.datetime(2026, 1, 1, 10, 0)
+    assert _parse_iso("") is None
+    assert _parse_iso("not-a-date") is None
+@
+
+
+\subsection{Formatting elapsed time for humans}
+
+Playback and analysis both need the same human-readable rendering.
+We keep the format compact so it fits naturally in a one-line status field:
+seconds for short retries, minutes and seconds for ordinary pauses, and hours
+and minutes for longer breaks.
+
+Negative intervals can happen if clocks skew or imported data is inconsistent.
+Rather than showing a confusing negative duration, we clamp anything below one
+second to [[< 1 s]].
+
+<<commits functions>>=
+def format_elapsed(seconds):
+    """Return a compact human-readable elapsed time.
+
+    Returns ``""`` for ``None``.  Values below one second,
+    including negative ones, are rendered as ``"< 1 s"``.
+    """
+    if seconds is None:
+        return ""
+
+    if seconds < 1:
+        return "< 1 s"
+
+    total = int(seconds)
+    if total < 60:
+        return f"{total} s"
+
+    if total < 3600:
+        minutes, secs = divmod(total, 60)
+        if secs == 0:
+            return f"{minutes} min"
+        return f"{minutes} min {secs} s"
+
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    return f"{hours} h {minutes} min"
+@
+
+We can pin down the display choices with a few representative cases:
+
+<<commits test functions>>=
+def test_format_elapsed_human_readable():
+    from learnlog.commits import format_elapsed
+    assert format_elapsed(None) == ""
+    assert format_elapsed(-5) == "< 1 s"
+    assert format_elapsed(0.2) == "< 1 s"
+    assert format_elapsed(5) == "5 s"
+    assert format_elapsed(120) == "2 min"
+    assert format_elapsed(135) == "2 min 15 s"
+    assert format_elapsed(3780) == "1 h 3 min"
+@
+
+
+\subsection{Recognising learnlog's own commits}
+
+Playback already filters [[Run: learnlog ...]] blocks out of the detailed
+display.
+The elapsed indicator should follow the same story: internal tool invocations
+must not become the \enquote{previous run} that a teacher interprets as a
+student retry.
+
+<<commits functions>>=
+def is_learnlog_commit(commit):
+    """Return true if ``commit`` records a learnlog CLI run."""
+    return commit.get("subject", "").startswith("Run: learnlog")
+@
+
+<<commits test functions>>=
+def test_is_learnlog_commit():
+    from learnlog.commits import is_learnlog_commit
+    assert is_learnlog_commit({"subject": "Run: learnlog play"})
+    assert not is_learnlog_commit({"subject": "Run: hello.py"})
+@
+
+
+\subsection{Computing playback gaps}
+
+The playback view walks commit summaries, not parsed run blocks, so the best
+shared signal is the difference between commit author dates.
+We look backwards for the previous commit that actually \emph{records a
+student run}---its subject begins [[Run:]] but is not one of learnlog's own
+[[Run: learnlog ...]] invocations---and subtract its date from the current
+commit's date.
+
+Requiring a [[Run:]] subject is what excludes the [[learnlog: initial
+commit]].
+That commit's author date is the project-setup time, and no program had run
+yet, so treating it as the previous run would label setup time as think time
+on the very first run.
+Skipping it means the first run simply shows no gap, which is correct: there
+was nothing before it.
+If either timestamp is missing or malformed, we return [[None]] so the caller
+simply omits the line.
+
+<<commits functions>>=
+def elapsed_since_previous_run(commits, index):
+    """Return seconds since the previous student run.
+
+    The interval is measured from the most recent earlier
+    commit that records a student run (its subject starts
+    with ``Run:`` and is not a ``Run: learnlog`` invocation)
+    to ``commits[index]``'s date.  The initial commit is
+    skipped, so the first run reports ``None``.  Returns
+    ``None`` when no such previous commit exists or either
+    timestamp cannot be parsed.
+    """
+    if index <= 0 or index >= len(commits):
+        return None
+
+    current = _parse_iso(commits[index].get("date"))
+    if current is None:
+        return None
+
+    for previous_index in range(index - 1, -1, -1):
+        previous_commit = commits[previous_index]
+        subject = previous_commit.get("subject", "")
+        if not subject.startswith("Run: ") or \
+                is_learnlog_commit(previous_commit):
+            continue
+        previous = _parse_iso(previous_commit.get("date"))
+        if previous is None:
+            return None
+        return (current - previous).total_seconds()
+
+    return None
+@
+
+The helper skips internal learnlog commits when looking for the reference
+point, so a teacher sees the gap between student attempts rather than the gap
+between a run and a later [[learnlog play]] command:
+
+<<commits test functions>>=
+def test_elapsed_since_previous_run_skips_learnlog():
+    from learnlog.commits import elapsed_since_previous_run
+    commits = [
+        {
+            "subject": "Run: hello.py",
+            "date": "2026-01-01T10:00:00+00:00",
+        },
+        {
+            "subject": "Run: learnlog play",
+            "date": "2026-01-01T10:01:00+00:00",
+        },
+        {
+            "subject": "Run: hello.py",
+            "date": "2026-01-01T10:05:00+00:00",
+        },
+    ]
+    assert elapsed_since_previous_run(commits, 0) is None
+    assert elapsed_since_previous_run(commits, 2) == 300
+@
+
+The very first program run has no earlier run to compare against: the only
+prior commit is the project's [[learnlog: initial commit]], whose date is the
+setup time.  Skipping it means the first run reports no gap rather than
+mislabelling setup time as think time:
+
+<<commits test functions>>=
+def test_elapsed_since_previous_run_skips_initial_commit():
+    from learnlog.commits import elapsed_since_previous_run
+    commits = [
+        {
+            "subject": "learnlog: initial commit",
+            "date": "2026-01-01T09:00:00+00:00",
+        },
+        {
+            "subject": "Run: hello.py",
+            "date": "2026-01-01T10:00:00+00:00",
+        },
+    ]
+    assert elapsed_since_previous_run(commits, 1) is None
+@
+
+A malformed timestamp on either commit yields [[None]] rather than an
+exception, so the viewer simply omits the line for that run:
+
+<<commits test functions>>=
+def test_elapsed_since_previous_run_invalid_date():
+    from learnlog.commits import elapsed_since_previous_run
+    commits = [
+        {"subject": "Run: hello.py", "date": "not-a-date"},
+        {
+            "subject": "Run: hello.py",
+            "date": "2026-01-01T10:05:00+00:00",
+        },
+    ]
+    assert elapsed_since_previous_run(commits, 1) is None
+@
+
+
 \section{Listing commits}
 
 We list commits in chronological order (oldest first) because

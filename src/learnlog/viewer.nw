@@ -55,7 +55,11 @@ from __future__ import annotations
 
 import sys
 
-from learnlog.commits import get_commit_detail
+from learnlog.commits import (
+    elapsed_since_previous_run,
+    format_elapsed,
+    get_commit_detail,
+)
 @
 
 
@@ -216,10 +220,21 @@ except curses.error:
 The content is the reordered [[git show]] output, which places
 the diff before the commit message so that code changes appear
 first.
-We split into lines for scrollable display.
+When we can compute it, we prepend a compact
+[[Time since last run: ...]] line so the pause becomes part of the
+scrollable commit narrative rather than competing with the fixed header.
 
 <<build content lines>>=
 content_lines = detail.split("\n")
+elapsed = format_elapsed(
+    elapsed_since_previous_run(self.commits, self.index)
+)
+if elapsed:
+    content_lines = [
+        f"Time since last run: {elapsed}",
+        "",
+        *content_lines,
+    ]
 @
 
 We display lines starting from the scroll offset, filling
@@ -378,12 +393,20 @@ def play_batch(repo, commits, start_index=0,
     When ``filter_learnlog`` is ``True``, learnlog's own run
     blocks are stripped and all-learnlog commits are skipped.
     """
-    for commit in commits[start_index:]:
+    for index in range(start_index, len(commits)):
+        commit = commits[index]
         detail = get_commit_detail(
             repo, commit["hash"], filter_learnlog,
         )
         if detail is None:
             continue
+        elapsed = format_elapsed(
+            elapsed_since_previous_run(commits, index)
+        )
+        if elapsed:
+            sys.stdout.write(
+                f"Time since last run: {elapsed}\n"
+            )
         sys.stdout.write(detail)
         sys.stdout.write("\n")
 @
@@ -403,4 +426,37 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
     captured = capsys.readouterr().out
     for c in commits:
         assert c["hash"][:7] in captured
+@
+
+The gap line should appear from the second run onward, never on the first.
+We edit the file before each run so both runs produce their own [[Run:]]
+commit; the first run's only predecessor is the initial commit, which carries
+no run and is therefore skipped, so only the second run prints a gap:
+
+<<viewer test functions>>=
+def test_play_batch_shows_time_since_last_run(workdir, capsys):
+    """Only the second of two run commits gets a gap line."""
+    import datetime
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text('print("v1")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 2, 15),
+    )
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    captured = capsys.readouterr().out
+    assert "Time since last run:" in captured
+    assert captured.count("Time since last run:") == 1
+    gap_pos = captured.index("Time since last run:")
+    second_pos = captured.index(commits[-1]["hash"])
+    assert gap_pos < second_pos
 @
