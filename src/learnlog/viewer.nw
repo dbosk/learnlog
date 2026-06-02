@@ -426,14 +426,22 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
     captured = capsys.readouterr().out
     for c in commits:
         assert c["hash"][:7] in captured
+@
 
+The gap line should appear from the second run onward, never on the first.
+We edit the file before each run so both runs produce their own [[Run:]]
+commit; the first run's only predecessor is the initial commit, which carries
+no run and is therefore skipped, so only the second run prints a gap:
+
+<<viewer test functions>>=
 def test_play_batch_shows_time_since_last_run(workdir, capsys):
-    """Only the second student run gets a gap line."""
+    """Only the second of two run commits gets a gap line."""
     import datetime
     from learnlog.viewer import play_batch
     from learnlog.commits import get_commits
     from learnlog.gitrepo import LearnlogRepo
     repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text('print("v1")\n')
     repo.begin_run(
         "hello.py", [],
         datetime.datetime(2026, 1, 1, 10, 0),
