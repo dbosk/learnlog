@@ -456,6 +456,11 @@ stays a plain Git runner.
 A [[LearnlogRepo]] instance serves a single run, so no two commits share
 this dict.
 
+The file is removed when the commit is done.
+A process killed in the middle leaves its index behind, but the name
+contains the run id, so nothing ever reuses it, and Git ignores every
+file in its directory that it did not ask for.
+
 <<repo methods>>=
 @contextlib.contextmanager
 def run_index(self, name):

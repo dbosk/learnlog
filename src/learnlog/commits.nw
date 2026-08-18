@@ -217,13 +217,17 @@ def iter_log_messages(output):
 def _starts_with_commit_hash(fragment):
     """True if ``fragment`` begins with a hash on its own line."""
     line = fragment.partition("\n")[0]
-    return len(line) == COMMIT_HASH_LEN and all(
+    return len(line) in COMMIT_HASH_LENGTHS and all(
         character in "0123456789abcdef"
         for character in line
     )
 <<commits constants>>=
-COMMIT_HASH_LEN = 40
+COMMIT_HASH_LENGTHS = (40, 64)
 @
+
+Both hash lengths are listed because a repository can use SHA-1 or
+SHA-256 object names, and which one a student's Git picks is
+configuration we do not control.
 
 Let's verify that a NUL inside a commit message does not split a
 record in two:
