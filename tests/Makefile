@@ -4,6 +4,16 @@
 # chunks named "<<test [[modulename.py]]>>". This Makefile automatically
 # discovers those chunks and tangles them to tests/unit/test_*.py files.
 
+# The suite imports learnlog into the pytest process itself, which
+# would otherwise start a run and commit the checkout into whatever
+# repository the upward search finds.  The opt-out is honoured by
+# initialize() on every import path (see learnlog.nw), so exporting it
+# here keeps the test run out of anybody's log.  Subprocess tests that
+# need logging strip it again from the environment they pass on (the
+# test_env fixture and _autostart_env do exactly that), so this does
+# not weaken what the suite checks.
+export LEARNLOG_SKIP_AUTOSTART = 1
+
 # Auto-discover test chunks in .nw files
 # A single .nw file may define several "<<test [[X.py]]>>" chunks, one per
 # module it tests; emit one target per distinct chunk.
