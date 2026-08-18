@@ -381,6 +381,18 @@ def test_classify_run_result_crash():
     assert classify_run_result(run) == ""
 @
 
+The two signals are deliberately independent.
+A program that ends with \mintinline{python}{sys.exit(3)} reports
+failure without raising anything, so there is no traceback to record
+(\cref{sec:exit-status}); the exit code alone has to carry the verdict:
+
+<<progsnap2 test functions>>=
+def test_classify_run_result_nonzero_exit_without_exception():
+    from learnlog.progsnap2 import classify_run_result
+    run = {"exit_code": "3", "exception_info": None}
+    assert classify_run_result(run) == "Error"
+@
+
 
 \section{Extracting exception type and message}
 
