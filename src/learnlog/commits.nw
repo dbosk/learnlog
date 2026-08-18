@@ -163,6 +163,9 @@ and it cannot know which commit holds it without looking.
 Reading every message once is therefore both simplest and
 cheapest: one [[git log]] call for the whole map, instead of one
 call per commit to hunt for its partner.
+As in [[get_commits]], an empty history makes [[git log]] exit
+non-zero; that is no trailers rather than an error, so the call opts
+out of [[check]] (\cref{gitrepo}).
 
 <<commits functions>>=
 def get_run_trailers(repo):
@@ -171,7 +174,9 @@ def get_run_trailers(repo):
     Reads every commit message once.  Commits that are not
     trailer commits are ignored.
     """
-    result = repo.git("log", "-z", "--format=%H%n%B")
+    result = repo.git(
+        "log", "-z", "--format=%H%n%B", check=False,
+    )
     if result.returncode != 0:
         return {}
 
@@ -345,7 +350,9 @@ def resolve_record_commit(repo, commit_hash):
     if not subject.startswith(TRAILER_PREFIX):
         return commit_hash
 
-    parent = repo.git("rev-parse", f"{commit_hash}^")
+    parent = repo.git(
+        "rev-parse", f"{commit_hash}^", check=False,
+    )
     if parent.returncode != 0:
         return commit_hash
     return parent.stdout.strip()
