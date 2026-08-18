@@ -2718,12 +2718,23 @@ For the less common case where the remote already contains commits
 This is safe because [[.learnlog/]] is a single-writer recording
 artefact---there is no risk of overwriting someone else's work.
 
-Unlike [[repo.git()]], which captures output with a ten-second
-timeout, [[push]] uses [[subprocess.run]] with inherited standard
-I/O---the same approach as the [[git]] passthrough command
-(\cref{sec:git}).
-This lets the user see transfer progress and respond to credential
-prompts.
+[[push]] uses [[subprocess.run]] with inherited standard I/O---the
+same approach as the [[git]] passthrough command (\cref{sec:git})---so
+that the user sees transfer progress and can answer a credential
+prompt.
+That is also why it stays outside [[LearnlogRepo.git]], even though
+the wrapper now covers the byte-stream case that used to push callers
+out of it (\cref{sec:git-bytes}).
+The wrapper's contract is captured output and a bounded timeout, and
+both are wrong here: capturing turns the progress meter and the
+password prompt into a buffer nobody sees, and any timeout we could
+pick would be a limit on how long the user may take to type a
+passphrase or the network to move a repository.
+Staying out loses nothing either, which is what separates this case
+from the code-state extraction that also thought it had a reason
+(\cref{sec:extract-code-state}): Git's own diagnosis has already
+reached the terminal, and the exit code below is Git's, so a failed
+push is neither silent nor mistaken for a successful one.
 
 <<typer commands>>=
 @app.command()
@@ -3169,6 +3180,9 @@ interactive Git commands all work naturally.
 We also forward Git's exit code, which makes the command usable in
 scripts (\eg [[learnlog git diff --quiet]] to test for uncommitted
 changes).
+For the same reason as [[push]] (\cref{sec:push}), this command does
+not go through [[LearnlogRepo.git]]: capturing the output is exactly
+what a passthrough must not do.
 
 Typer normally parses options like [[--oneline]] as its own flags.
 We prevent this with three context settings: [[ignore_unknown_options]]

@@ -78,7 +78,17 @@ Tutorial sources in `src/learnlog/tutorials/`:
 - `.learnlog/` in the working directory is the *product's* data (student log repo), not project config
 - Git operations use `subprocess.run` (no GitPython dependency)
 - `LearnlogRepo.git()` raises `GitError` by default; pass `check=False` only
-  where the exit status is the answer (`git diff --cached --quiet`, probes)
+  where the exit status is the answer (`git diff --cached --quiet`, probes),
+  and `text=False` where the output is a file rather than a message
+  (`git archive`) — the `GitError`/timeout semantics are identical.  The
+  commands that keep inherited stdio on purpose (`push`, `clone`, `pull`,
+  the `learnlog git` passthrough) stay outside the wrapper: capturing
+  would hide progress and credential prompts
+- ProgSnap2 code-state names are untrusted input: `safe_snapshot_path()`
+  in `progsnap2.nw` rejects absolute names, `..`, drive/UNC prefixes,
+  `.learnlog/` and anything resolving outside the work tree; unsafe
+  entries are skipped with a warning on stderr rather than aborting the
+  import
 - Commit messages always go in via `--file=-` and `input=`, never `-m`
   (Linux caps a single `argv` string at 128 KiB)
 - Failures learnlog must swallow are appended to `.learnlog/errors.log` and,

@@ -56,7 +56,7 @@ import datetime
 import io
 import zipfile
 import pytest
-from learnlog.gitrepo import LearnlogRepo
+from learnlog.gitrepo import GitError, LearnlogRepo
 
 <<progsnap2 test functions>>
 @
@@ -76,6 +76,10 @@ module's job (\cref{sec:run-join}): [[get_run_trailers]] and
 [[merge_run_trailers]] hand us the same complete run block that a
 single-commit log would have contained, so everything below parses
 one format.
+Every Git invocation goes through [[LearnlogRepo.git]]
+(\cref{sec:git-bytes}), so nothing here imports [[subprocess]];
+[[sys]] is imported for the single message the restorer writes to
+standard error (\cref{sec:reconstruct}).
 
 <<progsnap2 imports>>=
 from __future__ import annotations
@@ -86,7 +90,7 @@ import difflib
 import io
 import pathlib
 import shutil
-import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -104,6 +108,7 @@ from learnlog.commits import (
 )
 from learnlog.gitrepo import (
     GIT_TREE_TIMEOUT,
+    GitError,
     LearnlogRepo,
     format_run_header,
     format_run_trailer,
@@ -636,32 +641,52 @@ def get_code_state_id(repo, commit_hash, seen_trees):
 
 
 \section{Extracting code state files}
+\label{sec:extract-code-state}
 
 To populate [[CodeStates/]], we extract the file tree for each
 unique code state.
-We use [[git archive]] to produce a tar stream, which we unpack
-into the target directory.
-Unlike [[repo.git()]], which uses [[text=True]] and cannot
-handle binary data, we call [[subprocess.run]] directly with
-the repo's environment variables.
+[[git archive]] hands us the whole tree as a single tar stream, which
+we unpack into the target directory---one command per state, rather
+than a checkout per state that would disturb the work tree we are
+reading.
+
+A tar stream is bytes, and that used to be the reason this function
+bypassed [[repo.git()]] and called [[subprocess.run]] itself.
+The bypass cost more than the decoding it avoided.
+Without the wrapper's failure handling, a [[git archive]] that failed
+returned quietly, and the caller wrote an \emph{empty} directory into
+[[CodeStates/]].
+Nothing downstream can distinguish that from a genuinely empty working
+tree, so the export looked successful while the dataset claimed the
+student had deleted every file---and reading such a dataset back does
+exactly what it says: [[restore_code_state]]
+(\cref{sec:reconstruct}) treats a code state as the whole tree, so
+playback deletes the reconstructed work tree file by file.
+
+Now that the wrapper can return bytes (\cref{sec:git-bytes}),
+extraction is an ordinary [[repo.git()]] call and a failure raises
+[[GitError]] out of the export.
+Stopping is the right answer here even though a missing code state
+would only spoil part of the dataset: a dataset that lies about what
+the student wrote is worse than one that was never written, because
+only the one that was never written gets noticed.
+The timeout is the tree-sized one for the same reason [[git add .]]
+uses it---the command reads every file in the tree.
 
 <<progsnap2 functions>>=
 def extract_code_state(repo, commit_hash, state_dir):
     """Extract the file tree of a commit into a directory.
 
     Uses ``git archive`` to produce a tar stream and unpacks
-    it into ``state_dir``.
+    it into ``state_dir``.  Raises ``GitError`` if Git cannot
+    produce the archive, rather than leaving an empty state
+    behind.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "archive", "--format=tar", commit_hash],
-        env=repo.env,
-        cwd=str(repo.workdir),
-        capture_output=True,
+    result = repo.git(
+        "archive", "--format=tar", commit_hash,
+        text=False, timeout=GIT_TREE_TIMEOUT,
     )
-    if result.returncode != 0:
-        return
-
     with tarfile.open(
         fileobj=io.BytesIO(result.stdout)
     ) as tar:
@@ -670,6 +695,13 @@ def extract_code_state(repo, commit_hash, state_dir):
             filter="data",
         )
 @
+
+Unpacking needs no path check of its own.
+[[filter="data"]] is tarfile's strictest extraction policy: it refuses
+members whose names are absolute, escape the destination, or link
+outside it, which is precisely the guarantee the read-back path has to
+establish by hand (\cref{sec:reconstruct}) because there the names
+arrive from a zip index that no filter has vetted.
 
 <<progsnap2 test functions>>=
 def test_get_code_state_id_deduplicates(workdir):
@@ -725,6 +757,21 @@ def test_extract_code_state(workdir):
     # Should contain hello.py from the workdir fixture
     files = list(out.iterdir())
     assert len(files) >= 1
+@
+
+A commit Git cannot read must not pass for a commit with no files.
+The empty directory is the dangerous outcome, so the test asserts both
+that the failure is raised and that no state was left behind for a
+caller to mistake for a snapshot:
+
+<<progsnap2 test functions>>=
+def test_extract_code_state_raises_on_git_failure(workdir):
+    from learnlog.progsnap2 import extract_code_state
+    repo = LearnlogRepo(workdir)
+    out = workdir / "state_out"
+    with pytest.raises(GitError):
+        extract_code_state(repo, "0" * 40, out)
+    assert list(out.iterdir()) == []
 @
 
 
@@ -1016,8 +1063,27 @@ for commit in commits:
 for tree_hash, state_id in seen_trees.items():
     commit_hash = tree_to_commit[tree_hash]
     state_subdir = states_dir / str(state_id)
-    extract_code_state(repo, commit_hash, state_subdir)
+    try:
+        extract_code_state(repo, commit_hash, state_subdir)
+    except GitError as error:
+        raise SystemExit(
+            f"Failed to extract code state for "
+            f"{commit_hash}: {error}"
+        ) from error
 @
+
+The exporter is where a failed extraction turns from an exception into
+a sentence.
+[[extract_code_state]] raises [[GitError]] because that is what a
+library function owes its callers---the tests below distinguish it, and
+so could any future caller---but every path that reaches this chunk
+comes from a command a person typed, so it ends the same way
+[[do_export]] ends a failed bundle (\cref{sec:export}): one line naming
+what could not be read, and a non-zero exit status, rather than a
+traceback through a program the user did not write.
+The commit hash is in the message because a dataset is exported from a
+history the user still has: it is the one piece of information that
+makes the failure investigable with [[learnlog git]].
 
 The metadata CSV has two columns: [[Property]] and [[Value]].
 We declare version~8, consistent event ordering scoped per
@@ -1153,7 +1219,42 @@ def test_do_export_progsnap2_creates_zip(workdir):
             if n.startswith("Resources/")
         ]
         assert len(resources) >= 1
+@
 
+An export that cannot read one of its code states must fail as a
+message, not as a zip file missing a directory nobody looks in.
+We make the extraction fail and check that the exporter stops and says
+which commit it stopped on:
+
+<<progsnap2 test functions>>=
+def test_do_export_progsnap2_reports_failed_extraction(
+    workdir, monkeypatch,
+):
+    from learnlog import progsnap2
+    from learnlog.progsnap2 import do_export_progsnap2
+
+    def failing_extract(repo, commit_hash, state_dir):
+        raise GitError(
+            ("archive", commit_hash), 128,
+            "fatal: not a tree object",
+        )
+
+    monkeypatch.setattr(
+        progsnap2, "extract_code_state", failing_extract
+    )
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    output = workdir / "test.progsnap2"
+
+    with pytest.raises(SystemExit) as caught:
+        do_export_progsnap2(repo, output)
+
+    assert "not a tree object" in str(caught.value)
+    assert not output.exists()
+@
+
+<<progsnap2 test functions>>=
 def test_progsnap2_metadata_version(workdir):
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
@@ -1741,6 +1842,7 @@ def test_read_progsnap2_replaces_invalid_resource_bytes(
 
 
 \section{Reconstructing a temporary repository}
+\label{sec:reconstruct}
 
 The [[analyse]] command can work directly from the flat event
 stream, but [[play]] and [[list]] already rely on Git commit
@@ -1923,6 +2025,9 @@ def group_events_by_commit(events):
   rebuilding, so a snapshot must never touch that path.
 \item[File types] Content is written back with the same type it was
   read as, so binary files round-trip unchanged.
+\item[Untrusted names] Every entry name is checked before it is
+  joined onto the working directory, because a name in a dataset is
+  not necessarily a name that stays inside one.
 \end{description}
 
 The [[.learnlog]] rule is the one that was previously only half
@@ -1945,6 +2050,132 @@ def is_learnlog_path(name):
     return bool(parts) and parts[0] == ".learnlog"
 @
 
+[[.learnlog]] was only the nearest instance of a larger problem.
+A code-state entry is a \emph{name} that we join onto [[workdir]], and
+the names come from the zip index of a dataset learnlog did not
+necessarily write: a hand-edited file, an export from another tool, a
+classmate's dataset arriving by mail.
+Two shapes of name that [[pathlib]] accepts do not stay under
+[[workdir]] at all.
+A name like [[../id_rsa]] climbs out of the directory, and an absolute
+one discards it entirely---[[workdir / "/etc/passwd"]] \emph{is}
+[[/etc/passwd]], because joining an absolute path replaces the left
+operand instead of extending it.
+Playing back an untrusted dataset would then write attacker-chosen
+content wherever the student can write.
+
+The decision is one function, applied to every entry before anything
+is created, and it hands back the path to write rather than a yes or
+no: the join is the very thing being judged, so returning it is what
+stops the caller from computing it a second time and differently.
+It answers in two halves---a name half, which we can settle without
+touching the disk, and a filesystem half, which we cannot---and
+neither half subsumes the other.
+
+The name half rejects what cannot be a plain relative path: an empty
+name or [[.]], which select no file; a root or a drive, which make the
+join absolute; and any [[..]] component, which walks upwards.
+We read the name as a [[PureWindowsPath]] even on Unix.
+That is not portability decoration.
+[[PureWindowsPath]] treats both slashes as separators and recognises
+drive letters and UNC prefixes, so it sees [[C:/secrets]] and
+[[a\..\..\x]] as the paths whoever wrote them meant.
+A dataset is a file that travels between machines, and a check that
+only understands the conventions of the machine it happens to run on
+is a check an attacker satisfies by choosing the other platform's
+spelling.
+
+<<progsnap2 functions>>=
+def is_safe_relative_name(name):
+    """Return whether ``name`` is a plain relative path.
+
+    Rejects absolute names, drive and UNC prefixes, ``..``
+    components, and names that select no file at all.  The name is
+    read with Windows separator rules so that a dataset written on
+    either platform is judged the same way.
+    """
+    pure = pathlib.PureWindowsPath(name)
+    if pure.drive or pure.root:
+        return False
+    parts = pure.parts
+    return bool(parts) and ".." not in parts
+@
+
+The filesystem half answers the question a name cannot: where does the
+join actually land?
+A name can be relative, [[..]]-free and still escape through a
+symbolic link that already exists in the tree---with [[data]] pointing
+at [[/tmp]], the entry [[data/x]] lands in [[/tmp/x]].
+Resolving the join and requiring the result to stay under the resolved
+[[workdir]] settles that, because resolution is exactly what follows
+those links.
+We resolve [[workdir]] as well: comparing a resolved path against an
+unresolved root would report an escape for every project that lives
+under a symlinked home directory.
+Resolution can still refuse, on a symlink loop; refusing to write is
+then the answer we already wanted.
+
+<<progsnap2 functions>>=
+def safe_snapshot_path(workdir, name):
+    """Return where ``name`` may be restored, relative to ``workdir``.
+
+    Returns ``None`` when the entry must not be written: when it is
+    not a plain relative path, when it reaches into the ``.learnlog``
+    directory of the repository being rebuilt, or when the join
+    leaves ``workdir`` through a symbolic link.
+    """
+    if not is_safe_relative_name(name):
+        return None
+    parts = pathlib.PureWindowsPath(name).parts
+    relative = pathlib.Path(*parts)
+    if is_learnlog_path(relative):
+        return None
+    try:
+        target = (workdir / relative).resolve()
+        if not target.is_relative_to(workdir.resolve()):
+            return None
+    except OSError:
+        return None
+    return relative
+@
+
+Rebuilding the relative path from the parsed parts rather than using
+the name as given is what makes the [[.learnlog]] check and the join
+see the same path the name check saw: a Windows-style
+[[.learnlog\HEAD]] is one opaque file name to [[PurePath]] on Unix,
+and it must not slip past a guard that has already read it as two
+components.
+
+An unsafe entry is skipped, with a line on standard error naming it,
+and the rest of the state restores normally.
+Refusing the whole dataset is the other defensible answer, and for a
+tool that only ever read its own exports it would be the better one.
+This one reads foreign datasets on purpose---that is what
+[[learnlog play -f]] and [[learnlog analyse]] are for---and a
+researcher looking at someone else's data is better served by the
+files that were fine plus a visible complaint than by a command that
+refuses an entire dataset over one bad name.
+What we must not do is skip in silence: the same entry is an attack in
+one dataset and a bug in the exporter that produced another, and
+neither gets fixed by a tool that says nothing.
+
+The message goes to [[sys.stderr]], not to the [[sys.__stderr__]] that
+[[report_error]] uses (\cref{sec:diagnostics}).
+The difference is who is meant to read it.
+[[report_error]] reports learnlog failing behind a student's back and
+must stay out of the run it describes, whereas this is a command
+talking to the person who typed it, and it belongs in that command's
+output like every other message [[play]] and [[analyse]] print.
+
+<<progsnap2 functions>>=
+def warn_unsafe_snapshot_path(name):
+    """Report a code-state entry that was not restored."""
+    print(
+        f"learnlog: skipping unsafe code state path {name!r}",
+        file=sys.stderr,
+    )
+@
+
 Writing the snapshot has to preserve the distinction
 [[read_progsnap2]] recorded: [[str]] goes through [[write_text]] and
 [[bytes]] through [[write_bytes]].
@@ -1955,12 +2186,7 @@ the platform's default rules instead of the UTF-8 we decoded from.
 <<progsnap2 functions>>=
 def restore_code_state(workdir, code_state):
     """Replace ``workdir`` contents with a full code snapshot."""
-    snapshot = {
-        name: content
-        for name, content in code_state.items()
-        if not is_learnlog_path(name)
-    }
-    expected = {pathlib.Path(name) for name in snapshot}
+    <<vet the snapshot entries>>
 
     for path in sorted(workdir.rglob("*"), reverse=True):
         rel = path.relative_to(workdir)
@@ -1973,13 +2199,31 @@ def restore_code_state(workdir, code_state):
         elif rel not in expected:
             path.unlink()
 
-    for name, content in snapshot.items():
-        target = workdir / name
+    for relative, content in snapshot.items():
+        target = workdir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(content, bytes):
             target.write_bytes(content)
         else:
             target.write_text(content)
+@
+
+Vetting happens before either pass, and both passes then work from its
+result.
+That ordering is what keeps the two halves consistent: a rejected entry
+is not written, and---because the deletion pass removes whatever the
+snapshot does not claim---it is also not treated as a file the
+reconstructed tree ought to contain.
+
+<<vet the snapshot entries>>=
+snapshot = {}
+for name, content in code_state.items():
+    relative = safe_snapshot_path(workdir, name)
+    if relative is None:
+        warn_unsafe_snapshot_path(name)
+        continue
+    snapshot[relative] = content
+expected = set(snapshot)
 @
 
 Rebuilding the commit message mirrors the original structure as
@@ -2200,6 +2444,114 @@ def test_restore_code_state_writes_binary_content(tmp_path):
         == blob
     assert (tmp_path / "main.py").read_text() == \
         "print('main')\n"
+@
+
+The escaping names are what the guard exists for.
+We give the restorer a working directory with a sibling next to it and
+ask it to write over that sibling three ways---upwards, upwards via a
+subdirectory that does not exist, and sideways with a Windows drive
+letter.
+Nothing outside the working directory may appear or change, the
+legitimate entry must still restore, and each refusal must be audible:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_refuses_escaping_names(
+    tmp_path, capsys,
+):
+    from learnlog.progsnap2 import restore_code_state
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    restore_code_state(workdir, {
+        "../escaped.py": "print('escaped')\n",
+        "a/../../escaped.py": "print('escaped')\n",
+        "C:/escaped.py": "print('escaped')\n",
+        "pkg/main.py": "print('main')\n",
+    })
+
+    assert [p.name for p in tmp_path.iterdir()] == ["work"]
+    assert not (workdir / "C:").exists()
+    assert (workdir / "pkg" / "main.py").read_text() == \
+        "print('main')\n"
+    assert capsys.readouterr().err.count("escaped.py") == 3
+@
+
+An absolute name is the same attack without the [[..]], and it is the
+one [[pathlib]] makes easiest to write by accident: the join simply
+discards the working directory.
+Here the target is a real file that exists, so the test can assert the
+stronger property---that its contents are untouched:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_refuses_absolute_names(
+    tmp_path, capsys,
+):
+    from learnlog.progsnap2 import restore_code_state
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    victim = tmp_path / "victim.py"
+    victim.write_text("original\n")
+
+    restore_code_state(workdir, {
+        str(victim): "print('overwritten')\n",
+        "main.py": "print('main')\n",
+    })
+
+    assert victim.read_text() == "original\n"
+    assert (workdir / "main.py").exists()
+    assert str(victim) in capsys.readouterr().err
+@
+
+The name checks are worth testing directly too, because
+[[restore_code_state]] can only observe the ones that reach the
+filesystem:
+
+<<progsnap2 test functions>>=
+@pytest.mark.parametrize("name", [
+    "../escaped.py",
+    "a/../../escaped.py",
+    "/etc/passwd",
+    "C:/Windows/System32/drivers/etc/hosts",
+    "\\\\server\\share\\payload",
+    "",
+    ".",
+])
+def test_is_safe_relative_name_rejects(name):
+    from learnlog.progsnap2 import is_safe_relative_name
+    assert not is_safe_relative_name(name)
+
+@pytest.mark.parametrize("name", [
+    "main.py",
+    "pkg/main.py",
+    "pkg/sub/deep.py",
+    ".hidden",
+])
+def test_is_safe_relative_name_accepts(name):
+    from learnlog.progsnap2 import is_safe_relative_name
+    assert is_safe_relative_name(name)
+@
+
+The symbolic-link escape is the case only the filesystem half can
+catch: every component of [[data/x.py]] is an ordinary relative name,
+yet the join leaves the working directory:
+
+<<progsnap2 test functions>>=
+def test_safe_snapshot_path_refuses_symlink_escape(tmp_path):
+    from learnlog.progsnap2 import safe_snapshot_path
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workdir / "data").symlink_to(outside)
+
+    assert safe_snapshot_path(workdir, "main.py") is not None
+    assert safe_snapshot_path(workdir, "data/x.py") is None
+    assert safe_snapshot_path(
+        workdir, ".learnlog/HEAD"
+    ) is None
 @
 
 The next test checks that child I/O events rebuild a readable
