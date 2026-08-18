@@ -163,6 +163,9 @@ whether a run is recorded at all: what happens when Git fails, how long
 we are willing to wait for it, and how the commit message reaches Git.
 Each of them has cost us runs, so we take them in turn before assembling
 the method.
+A fourth decision---whether Git's output comes back as text or as
+bytes---costs no runs, but it decides who can use the wrapper at all,
+and a caller who cannot use it opts out of the other three as well.
 
 \subsection{Failure is an exception, not a return code}
 
@@ -204,10 +207,23 @@ class GitError(RuntimeError):
     def __init__(self, args, returncode, stderr):
         self.command = ("git",) + tuple(args)
         self.returncode = returncode
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
         self.stderr = (stderr or "").strip()
         <<build the [[GitError]] message>>
         super().__init__(message)
 @
+
+Standard error arrives as [[str]] from an ordinary call and as [[bytes]]
+from one that asked for a byte stream (\cref{sec:git-bytes}), so the
+constructor decodes it.
+A diagnostic is text whatever the command it describes was reading: it
+ends up in an exception message, on a terminal, and in the errors log
+(\cref{sec:diagnostics}).
+Decoding with [[errors="replace"]] rather than strictly is what keeps a
+failure reportable even when Git's complaint is not valid UTF-8---a
+locale mismatch or a mangled file name in the message must not turn a
+Git failure into a [[UnicodeDecodeError]] from the error path itself.
 
 We name the attribute [[command]] rather than [[args]] because
 [[BaseException.args]] already means something else---the constructor
@@ -288,11 +304,43 @@ about lengths at each call site: \emph{message content never travels in
 [[argv]]}.
 Every commit in this program passes its message through [[input]].
 
+\subsection{Text or bytes}
+\label{sec:git-bytes}
+
+Decoding Git's output as text is right for nearly every call we make:
+refs, hashes, log output and status are text by construction, and
+callers want [[str]].
+It is wrong for exactly the calls that hand us a file.
+[[git archive]] emits a tar stream, and a tar stream that has been
+through a UTF-8 decoder is no longer a tar stream---at best it raises,
+at worst it silently becomes replacement characters.
+
+Because the wrapper could not express that, the one caller that needed
+it---the ProgSnap2 exporter's code-state extraction
+(\cref{sec:extract-code-state})---called [[subprocess.run]] itself, and
+in doing so opted out of everything decided above: it repeated the
+environment and working directory by hand, ran without a timeout, and
+turned a failing [[git archive]] into an empty code state instead of an
+error.
+That is the general shape of the problem, and the reason the mode
+belongs in the wrapper rather than in the caller: a wrapper a caller
+cannot use is a wrapper that caller works around, and the workaround
+loses \emph{all} the guarantees, not the one it needed to escape.
+
+So the mode becomes a parameter, [[text]], with the same name and
+default as [[subprocess.run]]'s.
+A sibling [[git_bytes()]] method was the alternative; it would have had
+to repeat the failure handling, the timeouts and the standard-input
+plumbing, and that repetition is what would drift the next time one of
+those three decisions changes.
+A parameter cannot drift: there is still one code path, and the mode
+only chooses what type comes back out of it.
+
 \subsection{The wrapper}
 
 <<repo methods>>=
 def git(self, *args, check=True, timeout=GIT_TIMEOUT,
-        input=None):
+        input=None, text=True):
     """Run a Git command with the learnlog environment.
 
     Returns the ``CompletedProcess``.  Raises ``GitError`` when Git
@@ -300,6 +348,9 @@ def git(self, *args, check=True, timeout=GIT_TIMEOUT,
     ``check`` is false, when Git exits non-zero.  Text passed as
     ``input`` reaches Git on standard input; commit messages travel
     that way to escape the operating system's argument-size limit.
+    With ``text`` false, standard output and standard error come back
+    as bytes, for commands whose output is a file rather than a
+    message.
     """
     <<run Git, turning process failures into [[GitError]]>>
     if check and result.returncode != 0:
@@ -320,7 +371,7 @@ try:
         cwd=str(self.workdir),
         env=self.env,
         capture_output=True,
-        text=True,
+        text=text,
         timeout=timeout,
         input=input,
     )
@@ -329,7 +380,7 @@ except (OSError, subprocess.SubprocessError) as error:
 @
 
 Let's verify the helper runs Git commands in the right context, and
-that each of the three decisions above holds:
+that each of the four decisions above holds:
 
 <<test functions>>=
 def test_git_runs_command(workdir):
@@ -381,6 +432,27 @@ def test_git_input_reaches_git(workdir):
     blob = result.stdout.strip()
     assert repo.git("cat-file", "-p", blob).stdout \
         == "payload\n"
+
+def test_git_bytes_mode_returns_undecodable_output(workdir):
+    """Content Git hands back need not be text at all."""
+    repo = LearnlogRepo(workdir)
+    content = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
+    (workdir / "logo.png").write_bytes(content)
+    blob = repo.git(
+        "hash-object", "-w", "logo.png"
+    ).stdout.strip()
+    result = repo.git("cat-file", "-p", blob, text=False)
+    assert result.stdout == content
+
+def test_git_bytes_mode_reports_failures_as_text(workdir):
+    """A byte-mode failure is still a readable diagnostic."""
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError) as caught:
+        repo.git("cat-file", "-p", "0" * 40, text=False)
+    assert caught.value.returncode != 0
+    assert isinstance(caught.value.stderr, str)
+    assert caught.value.stderr
+    assert "b'" not in str(caught.value)
 @
 
 
