@@ -46,6 +46,9 @@ import pytest
 We import [[sys]] for [[play_batch]]'s stdout access and
 [[get_commit_detail]] from the commits module for fetching
 the display data.
+[[get_run_trailers]] comes along because a commit only becomes a
+complete run record once its trailer is merged back in
+(\cref{sec:run-join}).
 The [[curses]] import is deferred to inside methods because
 it is unavailable on Windows---we only need it when the user
 actually invokes the interactive viewer.
@@ -59,6 +62,7 @@ from learnlog.commits import (
     elapsed_since_previous_run,
     format_elapsed,
     get_commit_detail,
+    get_run_trailers,
 )
 @
 
@@ -92,16 +96,34 @@ class PlaybackViewer:
     """
 
     def __init__(self, repo, commits, start_index=0,
-                 filter_learnlog=True):
+                 filter_learnlog=True, trailers=None):
         self.repo = repo
         self.commits = commits
         self.index = start_index
         self.scroll = 0
         self.filter_learnlog = filter_learnlog
+        self.trailers = trailers
         self._detail_cache = {}
 
     <<player methods>>
 @
+
+The trailer map (\cref{sec:run-join}) is the same data for every
+commit, so we read it once and keep it.
+We read it on first use rather than in the constructor: the viewer
+redraws on every keystroke, so re-reading per redraw would make
+navigation crawl on a large repository, while doing it in the
+constructor would make merely \emph{creating} a viewer touch the
+repository.
+
+<<player methods>>=
+def _get_trailers(self):
+    """Return the trailer map, reading it on first use."""
+    if self.trailers is None:
+        self.trailers = get_run_trailers(self.repo)
+    return self.trailers
+@
+
 
 
 \subsection{Running the viewer}
@@ -171,6 +193,7 @@ def _get_detail(self, commit_hash):
             get_commit_detail(
                 self.repo, commit_hash,
                 self.filter_learnlog,
+                self._get_trailers(),
             )
     return self._detail_cache[commit_hash]
 @
@@ -387,16 +410,20 @@ changed as a result in a single continuous stream.
 
 <<viewer functions>>=
 def play_batch(repo, commits, start_index=0,
-               filter_learnlog=True):
+               filter_learnlog=True, trailers=None):
     """Print commit details sequentially to stdout.
 
     When ``filter_learnlog`` is ``True``, learnlog's own run
     blocks are stripped and all-learnlog commits are skipped.
+    ``trailers`` is the map from ``get_run_trailers``; it is
+    read from ``repo`` when not supplied.
     """
+    if trailers is None:
+        trailers = get_run_trailers(repo)
     for index in range(start_index, len(commits)):
         commit = commits[index]
         detail = get_commit_detail(
-            repo, commit["hash"], filter_learnlog,
+            repo, commit["hash"], filter_learnlog, trailers,
         )
         if detail is None:
             continue
@@ -426,6 +453,36 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
     captured = capsys.readouterr().out
     for c in commits:
         assert c["hash"][:7] in captured
+@
+
+A finished run must show up as one record: its header, its results, and
+no sign of the trailer commit that carried them:
+
+<<viewer test functions>>=
+def test_play_batch_shows_one_record_per_run(workdir, capsys):
+    """Results appear under the run; the trailer commit does not."""
+    import datetime
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    captured = capsys.readouterr().out
+    assert captured.count("Run: hello.py") == 1
+    assert "Exit-Code: 0" in captured
+    assert "stdout: hello" in captured
+    assert "Run-End:" not in captured
 @
 
 The gap line should appear from the second run onward, never on the first.

@@ -9,7 +9,13 @@ The [[.learnlog/]] directory contains only Git internals.
 
 We use [[subprocess]] rather than GitPython to keep the package
 dependency-free: Git is already installed on every lab machine, and our
-operations are simple (init, add, commit, amend).
+operations are simple (init, add, commit).
+
+The log is \emph{append-only}: we never rewrite a commit once it
+exists.
+\Cref{sec:two-commit-protocol} explains why that rules out the
+[[git commit --amend]] that earlier versions used, and how a run gets
+recorded instead.
 
 \section{Code overview}
 
@@ -26,6 +32,11 @@ import sys
 import os
 import pathlib
 import datetime
+import contextlib
+import shutil
+import uuid
+
+<<optional locking support>>
 
 <<constants>>
 <<classes>>
@@ -81,10 +92,16 @@ def workdir(tmp_path, monkeypatch):
 \section{The [[LearnlogRepo]] class}
 
 The class needs four operations: running Git commands, initialising the
-repository, beginning a run (committing or amending), and finalising a
-run (amending with results).
+repository, beginning a run (committing the code state and the run
+header), and finalising a run (committing the results).
 We introduce the class shell here and fill in each method in its own
 section below.
+
+One run spans both of the last two operations, so the instance also
+carries the identity of the run currently in progress: the run id that
+links its two commits together, and the command it records.
+[[finalize_run]] needs both, and an instance handles exactly one run
+because each captured process creates its own [[LearnlogRepo]].
 
 <<classes>>=
 class LearnlogRepo:
@@ -103,6 +120,9 @@ class LearnlogRepo:
             "GIT_DIR": str(self.git_dir),
             "GIT_WORK_TREE": str(self.workdir),
         }
+        self.run_id = None
+        self.run_script = None
+        self.run_args = []
         if not self.git_dir.exists():
             self.init_repo()
 
@@ -653,23 +673,200 @@ def test_init_is_idempotent(workdir):
 @
 
 
+\section{One run, two commits}
+\label{sec:two-commit-protocol}
+
+A run produces information at two different moments: what the student
+was about to run---the command, its arguments, and the code as it
+looked right then---and how it went---the end time, the exit code, the
+captured I/O, and any exception.
+Writing the first half down \emph{before} the program starts is what
+makes the log crash-resilient: a program killed by [[SIGKILL]] never
+reaches our exit handler, but its header is already committed.
+
+Earlier versions completed such a record with [[git commit --amend]].
+That is only correct while learnlog is the sole writer and nobody has
+seen the commit yet, and neither assumption holds:
+
+\begin{description}
+\item[Overlapping runs] [[--amend]] rewrites whatever sits at
+  \emph{HEAD}, not the commit this run created.  A program that starts
+  another logged program, a run left in the background, or a
+  [[learnlog]] command overlapping a student run all end with a
+  different commit at HEAD, so the results are appended to a stranger's
+  run block: one run looks like it crashed, the other reports someone
+  else's output.
+\item[Published history] Amending replaces a commit that
+  [[learnlog push]] may already have sent and [[learnlog tag]] may
+  already point at.  The next push is rejected as non-fast-forward, and
+  the tag is left behind on an abandoned commit.
+\item[Timestamps] An amend keeps the original author date, so runs
+  folded into one commit all share the first run's timestamp, and the
+  interval between runs (\cref{commits}) is wrong for every run but
+  that one.
+\end{description}
+
+So we never rewrite anything.
+[[begin_run]] writes a \emph{header commit} carrying a fresh run id,
+and [[finalize_run]] writes a separate \emph{trailer commit} that
+repeats that run id and carries the results.
+Each process only ever \emph{adds} a commit, and it names the run it is
+talking about instead of trusting HEAD, which is what makes the
+protocol safe under any interleaving.
+
+Folding consecutive runs of unchanged code into one commit goes away
+with the amend that implemented it: every run now gets its own header
+commit, even when it records no change at all.
+Empty commits cost a few dozen bytes---the tree is shared---and in
+exchange a run's record no longer depends on what the previous run
+wrote.
+
+The price is that [[learnlog git log]] shows two commits per run.
+Every learnlog reader---[[list]], [[play]], and the ProgSnap2
+exporter---joins the pair back into a single record by run id
+(\cref{commits}), so the two-commit structure is visible only to
+someone inspecting the Git history directly.
+
+
+\subsection{Which code state belongs to a run}
+
+The header commit also decides \emph{when} the code is snapshotted, and
+that is a second thing the old protocol got wrong: it staged the work
+tree at the end of the run, so a program that wrote [[a.out]] committed
+that binary into its own run.
+
+The code state that explains a run is the code that was executed, not
+what the execution produced.
+We therefore snapshot at the start and leave the tree alone afterwards.
+Files written during the run are not lost: the next run's snapshot
+picks them up, where they appear as a change that happened between the
+two runs---which is exactly what they are.
+If the student never runs anything again, those files never enter the
+log, and a build artefact is no loss.
+
+
+\subsection{Run identity}
+
+A run id has to be unique within one repository, and it is minted by
+processes that cannot see each other---the whole point is that they do
+not coordinate---so a counter is not an option.
+A random UUID is: 122 random bits make a collision far less likely than
+a disk error.
+
+<<functions>>=
+def new_run_id():
+    """Return a fresh run identifier.
+
+    The id links a run's header commit to its trailer commit.
+    """
+    return uuid.uuid4().hex
+@
+
+
+\subsection{Serialising commits}
+
+Two learnlog processes can reach [[begin_run]] at the same instant.
+Git guards its own data structures with lock files, but a losing
+command \emph{fails} ([[index.lock]] already exists) rather than
+waiting, and a dropped run is data loss.
+We would rather wait a few milliseconds, so we take an exclusive
+[[flock]] on a file in [[.learnlog/]] around each commit.
+
+The lock covers one commit operation and nothing more.
+A lock held from [[begin_run]] to [[finalize_run]] would make two
+terminals take turns \emph{running programs} instead of taking turns
+\emph{committing}---a student's program would block on another
+student's program, which breaks transparency far worse than the race it
+prevents.
+
+[[fcntl]] does not exist on Windows.
+Rather than fail there, we degrade to no locking: the protocol is still
+append-only, and the remaining window is the one Git itself guards.
+
+<<optional locking support>>=
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+@
+
+<<repo methods>>=
+@contextlib.contextmanager
+def commit_lock(self):
+    """Hold an exclusive lock while writing one commit."""
+    handle = self._acquire_lock()
+    try:
+        yield
+    finally:
+        if handle is not None:
+            handle.close()
+@
+
+Closing the file releases the lock, which also means the kernel releases
+it if the process dies mid-commit---no stale lock can wedge the next
+run.
+Failing to acquire the lock is not worth aborting a run over, so every
+error path here returns [[None]] and the commit proceeds unserialised.
+
+<<repo methods>>=
+def _acquire_lock(self):
+    """Return a locked file handle, or ``None`` if unavailable."""
+    if fcntl is None:
+        return None
+    try:
+        handle = open(self.git_dir / LOCK_FILE_NAME, "w")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        return None
+    return handle
+<<constants>>=
+LOCK_FILE_NAME = "learnlog.lock"
+@
+
+
+\subsection{A private index per run}
+
+Staging with [[git add .]] writes the repository's shared index.
+Two concurrent runs sharing that file do not merely collide on
+[[index.lock]]: the loser may also snapshot the winner's staged state,
+so one run's commit would carry another run's tree.
+Pointing [[GIT_INDEX_FILE]] at a per-run file makes each snapshot
+private, and Git then has nothing left to contend on.
+
+We set the variable on the environment dict that [[git]] passes to every
+command rather than threading a parameter through it, so the wrapper
+stays a plain Git runner.
+A [[LearnlogRepo]] instance serves a single run, so no two commits share
+this dict.
+
+The file is removed when the commit is done.
+A process killed in the middle leaves its index behind, but the name
+contains the run id, so nothing ever reuses it, and Git ignores every
+file in its directory that it did not ask for.
+
+<<repo methods>>=
+@contextlib.contextmanager
+def run_index(self, name):
+    """Point Git at a private index file named after the run."""
+    index_path = self.git_dir / f"{RUN_INDEX_PREFIX}{name}"
+    self.env["GIT_INDEX_FILE"] = str(index_path)
+    try:
+        yield index_path
+    finally:
+        self.env.pop("GIT_INDEX_FILE", None)
+        try:
+            index_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+<<constants>>=
+RUN_INDEX_PREFIX = "index-"
+@
+
+
 \section{Beginning a run}
 
-At the start of each program execution, [[begin_run]] stages all files
-and creates (or amends) a commit with the run header.
-
-The key decision is what to do when no files have changed since the last
-run.
-If the student runs the same program twice without editing anything,
-we do not want a new empty commit---that would clutter the log with
-duplicate snapshots.
-Instead, we amend the previous commit to append a new run block.
-This groups consecutive runs of identical code into a single commit,
-which is what you want when reviewing the log.
-
-When files \emph{have} changed, we create a fresh commit.
-The diff in that commit shows exactly what the student modified between
-runs.
+At the start of each program execution, [[begin_run]] snapshots the work
+tree and commits it together with the run header.
 
 The change detection is the second and last place in this module where
 a non-zero exit is data rather than trouble.
@@ -681,58 +878,76 @@ while everything around it does not.
 def begin_run(self, script, args, start_time):
     """Record the start of a program run.
 
-    Stages all files.  If there are changes, creates a new commit
-    with the run header.  If no files changed, amends the previous
-    commit to append a new run block.
+    Snapshots the current code state and commits it with the run
+    header, which carries the run id that :meth:`finalize_run`
+    will refer back to.
 
-    Returns the run header string (needed by :meth:`finalize_run`).
+    Returns the run header string.
     """
-    header = format_run_header(script, args, start_time)
-
-    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
-    diff = self.git(
-        "diff", "--cached", "--quiet", check=False
+    self.run_id = new_run_id()
+    self.run_script = script
+    self.run_args = list(args)
+    header = format_run_header(
+        script, args, start_time, self.run_id,
     )
-    has_changes = diff.returncode != 0
 
-    if has_changes:
-        self.git(
-            "commit", "--file=-", input=header,
-            timeout=GIT_TREE_TIMEOUT,
-        )
-    else:
-        <<amend previous commit with new run block>>
+    with self.commit_lock():
+        <<commit the code state with the run header>>
 
     return header
 @
 
-To amend, we read the existing commit message, add a separator, and
-append the new run header.
-On the very first run (the initial commit), this produces a commit
-message with both the initial-commit line and the run header.
+The commit is always made, with [[--allow-empty]] for the common case
+where the student re-runs unchanged code.
+Its tree is the work tree as it looks now, which is the state the
+program is about to execute.
 
-Note that [[combined]] inherits the length of every run already stored
-in this commit, so it crosses the argument-size limit sooner than a
-first commit does---the amend path is why one loud program can take the
-runs that follow it down with it.
-On standard input the accumulated message is simply a longer message.
-
-<<amend previous commit with new run block>>=
-existing = self.git(
-    "log", "-1", "--format=%B"
-).stdout.rstrip("\n")
-combined = existing + "\n\n---\n\n" + header
-self.git(
-    "commit", "--amend", "--allow-empty",
-    "--file=-", input=combined,
-    timeout=GIT_TREE_TIMEOUT,
-)
+<<commit the code state with the run header>>=
+with self.run_index(f"{self.run_id}-begin") as index_path:
+    <<seed the private index from the shared one>>
+    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    self.git(
+        "commit", "--allow-empty", "--file=-", input=header,
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    <<publish the private index as the shared one>>
 @
 
-Let's verify both the new-commit and amend paths:
+An index is also a stat cache: Git re-hashes a file only when its
+[[stat]] data differs from what the index recorded.
+Starting each run from an empty index would therefore re-read the whole
+project on every run, so we seed the private index with a copy of the
+shared one, and move it back afterwards.
+Moving it back keeps the cache warm for the next run and keeps
+[[learnlog git status]] honest---an index left behind at repository
+initialisation would report every later commit as unstaged work.
+Both steps are best-effort: a missing or unreadable index costs
+performance, never correctness, because [[git add .]] rebuilds whatever
+is missing.
+
+<<seed the private index from the shared one>>=
+shared_index = self.git_dir / SHARED_INDEX_NAME
+try:
+    shutil.copyfile(shared_index, index_path)
+except OSError:
+    pass
+@
+
+<<publish the private index as the shared one>>=
+try:
+    os.replace(index_path, shared_index)
+except OSError:
+    pass
+<<constants>>=
+SHARED_INDEX_NAME = "index"
+@
+
+Let's verify that each run gets its own commit, that the header
+carries the run id and the arguments, and that the snapshot is the code
+as it was when the run started:
 
 <<test functions>>=
-def test_begin_run_new_commit_on_file_change(workdir):
+def test_begin_run_commits_on_file_change(workdir):
     repo = LearnlogRepo(workdir)
     (workdir / "hello.py").write_text('print("changed")\n')
     now = datetime.datetime.now()
@@ -741,25 +956,30 @@ def test_begin_run_new_commit_on_file_change(workdir):
     lines = result.stdout.strip().split("\n")
     assert len(lines) == 2  # initial + run
 
-def test_begin_run_amends_on_no_change(workdir):
+def test_begin_run_commits_without_file_change(workdir):
+    """Unchanged code still gets its own header commit."""
     repo = LearnlogRepo(workdir)
     now = datetime.datetime.now()
     repo.begin_run("hello.py", [], now)
     result = repo.git("log", "--oneline")
     lines = result.stdout.strip().split("\n")
-    assert len(lines) == 1  # amended initial
+    assert len(lines) == 2  # initial + run
 
-def test_begin_run_two_runs_no_change_single_commit(workdir):
+def test_begin_run_two_runs_two_commits(workdir):
+    """Two runs of identical code are two separate records."""
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t1)
+    first = repo.git("rev-parse", "HEAD").stdout.strip()
     repo.begin_run("hello.py", ["--verbose"], t2)
     result = repo.git("log", "--oneline")
     lines = result.stdout.strip().split("\n")
-    assert len(lines) == 1
-    msg = repo.git("log", "-1", "--format=%B").stdout
-    assert "---" in msg  # separator between runs
+    assert len(lines) == 3
+    parent = repo.git(
+        "rev-parse", "HEAD^"
+    ).stdout.strip()
+    assert parent == first  # first record untouched
 
 def test_begin_run_header_includes_args(workdir):
     repo = LearnlogRepo(workdir)
@@ -768,6 +988,13 @@ def test_begin_run_header_includes_args(workdir):
     msg = repo.git("log", "-1", "--format=%B").stdout
     assert "arg1 arg2" in msg
 
+def test_begin_run_header_includes_run_id(workdir):
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", [], now)
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert f"Run-Id: {repo.run_id}" in msg
+
 def test_begin_run_new_commit_after_edit(workdir):
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
@@ -775,9 +1002,33 @@ def test_begin_run_new_commit_after_edit(workdir):
     (workdir / "hello.py").write_text('print("v2")\n')
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t2)
-    result = repo.git("log", "--oneline")
-    lines = result.stdout.strip().split("\n")
-    assert len(lines) == 2
+    result = repo.git("show", "HEAD:hello.py")
+    assert result.stdout == 'print("v2")\n'
+@
+
+Files written \emph{during} a run belong to the next run's snapshot,
+not to the run that produced them---this is the build-artefact case
+from \cref{sec:two-commit-protocol}:
+
+<<test functions>>=
+def test_run_output_files_stay_out_of_the_run(workdir):
+    """A file written during the run is not in its code state."""
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "a.out").write_text("binary\n")
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    files = repo.git("ls-tree", "-r", "--name-only", "HEAD")
+    assert "a.out" not in files.stdout
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    files = repo.git("ls-tree", "-r", "--name-only", "HEAD")
+    assert "a.out" in files.stdout
 @
 
 
@@ -787,21 +1038,33 @@ The run header is a plain-text block with key--value fields.
 We keep it simple---no YAML, no JSON---so it is easy to read in
 [[git log]] output.
 
+The [[Run-Id:]] field is what a reader matches against the trailer
+commit.
+It is optional because reconstructed histories (\cref{progsnap2}) build
+complete blocks that need no partner commit to look for.
+
 <<functions>>=
-def format_run_header(script, args, start_time):
+def format_run_header(script, args, start_time,
+                      run_id=None):
     """Format a run header block.
 
     The header records which script was run, its arguments, and
-    the start time.
+    the start time.  When ``run_id`` is given, it is recorded as
+    the ``Run-Id`` field that links this run to its trailer.
     """
     args_str = " ".join(args) if args else "(none)"
-    return (
-        f"Run: {script} {args_str}\n"
-        f"\n"
-        f"Script: {script}\n"
-        f"Arguments: {args_str}\n"
-        f"Start-Time: {start_time.isoformat()}"
-    )
+    lines = [
+        f"Run: {script} {args_str}",
+        "",
+        f"Script: {script}",
+        f"Arguments: {args_str}",
+        f"Start-Time: {start_time.isoformat()}",
+    ]
+    if run_id:
+        lines.append(f"{RUN_ID_FIELD} {run_id}")
+    return "\n".join(lines)
+<<constants>>=
+RUN_ID_FIELD = "Run-Id:"
 @
 
 Let's verify the format:
@@ -814,26 +1077,37 @@ def test_format_run_header_basic():
     assert "Script: hello.py" in header
     assert "Arguments: arg1" in header
     assert "Start-Time: 2026-03-20T14:30:00" in header
+    assert "Run-Id:" not in header
 
 def test_format_run_header_no_args():
     t = datetime.datetime(2026, 3, 20, 14, 30)
     header = format_run_header("hello.py", [], t)
     assert "Arguments: (none)" in header
+
+def test_format_run_header_with_run_id():
+    t = datetime.datetime(2026, 3, 20, 14, 30)
+    header = format_run_header("hello.py", [], t, "abc123")
+    assert "Run-Id: abc123" in header
 @
 
 
 \section{Finalising a run}
 
-After the program finishes (or crashes), [[finalize_run]] amends the
-current commit to append the I/O log, exception information, end time,
-and exit code.
-This completes the run block that [[begin_run]] started.
+After the program finishes (or crashes), [[finalize_run]] commits the
+I/O log, exception information, end time, and exit code as a new
+commit that names the run it completes.
 
 If the program was killed by SIGKILL, the [[atexit]] handler never
 fires and [[finalize_run]] is never called.
-The commit still exists with the run header from [[begin_run]], so we
-know a run was attempted---the missing [[End-Time]] field signals
-an abnormal termination.
+The header commit from [[begin_run]] still stands, so we know a run was
+attempted---the missing [[End-Time]] field signals an abnormal
+termination, exactly as before.
+
+A trailer written without a preceding [[begin_run]] has no header to
+point at.
+We still commit it, under a fresh id, rather than throwing the results
+away: no reader will show it, but the data is in the repository if
+someone goes looking.
 
 That signal is only trustworthy if the \emph{other} ways of losing a
 trailer are gone, which is what makes this method the one that most
@@ -845,32 +1119,49 @@ enters the message, so it was the method that failed on
 <<repo methods>>=
 def finalize_run(self, io_log, exception_info,
                  end_time, exit_code):
-    """Complete the current run block with results.
+    """Complete the current run with a trailer commit.
 
-    Amends the current commit to append I/O log, exception
-    information, end time, and exit code.
+    Commits the I/O log, exception information, end time, and
+    exit code under the run id from :meth:`begin_run`.  Nothing
+    already in the repository is modified, and the commit records
+    no code change.
     """
-    existing = self.git(
-        "log", "-1", "--format=%B"
-    ).stdout.rstrip("\n")
+    run_id = self.run_id or new_run_id()
+    self.run_id = None
 
     trailer = format_run_trailer(
         io_log, exception_info, end_time, exit_code
     )
-    combined = existing + "\n" + trailer
+    message = format_trailer_commit(
+        self.run_script, self.run_args, run_id, trailer,
+    )
 
-    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    with self.commit_lock():
+        <<commit the trailer without touching the tree>>
+@
+
+Reading HEAD's tree into the private index is what keeps the trailer
+free of code changes.
+Staging the work tree instead would attribute to the finished run both
+the files it wrote and any edit the student made while it was running.
+The tree we read is the \emph{current} HEAD's, not the header's: if
+another run committed in between, reverting to the header's tree would
+undo that run's snapshot.
+
+<<commit the trailer without touching the tree>>=
+with self.run_index(f"{run_id}-end"):
+    self.git("read-tree", "HEAD")
     self.git(
-        "commit", "--amend", "--allow-empty",
-        "--file=-", input=combined,
+        "commit", "--allow-empty", "--file=-", input=message,
         timeout=GIT_TREE_TIMEOUT,
     )
 @
 
-Let's verify that finalisation completes the run block:
+Let's verify that finalisation records the results and leaves the
+header commit alone:
 
 <<test functions>>=
-def test_finalize_appends_io_and_exit(workdir):
+def test_finalize_records_io_and_exit(workdir):
     repo = LearnlogRepo(workdir)
     now = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], now)
@@ -886,6 +1177,27 @@ def test_finalize_appends_io_and_exit(workdir):
     assert "Exit-Code: 0" in msg
     assert "stdout: hello" in msg
     assert "--- exception ---\nNone" in msg
+
+def test_finalize_keeps_header_commit(workdir):
+    """The trailer is a new commit; the header is untouched."""
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], now)
+    header_hash = repo.git(
+        "rev-parse", "HEAD"
+    ).stdout.strip()
+    run_id = repo.run_id
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+    parent = repo.git("rev-parse", "HEAD^").stdout.strip()
+    assert parent == header_hash
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert msg.startswith("Run-End: hello.py")
+    assert f"Run-Id: {run_id}" in msg
 
 def test_finalize_records_exception(workdir):
     repo = LearnlogRepo(workdir)
@@ -918,12 +1230,69 @@ def test_finalize_no_io(workdir):
     assert "(no I/O)" in msg
 @
 
+The interleaving from \cref{sec:two-commit-protocol} is the case the
+old protocol corrupted: a logged program starts another logged program,
+so the inner run finalises first.
+Each run must still get its own results.
+
+<<test functions>>=
+def test_overlapping_runs_keep_their_own_results(workdir):
+    """An inner run finalising first must not steal the trailer."""
+    parent = LearnlogRepo(workdir)
+    child = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    parent.begin_run("parent.py", [], t0)
+    parent_id = parent.run_id
+    child.begin_run("child.py", [], t0)
+    child_id = child.run_id
+    child.finalize_run(
+        io_log="stdout: CHILD\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    parent.finalize_run(
+        io_log="stdout: PARENT\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 2),
+        exit_code=3,
+    )
+
+    child_trailer = _trailer_for(parent, child_id)
+    parent_trailer = _trailer_for(parent, parent_id)
+    assert "stdout: CHILD" in child_trailer
+    assert "Exit-Code: 0" in child_trailer
+    assert "stdout: PARENT" in parent_trailer
+    assert "Exit-Code: 3" in parent_trailer
+@
+
+The helper looks for the trailer commit that names a given run id,
+which is the same join the readers in \cref{commits} perform---spelled
+out here so this test verifies the recorded data rather than the code
+that reads it back:
+
+<<test functions>>=
+def _trailer_for(repo, run_id):
+    """Return the trailer commit message naming ``run_id``."""
+    hashes = repo.git("log", "--format=%H").stdout.split()
+    for commit_hash in hashes:
+        message = repo.git(
+            "log", "-1", "--format=%B", commit_hash,
+        ).stdout
+        if message.startswith("Run-End:") and \
+                run_id in message:
+            return message
+    return ""
+@
+
 The regression test for the argument-size limit uses 300\,KB of I/O:
 comfortably past the 128\,KiB cap, and comfortably under
 [[MAX_IOLOG_BYTES]], so it is a size a real program can reach.
-The second run afterwards is not incidental---it is the amend path
-carrying the first run's 300\,KB forward, which is the site that fails
-next once [[finalize_run]] is fixed:
+The second run afterwards checks that a loud run does not disturb the
+records around it; both records are read from the whole log, since
+each run is a header and a trailer commit
+(\cref{sec:two-commit-protocol}):
 
 <<test functions>>=
 LARGE_IO_BYTES = 300_000
@@ -967,7 +1336,7 @@ def test_run_after_large_run_keeps_both(workdir):
         end_time=datetime.datetime(2026, 1, 1, 10, 1, 1),
         exit_code=0,
     )
-    msg = repo.git("log", "-1", "--format=%B").stdout
+    msg = repo.git("log", "--format=%B").stdout
     assert msg.count("x") >= LARGE_IO_BYTES
     assert "Arguments: again" in msg
     assert "stdout: second" in msg
@@ -976,8 +1345,12 @@ def test_run_after_large_run_keeps_both(workdir):
 
 \section{Formatting the run trailer}
 
-The trailer is appended by [[finalize_run]] and contains the end time,
-exit code, I/O log, and exception information.
+The trailer contains the end time, exit code, I/O log, and exception
+information.
+Its text is unchanged from when it was appended to the header inside
+one commit message: a reader that joins the two commits produces
+exactly the block format that older repositories already contain
+(\cref{commits}), so nothing downstream had to learn a second layout.
 
 <<functions>>=
 def format_run_trailer(io_log, exception_info,
@@ -1026,18 +1399,78 @@ def test_format_run_trailer_with_exception():
 @
 
 
+\subsection{The trailer commit message}
+
+The trailer commit needs a subject line of its own, because Git shows
+subjects everywhere ([[git log --oneline]], [[git shortlog]]) and
+\enquote{End-Time: \ldots} would read as noise.
+We reuse the header's shape with a [[Run-End:]] keyword, so a subject
+still says which command the commit is about, and a reader can tell the
+two kinds of commit apart by the keyword alone---the same test that
+decides which commits are learnlog's own (\cref{sec:filter-learnlog})
+can decide which are trailers.
+
+The run id comes first in the body so that the join key sits at a fixed
+place, and the trailer text follows verbatim: dropping the subject and
+the [[Run-Id:]] line is all a reader needs to do to recover it.
+
+<<functions>>=
+def format_trailer_commit(script, args, run_id, trailer):
+    """Format the commit message for a run's trailer.
+
+    ``script`` and ``args`` repeat the command from the header so
+    the commit subject is meaningful on its own; ``run_id``
+    identifies the run this trailer completes.
+    """
+    args_str = " ".join(args) if args else "(none)"
+    return "\n".join([
+        f"{TRAILER_PREFIX}{script or '(unknown)'} {args_str}",
+        "",
+        f"{RUN_ID_FIELD} {run_id}",
+        trailer,
+    ])
+<<constants>>=
+TRAILER_PREFIX = "Run-End: "
+@
+
+Let's verify that the message carries the join key and that its subject
+identifies the command:
+
+<<test functions>>=
+def test_format_trailer_commit():
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trailer = format_run_trailer("", None, end, 0)
+    message = format_trailer_commit(
+        "hello.py", ["arg1"], "abc123", trailer,
+    )
+    assert message.startswith("Run-End: hello.py arg1")
+    assert "Run-Id: abc123" in message
+    assert message.endswith(trailer)
+
+def test_format_trailer_commit_without_begin_run():
+    """A trailer with no recorded command still has a subject."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trailer = format_run_trailer("", None, end, 0)
+    message = format_trailer_commit(
+        None, [], "abc123", trailer,
+    )
+    assert message.startswith("Run-End: (unknown) (none)")
+@
+
+
 \section{Full lifecycle test}
 
-To verify the complete workflow, we simulate two runs: one where the
-student has not changed anything (amends), and one after an edit (new
-commit):
+To verify the complete workflow, we simulate two runs: one on unchanged
+code and one after an edit.
+Both produce a header and a trailer commit, and only the second changes
+the tree:
 
 <<test functions>>=
 def test_full_lifecycle(workdir):
     """Simulate two runs: one with changes, one without."""
     repo = LearnlogRepo(workdir)
 
-    # First run (amends initial commit since no change)
+    # First run, on the code as initially committed.
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
     repo.finalize_run(
@@ -1050,7 +1483,7 @@ def test_full_lifecycle(workdir):
     # Edit file
     (workdir / "hello.py").write_text('print("v2")\n')
 
-    # Second run (new commit since file changed)
+    # Second run, on the edited code.
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t2)
     repo.finalize_run(
@@ -1060,7 +1493,17 @@ def test_full_lifecycle(workdir):
         exit_code=0,
     )
 
-    result = repo.git("log", "--oneline")
-    lines = result.stdout.strip().split("\n")
-    assert len(lines) == 2  # initial+run1, run2
+    subjects = repo.git(
+        "log", "--reverse", "--format=%s"
+    ).stdout.strip().split("\n")
+    assert subjects == [
+        "learnlog: initial commit",
+        "Run: hello.py (none)",
+        "Run-End: hello.py (none)",
+        "Run: hello.py (none)",
+        "Run-End: hello.py (none)",
+    ]
+    assert repo.git(
+        "show", "HEAD:hello.py"
+    ).stdout == 'print("v2")\n'
 @
