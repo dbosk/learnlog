@@ -95,6 +95,7 @@ from learnlog.commits import (
     BLOCK_SEP,
 )
 from learnlog.gitrepo import (
+    GIT_TREE_TIMEOUT,
     LearnlogRepo,
     format_run_header,
     format_run_trailer,
@@ -1701,7 +1702,7 @@ for index, group in enumerate(commit_groups):
         repo.workdir,
         dataset["code_states"].get(group["code_state_id"], {}),
     )
-    repo.git("add", ".")
+    repo.git("add", ".", timeout=GIT_TREE_TIMEOUT)
 
     message = build_reconstructed_commit_message(
         group, dataset["resources"]
@@ -1715,17 +1716,26 @@ The first group replaces the placeholder initial commit that
 [[LearnlogRepo]] created during setup.  Later groups become
 ordinary commits.
 
+A reconstructed message contains the same captured I/O as the message
+it was exported from, so it is subject to the same argument-size limit
+(\cref{sec:commit-message-stdin}) and travels the same way: on standard
+input.
+Without that, importing a dataset would silently drop exactly the runs
+that were interesting enough to produce a lot of output.
+
 <<write reconstructed commit>>=
 if index == 0:
     repo.git(
         "commit", "--amend", "--allow-empty",
         "--reset-author",
-        "-m", message,
+        "--file=-", input=message,
+        timeout=GIT_TREE_TIMEOUT,
     )
 else:
     repo.git(
         "commit", "--allow-empty",
-        "-m", message,
+        "--file=-", input=message,
+        timeout=GIT_TREE_TIMEOUT,
     )
 @
 
@@ -2114,11 +2124,53 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
 
         status = reconstructed.git("show", "HEAD:main.py")
         assert status.returncode == 0
-        missing = reconstructed.git("show", "HEAD:hello.py")
+        missing = reconstructed.git(
+            "show", "HEAD:hello.py", check=False
+        )
         assert missing.returncode != 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+@
 
+The reconstruction rebuilds a message from the exported I/O, so a run
+that was too loud for [[argv]] on the way out is equally too loud on the
+way back in.
+This round-trip keeps the same 300\,KB the exporter had to carry:
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_large_io(workdir):
+    import shutil
+    from learnlog.commits import get_commits
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    repo.finalize_run(
+        io_log="stdout: " + "z" * 300_000 + "\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+
+    output = workdir / "large.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        rebuilt = get_commits(reconstructed)
+        message = reconstructed.git(
+            "log", "-1", "--format=%B", rebuilt[0]["hash"],
+        ).stdout
+        assert message.count("z") >= 300_000
+        assert "Exit-Code: 0" in message
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+<<progsnap2 test functions>>=
 def test_build_reconstructed_run_block_without_end_time():
     from learnlog.progsnap2 import build_reconstructed_run_block
 

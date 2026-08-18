@@ -101,7 +101,7 @@ import pytorial
 import typer
 
 from learnlog import find_learnlog_dir
-from learnlog.gitrepo import LearnlogRepo
+from learnlog.gitrepo import GIT_TREE_TIMEOUT, LearnlogRepo
 from learnlog.commits import (
     get_commits,
     parse_run_summary,
@@ -393,6 +393,11 @@ the whole log every time and let the student pick a lecture with
 DEFAULT_BUNDLE_NAME = "learnlog.learnlog"
 @
 
+Bundling writes out every object in the history, so it gets the
+tree-sized timeout rather than the default one, and it turns off
+[[check]] so that a failure reaches the user as the message below
+rather than as a [[GitError]] traceback.
+
 <<export functions>>=
 def do_export(repo, output):
     """Export the learnlog repository as a Git bundle.
@@ -401,7 +406,8 @@ def do_export(repo, output):
     commit history.
     """
     result = repo.git(
-        "bundle", "create", str(output), "--all"
+        "bundle", "create", str(output), "--all",
+        check=False, timeout=GIT_TREE_TIMEOUT,
     )
     if result.returncode != 0:
         raise SystemExit(
@@ -2547,6 +2553,10 @@ If [[origin]] already exists we update its URL with
 [[git remote add]].
 We detect the current state by checking the exit code of
 [[git remote get-url]], which fails when the remote does not exist.
+That probe is a question, not a command, so it runs with
+[[check=False]]; the [[set-url]]/[[add]] that follows does too, because
+a bad URL should reach the user as the message below rather than as a
+traceback.
 
 <<typer commands>>=
 @app.command(name="set-remote")
@@ -2569,14 +2579,17 @@ def set_remote(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    check = repo.git("remote", "get-url", "origin")
-    if check.returncode == 0:
+    existing = repo.git(
+        "remote", "get-url", "origin", check=False
+    )
+    if existing.returncode == 0:
         result = repo.git(
-            "remote", "set-url", "origin", url
+            "remote", "set-url", "origin", url,
+            check=False,
         )
     else:
         result = repo.git(
-            "remote", "add", "origin", url
+            "remote", "add", "origin", url, check=False,
         )
 
     if result.returncode != 0:
@@ -3412,13 +3425,15 @@ def test_play_all_shows_learnlog_runs(workdir):
 We resolve the starting ref through [[git rev-parse]], which
 handles tag names, branch names, and abbreviated hashes
 uniformly.
+Failure here is the ordinary case for an abbreviated hash, not an
+error, so the call opts out of [[check]].
 If [[rev-parse]] fails (for example, a typo), we fall back
 to prefix matching on the commit list---this covers the
 case where a short hash is ambiguous in Git but unique among
 the commits we have.
 
 <<find starting commit index>>=
-resolved = repo.git("rev-parse", start)
+resolved = repo.git("rev-parse", start, check=False)
 if resolved.returncode == 0:
     full_hash = resolved.stdout.strip()
     for i, c in enumerate(commits):

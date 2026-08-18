@@ -45,6 +45,7 @@ from learnlog.capture import *
 
 
 \section{The shared I/O log}
+\label{sec:iolog-cap}
 
 The central piece is [[IOLog]]---a thread-safe buffer that collects
 lines from all three streams in the order they arrive.
@@ -56,6 +57,19 @@ prevent a long-running program from consuming unbounded memory.
 Once the cap is reached, we stop recording but continue passing data
 through to the original streams---the student's program still works
 normally.
+
+The cap bounds memory, and nothing else.
+It is worth saying so explicitly, because for a while it also had to
+absorb a limit it was never designed for: the captured log ends up in a
+commit message, and while messages travelled in [[argv]] anything past
+128\,KiB destroyed the whole trailer
+(\cref{sec:commit-message-stdin}).
+Shrinking the cap below that would have hidden the symptom by throwing
+away student output instead---a poor trade for a log whose purpose is to
+keep that output.
+Now that message text reaches Git on standard input, the only question
+the cap has to answer is how much of a runaway program's output we are
+willing to hold in memory, and one megabyte remains a reasonable answer.
 
 <<constants>>=
 MAX_IOLOG_BYTES = 1_000_000

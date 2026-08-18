@@ -22,10 +22,12 @@ work tree.
 """
 
 import subprocess
+import sys
 import os
 import pathlib
 import datetime
 
+<<constants>>
 <<classes>>
 <<functions>>
 @
@@ -34,6 +36,7 @@ import datetime
 """Tests for the Git repository management module."""
 import tempfile
 import os
+import sys
 import pathlib
 import subprocess
 import datetime
@@ -94,7 +97,7 @@ class LearnlogRepo:
 
     def __init__(self, workdir):
         self.workdir = pathlib.Path(workdir)
-        self.git_dir = self.workdir / ".learnlog"
+        self.git_dir = self.workdir / GIT_DIR_NAME
         self.env = {
             **os.environ,
             "GIT_DIR": str(self.git_dir),
@@ -106,6 +109,17 @@ class LearnlogRepo:
     <<repo methods>>
 @
 
+The directory name appears in three places that must agree: the path we
+hand to Git, the exclude pattern that keeps the log out of its own
+history (\cref{sec:init-repo}), and the diagnostics file we write inside
+it (\cref{sec:diagnostics}).
+A constant makes that agreement checkable instead of a coincidence of
+three string literals.
+
+<<constants>>=
+GIT_DIR_NAME = ".learnlog"
+@
+
 
 \section{Running Git commands}
 
@@ -113,37 +127,380 @@ Every Git command needs the same environment variables and working
 directory.
 The [[git]] method wraps this boilerplate and returns the
 [[CompletedProcess]] object for callers that need to inspect the result.
-We set a 10-second timeout to prevent hangs from blocking the student's
-program.
+
+Beyond that boilerplate, three decisions in this one method determine
+whether a run is recorded at all: what happens when Git fails, how long
+we are willing to wait for it, and how the commit message reaches Git.
+Each of them has cost us runs, so we take them in turn before assembling
+the method.
+
+\subsection{Failure is an exception, not a return code}
+
+The wrapper used to hand every [[CompletedProcess]] back unexamined,
+which made \enquote{Git refused} indistinguishable from \enquote{Git
+succeeded} unless the caller remembered to look.
+Almost none did.
+Since the calls that matter most---[[add]], [[commit]]---are the ones
+whose result nobody inspected, a failing Git simply erased the run:
+[[.learnlog/index.lock]] held by a concurrent run, a scrubbed [[PATH]]
+under [[env -i]], a full disk.
+Nothing was written and nothing was said.
+
+Raising is the right default because the failure modes are not local to
+one call site: whoever ends up handling the exception can report it
+(\cref{sec:diagnostics}), whereas an ignored return code cannot be
+recovered further up.
+Callers that genuinely want the return code---[[git diff]] with
+[[--cached --quiet]], where the exit status \emph{is} the answer to
+\enquote{did anything change?}---opt out with [[check=False]] and get
+the old behaviour.
+
+The opt-out covers only the exit status.
+A missing [[git]] binary or an expired timeout still raises even under
+[[check=False]], because there is no exit status to interpret in those
+cases: treating them as \enquote{Git said no} would let
+[[check=False]] callers read [[returncode]] off a process that never
+ran.
+
+<<classes>>=
+class GitError(RuntimeError):
+    """A Git command run by learnlog failed.
+
+    Carries the command, its exit code (``None`` when Git could not
+    be run at all) and whatever Git wrote to standard error, so the
+    diagnostics path can report something actionable.
+    """
+
+    def __init__(self, args, returncode, stderr):
+        self.command = ("git",) + tuple(args)
+        self.returncode = returncode
+        self.stderr = (stderr or "").strip()
+        <<build the [[GitError]] message>>
+        super().__init__(message)
+@
+
+We name the attribute [[command]] rather than [[args]] because
+[[BaseException.args]] already means something else---the constructor
+arguments---and [[super().__init__]] would overwrite ours.
+
+The rendered command is truncated.
+Arguments are supposed to be short now that message text goes on
+standard input, but this string is appended to a file on disk
+(\cref{sec:diagnostics}), and a diagnostics channel that can be made to
+write a megabyte per failure is a new problem rather than a fix for the
+old one.
+The head of the command is what identifies it, so that is what we keep.
+
+<<constants>>=
+MAX_REPORTED_COMMAND_CHARS = 200
+<<build the [[GitError]] message>>=
+status = (
+    "could not be run"
+    if returncode is None
+    else f"exited with status {returncode}"
+)
+detail = f": {self.stderr}" if self.stderr else ""
+command = " ".join(self.command)
+if len(command) > MAX_REPORTED_COMMAND_CHARS:
+    command = command[:MAX_REPORTED_COMMAND_CHARS] + "..."
+message = f"{command} {status}{detail}"
+@
+
+\subsection{How long we are willing to wait}
+
+The original 10-second timeout was chosen to bound how long learnlog
+may stall a student's program.
+It also, unintentionally, bounded how much work Git was allowed to do:
+[[git add .]] and [[git commit]] hash the entire work tree, so a
+project with a data directory, a build tree, or a virtual environment
+that the exclude patterns do not cover can exceed ten seconds on the
+first run---and the penalty for exceeding it was not a slow run but a
+lost one.
+
+So we separate the two concerns the single timeout was conflating.
+Commands that read a ref or a single commit finish in milliseconds; a
+minute for them means Git is stuck, not busy.
+Commands that walk the whole tree get a budget large enough that only a
+genuinely wedged Git (a hung credential helper, an unresponsive network
+filesystem) hits it.
+Losing a run is worse than delaying one, so both budgets err on the
+generous side.
+
+<<constants>>=
+GIT_TIMEOUT = 60
+GIT_TREE_TIMEOUT = 600
+@
+
+\subsection{Message text travels on standard input}
+\label{sec:commit-message-stdin}
+
+Linux caps the length of a \emph{single} [[argv]] string at
+[[MAX_ARG_STRLEN]], 128\,KiB---a per-string limit, separate from the
+much larger limit on the total size of the argument vector, and one
+that [[ulimit]] cannot raise.
+A commit message is exactly the kind of argument that grows without
+bound: the trailer carries the program's whole captured I/O, up to
+[[MAX_IOLOG_BYTES]] (\cref{sec:iolog-cap}), which is an order of
+magnitude past the cap.
+Passing it as [[git commit -m <message>]] therefore made
+[[subprocess]] fail with [[OSError: Argument list too long]] before Git
+was even started, and a program printing more than about 128\,KB lost
+its entire trailer---exit code, I/O and exception alike.
+
+Standard input has no such limit, so [[git commit --file=-]] takes the
+message the same way an editor session would.
+The two forms are otherwise equivalent: with neither an editor nor an
+explicit [[--cleanup]], Git applies the [[whitespace]] cleanup mode in
+both cases, so messages are stored exactly as before.
+
+The rule this leaves us with is simple enough to apply without thinking
+about lengths at each call site: \emph{message content never travels in
+[[argv]]}.
+Every commit in this program passes its message through [[input]].
+
+\subsection{The wrapper}
 
 <<repo methods>>=
-def git(self, *args):
+def git(self, *args, check=True, timeout=GIT_TIMEOUT,
+        input=None):
     """Run a Git command with the learnlog environment.
 
-    Returns the ``CompletedProcess`` object.  Raises no exception
-    on non-zero exit codes---callers check ``returncode`` themselves.
+    Returns the ``CompletedProcess``.  Raises ``GitError`` when Git
+    cannot be run at all (missing binary, timeout) and, unless
+    ``check`` is false, when Git exits non-zero.  Text passed as
+    ``input`` reaches Git on standard input; commit messages travel
+    that way to escape the operating system's argument-size limit.
     """
-    return subprocess.run(
+    <<run Git, turning process failures into [[GitError]]>>
+    if check and result.returncode != 0:
+        raise GitError(args, result.returncode, result.stderr)
+    return result
+@
+
+[[subprocess]] reports \enquote{Git could not be run} in two unrelated
+exception hierarchies---[[OSError]] for a missing binary or an
+oversized argument list, [[SubprocessError]] for a timeout---so we
+catch both and re-raise them as the one type callers have to know
+about.
+
+<<run Git, turning process failures into [[GitError]]>>=
+try:
+    result = subprocess.run(
         ["git"] + list(args),
         cwd=str(self.workdir),
         env=self.env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
+        input=input,
     )
+except (OSError, subprocess.SubprocessError) as error:
+    raise GitError(args, None, str(error)) from error
 @
 
-Let's verify the helper runs Git commands in the right context:
+Let's verify the helper runs Git commands in the right context, and
+that each of the three decisions above holds:
 
 <<test functions>>=
 def test_git_runs_command(workdir):
     repo = LearnlogRepo(workdir)
     result = repo.git("status")
     assert result.returncode == 0
+
+def test_git_raises_on_failure(workdir):
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError):
+        repo.git("rev-parse", "--verify", "no/such/ref")
+
+def test_git_error_reports_command_and_stderr(workdir):
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError) as caught:
+        repo.git("cat-file", "-p", "0" * 40)
+    assert caught.value.returncode != 0
+    assert "cat-file" in str(caught.value)
+    assert caught.value.stderr
+
+def test_git_error_truncates_long_command(workdir):
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError) as caught:
+        repo.git("cat-file", "-p", "q" * 5_000)
+    head = str(caught.value).split(" exited with")[0]
+    assert len(head) == MAX_REPORTED_COMMAND_CHARS + 3
+
+def test_git_check_false_returns_failed_result(workdir):
+    repo = LearnlogRepo(workdir)
+    result = repo.git(
+        "rev-parse", "--verify", "no/such/ref", check=False
+    )
+    assert result.returncode != 0
+
+def test_git_missing_binary_raises_even_unchecked(workdir):
+    """A scrubbed PATH is not a return code to ignore."""
+    repo = LearnlogRepo(workdir)
+    repo.env["PATH"] = str(workdir / "empty")
+    with pytest.raises(GitError) as caught:
+        repo.git("status", check=False)
+    assert caught.value.returncode is None
+
+def test_git_input_reaches_git(workdir):
+    repo = LearnlogRepo(workdir)
+    result = repo.git(
+        "hash-object", "-w", "-t", "blob", "--stdin",
+        input="payload\n",
+    )
+    blob = result.stdout.strip()
+    assert repo.git("cat-file", "-p", blob).stdout \
+        == "payload\n"
+@
+
+
+\section{Reporting failures where a human can find them}
+\label{sec:diagnostics}
+
+Raising [[GitError]] only moves the problem: the callers in
+[[__init__.py]] must keep swallowing everything, because transparency
+means a student's program may not crash, and may not acquire extra
+output, just because learnlog had a bad day.
+What transparency does \emph{not} require is that the failure leave no
+trace at all.
+Today a dropped run and a clean run look identical from every angle---to
+the student, to the teacher reading the log, and to us reading a bug
+report---and that is what makes these failures so expensive to diagnose.
+
+So the exception handlers keep swallowing, and [[report_error]] gives
+the evidence somewhere to land.
+Two channels, because two different people need it at two different
+times.
+[[.learnlog/errors.log]] is written unconditionally and read later: it
+is the record that explains a gap in a student's history weeks after the
+fact, and it costs the running program one append.
+[[LEARNLOG_DEBUG]] additionally mirrors each entry to standard error,
+for whoever is debugging learnlog \emph{now} and should not have to know
+that the file exists.
+
+<<constants>>=
+ERRORS_LOG_NAME = "errors.log"
+DEBUG_ENV_VAR = "LEARNLOG_DEBUG"
+<<functions>>=
+def report_error(context, error, workdir=None):
+    """Record a learnlog failure without disturbing the program.
+
+    Appends a timestamped entry to ``.learnlog/errors.log`` under
+    ``workdir`` (the current directory by default) and, when
+    ``LEARNLOG_DEBUG`` is set in the environment, mirrors it to the
+    real standard error.  Never raises.
+    """
+    timestamp = datetime.datetime.now().isoformat()
+    entry = (
+        f"{timestamp} {context}: "
+        f"{type(error).__name__}: {error}"
+    )
+    <<mirror the entry to stderr when debugging>>
+    <<append the entry to the errors log>>
+@
+
+The mirror writes to [[sys.__stderr__]], not [[sys.stderr]]: by the time
+anything can fail, learnlog has usually replaced [[sys.stderr]] with its
+own capturing wrapper, and a diagnostic sent through that wrapper would
+be recorded in the commit as though the student's program had printed
+it.
+[[sys.__stderr__]] is [[None]] in interpreters started without a console
+(pythonw, some embedded hosts), so we fall back to whatever
+[[sys.stderr]] currently is.
+
+<<mirror the entry to stderr when debugging>>=
+if os.environ.get(DEBUG_ENV_VAR):
+    stream = sys.__stderr__ or sys.stderr
+    try:
+        print(f"learnlog: {entry}", file=stream)
+    except Exception:
+        pass
+@
+
+We append only to a [[.learnlog/]] that already exists.
+The alternative---creating it---would mean that a learnlog failure in a
+directory that is not a learnlog project silently starts one, which is
+precisely the surprise the diagnostics are supposed to prevent.
+
+Writing the log \emph{inside} the Git directory is what keeps it out of
+the history it describes: [[.learnlog]] is the first exclude pattern
+(\cref{sec:init-repo}), so [[git add .]] never stages anything under it.
+Git's built-in protection does not apply here---that rule is hard-coded
+for a directory literally named [[.git]]---which is why the exclude
+pattern and this path are derived from the same constant.
+
+Finally, every failure inside [[report_error]] is itself swallowed---
+including the path handling, not just the write.
+This is the one place where that matters more than it looks: the only
+callers are [[except]] blocks whose whole purpose is to stop an
+exception from reaching the student's program, so an exception escaping
+from here would do precisely the damage those handlers exist to
+prevent.
+A read-only checkout, a full disk, or a nonsensical [[workdir]] must not
+turn a reported failure into an unreported crash.
+
+<<append the entry to the errors log>>=
+try:
+    git_dir = (
+        pathlib.Path(workdir or os.getcwd()) / GIT_DIR_NAME
+    )
+    if not git_dir.is_dir():
+        return
+    with open(
+        git_dir / ERRORS_LOG_NAME, "a", encoding="utf-8"
+    ) as log:
+        log.write(entry + "\n")
+except Exception:
+    pass
+@
+
+Let's verify both channels, and the exclusion that keeps the log out of
+the history:
+
+<<test functions>>=
+def test_report_error_appends_to_log(workdir):
+    repo = LearnlogRepo(workdir)
+    report_error("begin_run", ValueError("boom"), workdir)
+    log = (workdir / ".learnlog" / "errors.log").read_text()
+    assert "begin_run" in log
+    assert "ValueError: boom" in log
+
+def test_report_error_without_repo_is_silent(tmp_path):
+    report_error("begin_run", ValueError("boom"), tmp_path)
+    assert not (tmp_path / ".learnlog").exists()
+
+def test_report_error_never_raises(tmp_path):
+    """An unusable target must not become a second failure."""
+    report_error("begin_run", ValueError("boom"), "\0bad")
+
+def test_report_error_debug_writes_stderr(
+    workdir, monkeypatch, capsys
+):
+    LearnlogRepo(workdir)
+    monkeypatch.setenv("LEARNLOG_DEBUG", "1")
+    monkeypatch.setattr(sys, "__stderr__", sys.stderr)
+    report_error("on_exit", ValueError("boom"), workdir)
+    assert "ValueError: boom" in capsys.readouterr().err
+
+def test_report_error_quiet_without_debug(
+    workdir, monkeypatch, capsys
+):
+    LearnlogRepo(workdir)
+    monkeypatch.delenv("LEARNLOG_DEBUG", raising=False)
+    monkeypatch.setattr(sys, "__stderr__", sys.stderr)
+    report_error("on_exit", ValueError("boom"), workdir)
+    assert capsys.readouterr().err == ""
+
+def test_errors_log_is_never_staged(workdir):
+    repo = LearnlogRepo(workdir)
+    report_error("begin_run", ValueError("boom"), workdir)
+    repo.git("add", ".")
+    assert "errors.log" not in repo.git("ls-files").stdout
 @
 
 
 \section{Repository initialisation}
+\label{sec:init-repo}
 
 On the very first run, we need to create the Git repository, configure
 a committer identity, set up exclusion patterns, and make an initial
@@ -177,10 +534,15 @@ This handles lab machines where students have never run
 [[git config]].
 We also disable GPG signing---these machine-generated commits do not
 need cryptographic signatures, and students may not have a GPG key
-configured:
+configured.
+
+The probe is one of the few places where a non-zero exit is the answer
+rather than a problem: [[git config user.name]] exits~1 precisely when
+the setting we are asking about is absent.
+It therefore runs with [[check=False]].
 
 <<set fallback identity if needed>>=
-name_check = self.git("config", "user.name")
+name_check = self.git("config", "user.name", check=False)
 if name_check.returncode != 0:
     self.git("config", "user.name", "learnlog")
     self.git("config", "user.email", "learnlog@localhost")
@@ -195,12 +557,21 @@ If the student has a [[.learnlogignore]] file, we append its
 patterns too---this is the only configuration hook, and it is empty by
 default.
 
+The first pattern carries more weight than it looks: it is the only
+thing standing between the Git directory and its own history.
+Git ignores a directory named [[.git]] by rule, but [[.learnlog]] is an
+ordinary directory to [[git add]], so anything we write inside it---the
+diagnostics log of \cref{sec:diagnostics}, a lock file, a session
+transcript---is excluded by this line and by nothing else.
+Naming it from [[GIT_DIR_NAME]] keeps the pattern and the path
+inseparable.
+
 <<set up exclude patterns>>=
 exclude_dir = self.git_dir / "info"
 exclude_dir.mkdir(parents=True, exist_ok=True)
 exclude_file = exclude_dir / "exclude"
 patterns = [
-    ".learnlog",
+    GIT_DIR_NAME,
     "__pycache__",
     "*.pyc",
     ".venv",
@@ -217,13 +588,26 @@ exclude_file.write_text(
 )
 @
 
+The initial commit stages everything the student already has, which
+makes it the largest single staging operation learnlog ever performs---a
+term's worth of files on the first run in an existing directory.
+Both halves therefore take the tree budget rather than the default one
+(\cref{sec:commit-message-stdin}).
+
+This message is a constant and would fit in [[argv]], but it still goes
+in on standard input.
+The rule \enquote{no message content in [[argv]]} is only useful if it
+holds without exception: an occurrence of [[-m]] then means a bug, and
+one [[grep]] settles it.
+
 <<initial commit>>=
-self.git("add", ".")
+self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
 self.git(
     "commit",
     "--allow-empty",
-    "-m",
-    "learnlog: initial commit",
+    "--file=-",
+    input="learnlog: initial commit",
+    timeout=GIT_TREE_TIMEOUT,
 )
 @
 
@@ -287,6 +671,12 @@ When files \emph{have} changed, we create a fresh commit.
 The diff in that commit shows exactly what the student modified between
 runs.
 
+The change detection is the second and last place in this module where
+a non-zero exit is data rather than trouble.
+[[git diff --cached --quiet]] answers \enquote{is the index different
+from [[HEAD]]?} with its exit status, so it runs with [[check=False]]
+while everything around it does not.
+
 <<repo methods>>=
 def begin_run(self, script, args, start_time):
     """Record the start of a program run.
@@ -299,12 +689,17 @@ def begin_run(self, script, args, start_time):
     """
     header = format_run_header(script, args, start_time)
 
-    self.git("add", ".")
-    diff = self.git("diff", "--cached", "--quiet")
+    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    diff = self.git(
+        "diff", "--cached", "--quiet", check=False
+    )
     has_changes = diff.returncode != 0
 
     if has_changes:
-        self.git("commit", "-m", header)
+        self.git(
+            "commit", "--file=-", input=header,
+            timeout=GIT_TREE_TIMEOUT,
+        )
     else:
         <<amend previous commit with new run block>>
 
@@ -316,6 +711,12 @@ append the new run header.
 On the very first run (the initial commit), this produces a commit
 message with both the initial-commit line and the run header.
 
+Note that [[combined]] inherits the length of every run already stored
+in this commit, so it crosses the argument-size limit sooner than a
+first commit does---the amend path is why one loud program can take the
+runs that follow it down with it.
+On standard input the accumulated message is simply a longer message.
+
 <<amend previous commit with new run block>>=
 existing = self.git(
     "log", "-1", "--format=%B"
@@ -323,7 +724,8 @@ existing = self.git(
 combined = existing + "\n\n---\n\n" + header
 self.git(
     "commit", "--amend", "--allow-empty",
-    "-m", combined,
+    "--file=-", input=combined,
+    timeout=GIT_TREE_TIMEOUT,
 )
 @
 
@@ -433,6 +835,13 @@ The commit still exists with the run header from [[begin_run]], so we
 know a run was attempted---the missing [[End-Time]] field signals
 an abnormal termination.
 
+That signal is only trustworthy if the \emph{other} ways of losing a
+trailer are gone, which is what makes this method the one that most
+needed \cref{sec:commit-message-stdin}: it is where the captured I/O
+enters the message, so it was the method that failed on
+[[MAX_ARG_STRLEN]], and it failed by producing exactly the record a
+[[SIGKILL]] leaves behind.
+
 <<repo methods>>=
 def finalize_run(self, io_log, exception_info,
                  end_time, exit_code):
@@ -450,10 +859,11 @@ def finalize_run(self, io_log, exception_info,
     )
     combined = existing + "\n" + trailer
 
-    self.git("add", ".")
+    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
     self.git(
         "commit", "--amend", "--allow-empty",
-        "-m", combined,
+        "--file=-", input=combined,
+        timeout=GIT_TREE_TIMEOUT,
     )
 @
 
@@ -506,6 +916,61 @@ def test_finalize_no_io(workdir):
     )
     msg = repo.git("log", "-1", "--format=%B").stdout
     assert "(no I/O)" in msg
+@
+
+The regression test for the argument-size limit uses 300\,KB of I/O:
+comfortably past the 128\,KiB cap, and comfortably under
+[[MAX_IOLOG_BYTES]], so it is a size a real program can reach.
+The second run afterwards is not incidental---it is the amend path
+carrying the first run's 300\,KB forward, which is the site that fails
+next once [[finalize_run]] is fixed:
+
+<<test functions>>=
+LARGE_IO_BYTES = 300_000
+
+def test_finalize_survives_io_beyond_argv_limit(workdir):
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    io_log = "x" * LARGE_IO_BYTES + "\nstdout: TAIL\n"
+    repo.finalize_run(
+        io_log=io_log,
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=7,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert "End-Time: 2026-01-01T10:00:05" in msg
+    assert "Exit-Code: 7" in msg
+    assert "stdout: TAIL" in msg
+    assert msg.count("x") >= LARGE_IO_BYTES
+
+def test_run_after_large_run_keeps_both(workdir):
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    repo.finalize_run(
+        io_log="x" * LARGE_IO_BYTES,
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+    repo.begin_run(
+        "hello.py", ["again"],
+        datetime.datetime(2026, 1, 1, 10, 1),
+    )
+    repo.finalize_run(
+        io_log="stdout: second\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 1, 1),
+        exit_code=0,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert msg.count("x") >= LARGE_IO_BYTES
+    assert "Arguments: again" in msg
+    assert "stdout: second" in msg
 @
 
 

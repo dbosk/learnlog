@@ -61,7 +61,7 @@ Five modules, all defined as `.nw` literate source in `src/learnlog/`:
 | `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup |
 | `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the venv's project root (marker file + `sys.prefix`) for `initialize()`, and imports `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs. Must never import `learnlog` at module scope: `import learnlog._autostart` already runs `__init__.py`, so the activation veto (`LEARNLOG_SKIP_AUTOSTART`, `learnlog init`) lives in `initialize()`, not here |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
-| `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; crash-resilient commit strategy (commit header before run, amend with results after) |
+| `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; crash-resilient commit strategy (commit header before run, amend with results after); `git()` raises `GitError` on failure and `report_error()` records swallowed failures |
 | `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), and `analyse` |
 
 Tutorial sources in `src/learnlog/tutorials/`:
@@ -76,6 +76,12 @@ Tutorial sources in `src/learnlog/tutorials/`:
 - **Crash resilience**: `begin_run()` commits before execution, `finalize_run()` amends after
 - `.learnlog/` in the working directory is the *product's* data (student log repo), not project config
 - Git operations use `subprocess.run` (no GitPython dependency)
+- `LearnlogRepo.git()` raises `GitError` by default; pass `check=False` only
+  where the exit status is the answer (`git diff --cached --quiet`, probes)
+- Commit messages always go in via `--file=-` and `input=`, never `-m`
+  (Linux caps a single `argv` string at 128 KiB)
+- Failures learnlog must swallow are appended to `.learnlog/errors.log` and,
+  with `LEARNLOG_DEBUG` set, mirrored to stderr — never `except: pass`
 - Runtime dependencies: `typer>=0.9.0` (CLI), `virtualenv>=20` (used by
   `learnlog init` to create project venvs reliably on PEP 668 / split-
   `python3-venv` systems), and `pytorial>=0.2` (embedded interactive
