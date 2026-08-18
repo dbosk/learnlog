@@ -1217,7 +1217,7 @@ def run_without_git(self, workdir, env):
     )
     env = dict(env, PATH=str(workdir / "no-such-bin"))
     return subprocess.run(
-        [sys.executable, str(script)],
+        [sys.executable, "-S", str(script)],
         cwd=str(workdir), env=env,
         capture_output=True, text=True, timeout=30,
     )
