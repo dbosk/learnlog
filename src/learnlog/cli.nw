@@ -104,8 +104,11 @@ from learnlog import find_learnlog_dir
 from learnlog.gitrepo import LearnlogRepo
 from learnlog.commits import (
     get_commits,
+    get_run_trailers,
+    merge_run_trailers,
     parse_run_summary,
     filter_learnlog_runs,
+    resolve_record_commit,
     commit_outcomes,
 )
 from learnlog.progsnap2 import (
@@ -2119,6 +2122,7 @@ def list_commits(
             raise SystemExit("No commits found.")
 
         filter_lr = not show_all
+        trailers = get_run_trailers(repo)
         <<build wanted outcome set>>
         for commit in commits:
             <<get and summarise commit>>
@@ -2141,17 +2145,25 @@ if failure:
     wanted.add("failure")
 @
 
-For each commit we fetch the full message body, optionally
+For each commit we fetch the full message body, merge in the
+trailers of the runs it records (\cref{sec:run-join}), optionally
 filter out learnlog's own runs using [[filter_learnlog_runs]],
 drop commits that do not match the outcome filter, and then
 extract the summary with [[parse_run_summary]].
 Commits whose runs are all filtered out (or that have no run
 blocks, like the initial commit) are silently skipped.
 
+Merging matters here beyond cosmetics: the outcome filters read the
+exit code, which lives in the trailer.
+Without the merge, [[--success]] and [[--failure]] would match
+nothing at all, since every commit would look like an interrupted
+run.
+
 <<get and summarise commit>>=
 body = repo.git(
     "log", "-1", "--format=%B", commit["hash"],
 ).stdout.rstrip("\n")
+body = merge_run_trailers(body, trailers)
 if filter_lr:
     body = filter_learnlog_runs(body)
 <<skip commits that do not match the outcome filter>>
@@ -2213,8 +2225,8 @@ def test_list_command_via_from_option(workdir):
     assert result.exit_code == 0
     assert "hello.py arg1" in result.output
 
-def test_list_command_multiple_runs(workdir):
-    """Multiple runs in one commit show run count."""
+def test_list_command_lists_each_run(workdir):
+    """Each run is a line of its own."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -2222,6 +2234,37 @@ def test_list_command_multiple_runs(workdir):
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("hello.py", [], t2)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "2026-01-01 10:00 hello.py" in result.output
+    assert "2026-01-01 10:05 hello.py" in result.output
+
+def test_list_command_counts_runs_in_one_commit(workdir):
+    """A commit holding several runs shows the run count.
+
+    Logs recorded before the two-commit protocol grouped
+    consecutive runs of unchanged code into one commit, and
+    ProgSnap2 reconstruction still builds such commits.
+    """
+    from learnlog.cli import app
+    from learnlog.commits import BLOCK_SEP
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    block = (
+        "Run: hello.py (none)\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:0{minute}:00"
+    )
+    repo.git(
+        "commit", "--allow-empty", "-m",
+        block.format(minute=0) + BLOCK_SEP
+        + block.format(minute=5),
+    )
     runner = CliRunner()
     result = runner.invoke(
         app, ["list", "--from", str(workdir)]
@@ -2246,7 +2289,7 @@ def test_list_command_filters_learnlog(workdir):
     assert "learnlog" not in result.output
 
 def test_list_command_all_shows_learnlog(workdir):
-    """The --all flag counts learnlog runs too."""
+    """The --all flag lists learnlog runs too."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -2258,13 +2301,29 @@ def test_list_command_all_shows_learnlog(workdir):
     filtered = runner.invoke(
         app, ["list", "--from", str(workdir)]
     )
-    assert "(2 runs)" not in filtered.output
-    # With --all, both runs are counted.
+    assert "learnlog play" not in filtered.output
+    # With --all, it is listed as its own record.
     unfiltered = runner.invoke(
         app, ["list", "--all", "--from", str(workdir)]
     )
     assert unfiltered.exit_code == 0
-    assert "(2 runs)" in unfiltered.output
+    assert "learnlog play" in unfiltered.output
+
+def test_list_command_hides_pip_install_of_learnlog(workdir):
+    """Installing learnlog is setup noise, not development."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("pip", ["install", "learnlog"], t1)
+    repo.begin_run("pip", ["install", "requests"], t1)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "install learnlog" not in result.output
+    assert "install requests" in result.output
 @
 
 Let's verify the outcome filters.  The first two tests use a
@@ -2379,28 +2438,35 @@ def test_list_both_flags_show_either(workdir):
     assert "bad.py" in result.output
 
 def test_list_mixed_commit_appears_in_both(workdir):
-    """A commit with both outcomes shows under each flag."""
+    """A commit with both outcomes shows under each flag.
+
+    One commit holds several runs in logs recorded before the
+    two-commit protocol and in ProgSnap2 reconstructions, so we
+    build such a commit directly here.
+    """
     from learnlog.cli import app
+    from learnlog.commits import BLOCK_SEP
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
-    t1 = datetime.datetime(2026, 1, 1, 10, 0)
-    end1 = datetime.datetime(2026, 1, 1, 10, 0, 1)
-    repo.begin_run("mixed.py", [], t1)
-    repo.finalize_run(
-        io_log="",
-        exception_info=None,
-        end_time=end1,
-        exit_code=0,
+    block = (
+        "Run: mixed.py (none)\n"
+        "\n"
+        "Script: mixed.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:0{minute}:00\n"
+        "End-Time: 2026-01-01T10:0{minute}:01\n"
+        "Exit-Code: {code}\n"
+        "\n"
+        "--- I/O ---\n"
+        "(no I/O)\n"
+        "\n"
+        "--- exception ---\n"
+        "None"
     )
-    # Same code re-run: amends the commit with a second block.
-    t2 = datetime.datetime(2026, 1, 1, 10, 5)
-    end2 = datetime.datetime(2026, 1, 1, 10, 5, 1)
-    repo.begin_run("mixed.py", [], t2)
-    repo.finalize_run(
-        io_log="",
-        exception_info=None,
-        end_time=end2,
-        exit_code=1,
+    repo.git(
+        "commit", "--allow-empty", "-m",
+        block.format(minute=0, code=0) + BLOCK_SEP
+        + block.format(minute=5, code=1),
     )
     runner = CliRunner()
     success_result = runner.invoke(
@@ -2687,7 +2753,11 @@ def push(
 
 We test [[push]] by creating a bare repository as the remote target,
 configuring [[origin]] to point at it, and verifying that the commits
-arrive:
+arrive.
+Pushing twice deserves its own test: it used to fail, because
+finishing the first [[push]] rewrote the very commit it had just
+sent (\cref{sec:two-commit-protocol})---which is why [[--force]]
+looked necessary for an ordinary second push.
 
 <<test functions>>=
 def test_push_command(workdir, monkeypatch):
@@ -2766,6 +2836,37 @@ def test_push_to_divergent_remote(workdir, monkeypatch):
     # With --force, it succeeds.
     result = runner.invoke(app, ["push", "--force"])
     assert result.exit_code == 0
+
+def test_push_twice_succeeds(workdir, monkeypatch):
+    """Pushing twice in a row works.
+
+    Running ``learnlog push`` is itself a captured run, so the
+    push is bracketed by a header and a trailer commit.  As long
+    as neither rewrites what the first push already sent, the
+    second push is an ordinary fast-forward.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir.parent / "twice-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    runner.invoke(app, ["set-remote", str(bare)])
+    for minute in (0, 5):
+        moment = datetime.datetime(2026, 1, 1, 10, minute)
+        repo.begin_run("learnlog", ["push"], moment)
+        result = runner.invoke(app, ["push"])
+        assert result.exit_code == 0
+        repo.finalize_run(
+            io_log="",
+            exception_info=None,
+            end_time=moment,
+            exit_code=0,
+        )
 
 def test_push_no_remote_fails(workdir, monkeypatch):
     """Push fails when no remote is configured."""
@@ -3225,6 +3326,34 @@ def test_tag_command_lists_tags(workdir, monkeypatch):
     result = runner.invoke(app, ["tag", "-l"])
     assert result.exit_code == 0
 
+def test_tag_stays_on_the_history(workdir, monkeypatch):
+    """A tag survives the tagging command finishing.
+
+    ``learnlog tag`` is a captured run, so a trailer commit
+    lands after the tag is created.  The tag must still be an
+    ancestor of HEAD afterwards, or playback and bundles see a
+    forked history.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("learnlog", ["tag", "lab1"], moment)
+    result = runner.invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=moment,
+        exit_code=0,
+    )
+    ancestor = repo.git(
+        "merge-base", "--is-ancestor", "lab1", "HEAD",
+    )
+    assert ancestor.returncode == 0
+
 def test_tag_command_no_learnlog_dir(
     tmp_path, monkeypatch
 ):
@@ -3391,6 +3520,41 @@ def test_play_hides_learnlog_runs(workdir):
     assert "Script: hello.py" in result.output
     assert "Script: learnlog" not in result.output
 
+def test_play_keeps_student_run_intact(workdir):
+    """A learnlog run overlapping a student run stays separate.
+
+    The student starts a program; while it runs, ``learnlog
+    play`` is invoked and finishes first.  The student's output
+    must be attributed to the student's run---not swallowed by
+    the learnlog block that is hidden from playback.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    student = LearnlogRepo(workdir)
+    tool = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    student.begin_run("hello.py", [], t1)
+    tool.begin_run("learnlog", ["play"], t1)
+    tool.finalize_run(
+        io_log="stdout: CURSES SCREEN\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    student.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 2),
+        exit_code=0,
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "stdout: hello" in result.output
+    assert "CURSES SCREEN" not in result.output
+
 def test_play_all_shows_learnlog_runs(workdir):
     """The --all flag includes learnlog runs."""
     from learnlog.cli import app
@@ -3411,7 +3575,11 @@ def test_play_all_shows_learnlog_runs(workdir):
 
 We resolve the starting ref through [[git rev-parse]], which
 handles tag names, branch names, and abbreviated hashes
-uniformly.
+uniformly, and then through [[resolve_record_commit]]
+(\cref{sec:run-join}), which turns a ref pointing at a run's
+trailer commit into the run itself---otherwise a tag created
+right after a run finished would name a commit that playback
+does not list.
 If [[rev-parse]] fails (for example, a typo), we fall back
 to prefix matching on the commit list---this covers the
 case where a short hash is ambiguous in Git but unique among
@@ -3420,7 +3588,9 @@ the commits we have.
 <<find starting commit index>>=
 resolved = repo.git("rev-parse", start)
 if resolved.returncode == 0:
-    full_hash = resolved.stdout.strip()
+    full_hash = resolve_record_commit(
+        repo, resolved.stdout.strip(),
+    )
     for i, c in enumerate(commits):
         if c["hash"] == full_hash:
             start_index = i

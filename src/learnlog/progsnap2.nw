@@ -71,6 +71,11 @@ We import [[get_commits]], [[filter_learnlog_runs]],
 rather than reimplementing the commit-walking logic.
 The tag map lets us populate the [[X-Tag]] column in the
 event table.
+Reassembling a run from its two commits is likewise the commits
+module's job (\cref{sec:run-join}): [[get_run_trailers]] and
+[[merge_run_trailers]] hand us the same complete run block that a
+single-commit log would have contained, so everything below parses
+one format.
 
 <<progsnap2 imports>>=
 from __future__ import annotations
@@ -90,8 +95,11 @@ from learnlog.commits import (
     _parse_iso,
     format_elapsed,
     get_commits,
+    get_run_trailers,
     get_tag_map,
     filter_learnlog_runs,
+    is_learnlog_run,
+    merge_run_trailers,
     BLOCK_SEP,
 )
 from learnlog.gitrepo import (
@@ -759,6 +767,7 @@ suffices.
 <<collect events and code states>>=
 commits = get_commits(repo)
 tag_map = get_tag_map(repo)
+trailers = get_run_trailers(repo)
 seen_trees = {}
 events = []
 resource_files = []
@@ -834,10 +843,14 @@ if current_tree != prev_tree:
 
 For each run block we emit a [[Run.Program]] event with the
 parsed metadata.
-When [[filter_learnlog_flag]] is set, we skip blocks whose
-script is [[learnlog]] (the same filtering logic as
-[[filter_learnlog_runs]], but at the parsed-block level
-rather than raw text).
+The message we parse is the commit's own message with the run's
+trailer merged back in, so a run that finished contributes its exit
+code, timing, and I/O to the same event as its header---the
+[[Run.Program]] event stays anchored to the commit that holds the
+code state the run executed.
+When [[filter_learnlog_flag]] is set, we skip blocks that record
+learnlog's own activity (the same test as [[filter_learnlog_runs]],
+but at the parsed-block level rather than raw text).
 
 After emitting the [[Run.Program]] event, we generate
 chunked I/O events for that run's captured output and input.
@@ -851,11 +864,11 @@ advances past the I/O events.
 body = repo.git(
     "log", "-1", "--format=%B", commit_hash,
 ).stdout.rstrip("\n")
+body = merge_run_trailers(body, trailers)
 
 runs = parse_commit_runs(body)
 for run in runs:
-    if filter_learnlog_flag \
-            and run["script"] == "learnlog":
+    if filter_learnlog_flag and is_learnlog_run(run):
         continue
 
     order += 1
@@ -2049,6 +2062,13 @@ reconstruct it, and verify that playback-oriented Git features
 still work: commit count, tags, commit messages, and deleted
 files.
 
+The first run's record is the \emph{second} commit: the initial
+snapshot stands on its own, since no run is folded into it any more
+(\cref{sec:two-commit-protocol}).
+The tag is worth watching too---it was created while HEAD was a
+trailer commit, so it only survives the round trip because
+[[get_tag_map]] reports it on the run's header commit.
+
 <<progsnap2 test functions>>=
 def test_read_progsnap2_as_repo_roundtrip(workdir):
     import shutil
@@ -2101,7 +2121,7 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
 
         first_message = reconstructed.git(
             "log", "-1", "--format=%B",
-            rebuilt_commits[0]["hash"],
+            rebuilt_commits[1]["hash"],
         )
         assert first_message.returncode == 0
         assert "Run: hello.py --name Alice" in \
