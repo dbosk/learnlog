@@ -1514,18 +1514,52 @@ Each tagged hash goes through [[resolve_record_commit]]
 run finished---and therefore sitting on that run's trailer
 commit---still lands on a commit the callers can find.
 
+\subsection{A tag does not always name a commit directly}
+
+A lightweight tag is a ref whose object \emph{is} the
+commit, but [[git tag -a]] creates an intermediate
+\emph{tag object} that carries the tagger, the date and a
+message, and that object in turn names the commit.
+Both kinds reach a learnlog repository: [[learnlog git]]
+passes [[tag -a]] straight through, and so does a plain
+[[git tag -a]] in a clone---which is what a teacher
+marking a submission point reaches for.
+
+The field [[%(objectname)]] reports the object the ref
+points at, without dereferencing.
+For an annotated tag that is the tag object's hash, and a
+tag object's hash equals no commit in the log, so the
+lookups below never matched and every annotated tag
+vanished from [[list]], [[play]] and the ProgSnap2 export.
+The peeled field [[%(*objectname)]] is the hash Git
+arrives at after following the tag object, and it is
+\emph{empty} for a ref that needs no following.
+
+Neither field alone therefore covers both kinds, and
+[[%(if)]] is Git's own way of choosing between them: it
+emits the peeled hash when there is one and the direct
+hash otherwise.
+Reading both fields and choosing in Python would work
+equally well, but doing it in the format string keeps
+every line one hash and one name---the shape the loop
+below already parses---so the difference between the two
+kinds of tag never leaves Git.
+
 <<commits functions>>=
 def get_tag_map(repo):
     """Map commit hashes to tag names.
 
     Returns a dict where keys are full commit hashes
     and values are lists of tag names pointing at that
-    commit.  Tags on a trailer commit are reported on the
-    run's header commit instead.
+    commit.  Annotated tags are reported on the commit
+    their tag object names, and tags on a trailer commit
+    are reported on the run's header commit instead.
     """
     result = repo.git(
         "tag", "-l",
-        "--format=%(objectname) %(refname:short)",
+        "--format=%(if)%(*objectname)%(then)"
+        "%(*objectname)%(else)%(objectname)%(end)"
+        " %(refname:short)",
         check=False,
     )
     if result.returncode != 0:
@@ -1574,4 +1608,50 @@ def test_get_tag_map_no_tags(workdir):
     repo = LearnlogRepo(workdir)
     tag_map = get_tag_map(repo)
     assert tag_map == {}
+@
+
+Those tags are all lightweight, so they exercise only the
+[[%(objectname)]] half of the format string.
+A test for the other half has to be careful about which
+commit it tags, because [[resolve_record_commit]] hides
+the bug on exactly the commit one would reach for first.
+It asks Git for the tagged object's subject and for its
+first parent, and both of those requests peel a tag object
+on their way to a commit---so a tag object naming a
+\emph{trailer} commit still comes back as that run's
+header commit, by accident rather than by design.
+Everywhere else, including the header commit itself, the
+tag object's hash is what [[resolve_record_commit]]
+returns unchanged, and the tag is lost.
+
+So we tag a header commit by name, put one tag of each
+kind on it, and assert both names against that one hash.
+Dropping either half of the format string then fails the
+test, and the assertion states the invariant the two kinds
+share: how a tag was created must not change which commit
+it lands on.
+
+<<commits test functions>>=
+def test_get_tag_map_annotated_tag(workdir):
+    """Annotated and lightweight tags land alike."""
+    from learnlog.commits import get_tag_map
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    header = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("tag", "lab1", header)
+    repo.git(
+        "tag", "-a", "-m", "handed in", "submitted", header,
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    names = get_tag_map(repo)[header]
+    assert "lab1" in names
+    assert "submitted" in names
 @
