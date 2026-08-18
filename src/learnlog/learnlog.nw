@@ -525,7 +525,7 @@ import atexit
 import traceback
 
 from learnlog.capture import IOLog, StreamCapture, InputCapture
-from learnlog.gitrepo import LearnlogRepo
+from learnlog.gitrepo import LearnlogRepo, report_error
 
 <<module state>>
 <<functions>>
@@ -652,6 +652,18 @@ The entire function is wrapped in a [[try]]/[[except]] that catches
 \emph{everything}.
 If learnlog fails for any reason---no Git installed, permission denied,
 disk full---the student's program must still work.
+
+This handler is the last line of defence, and it stays one: nothing that
+happens here may reach the student's program, and it must keep catching
+[[Exception]] rather than the [[GitError]] of \cref{sec:diagnostics}
+alone, since \emph{any} failure in learnlog is learnlog's problem and
+not the program's.
+What changes is where the exception goes.
+Discarding it made a failed run indistinguishable from a successful one
+for everybody---including us---so instead of [[pass]] we hand it to
+[[report_error]], which records it somewhere that costs the running
+program nothing and stays silent unless [[LEARNLOG_DEBUG]] asks
+otherwise.
 
 Autostart widens the set of invocations that reach [[initialize]].
 Besides ordinary [[script.py]] runs we now see the bare REPL,
@@ -1037,8 +1049,80 @@ def initialize():
         <<install REPL capture>>
         <<install exception hook>>
         atexit.register(on_exit)
-    except Exception:
-        pass
+    except Exception as error:
+        _report_swallowed_failure("initialize", error)
+@
+
+Where the entry is written depends on how far initialisation got.
+Once [[repo]] exists we know which project the failure belongs to; a
+failure before that---an unreadable working directory, a Git that will
+not start---has no project yet, and [[report_error]] falls back to the
+current directory, writing only if a [[.learnlog/]] is already there.
+
+<<functions>>=
+def _report_swallowed_failure(context, error):
+    """Send an exception we must not raise to the diagnostics path."""
+    report_error(
+        context, error,
+        repo.workdir if repo is not None else None,
+    )
+@
+
+Let's verify the two halves of that bargain against a Git that cannot
+run at all---an empty [[PATH]], which is what [[env -i]] and some
+[[Makefile]]s hand us.
+The program must come through untouched, and the failure must
+nevertheless be recoverable afterwards:
+
+<<test functions>>=
+class TestSwallowedFailureDiagnostics:
+    <<swallowed failure test helpers>>
+
+    def test_program_survives_broken_git(
+        self, workdir, test_env
+    ):
+        result = self.run_without_git(workdir, test_env)
+        assert result.returncode == 0
+        assert result.stdout == "visible\n"
+        assert result.stderr == ""
+
+    def test_failure_is_recorded(self, workdir, test_env):
+        self.run_without_git(workdir, test_env)
+        log = (
+            workdir / ".learnlog" / "errors.log"
+        ).read_text()
+        assert "initialize" in log
+
+    def test_debug_mirrors_failure_to_stderr(
+        self, workdir, test_env
+    ):
+        env = test_env.copy()
+        env["LEARNLOG_DEBUG"] = "1"
+        result = self.run_without_git(workdir, env)
+        assert result.stdout == "visible\n"
+        assert "learnlog:" in result.stderr
+@
+
+The helper prepares a repository first, because [[report_error]]
+deliberately refuses to create a [[.learnlog/]] of its own: without one
+already there, there would be nothing to write into and nothing to
+assert.
+
+<<swallowed failure test helpers>>=
+def run_without_git(self, workdir, env):
+    """Run a script with an empty PATH, so Git cannot start."""
+    LearnlogRepo(workdir)
+    script = workdir / "visible.py"
+    script.write_text(
+        "import learnlog\n"
+        "print('visible')\n"
+    )
+    env = dict(env, PATH=str(workdir / "no-such-bin"))
+    return subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(workdir), env=env,
+        capture_output=True, text=True, timeout=30,
+    )
 @
 
 <<detect main script>>=
@@ -1688,6 +1772,12 @@ then finalises the run in the repository.
 
 We wrap everything in a [[try]]/[[except]] for the same reason as
 [[initialize]]: learnlog must never cause an error at exit.
+It routes to the same diagnostics path too, and this is the handler
+where that matters most: an exception here loses the results of a run
+that has already happened, and the surviving header is
+indistinguishable from the one a [[SIGKILL]] leaves behind
+(\cref{gitrepo}).
+The [[errors.log]] entry is what tells those two apart afterwards.
 
 <<functions>>=
 def on_exit():
@@ -1708,8 +1798,8 @@ def on_exit():
         <<restore original streams>>
         <<restore REPL capture>>
         <<finalise the run>>
-    except Exception:
-        pass
+    except Exception as error:
+        _report_swallowed_failure("on_exit", error)
 @
 
 <<restore original streams>>=
