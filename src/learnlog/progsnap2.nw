@@ -1472,7 +1472,8 @@ The reader returns a dict with four keys:
   dicts, preserving the CSV column names as keys.
 \item[ [[code_states]] ] A nested dict mapping each
   [[CodeStateID]] to a dict of
-  \{filename: file content\} pairs.
+  \{filename: file content\} pairs.  Content is [[str]] for
+  files that decode as UTF-8 and [[bytes]] for the rest.
 \item[ [[resources]] ] A dict mapping resource paths
   (e.g.\ [[Resources/io_3.txt]]) to their text content.
 \end{description}
@@ -1528,9 +1529,41 @@ events = list(reader)
 @
 
 Code states live under [[CodeStates/{id}/]] in the zip.
-We read each file's content as a string, grouping by state ID.
-Binary files are skipped---ProgSnap2 is designed for source
-code, and our code states contain only text files.
+A code state is a snapshot of the student's entire working tree, and a
+working tree is not necessarily text: a sprite for a game, a compiled
+[[a.out]], a [[.pyc]], or a PDF handed in with the code all end up
+there because [[extract_code_state]] archives whatever Git tracked.
+Reading every entry as UTF-8 therefore cannot work.
+Skipping the undecodable ones---what we used to do---is worse than it
+sounds: [[restore_code_state]] treats the code state as the
+\emph{whole} tree, so a file missing from the dict is a file
+\emph{deleted} from the reconstructed working tree, and playback of a
+student's own project silently loses their data files.
+
+We therefore keep the decoded [[str]] when the bytes are valid UTF-8
+and the raw [[bytes]] when they are not.
+The type then carries what we actually know about the file: text for
+everything the diff and \LaTeX{} machinery can work with, bytes for
+what only a byte-exact round trip can preserve.
+This is the same text-versus-binary distinction Git itself makes, and
+it keeps the common case---source code---unchanged for every consumer.
+
+<<progsnap2 functions>>=
+def decode_if_text(data):
+    """Return ``data`` decoded as UTF-8, or the raw bytes.
+
+    Bytes that are not valid UTF-8 are returned unchanged so that
+    binary files survive a round trip byte for byte.
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+@
+
+With the decoding decision isolated, the reader itself only has to
+split each archive entry into its state ID and its path inside that
+state:
 
 <<read code states from zip>>=
 code_states = {}
@@ -1544,23 +1577,29 @@ for name in zf.namelist():
     filename = parts[1]
     if state_id not in code_states:
         code_states[state_id] = {}
-    try:
-        code_states[state_id][filename] = (
-            zf.read(name).decode("utf-8")
-        )
-    except UnicodeDecodeError:
-        pass
+    code_states[state_id][filename] = decode_if_text(
+        zf.read(name)
+    )
 @
 
 Resource files (I/O text) live under [[Resources/]].
+Here the same fallback would be useless: a resource is a captured I/O
+log whose only destination is a reconstructed commit message, and
+there is nothing sensible to do with raw bytes on that path.
+Our own exporter writes these from [[str]], so they are always valid
+UTF-8, but a dataset produced by another tool---or by a future version
+that captures I/O at the file-descriptor level---may not be.
+Decoding with [[errors="replace"]] turns that into a few replacement
+characters in one line of output instead of a [[UnicodeDecodeError]]
+that makes the entire dataset unreadable.
 
 <<read resource files from zip>>=
 resources = {}
 for name in zf.namelist():
     if not name.startswith("Resources/"):
         continue
-    resources[name] = (
-        zf.read(name).decode("utf-8")
+    resources[name] = zf.read(name).decode(
+        "utf-8", errors="replace"
     )
 @
 
@@ -1613,6 +1652,66 @@ def test_read_progsnap2_from_buffer(workdir):
     dataset = read_progsnap2(buf)
     assert "events" in dataset
     assert "metadata" in dataset
+@
+
+A student project with a binary file in it is the case that used to
+lose data, so we check the whole path: a PNG-like blob with an
+embedded [[NUL]] and a lone \verb|0xff| byte (which no UTF-8 decoder
+accepts) must come back byte for byte, while the source file next to
+it still comes back as text.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_roundtrips_binary_file(workdir):
+    """Binary code-state files survive export and read-back."""
+    from learnlog.progsnap2 import (
+        do_export_progsnap2, read_progsnap2,
+    )
+    blob = b"\x89PNG\r\n\x1a\n\x00\xff\xferaw"
+    (workdir / "logo.png").write_bytes(blob)
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hi\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    output = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    dataset = read_progsnap2(output)
+    states = dataset["code_states"]
+    state = states[max(states, key=int)]
+    assert state["logo.png"] == blob
+    assert isinstance(state["hello.py"], str)
+@
+
+Resources come from student I/O, and a dataset written by another tool
+may hold bytes that are not valid UTF-8.
+Reading must still succeed; we assemble a minimal dataset by hand so
+the test does not depend on our own exporter ever producing such a
+resource:
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_replaces_invalid_resource_bytes(
+    tmp_path,
+):
+    """Undecodable resource bytes do not abort the read."""
+    from learnlog.progsnap2 import read_progsnap2
+
+    output = tmp_path / "manual.progsnap2"
+    with zipfile.ZipFile(output, "w") as zf:
+        zf.writestr(
+            "DatasetMetadata.csv",
+            "Property,Value\nVersion,8\n",
+        )
+        zf.writestr("MainTable.csv", "EventID,Order\n")
+        zf.writestr("Resources/io_1.txt", b"ok\xffbad")
+
+    dataset = read_progsnap2(output)
+    assert dataset["resources"]["Resources/io_1.txt"] == \
+        "ok\ufffdbad"
 @
 
 
@@ -1794,16 +1893,53 @@ def group_events_by_commit(events):
   new snapshot are removed.
 \item[Directories] We create parent directories on demand so
   nested files under [[CodeStates/]] restore cleanly.
+\item[Log repository] The reconstructed repository keeps its Git
+  directory at [[.learnlog]] \emph{inside} the working tree it is
+  rebuilding, so a snapshot must never touch that path.
+\item[File types] Content is written back with the same type it was
+  read as, so binary files round-trip unchanged.
 \end{description}
+
+The [[.learnlog]] rule is the one that was previously only half
+applied.
+Skipping the directory while deleting but not while writing looks
+harmless, because learnlog's own exporter never puts [[.learnlog]]
+paths into a code state.
+It is not: a code state is student-controlled data, so a project that
+happens to contain a directory called [[.learnlog]]---or a dataset
+from another tool, or a hand-edited one---makes the write loop
+overwrite [[HEAD]], the index, or a ref of the very repository we are
+committing into, mid-replay.
+Expressing both passes through one predicate is what makes the guard
+symmetric by construction rather than by inspection.
+
+<<progsnap2 functions>>=
+def is_learnlog_path(name):
+    """Return whether ``name`` lies inside the ``.learnlog`` directory."""
+    parts = pathlib.PurePath(name).parts
+    return bool(parts) and parts[0] == ".learnlog"
+@
+
+Writing the snapshot has to preserve the distinction
+[[read_progsnap2]] recorded: [[str]] goes through [[write_text]] and
+[[bytes]] through [[write_bytes]].
+Forcing everything through [[write_text]] would raise on a binary file,
+and forcing everything through [[write_bytes]] would encode text with
+the platform's default rules instead of the UTF-8 we decoded from.
 
 <<progsnap2 functions>>=
 def restore_code_state(workdir, code_state):
     """Replace ``workdir`` contents with a full code snapshot."""
-    expected = {pathlib.Path(name) for name in code_state}
+    snapshot = {
+        name: content
+        for name, content in code_state.items()
+        if not is_learnlog_path(name)
+    }
+    expected = {pathlib.Path(name) for name in snapshot}
 
     for path in sorted(workdir.rglob("*"), reverse=True):
         rel = path.relative_to(workdir)
-        if rel.parts and rel.parts[0] == ".learnlog":
+        if is_learnlog_path(rel):
             continue
         if path.is_dir():
             if any(rel in item.parents for item in expected):
@@ -1812,10 +1948,13 @@ def restore_code_state(workdir, code_state):
         elif rel not in expected:
             path.unlink()
 
-    for name, content in code_state.items():
+    for name, content in snapshot.items():
         target = workdir / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content)
 @
 
 Rebuilding the commit message mirrors the original structure as
@@ -1987,6 +2126,55 @@ def test_restore_code_state_replaces_full_snapshot(tmp_path):
     assert (tmp_path / "main.py").read_text() == \
         "print('main')\n"
     assert (tmp_path / ".learnlog").exists()
+@
+
+The write pass needs its own guard test, because the deletion pass
+above passes either way.
+We seed a plausible Git directory and then hand the restorer a
+snapshot that claims to contain it; the live [[HEAD]] must survive:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_never_writes_into_learnlog(
+    tmp_path,
+):
+    from learnlog.progsnap2 import restore_code_state
+
+    (tmp_path / ".learnlog").mkdir()
+    (tmp_path / ".learnlog" / "HEAD").write_text(
+        "ref: refs/heads/main\n"
+    )
+
+    restore_code_state(tmp_path, {
+        "main.py": "print('main')\n",
+        ".learnlog/HEAD": "ref: refs/heads/attacker\n",
+        ".learnlog/hooks/pre-commit": "#!/bin/sh\nrm -rf .\n",
+    })
+
+    assert (tmp_path / ".learnlog" / "HEAD").read_text() == \
+        "ref: refs/heads/main\n"
+    assert not (
+        tmp_path / ".learnlog" / "hooks"
+    ).exists()
+    assert (tmp_path / "main.py").exists()
+@
+
+Binary content must reach the working tree unchanged; writing it as
+text would either raise or re-encode it:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_writes_binary_content(tmp_path):
+    from learnlog.progsnap2 import restore_code_state
+
+    blob = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
+    restore_code_state(tmp_path, {
+        "assets/logo.png": blob,
+        "main.py": "print('main')\n",
+    })
+
+    assert (tmp_path / "assets" / "logo.png").read_bytes() \
+        == blob
+    assert (tmp_path / "main.py").read_text() == \
+        "print('main')\n"
 @
 
 The next test checks that child I/O events rebuild a readable
@@ -2170,6 +2358,45 @@ def test_read_progsnap2_as_repo_large_io(workdir):
         assert "Exit-Code: 0" in message
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+Reconstruction is the path [[learnlog play -f dataset.progsnap2]]
+takes, so it is where a binary file in the student's project used to
+be lost.
+We check the bytes at the far end of the whole pipeline---export,
+read, restore, commit---rather than trusting the reader test alone,
+because each stage had its own opportunity to turn them into text.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_keeps_binary_file(workdir):
+    import shutil
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    blob = b"\x89PNG\r\n\x1a\n\x00\xff\xferaw"
+    (workdir / "logo.png").write_bytes(blob)
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hi\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    output = workdir / "binary.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        restored = reconstructed.workdir / "logo.png"
+        assert restored.read_bytes() == blob
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
 <<progsnap2 test functions>>=
 def test_build_reconstructed_run_block_without_end_time():
     from learnlog.progsnap2 import build_reconstructed_run_block
@@ -3111,6 +3338,27 @@ def format_edit_latex(pair, prev_pair, code_states):
         <<format edit as unified diff>>
 @
 
+Now that code states keep binary files instead of dropping them
+(\cref{sec:read-progsnap2}), the formatter has to say something about
+a file it cannot typeset.
+Neither [[minted]] nor [[difflib]] can do anything useful with a PNG,
+so we report its presence and size and move on; silently omitting it
+would make the report claim the student's tree contained only the
+text files.
+The note ends with a newline so that joining the parts leaves a blank
+line after it; two binary files in a row would otherwise run together
+into a single \LaTeX{} paragraph.
+
+<<progsnap2 functions>>=
+def format_binary_file_latex(filename, content):
+    """Note a binary code-state file that cannot be shown."""
+    return (
+        "\\textbf{Binary file: "
+        f"\\texttt{{{_latex_escape(filename)}}}"
+        f"}} ({len(content)} bytes, content not shown)\n"
+    )
+@
+
 When there is no previous state, we show each file
 in its entirety.
 To keep the filename visible in the rendered document, we emit
@@ -3120,6 +3368,11 @@ an explicit label rather than a LaTeX comment.
 parts = []
 for filename in sorted(current.keys()):
     content = current[filename]
+    if isinstance(content, bytes):
+        parts.append(
+            format_binary_file_latex(filename, content)
+        )
+        continue
     parts.append(
         "\\textbf{File: "
         f"\\texttt{{{_latex_escape(filename)}}}"
@@ -3136,6 +3389,10 @@ For subsequent edits, we compute a unified diff per
 file.
 Files that did not change are skipped.
 New files show as additions; deleted files as removals.
+A file that is binary on either side gets the same note as above
+rather than a diff: comparing the two byte strings is enough to tell
+that it changed, which is all a diff of unprintable data could
+convey anyway.
 
 <<format edit as unified diff>>=
 all_files = sorted(
@@ -3147,6 +3404,12 @@ for filename in all_files:
     old = previous.get(filename, "")
     new = current.get(filename, "")
     if old == new:
+        continue
+    if isinstance(new, bytes) or isinstance(old, bytes):
+        changed = new if isinstance(new, bytes) else old
+        parts.append(
+            format_binary_file_latex(filename, changed)
+        )
         continue
     diff_lines = list(difflib.unified_diff(
         old.splitlines(keepends=True),
@@ -3764,6 +4027,35 @@ def test_format_edit_latex_diff():
     assert "\\begin{minted}{diff}" in result
     assert "-" in result
     assert "+" in result
+
+def test_format_edit_latex_notes_binary_files():
+    """Binary code-state files are reported, not typeset."""
+    from learnlog.progsnap2 import format_edit_latex
+    prev_pair = {
+        "edit": {"EventID": "1"},
+        "run": None,
+        "io": [],
+        "code_state_id": "0",
+    }
+    pair = {
+        "edit": {"EventID": "2"},
+        "run": None,
+        "io": [],
+        "code_state_id": "1",
+    }
+    code_states = {
+        "0": {"logo.png": b"\x89PNG\x00\xff"},
+        "1": {"logo.png": b"\x89PNG\x00\xfe\xfd"},
+    }
+    first = format_edit_latex(pair, None, code_states)
+    assert "\\texttt{logo.png}" in first
+    assert "\\begin{minted}" not in first
+
+    diff = format_edit_latex(
+        pair, prev_pair, code_states,
+    )
+    assert "\\texttt{logo.png}" in diff
+    assert "\\begin{minted}" not in diff
 
 def test_format_run_latex_with_io():
     """Run with I/O shows script info and minted block."""
