@@ -522,6 +522,7 @@ import builtins
 import pathlib
 import datetime
 import atexit
+import functools
 import threading
 import traceback
 
@@ -1734,19 +1735,217 @@ the program carries on; recording that status would report a failure
 for a run that goes on to succeed.
 We therefore note the status only when the call comes from the thread
 whose stack the interpreter will actually unwind.
+The check lives in its own function because the wrapper is not the only
+caller---the [[exit()]] built-in needs exactly the same treatment below.
+
+<<functions>>=
+def _record_system_exit(code):
+    """Note the status a main-thread ``SystemExit`` will produce."""
+    global system_exit_status
+    if threading.current_thread() is threading.main_thread():
+        system_exit_status = _system_exit_status(code)
+@
+
+[[functools.wraps]] copies the built-in's [[__name__]], [[__doc__]] and
+[[__module__]] onto the wrapper, so [[help(sys.exit)]] and anything else
+that introspects the function still describes the real one.
 
 <<functions>>=
 def _wrap_exit(original_exit):
     """Return a ``sys.exit`` wrapper that records the exit status."""
+    @functools.wraps(original_exit)
     def logged_exit(*args):
-        global system_exit_status
-        if threading.current_thread() is threading.main_thread():
-            system_exit_status = _system_exit_status(
-                args[0] if args else None
-            )
+        _record_system_exit(args[0] if args else None)
         original_exit(*args)
 
     return logged_exit
+@
+
+Let's verify that the wrapper still passes for the built-in it replaces:
+
+<<test functions>>=
+class TestExitWrapper:
+    def test_wrapper_borrows_the_builtin_identity(self):
+        from learnlog import _wrap_exit
+        wrapped = _wrap_exit(sys.exit)
+        assert wrapped.__name__ == "exit"
+        assert wrapped.__module__ == "sys"
+        assert "SystemExit" in (wrapped.__doc__ or "")
+@
+
+
+\subsection{The [[exit()]] and [[quit()]] built-ins}
+
+[[sys.exit]] is not the only door out.
+Students who met Python in the REPL write \mintinline{python}{exit(1)}
+in scripts too, and that name is not [[sys.exit]]: [[site]] installs a
+[[Quitter]] instance in [[builtins]] which closes [[sys.stdin]] and then
+raises [[SystemExit]] itself, never going near our wrapper.
+
+A plain function cannot stand in for it.
+Typing [[exit]] \emph{without} parentheses in the REPL is supposed to
+answer \enquote{Use exit() or Ctrl-D (i.e. EOF) to exit}, and that
+answer is [[Quitter.__repr__]] talking; a function would print its own
+[[<function ...>]] instead and change what the student sees.
+The stand-in is therefore an object that records the status, delegates
+the call, and hands [[repr]] straight back to the original.
+
+<<functions>>=
+class _QuitterProxy:
+    """Stand-in for the ``exit``/``quit`` built-ins.
+
+    Records the exit status, then delegates to the original quitter.
+    Attribute access that matters for these objects is ``repr``, which
+    the REPL shows when the name is typed without parentheses; it comes
+    from the original so the message is unchanged.
+    """
+
+    def __init__(self, original):
+        self._original = original
+
+    def __call__(self, code=None):
+        _record_system_exit(code)
+        self._original(code)
+
+    def __repr__(self):
+        return repr(self._original)
+@
+
+Let's verify both halves of that contract, the recording and the
+borrowed [[repr]]:
+
+<<test functions>>=
+class FakeQuitter:
+    """Stand-in for site.Quitter with its distinctive repr."""
+
+    def __repr__(self):
+        return "Use exit() or Ctrl-D (i.e. EOF) to exit"
+
+    def __call__(self, code=None):
+        raise SystemExit(code)
+
+
+class TestQuitterProxy:
+    def test_repr_comes_from_the_original(self):
+        from learnlog import _QuitterProxy
+        proxy = _QuitterProxy(FakeQuitter())
+        assert repr(proxy) == repr(FakeQuitter())
+
+    def test_call_records_status_and_delegates(self, monkeypatch):
+        import learnlog
+        monkeypatch.setattr(learnlog, "system_exit_status", None)
+        proxy = learnlog._QuitterProxy(FakeQuitter())
+        with pytest.raises(SystemExit):
+            proxy(2)
+        assert learnlog.system_exit_status == 2
+@
+
+Both names get the same treatment, and either may be missing---
+[[python -S]] skips [[site.py]] altogether, and an embedded interpreter
+may never create them---so we replace only what is there.
+The function also reports whether it managed to wrap both, because the
+caller has a second strategy for when it did not, and it must stay
+harmless to call twice.
+
+<<constants>>=
+QUITTER_NAMES = ("exit", "quit")
+<<functions>>=
+def _install_quitter_proxies():
+    """Wrap the ``exit``/``quit`` built-ins with recording proxies.
+
+    Returns ``True`` once both names carry a proxy.
+    """
+    for name in QUITTER_NAMES:
+        original = getattr(builtins, name, None)
+        if original is None or isinstance(original, _QuitterProxy):
+            continue
+        setattr(builtins, name, _QuitterProxy(original))
+    return all(
+        isinstance(getattr(builtins, name, None), _QuitterProxy)
+        for name in QUITTER_NAMES
+    )
+@
+
+
+\subsection{When the built-ins do not exist yet}
+
+There is an ordering trap here, and it bites in exactly the
+configuration that matters most.
+[[site.py]] evaluates [[.pth]] files inside [[addsitepackages()]] and
+only \emph{afterwards} calls [[setquit()]] to create the two
+[[Quitter]] instances.
+Our autostart hook (\cref{sec:autostart}) is a [[.pth]] line, so in a
+student's wired venv [[initialize]] runs before [[builtins.exit]]
+exists, and a straightforward replacement would silently wrap nothing.
+The symptom would be a feature that passes a hand-written test using an
+explicit \mintinline{python}{import learnlog} and does nothing at all
+for the students it was written for.
+
+We therefore install the proxies as soon as the quitters appear.
+The [[site]] module is halfway through its own [[main()]] when our hook
+runs, so it is already in [[sys.modules]] and we can replace its
+[[setquit]] with one that calls the original and then wraps what that
+call has just created.
+The replacement puts [[site.setquit]] back before delegating, so the
+[[site]] module is left as we found it and a repeated call cannot stack
+a second layer.
+When learnlog is imported the ordinary way---from a script, long after
+startup---[[setquit]] has already run, the first attempt succeeds, and
+this path is never taken.
+
+<<functions>>=
+def _install_quitter_proxies_after_site(site_module):
+    """Install the quitter proxies once ``site`` has created them."""
+    original_setquit = getattr(site_module, "setquit", None)
+    if original_setquit is None:
+        return
+
+    def setquit():
+        site_module.setquit = original_setquit
+        original_setquit()
+        _install_quitter_proxies()
+
+    site_module.setquit = setquit
+@
+
+<<install exit status hook>>=
+if not _install_quitter_proxies():
+    site_module = sys.modules.get("site")
+    if site_module is not None:
+        _install_quitter_proxies_after_site(site_module)
+@
+
+Let's verify the deferred path with a stand-in for [[site]], since the
+real one has long finished by the time the tests run:
+
+<<test functions>>=
+class FakeSiteModule:
+    """Minimal stand-in for the site module."""
+
+    def __init__(self, setquit):
+        self.setquit = setquit
+
+
+class TestDeferredQuitterProxies:
+    def test_proxies_wait_for_setquit(self, monkeypatch):
+        import builtins as builtins_module
+        import learnlog
+
+        monkeypatch.delattr(builtins_module, "exit", raising=False)
+        monkeypatch.delattr(builtins_module, "quit", raising=False)
+        assert not learnlog._install_quitter_proxies()
+
+        def setquit():
+            builtins_module.exit = FakeQuitter()
+            builtins_module.quit = FakeQuitter()
+
+        site_module = FakeSiteModule(setquit)
+        learnlog._install_quitter_proxies_after_site(site_module)
+        site_module.setquit()
+
+        assert isinstance(builtins_module.exit, learnlog._QuitterProxy)
+        assert isinstance(builtins_module.quit, learnlog._QuitterProxy)
+        assert site_module.setquit is setquit
 @
 
 
@@ -1886,16 +2085,36 @@ The claim that matters is about a whole process---the wrapper has to
 be installed before the student's code runs, survive it, and reach the
 commit---so the regression tests run real scripts and read the trailer
 back out of the log repository.
-This helper removes the boilerplate they would otherwise repeat:
+This helper removes the boilerplate they would otherwise repeat.
+It launches [[python -S]] with the checkout's [[src/]] on
+[[PYTHONPATH]], mirroring [[run_explicit_import]] above: skipping
+[[site.py]] keeps the installed [[.pth]] hook out of the way, so the
+run under test is the one the script itself starts.
+The [[exit()]] built-in is the exception---it only exists when
+[[site.py]] has run---so that one test asks for [[site]] and disables
+the autostart hook by environment variable instead:
 
 <<test helpers>>=
-def run_and_read_commit(source, *, workdir, env, name):
+def run_and_read_commit(source, *, workdir, env, name, with_site=False):
     """Run ``source`` as a script and return result and commit message."""
     script = pathlib.Path(workdir) / name
     script.write_text(source)
+    run_env = env.copy()
+    source_root = pathlib.Path(__file__).resolve().parents[2] / "src"
+    pythonpath = str(source_root)
+    existing_pythonpath = run_env.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath = pythonpath + os.pathsep + existing_pythonpath
+    run_env["PYTHONPATH"] = pythonpath
+    command = [sys.executable]
+    if with_site:
+        run_env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    else:
+        command.append("-S")
+    command.append(str(script))
     result = subprocess.run(
-        [sys.executable, str(script)],
-        cwd=str(workdir), env=env,
+        command,
+        cwd=str(workdir), env=run_env,
         capture_output=True, text=True, timeout=30,
     )
     message = subprocess.run(
@@ -1950,6 +2169,16 @@ class TestRecordedExitStatus:
         assert "Exit-Code: 1" in message
         assert "no input file" in result.stderr
         assert "no input file" in message
+
+    def test_builtin_exit(self, workdir, test_env):
+        result, message = run_and_read_commit(
+            "import learnlog\n"
+            "exit(2)\n",
+            workdir=workdir, env=test_env, name="exit_builtin.py",
+            with_site=True,
+        )
+        assert result.returncode == 2
+        assert "Exit-Code: 2" in message
 
     def test_unhandled_exception(self, workdir, test_env):
         result, message = run_and_read_commit(
@@ -2008,14 +2237,13 @@ being explicit about what the log says for each.
   A real wait status can only be read by whatever waits for the
   process, which is why exit-status fidelity for killed runs belongs
   to a future [[learnlog run]] wrapper rather than to this module.
-\item[Raising [[SystemExit]] without [[sys.exit]] ] happens when a
-  program writes \mintinline{python}{raise SystemExit(3)} directly, or
-  calls the [[exit()]] and [[quit()]] built-ins that [[site]] installs
-  for interactive use---both construct the exception themselves.
-  The wrapper never sees those, so the run is recorded as if it had
-  ended normally.
-  We could close the gap by rebinding [[SystemExit]] in [[builtins]]
-  to a subclass of our own, but that would break every
+\item[Raising [[SystemExit]] directly] is the one remaining gap.
+  A program that writes \mintinline{python}{raise SystemExit(3)}
+  constructs the exception itself, so neither the [[sys.exit]] wrapper
+  nor the [[exit()]] stand-in sees it and the run is recorded as if it
+  had ended normally.
+  We could close it by rebinding [[SystemExit]] in [[builtins]] to a
+  subclass of our own, but that would break every
   \mintinline{python}{except SystemExit} that catches a genuine
   [[SystemExit]] raised elsewhere, which is far worse than an
   occasional wrong exit code.
