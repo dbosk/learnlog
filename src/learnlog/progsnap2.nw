@@ -2384,7 +2384,7 @@ def test_read_progsnap2_as_repo_large_io(workdir):
     try:
         rebuilt = get_commits(reconstructed)
         message = reconstructed.git(
-            "log", "-1", "--format=%B", rebuilt[0]["hash"],
+            "log", "-1", "--format=%B", rebuilt[-1]["hash"],
         ).stdout
         assert message.count("z") >= 300_000
         assert "Exit-Code: 0" in message
