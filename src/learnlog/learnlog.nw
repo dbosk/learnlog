@@ -532,7 +532,10 @@ import traceback
 
 from learnlog.capture import IOLog, StreamCapture, InputCapture
 from learnlog.gitrepo import LearnlogRepo, report_error
-from learnlog._autostart import _resolve_project_root
+from learnlog._autostart import (
+    _is_autostart_wired,
+    _resolve_project_root,
+)
 
 <<constants>>
 <<module state>>
@@ -544,8 +547,9 @@ from learnlog._autostart import _resolve_project_root
 The last import fixes the direction of a dependency that must never be
 reversed.
 [[learnlog._autostart]] answers \enquote{which project does a run in
-this interpreter belong to?} (\cref{sec:autostart}), and the package
-consults it while initialising.
+this interpreter belong to?}---and, when it cannot, \enquote{was this
+interpreter supposed to belong to one at all?}
+(\cref{sec:autostart}); the package consults both while initialising.
 The gate module imports nothing from [[learnlog]] in return;
 \cref{sec:autostart-import-order} explains why that asymmetry is
 load-bearing rather than a matter of taste.
@@ -598,6 +602,7 @@ repl_capture_skip_input = None
 
 
 \section{Finding the learnlog directory}
+\label{sec:find-learnlog-dir}
 
 Before creating a new repository, we search upward from the current
 directory for an existing [[.learnlog/]] directory, mirroring how Git
@@ -607,22 +612,106 @@ activity is recorded in a single repository at the course root.
 The function lives in the core module because both import-time
 initialisation and the CLI need it.
 
+Where the search \emph{stops} turns out to matter more than where it
+starts, and the first version had no stopping rule at all: it walked
+to the filesystem root.
+That is not the harmless generalisation it looks like.
+One unanchored run launched from a home directory is enough to create
+a [[.learnlog/]] there, and from then on every unanchored run anywhere
+below it resolves to \emph{that} repository---whose worktree is the
+whole home directory, which [[begin_run]] then stages with
+[[git add .]] (\cref{sec:two-commit-protocol}).
+The observed result was a 1.7~GB repository built out of one stray
+directory.
+The damage grows with how far the walk is allowed to travel, so the
+walk needs a boundary.
+
+We use two, and both say the same thing: the search may look for the
+project a run belongs to, but it may not wander out of it.
+
+\begin{description}
+\item[The home directory] The home directory and everything above it
+  is never a project root.
+  A home directory is where projects live rather than being one, so
+  adopting it makes every unrelated file in it part of one student's
+  log.
+\item[The enclosing Git working tree] A directory holding a [[.git]]
+  is where the search stops when it has no [[.learnlog/]] of its own.
+  It is the conventional marker for \enquote{this is a self-contained
+  project}, so a [[.learnlog/]] further up belongs to something else.
+\end{description}
+
+Within a directory we look for [[.learnlog/]] \emph{before} asking
+whether we have reached a boundary, and that order is what keeps the
+ordinary layout working: a course root that is both a Git checkout and
+a learnlog project is still found from a lab subdirectory below it.
+
+The cost we accept is the opposite nesting.
+A Git checkout \emph{inside} a learnlog project---a per-lab repository
+cloned into a course directory---no longer resolves to the course
+root, so an unanchored run there starts a log of its own.
+We prefer that trade because the two outcomes are not comparable in
+severity: a split log is a nuisance a teacher can merge, while an
+adopted home directory is an unbounded commit of unrelated files.
+The [[learnlog init]] workflow does not reach this code at all---a
+venv wired by [[init]] anchors the run through its marker file
+(\cref{sec:autostart})---so this walk is only ever the guess made when
+there is nothing to anchor to.
+
+<<functions>>=
+def _is_home_or_above(path, home=None):
+    """True iff ``path`` is the home directory or an ancestor of it.
+
+    Such a directory is never a learnlog project root: it holds
+    projects rather than being one.
+    """
+    try:
+        home = pathlib.Path(
+            home if home is not None else pathlib.Path.home()
+        ).resolve()
+        path = pathlib.Path(path).resolve()
+    except Exception:
+        return False
+    return path == home or path in home.parents
+@
+
+An unusable home directory---no [[HOME]], no matching password entry,
+a path we cannot resolve---makes the predicate answer [[False]] rather
+than raise.
+Failing open is the right direction here: the worst case is the old
+unbounded behaviour, whereas failing closed would refuse to find a
+perfectly ordinary project because of an unrelated environment
+problem.
+
+Applying the two boundaries at every step gives the search itself.
+
 <<functions>>=
 def find_learnlog_dir(start=None):
     """Walk up from ``start`` to find a ``.learnlog/`` directory.
 
-    Returns the directory containing ``.learnlog/``, or ``None``
-    if no learnlog repository is found.
+    The search never considers the home directory or anything above
+    it, and it stops at the root of the enclosing Git working tree.
+    Returns the directory containing ``.learnlog/``, or ``None`` if
+    no learnlog repository is found within those bounds.
     """
     path = pathlib.Path(start or os.getcwd()).resolve()
-    while True:
+    while not _is_home_or_above(path):
         if (path / ".learnlog").is_dir():
             return path
+        if (path / ".git").exists():
+            return None
         parent = path.parent
         if parent == path:
             return None
         path = parent
+    return None
 @
+
+The Git boundary is tested with [[exists]] rather than [[is_dir]] on
+purpose.
+In a linked worktree, a submodule, or any checkout produced by
+[[git worktree add]], [[.git]] is a \emph{file} holding a [[gitdir:]]
+line---and those are checkouts the walk must not escape either.
 
 Let's verify that the upward search works correctly.
 These tests use [[LearnlogRepo]] (\cref{gitrepo}) to create a
@@ -651,6 +740,45 @@ class TestFindLearnlogDir:
         .learnlog/ exists."""
         from learnlog import find_learnlog_dir
         assert find_learnlog_dir(tmp_path) is None
+@
+
+Now the two boundaries.
+The home test reproduces the incident in miniature: a [[.learnlog/]]
+sitting in the home directory, and a run one level below it that must
+\emph{not} find it.
+The Git test pairs the two nestings against each other, which is the
+only way to see that the boundary is applied after the [[.learnlog/]]
+check rather than before it: the same [[.git]] marker stops the search
+in one layout and is ignored in the other.
+
+<<test functions>>=
+    def test_home_directory_is_never_a_project_root(
+        self, tmp_path, monkeypatch,
+    ):
+        """A .learnlog/ in $HOME is out of bounds."""
+        from learnlog import find_learnlog_dir
+        monkeypatch.setenv("HOME", str(tmp_path))
+        LearnlogRepo(tmp_path)
+        work = tmp_path / "work"
+        work.mkdir()
+        assert find_learnlog_dir(work) is None
+
+    def test_search_stops_at_a_git_working_tree(self, workdir):
+        """A checkout below the project bounds the search."""
+        from learnlog import find_learnlog_dir
+        LearnlogRepo(workdir)
+        checkout = workdir / "lab1"
+        (checkout / ".git").mkdir(parents=True)
+        assert find_learnlog_dir(checkout) is None
+
+    def test_project_root_may_be_a_git_working_tree(self, workdir):
+        """A .learnlog/ next to .git/ is still found."""
+        from learnlog import find_learnlog_dir
+        LearnlogRepo(workdir)
+        (workdir / ".git").mkdir()
+        sub = workdir / "src"
+        sub.mkdir()
+        assert find_learnlog_dir(sub) == workdir
 @
 
 
@@ -699,6 +827,9 @@ and finally the upward search from the current directory.
 The venv anchor is what lets a script launched from [[/tmp]] still log
 into the course project's [[.learnlog/]] instead of dropping a fresh
 repository next to whatever the student happened to [[cd]] into.
+There is also a fourth possible answer, \enquote{nowhere}: some
+invocations must not be logged at all rather than logged in the wrong
+place, and [[_resolve_workdir]] says so by raising.
 
 The invocation name is normalised rather than copied from
 [[sys.argv[0]]] verbatim.
@@ -1246,6 +1377,16 @@ The three-source lookup announced above is worth spelling out as its
 own function, because each source answers a different question and the
 order between them is the whole design.
 
+The dividing line runs between the first two sources and the third.
+[[LEARNLOG_PROJECT_ROOT]] and the venv anchor are \emph{statements}:
+somebody---an outer layer, or the human who ran [[learnlog init]]---has
+said which project this run belongs to.
+The upward search is a \emph{guess} assembled from the working
+directory.
+Statements are obeyed as given, guesses are bounded
+(\cref{sec:find-learnlog-dir}), and a guess we are not entitled to make
+is refused outright.
+
 [[LEARNLOG_PROJECT_ROOT]] comes first: if it is already in the
 environment, some outer layer---a parent Python process, or a future
 [[learnlog run]]---has decided, and an inner layer that overrode that
@@ -1261,27 +1402,111 @@ inherits the same anchor without having to re-resolve it---including
 children started with a different interpreter, which would not run our
 [[.pth]] hook at all.
 
-The upward search comes last, and with it the fallback to
-[[os.getcwd()]].
-This is the path taken by the explicit
-\mintinline{python}{import learnlog} that a student adds by hand on a
-machine where no venv could be wired (\cref{learnlog}).
-There is no anchor to consult there, so \enquote{where am I} is the
-only question we can answer; creating a fresh repository in the current
-directory is what makes that first run work with no setup at all.
-
 <<functions>>=
 def _resolve_workdir():
-    """Return the directory whose ``.learnlog/`` this run belongs to."""
-    root = os.environ.get("LEARNLOG_PROJECT_ROOT")
-    if root is None:
-        anchor = _resolve_project_root()
-        if anchor is not None:
-            root = str(anchor)
-            os.environ["LEARNLOG_PROJECT_ROOT"] = root
-    if root is not None:
-        return pathlib.Path(root)
-    return pathlib.Path(find_learnlog_dir() or os.getcwd())
+    """Return the directory whose ``.learnlog/`` this run belongs to.
+
+    Raises ``UnanchoredRun`` when this invocation must not be logged
+    anywhere.
+    """
+    <<obey an inherited or venv anchor>>
+    <<refuse to guess for a wired interpreter>>
+    <<guess the project from the working directory>>
+@
+
+<<obey an inherited or venv anchor>>=
+root = os.environ.get("LEARNLOG_PROJECT_ROOT")
+if root is None:
+    anchor = _resolve_project_root()
+    if anchor is not None:
+        root = str(anchor)
+        os.environ["LEARNLOG_PROJECT_ROOT"] = root
+if root is not None:
+    return pathlib.Path(root)
+@
+
+Reaching the next line means both statements are silent, and there the
+two callers part company.
+
+An interpreter that [[learnlog init]] wired for autostart has already
+been told which project it serves; the marker file next to its [[.pth]]
+hook is that instruction (\cref{sec:autostart}).
+If neither the marker nor the [[sys.prefix]] backup resolves, the
+instruction has been \emph{lost}---the project was deleted, or the
+marker was left behind by a project that no longer exists---and the one
+thing we know is that the answer is not \enquote{wherever the student
+happens to be standing}.
+Guessing there is how a stale marker in a development venv turned every
+run into a fresh repository in an unrelated directory.
+So a wired interpreter with no resolvable project logs nothing at all.
+
+<<refuse to guess for a wired interpreter>>=
+if _is_autostart_wired():
+    raise UnanchoredRun(
+        "autostart-wired interpreter has no resolvable project "
+        "root; not logging this run.  Re-run learnlog init in the "
+        "project you want to log into."
+    )
+@
+
+The remaining caller is the explicit
+\mintinline{python}{import learnlog} that a student adds by hand on a
+machine where no venv could be wired (\cref{learnlog}).
+Nothing has stated a project, so \enquote{where am I} is the only
+question left, and creating a fresh repository in the current directory
+is what makes that first run work with no setup at all.
+
+The current directory is subject to the same bound as the search above
+it.
+A home directory is not a project, so a bare
+\mintinline{python}{import learnlog} run from [[$HOME]] itself must not
+start a repository whose worktree is everything the student owns.
+There is no better guess to fall back on, and inventing a directory
+would be worse than doing nothing, so this too refuses.
+The student sees no difference---that is the transparency requirement---
+and [[LEARNLOG_DEBUG]] explains it to anyone who asks
+(\cref{sec:diagnostics}).
+
+<<guess the project from the working directory>>=
+found = find_learnlog_dir()
+if found is not None:
+    return found
+cwd = pathlib.Path(os.getcwd())
+if _is_home_or_above(cwd):
+    raise UnanchoredRun(
+        f"refusing to start a repository in {cwd}; a home "
+        "directory is not a project.  Run learnlog init in a "
+        "project directory instead."
+    )
+return cwd
+@
+
+Both refusals travel as an exception rather than as a [[None]] return,
+and that is not a stylistic choice.
+[[initialize]] already wraps everything in the handler that turns
+\enquote{learnlog cannot do its job} into a diagnostic which costs the
+student's program nothing (\cref{sec:initialize}), and raising is what
+routes the refusal through it: the run is abandoned before any stream
+is wrapped, [[repo]] stays [[None]], and the reason is recorded by
+[[report_error]] exactly like any other swallowed failure.
+Since a refused run has no repository to write into, [[report_error]]
+finds no [[errors.log]] to append to and the explanation surfaces only
+under [[LEARNLOG_DEBUG]]---which is the whole story: there is nowhere
+to write, so there is nothing written.
+
+A distinct exception type is what keeps that entry readable.
+[[errors.log]] and the debug mirror both print the class name, so
+[[UnanchoredRun]] tells a reader that learnlog declined on purpose
+rather than crashed.
+
+<<functions>>=
+class UnanchoredRun(Exception):
+    """Raised when a run belongs to no project that may be logged.
+
+    Signals a deliberate refusal, not a malfunction: either the
+    interpreter is wired for autostart but its project is gone, or
+    the only candidate directory is a home directory.
+    """
 @
 
 At this point we already know which worktree the run belongs to.
@@ -1671,6 +1896,93 @@ class TestInitialize:
             capture_output=True, text=True,
         )
         assert "hello.py" in git_result.stdout
+@
+
+The home directory is where that convenience turns into a hazard, so
+it gets its own tests.
+They vary one thing against the test above---the run's [[HOME]] is the
+directory it would otherwise adopt---and demand the opposite outcome
+in both directions: an existing [[.learnlog/]] there must be ignored
+rather than joined, and an absent one must not be created.
+The first test is the reported incident at one thousandth of the
+scale; the second is the case that has no repository to fall back on
+at all.
+
+<<test functions>>=
+    def test_ignores_a_learnlog_repo_in_the_home_directory(
+        self, workdir, test_env,
+    ):
+        """A stray ~/.learnlog never captures runs below it."""
+        LearnlogRepo(workdir)
+        env = dict(test_env, HOME=str(workdir))
+        work = workdir / "work"
+        work.mkdir()
+        script = work / "below_home.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('visible')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-S", str(script)],
+            cwd=str(work), env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert (work / ".learnlog").is_dir()
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        assert "below_home.py" not in git_result.stdout
+
+    def test_refuses_to_start_a_repo_in_the_home_directory(
+        self, workdir, test_env,
+    ):
+        """A run whose only candidate root is $HOME logs nothing."""
+        env = dict(test_env, HOME=str(workdir), LEARNLOG_DEBUG="1")
+        script = workdir / "in_home.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('visible')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-S", str(script)],
+            cwd=str(workdir), env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "visible\n"
+        assert not (workdir / ".learnlog").exists()
+        assert "UnanchoredRun" in result.stderr
+@
+
+Refusing has to stay invisible to the student, which is a stronger
+claim than \enquote{no repository appeared}: the diagnostic above is
+opt-in, so without [[LEARNLOG_DEBUG]] the run must be
+indistinguishable from one where learnlog was never imported.
+
+<<test functions>>=
+    def test_refusal_is_silent_without_debug(
+        self, workdir, test_env,
+    ):
+        """Declining to log prints nothing by default."""
+        env = dict(test_env, HOME=str(workdir))
+        env.pop("LEARNLOG_DEBUG", None)
+        script = workdir / "quiet_in_home.py"
+        script.write_text(
+            "import learnlog\n"
+            "print('visible')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-S", str(script)],
+            cwd=str(workdir), env=env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert result.stdout == "visible\n"
+        assert result.stderr == ""
 @
 
 Let's verify the helper pieces directly.
@@ -2345,10 +2657,16 @@ The [[exit()]] built-in is the exception---it only exists when
 [[site.py]] has run---so that one test asks for [[site]].
 We cannot disable a possibly installed [[.pth]] hook there with
 [[LEARNLOG_SKIP_AUTOSTART]], because that variable is a real opt-out
-(\cref{sec:initialize}) and would silence the explicit import too;
-instead we accept that the hook, if present, starts the run from the
-same working directory, which is exactly the deployed configuration
-the deferred [[site.setquit]] hook exists for:
+(\cref{sec:initialize}) and would silence the explicit import too.
+What we can do is take the question of \emph{where} out of the hook's
+hands by exporting [[LEARNLOG_PROJECT_ROOT]] for that run.
+Every source defers to it (\cref{sec:initialize}), so the run lands in
+the temporary directory whether the hook fires or not, and the test
+stops depending on how the developer's own venv happens to be wired---
+a venv whose marker points at a project that no longer exists would
+otherwise make the run decline to log at all.
+The deployed configuration the deferred [[site.setquit]] hook exists
+for is reproduced either way:
 
 <<test helpers>>=
 def run_and_read_commit(source, *, workdir, env, name, with_site=False):
@@ -2365,6 +2683,8 @@ def run_and_read_commit(source, *, workdir, env, name, with_site=False):
     command = [sys.executable]
     if not with_site:
         command.append("-S")
+    else:
+        run_env["LEARNLOG_PROJECT_ROOT"] = str(workdir)
     command.append(str(script))
     result = subprocess.run(
         command,
@@ -2766,9 +3086,17 @@ The parent's own capture never sees the child's output, because the
 child writes to the inherited file descriptor rather than through the
 parent's [[sys.stdout]] wrapper.
 
+Both processes run with [[site.py]] enabled, since the child is
+started by the parent script rather than by the test, so a [[.pth]]
+hook in the developer's own venv takes part in the run.
+As in [[run_and_read_commit]] above, we settle the resulting ambiguity
+by naming the project explicitly: what this test is about is that two
+records stay apart, not where they are written.
+
 <<test functions>>=
 def test_nested_runs_keep_their_own_records(workdir, test_env):
     """A logged program starting another yields two records."""
+    env = dict(test_env, LEARNLOG_PROJECT_ROOT=str(workdir))
     (workdir / "child.py").write_text(
         "import learnlog\n"
         "print('CHILD')\n"
@@ -2784,7 +3112,7 @@ def test_nested_runs_keep_their_own_records(workdir, test_env):
 
     result = subprocess.run(
         [sys.executable, "parent.py"],
-        cwd=str(workdir), env=test_env,
+        cwd=str(workdir), env=env,
         capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0
@@ -3171,6 +3499,61 @@ def _resolve_project_root(marker_path=None, sys_prefix=None):
 @
 
 
+\subsection{Wired, but anchored nowhere}
+\label{sec:autostart-wired}
+
+Returning [[None]] answers \enquote{which project?} with
+\enquote{cannot tell}, and the caller needs one more bit before it can
+act on that: was this interpreter ever \emph{meant} to log into a
+project?
+The two situations that produce [[None]] are opposites.
+An interpreter that nobody wired---the system Python a student has
+added \mintinline{python}{import learnlog} to by hand---has no project
+because nobody named one, and the working directory is a reasonable
+guess.
+An interpreter that [[learnlog init]] wired has a project that has gone
+missing, and there the working directory is not a guess but a mistake:
+it is how a stale marker turns every run into a new repository beside
+whatever the student is working on.
+
+The marker file distinguishes them, because [[learnlog init]] is the
+only thing that writes one.
+Its \emph{presence} means \enquote{this interpreter was told which
+project it serves}, independently of whether its \emph{contents} still
+resolve---which is exactly the distinction the caller is missing.
+
+[[python -S]] is the one case where a marker is present and the wiring
+is nevertheless not in effect: [[-S]] skips [[site.py]], and with it
+every [[.pth]] file, so the hook never runs and learnlog is only in the
+process because something imported it explicitly.
+Reporting such a run as wired would refuse to log the very
+\mintinline{python}{import learnlog} the student wrote.
+[[sys.flags.no_site]] is CPython's own record of that flag, so we ask
+it rather than trying to detect our hook after the fact.
+
+<<project root resolution>>=
+def _is_autostart_wired(marker_path=None, no_site=None):
+    """True iff ``learnlog init`` wired this interpreter for autostart.
+
+    The marker file is written next to the autostart ``.pth`` file,
+    so its presence means every run of this interpreter was meant to
+    be logged into one particular project.  Under ``python -S`` no
+    ``.pth`` file runs at all, so such a run is never wired whatever
+    the venv contains.
+    """
+    if no_site is None:
+        no_site = bool(sys.flags.no_site)
+    if no_site:
+        return False
+    if marker_path is None:
+        marker_path = _DEFAULT_MARKER_PATH
+    try:
+        return pathlib.Path(marker_path).exists()
+    except Exception:
+        return False
+@
+
+
 \subsection{Startup entry point}
 \label{sec:autostart-on-import}
 
@@ -3266,11 +3649,15 @@ import os
 import pathlib
 import pytest
 import select
+import shutil
 import subprocess
 import sys
 import sysconfig
 
-from learnlog._autostart import _resolve_project_root
+from learnlog._autostart import (
+    _is_autostart_wired,
+    _resolve_project_root,
+)
 
 <<autostart test helpers>>
 <<autostart test functions>>
@@ -3410,6 +3797,35 @@ backup different valid projects; the marker's project is what
             sys_prefix=str(venv),
         )
         assert result == project
+@
+
+The wiring question is separate from the anchoring one, and the tests
+keep them separate too.
+A marker that no longer resolves still reports the interpreter as
+wired---that combination is the whole point of the predicate---while
+[[-S]] makes even a present marker report as unwired.
+
+<<autostart test functions>>=
+class TestIsAutostartWired:
+    def test_marker_present_means_wired(self, tmp_path):
+        marker = tmp_path / "marker.txt"
+        marker.write_text("/gone\n")
+        assert _is_autostart_wired(
+            marker_path=marker, no_site=False,
+        )
+
+    def test_no_marker_means_not_wired(self, tmp_path):
+        missing = tmp_path / "nonexistent.txt"
+        assert not _is_autostart_wired(
+            marker_path=missing, no_site=False,
+        )
+
+    def test_dash_s_run_is_never_wired(self, tmp_path):
+        marker = tmp_path / "marker.txt"
+        marker.write_text("/gone\n")
+        assert not _is_autostart_wired(
+            marker_path=marker, no_site=True,
+        )
 @
 
 
@@ -3683,6 +4099,52 @@ def test_autostart_from_foreign_cwd_uses_the_venv_project(tmp_path):
 
     assert not (foreign / ".learnlog").exists()
     assert "Script: scratch.py" in _git_history(project)
+@
+
+The same setup answers the harder version of that question: what
+should happen when the venv is wired but the project it was wired for
+is gone (\cref{sec:autostart-wired})?
+We take the working autostart venv apart in exactly the two ways that
+break anchoring---delete the project's [[.learnlog/]] so the
+[[sys.prefix]] backup cannot answer, and point the marker at a path
+that never existed---and then run an ordinary script from an unrelated
+directory.
+Nothing may be logged: not in the foreign directory, and not by
+resurrecting the project's repository either.
+The [[secrets.env]] is there for the same reason as above, and the
+assertions on the program's own behaviour are the ones that matter
+most---a refusal that made the student's script fail would be a worse
+bug than the one being fixed.
+
+<<autostart test functions>>=
+def test_wired_venv_without_a_project_logs_nowhere(tmp_path):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    from learnlog import cli
+
+    shutil.rmtree(project / ".learnlog")
+    marker = cli.venv_purelib(venv_dir) / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-project") + "\n")
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "secrets.env").write_text("TOKEN=hunter2\n")
+    script = foreign / "scratch.py"
+    script.write_text("print('scratch')\n")
+
+    result = subprocess.run(
+        [str(_venv_binary(venv_dir, "python")), str(script)],
+        cwd=str(foreign),
+        env=_autostart_env(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "scratch\n"
+    assert result.stderr == ""
+    assert not (foreign / ".learnlog").exists()
+    assert not (project / ".learnlog").exists()
 @
 
 The next test covers the widened invocation scope through the real

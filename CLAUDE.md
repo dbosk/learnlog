@@ -58,7 +58,7 @@ Five modules, all defined as `.nw` literate source in `src/learnlog/`:
 
 | Module | File | Purpose |
 |--------|------|---------|
-| `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup |
+| `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup; `find_learnlog_dir()`/`_resolve_workdir()` decide which project a run belongs to |
 | `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the venv's project root (marker file + `sys.prefix`) for `initialize()`, and imports `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs. Must never import `learnlog` at module scope: `import learnlog._autostart` already runs `__init__.py`, so the activation veto (`LEARNLOG_SKIP_AUTOSTART`, `learnlog init`) lives in `initialize()`, not here |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
 | `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; append-only two-commit protocol (header commit with the code state before the run, trailer commit with the results after, linked by `Run-Id`), `flock` + per-run `GIT_INDEX_FILE` around each commit; `git()` raises `GitError` on failure and `report_error()` records swallowed failures |
@@ -76,6 +76,16 @@ Tutorial sources in `src/learnlog/tutorials/`:
 - **Crash resilience**: `begin_run()` commits a header before execution, `finalize_run()` commits a trailer after; nothing is ever rewritten (no `--amend`), so overlapping runs, pushes, and tags stay correct
 - **Reading**: `commits.nw` joins each run's two commits by `Run-Id` (`get_run_trailers`/`merge_run_trailers`); `get_commits()` hides trailer commits, so `list`/`play`/ProgSnap2 show one record per run
 - `.learnlog/` in the working directory is the *product's* data (student log repo), not project config
+- **Bounded discovery**: `find_learnlog_dir()` never returns `$HOME` or
+  anything above it, and stops at a `.git` boundary (checked after
+  `.learnlog/`, so a project root that is also a checkout still wins). An
+  autostart-wired interpreter (marker file present, `site.py` enabled) whose
+  project no longer resolves logs *nothing* rather than guessing; so does a
+  run whose only candidate root is `$HOME`. Both raise `UnanchoredRun`, which
+  `initialize()`'s handler turns into a `LEARNLOG_DEBUG` diagnostic
+- `tests/Makefile` exports `LEARNLOG_SKIP_AUTOSTART=1` so the suite never logs
+  its own pytest process; `test_env`/`_autostart_env` strip it for the
+  subprocess tests that must be logged
 - Git operations use `subprocess.run` (no GitPython dependency)
 - `LearnlogRepo.git()` raises `GitError` by default; pass `check=False` only
   where the exit status is the answer (`git diff --cached --quiet`, probes),
