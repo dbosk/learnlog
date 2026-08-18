@@ -522,12 +522,15 @@ import builtins
 import pathlib
 import datetime
 import atexit
+import functools
+import threading
 import traceback
 
 from learnlog.capture import IOLog, StreamCapture, InputCapture
 from learnlog.gitrepo import LearnlogRepo, report_error
 from learnlog._autostart import _resolve_project_root
 
+<<constants>>
 <<module state>>
 <<functions>>
 
@@ -580,6 +583,7 @@ original_stderr = None
 original_stdin = None
 original_input = None
 exception_info = None
+system_exit_status = None
 start_time = None
 main_script = None
 main_args = None
@@ -1146,6 +1150,7 @@ def initialize():
         <<install I/O wrappers>>
         <<install REPL capture>>
         <<install exception hook>>
+        <<install exit status hook>>
         atexit.register(on_exit)
     except Exception as error:
         _report_swallowed_failure("initialize", error)
@@ -1920,6 +1925,573 @@ class TestExceptionCapture:
 @
 
 
+\section{Recording the exit status}
+\label{sec:exit-status}
+
+Every run's trailer carries an [[Exit-Code:]] line, and the analysis
+tools turn it into a verdict: [[classify_run_block]]
+(\cref{sec:classify-run-outcomes}) calls a run a failure when the code
+is non-zero, and the ProgSnap2 exporter (\cref{progsnap2}) maps the
+same field onto [[ProgramResult]].
+A number we invent rather than observe therefore does not merely lose
+detail---it mislabels the run.
+
+The natural place to read the status is the exit handler, but the
+interpreter never tells Python code which status it is about to use.
+When an uncaught [[SystemExit]] reaches the top of the stack, CPython
+does not consult [[sys.excepthook]] at all: it special-cases the
+exception in C, reads its [[code]] attribute, converts it to an
+integer, clears the exception, and calls [[Py_Exit]].
+Interpreter finalisation---and with it our [[atexit]] handler---runs
+\emph{inside} that call, by which time [[sys.exc_info()]] is empty
+again and the integer exists only on the C side.
+An exit handler that asks \enquote{how did this end?} can thus
+distinguish nothing, which is why the earlier code had to guess: it
+reported~[[0]] unless the exception hook had fired, so
+\mintinline{python}{sys.exit(3)} was logged as a clean run and
+exported as [[Success]].
+
+The status has to be captured where it is still visible: at the moment
+[[SystemExit]] is raised.
+[[sys.exit]] is an ordinary attribute of the [[sys]] module, so we can
+put a wrapper in front of it that notes the status and then delegates,
+exactly as we already do for [[builtins.input]].
+
+<<install exit status hook>>=
+original_exit = sys.exit
+sys.exit = _wrap_exit(original_exit)
+@
+
+The wrapper takes [[*args]] instead of a parameter defaulting to
+[[None]] so that it can pass the call on unchanged.
+\mintinline{python}{sys.exit()} must keep raising
+\mintinline{python}{SystemExit()} with an empty [[args]] tuple rather
+than the subtly different \mintinline{python}{SystemExit(None)}: a
+program that catches its own [[SystemExit]] and inspects it must not
+be able to tell that we are in the way.
+
+Only the main thread's [[SystemExit]] ends the process.
+A worker thread that calls [[sys.exit]] raises an exception that
+[[threading.excepthook]] discards on purpose, so the thread stops and
+the program carries on; recording that status would report a failure
+for a run that goes on to succeed.
+We therefore note the status only when the call comes from the thread
+whose stack the interpreter will actually unwind.
+The check lives in its own function because the wrapper is not the only
+caller---the [[exit()]] built-in needs exactly the same treatment below.
+
+<<functions>>=
+def _record_system_exit(code):
+    """Note the status a main-thread ``SystemExit`` will produce."""
+    global system_exit_status
+    if threading.current_thread() is threading.main_thread():
+        system_exit_status = _system_exit_status(code)
+@
+
+[[functools.wraps]] copies the built-in's [[__name__]], [[__doc__]] and
+[[__module__]] onto the wrapper, so [[help(sys.exit)]] and anything else
+that introspects the function still describes the real one.
+
+<<functions>>=
+def _wrap_exit(original_exit):
+    """Return a ``sys.exit`` wrapper that records the exit status."""
+    @functools.wraps(original_exit)
+    def logged_exit(*args):
+        _record_system_exit(args[0] if args else None)
+        original_exit(*args)
+
+    return logged_exit
+@
+
+Let's verify that the wrapper still passes for the built-in it replaces:
+
+<<test functions>>=
+class TestExitWrapper:
+    def test_wrapper_borrows_the_builtin_identity(self):
+        from learnlog import _wrap_exit
+        wrapped = _wrap_exit(sys.exit)
+        assert wrapped.__name__ == "exit"
+        assert wrapped.__module__ == "sys"
+        assert "SystemExit" in (wrapped.__doc__ or "")
+@
+
+
+\subsection{The [[exit()]] and [[quit()]] built-ins}
+
+[[sys.exit]] is not the only door out.
+Students who met Python in the REPL write \mintinline{python}{exit(1)}
+in scripts too, and that name is not [[sys.exit]]: [[site]] installs a
+[[Quitter]] instance in [[builtins]] which closes [[sys.stdin]] and then
+raises [[SystemExit]] itself, never going near our wrapper.
+
+A plain function cannot stand in for it.
+Typing [[exit]] \emph{without} parentheses in the REPL is supposed to
+answer \enquote{Use exit() or Ctrl-D (i.e. EOF) to exit}, and that
+answer is [[Quitter.__repr__]] talking; a function would print its own
+[[<function ...>]] instead and change what the student sees.
+The stand-in is therefore an object that records the status, delegates
+the call, and hands [[repr]] straight back to the original.
+
+<<functions>>=
+class _QuitterProxy:
+    """Stand-in for the ``exit``/``quit`` built-ins.
+
+    Records the exit status, then delegates to the original quitter.
+    Attribute access that matters for these objects is ``repr``, which
+    the REPL shows when the name is typed without parentheses; it comes
+    from the original so the message is unchanged.
+    """
+
+    def __init__(self, original):
+        self._original = original
+
+    def __call__(self, code=None):
+        _record_system_exit(code)
+        self._original(code)
+
+    def __repr__(self):
+        return repr(self._original)
+@
+
+Let's verify both halves of that contract, the recording and the
+borrowed [[repr]]:
+
+<<test functions>>=
+class FakeQuitter:
+    """Stand-in for site.Quitter with its distinctive repr."""
+
+    def __repr__(self):
+        return "Use exit() or Ctrl-D (i.e. EOF) to exit"
+
+    def __call__(self, code=None):
+        raise SystemExit(code)
+
+
+class TestQuitterProxy:
+    def test_repr_comes_from_the_original(self):
+        from learnlog import _QuitterProxy
+        proxy = _QuitterProxy(FakeQuitter())
+        assert repr(proxy) == repr(FakeQuitter())
+
+    def test_call_records_status_and_delegates(self, monkeypatch):
+        import learnlog
+        monkeypatch.setattr(learnlog, "system_exit_status", None)
+        proxy = learnlog._QuitterProxy(FakeQuitter())
+        with pytest.raises(SystemExit):
+            proxy(2)
+        assert learnlog.system_exit_status == 2
+@
+
+Both names get the same treatment, and either may be missing---
+[[python -S]] skips [[site.py]] altogether, and an embedded interpreter
+may never create them---so we replace only what is there.
+The function also reports whether it managed to wrap both, because the
+caller has a second strategy for when it did not, and it must stay
+harmless to call twice.
+
+<<constants>>=
+QUITTER_NAMES = ("exit", "quit")
+<<functions>>=
+def _install_quitter_proxies():
+    """Wrap the ``exit``/``quit`` built-ins with recording proxies.
+
+    Returns ``True`` once both names carry a proxy.
+    """
+    for name in QUITTER_NAMES:
+        original = getattr(builtins, name, None)
+        if original is None or isinstance(original, _QuitterProxy):
+            continue
+        setattr(builtins, name, _QuitterProxy(original))
+    return all(
+        isinstance(getattr(builtins, name, None), _QuitterProxy)
+        for name in QUITTER_NAMES
+    )
+@
+
+
+\subsection{When the built-ins do not exist yet}
+
+There is an ordering trap here, and it bites in exactly the
+configuration that matters most.
+[[site.py]] evaluates [[.pth]] files inside [[addsitepackages()]] and
+only \emph{afterwards} calls [[setquit()]] to create the two
+[[Quitter]] instances.
+Our autostart hook (\cref{sec:autostart}) is a [[.pth]] line, so in a
+student's wired venv [[initialize]] runs before [[builtins.exit]]
+exists, and a straightforward replacement would silently wrap nothing.
+The symptom would be a feature that passes a hand-written test using an
+explicit \mintinline{python}{import learnlog} and does nothing at all
+for the students it was written for.
+
+We therefore install the proxies as soon as the quitters appear.
+The [[site]] module is halfway through its own [[main()]] when our hook
+runs, so it is already in [[sys.modules]] and we can replace its
+[[setquit]] with one that calls the original and then wraps what that
+call has just created.
+The replacement puts [[site.setquit]] back before delegating, so the
+[[site]] module is left as we found it and a repeated call cannot stack
+a second layer.
+When learnlog is imported the ordinary way---from a script, long after
+startup---[[setquit]] has already run, the first attempt succeeds, and
+this path is never taken.
+
+<<functions>>=
+def _install_quitter_proxies_after_site(site_module):
+    """Install the quitter proxies once ``site`` has created them."""
+    original_setquit = getattr(site_module, "setquit", None)
+    if original_setquit is None:
+        return
+
+    def setquit():
+        site_module.setquit = original_setquit
+        original_setquit()
+        _install_quitter_proxies()
+
+    site_module.setquit = setquit
+@
+
+<<install exit status hook>>=
+if not _install_quitter_proxies():
+    site_module = sys.modules.get("site")
+    if site_module is not None:
+        _install_quitter_proxies_after_site(site_module)
+@
+
+Let's verify the deferred path with a stand-in for [[site]], since the
+real one has long finished by the time the tests run:
+
+<<test functions>>=
+class FakeSiteModule:
+    """Minimal stand-in for the site module."""
+
+    def __init__(self, setquit):
+        self.setquit = setquit
+
+
+class TestDeferredQuitterProxies:
+    def test_proxies_wait_for_setquit(self, monkeypatch):
+        import builtins as builtins_module
+        import learnlog
+
+        monkeypatch.delattr(builtins_module, "exit", raising=False)
+        monkeypatch.delattr(builtins_module, "quit", raising=False)
+        assert not learnlog._install_quitter_proxies()
+
+        def setquit():
+            builtins_module.exit = FakeQuitter()
+            builtins_module.quit = FakeQuitter()
+
+        site_module = FakeSiteModule(setquit)
+        learnlog._install_quitter_proxies_after_site(site_module)
+        site_module.setquit()
+
+        assert isinstance(builtins_module.exit, learnlog._QuitterProxy)
+        assert isinstance(builtins_module.quit, learnlog._QuitterProxy)
+        assert site_module.setquit is setquit
+@
+
+
+\subsection{Translating a [[SystemExit]] code}
+
+The [[code]] carried by a [[SystemExit]] is not an exit status yet.
+We reproduce CPython's own translation, because the point of the
+exercise is to predict what the process will do, not to invent a
+second convention:
+\begin{description}
+\item[A [[None]] code] means success.
+  Both \mintinline{python}{sys.exit()} and
+  \mintinline{python}{sys.exit(None)} end the program normally, so they
+  must be indistinguishable from falling off the end of the script.
+\item[An integer] is the status itself.
+  Booleans count as integers here, matching CPython's
+  [[PyLong_Check]]: \mintinline{python}{sys.exit(False)} is a success
+  and \mintinline{python}{sys.exit(True)} a failure, which is what makes
+  the [[unittest]] idiom \mintinline{python}{sys.exit(not ok)} work.
+\item[Any other object] means failure.
+  CPython prints it to [[sys.stderr]] and exits with~1, so
+  \mintinline{python}{sys.exit("no input file")} is a failing run whose
+  message we capture as ordinary [[stderr]] output---the streams are
+  still wrapped when the interpreter writes it.
+\end{description}
+
+The mask deserves a word.
+[[Py_Exit]] hands its integer to the C library's [[exit]], which keeps
+only the low eight bits, so the status a parent process can observe for
+\mintinline{python}{sys.exit(300)} is~44 and for
+\mintinline{python}{sys.exit(-1)} it is~255.
+We record the truncated value because the log is a record of what
+happened, and what happened is what the shell, the test runner, or a
+future [[learnlog run]] wrapper would see.
+
+<<constants>>=
+EXIT_STATUS_MASK = 0xFF
+<<functions>>=
+def _system_exit_status(code):
+    """Translate a ``SystemExit`` code into a process exit status.
+
+    Mirrors CPython: ``None`` is success, an integer is the status
+    truncated to the eight bits the operating system keeps, and any
+    other object is printed to stderr and yields 1.
+    """
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code & EXIT_STATUS_MASK
+    return 1
+@
+
+Let's verify the translation against the cases the prose distinguishes:
+
+<<test functions>>=
+class TestSystemExitStatus:
+    def test_none_is_success(self):
+        from learnlog import _system_exit_status
+        assert _system_exit_status(None) == 0
+
+    def test_integer_is_the_status(self):
+        from learnlog import _system_exit_status
+        assert _system_exit_status(3) == 3
+
+    def test_booleans_count_as_integers(self):
+        from learnlog import _system_exit_status
+        assert _system_exit_status(False) == 0
+        assert _system_exit_status(True) == 1
+
+    def test_status_is_truncated_like_the_c_library(self):
+        from learnlog import _system_exit_status
+        assert _system_exit_status(-1) == 255
+        assert _system_exit_status(300) == 44
+
+    def test_other_objects_mean_failure(self):
+        from learnlog import _system_exit_status
+        assert _system_exit_status("no input file") == 1
+        assert _system_exit_status(object()) == 1
+@
+
+
+\subsection{Choosing the status to record}
+
+Two observations can now disagree, so the exit handler has to rank
+them.
+An unhandled exception wins over a recorded [[SystemExit]]: once the
+exception hook has fired we know the traceback reached the top of the
+stack, and CPython ends such a run with status~1 no matter what the
+program did earlier.
+This also repairs the one case the wrapper alone gets wrong---a program
+that calls [[sys.exit]], catches its own [[SystemExit]], and then dies
+of a real exception.
+The remaining blind spot is the mirror image, a swallowed
+[[sys.exit]] followed by a clean end; we accept it because a program
+that asks to terminate and then carries on regardless is pathological,
+whereas guessing~[[0]] for every deliberate exit got the ordinary case
+wrong.
+
+<<functions>>=
+def _resolve_exit_code():
+    """Return the status the interpreter will terminate with."""
+    if exception_info is not None:
+        return 1
+    if system_exit_status is not None:
+        return system_exit_status
+    return 0
+@
+
+Let's verify the ranking, including that an unhandled exception
+overrides a [[SystemExit]] the program swallowed on the way:
+
+<<test functions>>=
+class TestResolveExitCode:
+    def test_clean_run_is_zero(self, monkeypatch):
+        import learnlog
+        monkeypatch.setattr(learnlog, "exception_info", None)
+        monkeypatch.setattr(learnlog, "system_exit_status", None)
+        assert learnlog._resolve_exit_code() == 0
+
+    def test_recorded_system_exit_is_used(self, monkeypatch):
+        import learnlog
+        monkeypatch.setattr(learnlog, "exception_info", None)
+        monkeypatch.setattr(learnlog, "system_exit_status", 3)
+        assert learnlog._resolve_exit_code() == 3
+
+    def test_unhandled_exception_wins(self, monkeypatch):
+        import learnlog
+        monkeypatch.setattr(
+            learnlog, "exception_info", "Traceback ...",
+        )
+        monkeypatch.setattr(learnlog, "system_exit_status", 3)
+        assert learnlog._resolve_exit_code() == 1
+@
+
+Unit tests can only show that the pieces agree with each other.
+The claim that matters is about a whole process---the wrapper has to
+be installed before the student's code runs, survive it, and reach the
+commit---so the regression tests run real scripts and read the trailer
+back out of the log repository.
+This helper removes the boilerplate they would otherwise repeat.
+It launches [[python -S]] with the checkout's [[src/]] on
+[[PYTHONPATH]], mirroring [[run_explicit_import]] above: skipping
+[[site.py]] keeps the installed [[.pth]] hook out of the way, so the
+run under test is the one the script itself starts.
+The [[exit()]] built-in is the exception---it only exists when
+[[site.py]] has run---so that one test asks for [[site]] and disables
+the autostart hook by environment variable instead:
+
+<<test helpers>>=
+def run_and_read_commit(source, *, workdir, env, name, with_site=False):
+    """Run ``source`` as a script and return result and commit message."""
+    script = pathlib.Path(workdir) / name
+    script.write_text(source)
+    run_env = env.copy()
+    source_root = pathlib.Path(__file__).resolve().parents[2] / "src"
+    pythonpath = str(source_root)
+    existing_pythonpath = run_env.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath = pythonpath + os.pathsep + existing_pythonpath
+    run_env["PYTHONPATH"] = pythonpath
+    command = [sys.executable]
+    if with_site:
+        run_env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    else:
+        command.append("-S")
+    command.append(str(script))
+    result = subprocess.run(
+        command,
+        cwd=str(workdir), env=run_env,
+        capture_output=True, text=True, timeout=30,
+    )
+    message = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "log", "-1", "--format=%B"],
+        cwd=str(workdir),
+        capture_output=True, text=True,
+    ).stdout
+    return result, message
+@
+
+The scripts differ only in how they end, and every assertion pairs the
+status the operating system reports with the status we recorded---a
+test that only checked the trailer could pass against a wrapper that
+agreed with itself but not with reality.
+The last one is the thread case, where the two must differ from the
+naive reading: the worker asks for status~3 and the process still
+succeeds.
+A run that simply falls off the end of the script is already covered by
+[[TestOnExit]] above, which asserts [[Exit-Code: 0]] for it.
+
+<<test functions>>=
+class TestRecordedExitStatus:
+    def test_sys_exit_with_status(self, workdir, test_env):
+        result, message = run_and_read_commit(
+            "import learnlog\n"
+            "import sys\n"
+            "sys.exit(3)\n",
+            workdir=workdir, env=test_env, name="exit_three.py",
+        )
+        assert result.returncode == 3
+        assert "Exit-Code: 3" in message
+
+    def test_bare_sys_exit(self, workdir, test_env):
+        result, message = run_and_read_commit(
+            "import learnlog\n"
+            "import sys\n"
+            "sys.exit()\n",
+            workdir=workdir, env=test_env, name="exit_bare.py",
+        )
+        assert result.returncode == 0
+        assert "Exit-Code: 0" in message
+
+    def test_sys_exit_with_message(self, workdir, test_env):
+        result, message = run_and_read_commit(
+            "import learnlog\n"
+            "import sys\n"
+            "sys.exit('no input file')\n",
+            workdir=workdir, env=test_env, name="exit_message.py",
+        )
+        assert result.returncode == 1
+        assert "Exit-Code: 1" in message
+        assert "no input file" in result.stderr
+        assert "no input file" in message
+
+    def test_builtin_exit(self, workdir, test_env):
+        result, message = run_and_read_commit(
+            "import learnlog\n"
+            "exit(2)\n",
+            workdir=workdir, env=test_env, name="exit_builtin.py",
+            with_site=True,
+        )
+        assert result.returncode == 2
+        assert "Exit-Code: 2" in message
+
+    def test_unhandled_exception(self, workdir, test_env):
+        result, message = run_and_read_commit(
+            "import learnlog\n"
+            "raise ValueError('boom')\n",
+            workdir=workdir, env=test_env, name="exit_raise.py",
+        )
+        assert result.returncode == 1
+        assert "Exit-Code: 1" in message
+        assert "ValueError: boom" in message
+
+    def test_worker_thread_exit_is_ignored(self, workdir, test_env):
+        result, message = run_and_read_commit(
+            "import learnlog\n"
+            "import sys\n"
+            "import threading\n"
+            "worker = threading.Thread(target=lambda: sys.exit(3))\n"
+            "worker.start()\n"
+            "worker.join()\n"
+            "print('main thread continues')\n",
+            workdir=workdir, env=test_env, name="exit_thread.py",
+        )
+        assert result.returncode == 0
+        assert "Exit-Code: 0" in message
+@
+
+
+\subsection{What we cannot observe}
+
+Three ways of ending a run never reach the wrapper, and it is worth
+being explicit about what the log says for each.
+
+\begin{description}
+\item[Bypassing shutdown with [[os._exit]] ] terminates the process
+  through the C library without finalising the interpreter, so no
+  [[atexit]] handler runs and the run keeps the header
+  [[begin_run]] committed but never gets a trailer.
+  A block with no [[Exit-Code:]] line is classified as \emph{unknown}
+  rather than as a failure (\cref{sec:classify-run-outcomes}), which
+  is the honest answer: we know the run started and nothing about how
+  it ended.
+  We deliberately leave [[os._exit]] alone.  Its whole purpose is to
+  skip cleanup---a forked child that must not run its parent's
+  handlers depends on that---so wrapping it would change program
+  behaviour rather than observe it.
+\item[Death by signal] cannot be seen from inside at all.
+  [[SIGKILL]] is not deliverable to a handler, and catching
+  [[SIGTERM]] would not be observation either: a Python-level handler
+  turns an immediate, default-disposition kill into an ordinary
+  interpreter shutdown, changes the status the parent reads unless the
+  handler carefully restores the default disposition and re-raises,
+  and either overwrites a handler the student's own program installs
+  or is overwritten by it.
+  Since transparency outranks completeness here, we install no signal
+  handlers, and such runs stay headers without trailers as well.
+  A real wait status can only be read by whatever waits for the
+  process, which is why exit-status fidelity for killed runs belongs
+  to a future [[learnlog run]] wrapper rather than to this module.
+\item[Raising [[SystemExit]] directly] is the one remaining gap.
+  A program that writes \mintinline{python}{raise SystemExit(3)}
+  constructs the exception itself, so neither the [[sys.exit]] wrapper
+  nor the [[exit()]] stand-in sees it and the run is recorded as if it
+  had ended normally.
+  We could close it by rebinding [[SystemExit]] in [[builtins]] to a
+  subclass of our own, but that would break every
+  \mintinline{python}{except SystemExit} that catches a genuine
+  [[SystemExit]] raised elsewhere, which is far worse than an
+  occasional wrong exit code.
+\end{description}
+
+
 \section{Exit handler}
 
 The [[on_exit]] function runs when the program terminates (via
@@ -1980,6 +2552,12 @@ repl_capture_flush = None
 repl_capture_skip_input = None
 @
 
+Only now is the exit status decided.
+Both witnesses---the [[sys.exit]] wrapper and the exception hook---have
+had their chance to fire, so [[_resolve_exit_code]]
+(\cref{sec:exit-status}) is looking at all the evidence there will ever
+be.
+
 <<finalise the run>>=
 end_time = datetime.datetime.now()
 io_text = iolog.getvalue() if iolog else ""
@@ -1987,7 +2565,7 @@ repo.finalize_run(
     io_log=io_text,
     exception_info=exception_info,
     end_time=end_time,
-    exit_code=0 if exception_info is None else 1,
+    exit_code=_resolve_exit_code(),
 )
 @
 
