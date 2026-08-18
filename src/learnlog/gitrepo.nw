@@ -51,6 +51,7 @@ import sys
 import pathlib
 import subprocess
 import datetime
+import time
 import pytest
 from learnlog.gitrepo import *
 
@@ -123,11 +124,20 @@ class LearnlogRepo:
         self.run_id = None
         self.run_script = None
         self.run_args = []
-        if not self.git_dir.exists():
-            self.init_repo()
+        self.init_repo()
 
     <<repo methods>>
 @
+
+The constructor used to call [[init_repo]] only when [[.learnlog/]] was
+missing.
+Deciding from the directory alone is what a concurrent first run breaks
+(\cref{sec:init-repo}): the directory appears the instant one process
+starts initialising, so a second process constructed in that window
+would conclude that a repository was ready and run its first
+[[git add]] against one that was not there yet.
+[[init_repo]] is idempotent and answers that question properly, so the
+constructor simply always asks it.
 
 The directory name appears in three places that must agree: the path we
 hand to Git, the exclude pattern that keeps the log out of its own
@@ -526,12 +536,35 @@ On the very first run, we need to create the Git repository, configure
 a committer identity, set up exclusion patterns, and make an initial
 commit of all source files.
 
-The learnlog repository inherits the student's global Git identity and
-GPG signing configuration.
-If a student has not configured Git at all, commits would fail---so we
-set a fallback identity only when no global one exists.
-This means commits are signed with the student's own key when available,
-which is the right thing for a log of \emph{their} work.
+That first run need not be alone.
+Two terminals open in the same project, a parallel [[make]], or a
+logged program that starts another logged program all reach this method
+within milliseconds of each other in a directory that has no
+[[.learnlog/]] yet, and each of them finds no repository to use.
+Running [[git init]] twice in \emph{sequence} is harmless---it is
+deliberately re-runnable---but running it twice at once is not.
+Both processes copy Git's template hooks into the new directory, and
+the one that loses on any single file dies with \enquote{cannot copy
+\ldots{} File exists}, taking its run with it.
+Even where both survive, the initial commit does not: two commits made
+with no [[HEAD]] to build on are two \emph{root} commits on the same
+branch, and the branch update that lands second leaves the other root,
+together with every run recorded on top of it, reachable from nothing.
+
+The single-writer lock of \cref{sec:commit-lock} is the right mechanism
+and cannot be used as it stands, because the file it locks lives inside
+the very directory whose creation is being raced.
+Creating that directory ourselves is what makes it usable: [[mkdir]]
+with [[exist_ok]] is safe for any number of simultaneous callers, an
+empty [[.learnlog/]] is one [[git init]] is perfectly happy to
+initialise, and a lock file inside it is kept out of the log by the
+same exclude pattern that keeps the rest of the Git directory out.
+
+Under the lock, the question to ask is not whether the directory
+exists---it does, we just made it---but whether the repository already
+has a commit.
+The loser of the race blocks until the winner's initial commit is in,
+finds one, and returns without writing anything.
 
 <<repo methods>>=
 def init_repo(self):
@@ -540,13 +573,73 @@ def init_repo(self):
     Creates the repository, sets a fallback committer identity
     (only if the student has none configured globally), sets up
     exclusion patterns, and makes an initial commit of all files.
-    """
-    self.git("init")
-    <<set fallback identity if needed>>
 
-    <<set up exclude patterns>>
-    <<initial commit>>
+    Returns without doing anything when the repository already
+    has a commit, so that concurrent first runs share one initial
+    commit instead of making a root commit each.
+    """
+    if self.has_commit():
+        return
+    self.git_dir.mkdir(parents=True, exist_ok=True)
+    with self.commit_lock():
+        <<initialise unless another process got there first>>
 @
+
+The check before the lock is the one that runs on every later
+construction, and it is there to keep the common case---an established
+repository---from queueing behind whatever else is committing.
+The check inside the lock is the one that is authoritative.
+
+<<initialise unless another process got there first>>=
+if self.has_commit():
+    return
+self.git("init")
+<<set fallback identity if needed>>
+
+<<set up exclude patterns>>
+<<initial commit>>
+@
+
+\enquote{Has a commit} is the property that matters, rather than
+\enquote{has a Git directory}, because the directory appears at the
+very start of initialisation and the repository only becomes usable at
+the end of it.
+[[git rev-parse --verify]] answers it, and this is the first of the
+three places in this module where a non-zero exit is the answer rather
+than a problem: [[HEAD]] fails to resolve exactly while the branch is
+still unborn.
+The filesystem answers for free in the one case where it can---a
+directory that is not there cannot hold a commit---but every
+[[LearnlogRepo]] built on an existing log does pay for one
+[[rev-parse]].
+That is the price of the correctness above, and it is a small one next
+to what the same process is about to do: a run makes two commits, each
+of which walks the work tree.
+
+<<repo methods>>=
+def has_commit(self):
+    """Return whether the repository exists and has a commit."""
+    if not self.git_dir.is_dir():
+        return False
+    probe = self.git(
+        "rev-parse", "--verify", "--quiet", "HEAD",
+        check=False,
+    )
+    return probe.returncode == 0
+@
+
+Where [[fcntl]] is missing the lock is a no-op
+(\cref{sec:commit-lock}), and check-then-initialise is racy again.
+That is the same trade as for the commit lock itself: a platform
+without [[flock]] gets the protocol without the serialisation, rather
+than no learnlog at all.
+
+The learnlog repository inherits the student's global Git identity and
+GPG signing configuration.
+If a student has not configured Git at all, commits would fail---so we
+set a fallback identity only when no global one exists.
+This means commits are signed with the student's own key when available,
+which is the right thing for a log of \emph{their} work.
 
 We check whether Git can resolve a user name; if not, we provide a
 generic fallback.
@@ -556,9 +649,8 @@ We also disable GPG signing---these machine-generated commits do not
 need cryptographic signatures, and students may not have a GPG key
 configured.
 
-The probe is one of the few places where a non-zero exit is the answer
-rather than a problem: [[git config user.name]] exits~1 precisely when
-the setting we are asking about is absent.
+This probe is the second of those places: [[git config user.name]]
+exits~1 precisely when the setting we are asking about is absent.
 It therefore runs with [[check=False]].
 
 <<set fallback identity if needed>>=
@@ -672,6 +764,132 @@ def test_init_is_idempotent(workdir):
     assert result.stdout.strip().count("\n") == 0
 @
 
+The constructor's change has a test of its own, and it does not need
+concurrency at all.
+An initialising process leaves [[.learnlog/]] in a state no newcomer
+can distinguish from a bare directory, and the shortest way to produce
+that state on purpose is to make the bare directory.
+A [[LearnlogRepo]] built on it must come out with a working
+repository---which also means a first run killed halfway through
+initialisation is repaired by the next one instead of poisoning the
+project.
+
+<<test functions>>=
+def test_init_completes_a_bare_git_dir(workdir):
+    """A directory with no repository in it still gets one."""
+    (workdir / ".learnlog").mkdir()
+    repo = LearnlogRepo(workdir)
+    log = repo.git("log", "--oneline").stdout
+    assert "initial commit" in log
+    assert "hello.py" in repo.git("ls-files").stdout
+@
+
+Every remaining property above holds within a single process, and the
+one this section exists for does not: it needs several processes
+reaching an empty directory together.
+Separate processes rather than threads, because the lock they contend
+on is a kernel object shared between processes, and because that is the
+situation the students are in.
+
+Each of them runs the same short program.
+It has to be started with [[python -S]], an explicit [[PYTHONPATH]] and
+[[LEARNLOG_SKIP_AUTOSTART]], for a reason specific to this test: if
+[[import learnlog]] logged its own run, the repository would be created
+during the import, before the test had a chance to line the processes
+up, and the race under test would never happen.
+
+<<test functions>>=
+CONCURRENT_INIT_SOURCE = """\
+import datetime
+import pathlib
+import sys
+import time
+
+from learnlog.gitrepo import LearnlogRepo
+
+workdir, script, deadline = sys.argv[1], sys.argv[2], sys.argv[3]
+time.sleep(max(0.0, float(deadline) - time.time()))
+
+repo = LearnlogRepo(pathlib.Path(workdir))
+repo.begin_run(script, [], datetime.datetime(2026, 1, 1, 10, 0))
+print(repo.run_id)
+repo.finalize_run(
+    io_log="",
+    exception_info=None,
+    end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+    exit_code=0,
+)
+"""
+@
+
+Lining them up is the whole difficulty.
+Interpreter startup takes far longer, and varies far more, than the
+window between \enquote{no repository here} and \enquote{initial commit
+written}, so processes merely launched in a loop would arrive one after
+another and the test would pass on the broken code.
+Each child therefore sleeps until a wall-clock instant the parent
+picked in advance, which costs one fixed delay and puts every child at
+[[LearnlogRepo]] within a scheduling quantum of the others.
+A machine too slow to reach the deadline in time only makes the test
+less concurrent, never wrong.
+
+<<test functions>>=
+CONCURRENT_INIT_PROCESSES = 4
+CONCURRENT_INIT_BARRIER_SECONDS = 0.5
+@
+
+Two things are then true of a correctly initialised log, and each of
+them fails on its own kind of damage.
+There is exactly one root commit reachable from [[HEAD]], which a
+second initial commit breaks.
+And every run contributes its id twice, once from its header commit and
+once from its trailer, which breaks when a branch update lands on top
+of a root that another process had already replaced---the commits
+survive as objects, but nothing reaches them any more.
+
+<<test functions>>=
+def test_concurrent_init_keeps_one_root_and_every_run(
+        workdir):
+    """Simultaneous first runs share one initial commit."""
+    env = os.environ.copy()
+    checkout = pathlib.Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = str(checkout / "src")
+    env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    env.pop("LEARNLOG_PROJECT_ROOT", None)
+    deadline = time.time() + CONCURRENT_INIT_BARRIER_SECONDS
+
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable, "-S", "-c",
+                CONCURRENT_INIT_SOURCE,
+                str(workdir), f"run{n}.py", str(deadline),
+            ],
+            cwd=str(workdir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for n in range(CONCURRENT_INIT_PROCESSES)
+    ]
+    run_ids = []
+    for process in processes:
+        out, err = process.communicate(timeout=60)
+        assert process.returncode == 0, err
+        run_ids.append(out.strip())
+    assert len(set(run_ids)) == CONCURRENT_INIT_PROCESSES
+
+    repo = LearnlogRepo(workdir)
+    roots = repo.git(
+        "rev-list", "--max-parents=0", "HEAD",
+    ).stdout.split()
+    assert len(roots) == 1
+    log = repo.git("log", "--format=%B").stdout
+    for run_id in run_ids:
+        assert log.count(f"Run-Id: {run_id}") == 2
+@
+
 
 \section{One run, two commits}
 \label{sec:two-commit-protocol}
@@ -764,6 +982,7 @@ def new_run_id():
 
 
 \subsection{Serialising commits}
+\label{sec:commit-lock}
 
 Two learnlog processes can reach [[begin_run]] at the same instant.
 Git guards its own data structures with lock files, but a losing
@@ -778,6 +997,15 @@ terminals take turns \emph{running programs} instead of taking turns
 \emph{committing}---a student's program would block on another
 student's program, which breaks transparency far worse than the race it
 prevents.
+
+Repository creation takes this same lock (\cref{sec:init-repo}),
+because the initial commit is a commit that must happen exactly once
+too.
+The lock therefore means \enquote{learnlog is writing to this
+repository}, not \enquote{a run is being committed}, and that is why
+its file has to live somewhere creation can be relied on to have made:
+inside [[.learnlog/]], which [[init_repo]] creates before it takes the
+lock.
 
 [[fcntl]] does not exist on Windows.
 Rather than fail there, we degrade to no locking: the protocol is still
@@ -868,7 +1096,7 @@ RUN_INDEX_PREFIX = "index-"
 At the start of each program execution, [[begin_run]] snapshots the work
 tree and commits it together with the run header.
 
-The change detection is the second and last place in this module where
+The change detection is the third and last place in this module where
 a non-zero exit is data rather than trouble.
 [[git diff --cached --quiet]] answers \enquote{is the index different
 from [[HEAD]]?} with its exit status, so it runs with [[check=False]]
