@@ -5652,7 +5652,13 @@ asks both halves: the help output must not advertise the command, and
 the command must still answer to its name.
 The help is checked against the word as a command entry rather than
 as a substring, because \enquote{git} appears in other commands' help
-texts legitimately:
+texts legitimately.
+Typer draws its command table with the box-drawing character U+2502,
+and the test needs that exact character to recognise a table row---but
+noweave copies code chunks verbatim into the woven \LaTeX{}, where
+pdf\LaTeX{} has no glyph set up for it and stops with an error.
+Spelling it [[chr(0x2502)]] gives the running test the real character
+while the source stays within what the document engine typesets:
 
 <<test functions>>=
 def test_git_command_is_hidden_but_works(workdir, monkeypatch):
@@ -5665,10 +5671,12 @@ def test_git_command_is_hidden_but_works(workdir, monkeypatch):
 
     listed = runner.invoke(app, ["--help"])
     assert listed.exit_code == 0
+    table_edge = chr(0x2502)
     commands = [
         line.split()[1]
         for line in listed.output.splitlines()
-        if line.strip().startswith("│") and len(line.split()) > 1
+        if line.strip().startswith(table_edge)
+        and len(line.split()) > 1
     ]
     assert "git" not in commands
     assert "list" in commands
