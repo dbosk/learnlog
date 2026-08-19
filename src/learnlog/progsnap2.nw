@@ -1864,6 +1864,16 @@ Two details need explicit care.
 First, [[LearnlogRepo(tmpdir / "repo")]] auto-creates an
 initial commit; the first reconstructed commit therefore amends
 that commit instead of adding an extra synthetic one.
+This is the one [[--amend]] left in the program, and it does not
+conflict with the append-only rule of
+\cref{sec:two-commit-protocol}: that rule protects a \emph{live}
+log that overlapping runs, pushes, and tags may be reading while
+it grows, whereas this repository is a private scratch copy that
+one process builds in one pass and deletes after playback.
+Nothing observes its intermediate states, so replacing the
+placeholder is safe---and better than keeping it, since a
+synthetic root commit would show up as a run that never
+happened.
 Second, ProgSnap2's I/O model merges [[stderr]] into output and
 still cannot recover that distinction.
 We therefore rebuild the header faithfully, preserve end time when

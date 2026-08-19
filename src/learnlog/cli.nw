@@ -999,10 +999,16 @@ files are placed inside the venv's [[site-packages]]:
     from outside the project (say, [[python
     /tmp/scratch.py]] inside an activated venv) would have
     no way to find the matching [[.learnlog/]] by walking
-    up from its own directory.  [[_autostart]] reads this
-    file and exports it as [[LEARNLOG_PROJECT_ROOT]], which
-    [[initialize()]] consults before falling back to the
-    cwd search (\cref{learnlog}).
+    up from its own directory.  [[_autostart]] only
+    \emph{resolves} the recorded path; it is
+    [[initialize()]] that asks for it, exports the answer
+    as [[LEARNLOG_PROJECT_ROOT]] so child processes
+    inherit the same anchor, and consults it before
+    falling back to the cwd search
+    (\cref{sec:initialize}).
+    The split keeps [[_autostart]] free of any import of
+    the package, which \cref{learnlog} explains is
+    load-bearing.
 \end{description}
 
 To find [[site-packages]] on both POSIX and Windows
