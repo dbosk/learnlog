@@ -112,6 +112,7 @@ from learnlog.gitrepo import (
     LearnlogRepo,
     format_run_header,
     format_run_trailer,
+    parse_run_arguments,
 )
 @
 
@@ -2316,12 +2317,19 @@ run apart from the already-lost [[stderr]] split.
 For older datasets without [[X-EndTime]], we fall back to the older
 behaviour and omit the [[End-Time:]] line.
 
+[[X-Arguments]] holds the field exactly as the header wrote it, so
+recovering the list is [[parse_run_arguments]] and nothing else
+(\cref{sec:run-arguments}).
+Splitting the column on whitespace instead---which is what this did
+before---turns one argument containing a space into two, and a
+[[python -c]] source into as many arguments as it has words, so the
+block we rebuild would not be the block we exported.
+
 <<progsnap2 functions>>=
 def build_reconstructed_run_block(event, io_log):
     """Rebuild one run block from a ProgSnap2 run event."""
     script = event.get("X-Script", "") or "(unknown)"
-    args_value = event.get("X-Arguments", "")
-    args = [] if args_value in ("", "(none)") else args_value.split()
+    args = parse_run_arguments(event.get("X-Arguments", ""))
     start_time = datetime.datetime.fromisoformat(
         event["ServerTimestamp"]
     )
@@ -2913,6 +2921,76 @@ def test_build_reconstructed_run_block_without_end_time():
     assert "Run: hello.py" in block
     assert "Exit-Code: 1" in block
     assert "End-Time:" not in block
+@
+
+The awkward case is the one the export exists for: a [[python -c]] run,
+whose first argument is a program source with spaces and newlines in
+it, followed by the arguments the student actually passed.
+Let's follow one all the way through---commit, export, read back---and
+check that the list that comes out is the list that went in, while a
+plain script run still reads like a command line in the column:
+
+<<progsnap2 test functions>>=
+def test_progsnap2_round_trips_python_c_arguments(workdir):
+    import csv as csv_mod
+    import shutil
+    from learnlog.gitrepo import parse_run_arguments
+    from learnlog.progsnap2 import (
+        do_export_progsnap2, read_progsnap2_as_repo,
+    )
+    source = 'import sys\nprint("hi there")'
+    args = [source, "alpha", "beta"]
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("<python -c>", args, t1)
+    repo.finalize_run(
+        io_log="stdout: hi there\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    output = workdir / "c.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    runs = [
+        event for event in csv_mod.DictReader(io.StringIO(main))
+        if event["EventType"] == "Run.Program"
+    ]
+    assert len(runs) == 1
+    assert parse_run_arguments(runs[0]["X-Arguments"]) == args
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        message = reconstructed.git(
+            "log", "-1", "--format=%B"
+        ).stdout
+        recovered = [
+            line.split(":", 1)[1]
+            for line in message.split("\n")
+            if line.startswith("Arguments:")
+        ]
+        assert parse_run_arguments(recovered[0]) == args
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def test_progsnap2_plain_arguments_stay_readable(workdir):
+    """Ordinary arguments are not dressed up in quotes."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", ["alpha", "beta"], t1)
+    output = workdir / "plain.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    runs = [
+        event for event in csv_mod.DictReader(io.StringIO(main))
+        if event["EventType"] == "Run.Program"
+    ]
+    assert runs[0]["X-Arguments"] == "alpha beta"
 @
 
 

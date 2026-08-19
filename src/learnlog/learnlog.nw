@@ -561,6 +561,7 @@ verifying the full pipeline from import to commit:
 """Integration tests for the learnlog package."""
 import datetime
 import io
+import shlex
 import tempfile
 import subprocess
 import os
@@ -2113,7 +2114,7 @@ def committed_c_source(workdir, name=C_INVOCATION_NAME):
         ("argv", "expected_script", "expected_args"),
         [
             ([""], "<repl>", "(none)"),
-            (["-c"], "<python -c>", "print(1)"),
+            (["-c"], "<python -c>", shlex.quote("print(1)")),
             (["-m", "pip", "--version"], "<python -m>",
              "pip --version"),
             (["/tmp/demo.py", "arg1"], "demo.py", "arg1"),
@@ -2184,7 +2185,7 @@ def committed_c_source(workdir, name=C_INVOCATION_NAME):
         )
         msg = git_result.stdout
         assert "Script: <python -c>" in msg
-        assert f"Arguments: {source}" in msg
+        assert f"Arguments: {shlex.quote(source)}" in msg
         assert committed_c_source(workdir) == source
 
     def test_python_c_preserves_extras_after_source(
@@ -2209,7 +2210,9 @@ def committed_c_source(workdir, name=C_INVOCATION_NAME):
         )
         msg = git_result.stdout
         assert "Script: <python -c>" in msg
-        assert f"Arguments: {source} alpha beta" in msg
+        assert (
+            f"Arguments: {shlex.quote(source)} alpha beta" in msg
+        )
         assert committed_c_source(workdir) == source
 @
 
@@ -4832,7 +4835,7 @@ def test_autostart_captures_common_invocations(tmp_path):
 
     history = _git_history(project)
     assert "Script: <python -c>" in history
-    assert "Arguments: print(1)" in history
+    assert "Arguments: 'print(1)'" in history
     assert "Script: pip" in history
     assert "Script: quick.py" in history
     assert "stdin: hello from tty\n" in history
