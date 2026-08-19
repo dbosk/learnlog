@@ -186,6 +186,10 @@ call per commit to hunt for its partner.
 As in [[get_commits]], an empty history makes [[git log]] exit
 non-zero; that is no trailers rather than an error, so the call opts
 out of [[check]] (\cref{gitrepo}).
+The walk starts from the recording branch rather than from
+[[HEAD]], for the reason \cref{sec:run-visibility} spells out for
+[[get_commits]]: the two must read the same history, or a run
+could be listed whose trailer this map does not hold.
 
 The same pass answers the opposite question for free.
 Refs land on trailer commits (\cref{sec:trailer-refs}), and
@@ -206,7 +210,8 @@ def scan_run_commits(repo):
     run's record.  Commits that belong to no run are ignored.
     """
     result = repo.git(
-        "log", "-z", "--format=%H%n%B", check=False,
+        "log", "-z", "--format=%H%n%B",
+        repo.recording_branch(), check=False,
     )
     if result.returncode != 0:
         return {}, {}
@@ -1078,6 +1083,19 @@ bundle that turned out to be empty---makes [[git log]] exit non-zero.
 That is an empty history rather than a broken one, so this call opts out
 of [[check]] and reports it as an empty list.
 
+\label{sec:run-visibility}
+The listing walks the recording branch by name rather than
+[[HEAD]], because the two are no longer the same thing.
+Runs are committed to the branch wherever [[HEAD]] happens to
+point (\cref{sec:recording-branch}); a student who detaches
+[[HEAD]] with [[learnlog git checkout]] to look at an older
+version keeps recording runs, and a reader that walked [[HEAD]]
+would silently stop showing them---the newest runs would be the
+missing ones, with nothing to say so.
+Asking [[recording_branch]] makes the reader and the recorder
+agree on which history the log is, whatever the student does with
+[[HEAD]].
+
 Trailer commits are left out here, which is what makes every
 caller---listing, playback, and export---see one entry per run
 without knowing about the two-commit protocol.
@@ -1096,7 +1114,7 @@ def get_commits(repo):
     """
     result = repo.git(
         "log", "--format=%H\t%s\t%aI", "--reverse",
-        check=False,
+        repo.recording_branch(), check=False,
     )
     if result.returncode != 0:
         return []
@@ -1135,6 +1153,48 @@ def test_get_commits_excludes_trailer_commits(workdir):
         "learnlog: initial commit",
         "Run: hello.py (none)",
     ]
+@
+
+A run recorded while [[HEAD]] is detached must show up like any
+other, complete with its trailer: this is the reader's half of the
+detached-head story, whose recorder's half
+\cref{sec:awkward-state} tests.
+The run id check goes through [[get_run_trailers]] so both walks
+of this section are held to the branch, not just the listing:
+
+<<commits test functions>>=
+def test_readers_follow_the_recording_branch(workdir):
+    from learnlog.commits import get_commits, get_run_trailers
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    old = repo.git("rev-parse", "HEAD~2").stdout.strip()
+    repo.git("checkout", "--detach", old)
+
+    detached = LearnlogRepo(workdir)
+    detached.begin_run(
+        "later.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    detached.finalize_run(
+        io_log="stdout: still visible\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 11, 0, 1),
+        exit_code=0,
+    )
+
+    subjects = [c["subject"] for c in get_commits(repo)]
+    assert "Run: later.py (none)" in subjects
+    trailers = get_run_trailers(repo)
+    assert any(
+        "still visible" in text for text in trailers.values()
+    )
 @
 
 <<commits test functions>>=
