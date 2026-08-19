@@ -2843,7 +2843,7 @@ merely launched in a loop would arrive one after another and the test
 would pass on the broken code.
 
 <<test helpers>>=
-CONCURRENT_C_SOURCE = """\\
+CONCURRENT_C_SOURCE = """\
 import sys
 import time
 
