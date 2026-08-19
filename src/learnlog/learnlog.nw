@@ -527,6 +527,7 @@ import pathlib
 import datetime
 import atexit
 import functools
+import hashlib
 import threading
 import traceback
 
@@ -536,6 +537,8 @@ from learnlog._autostart import (
     _is_autostart_wired,
     _resolve_project_root,
 )
+
+<<optional claim locking>>
 
 <<constants>>
 <<module state>>
@@ -564,16 +567,20 @@ import io
 import shlex
 import tempfile
 import subprocess
+import hashlib
 import os
 import pathlib
 import sys
+import time
 import pytest
 from learnlog import (
-    C_INVOCATION_CLAIM_NAME,
     C_INVOCATION_NAME,
-    _claim_c_invocation_path,
+    C_INVOCATION_STEM,
+    _c_invocation_record,
+    _claim_is_abandoned,
     _is_opted_out,
     _persist_c_invocation,
+    _reclaim_c_invocations,
     _release_c_invocation,
 )
 from learnlog.gitrepo import LearnlogRepo
@@ -1081,33 +1088,165 @@ What the claim has to say has narrowed along with the file's lifetime.
 It is no longer a naming policy that must outlive the process to keep
 consecutive runs pointed at one file: the name is given back at the end
 of every run, so the next run finds it free by itself.
-What [[.learnlog/c-invocation]] records now is a single fact: that
-learnlog has written a file and has not removed it yet.
-The claim is created before the write and destroyed together with the
-file, so a claim found at the start of a run can only mean that the
-previous run died between those two moments---a [[SIGKILL]], a power
-cut, a pulled plug---and that the file it names, if it is still there,
-is learnlog's own leftover rather than something the student owns.
-Reusing that name is therefore both safe and self-healing: the next
-[[python -c]] run overwrites the leftover and then releases it, so a
-killed run costs one stale file until that happens instead of a
-growing pile of near-identical ones.
-Runs that are not [[python -c]] runs deliberately leave the leftover
-alone; a claim proves that learnlog wrote the file at some point, not
-that the bytes on disk are still the ones it wrote, and that is too
-thin a warrant for deleting a file in a run that had no business
-writing one.
+What is left for it to say is who owns a name at this moment, and that
+turns out to be two questions rather than one.
 
-Recording the claim beside the repository rather than inside the
-source file is unchanged, and so is the reason: the bytes of that file
-are the program that ran, and a code state that quietly gained a
-marker comment learnlog wrote is no longer a record of the student's
-code.
+An earlier claim answered neither.
+It recorded a single fact---learnlog has written a file and not yet
+removed it---in [[.learnlog/c-invocation]], which names a path without
+saying which run holds it or what is under it, and both gaps end at
+files the student owns.
 
-The helper hands the path it claimed back to its caller, because
-releasing has to remove precisely the file this run wrote and not the
-one the student may own beside it.
-It hands the path back even when the write failed, since a
+Two [[python -c]] runs that pick the same name write over each other.
+Nothing serialises them here: the commit lock (\cref{sec:commit-lock})
+is taken inside [[begin_run]], the step after this one, and asking
+whether a name is free is a separate system call from the write that
+takes it.
+The run that stages the work tree last therefore commits the other
+run's source under its own header---or an empty slot, if the other run
+gave its file back first---and neither commit records the run it
+belongs to.
+
+A killed run's leftover is the other gap.
+The file outlives the process, and the name it sits under is one the
+student can take back: they delete the file they never wrote and put
+their own [[python_c_invocation.py]] there.
+A claim that says only \enquote{learnlog wrote this name} then licenses
+the next run to overwrite their file---the clobber the claim exists to
+prevent, reached through the claim itself.
+
+The claim we need instead identifies a run and the bytes it wrote.
+Three properties give it that, and the code below builds them in turn.
+
+\begin{description}
+\item[A name is taken, never merely tested] Learnlog creates its file
+  with an exclusive create, which fails if anything already occupies
+  the name.  No window is left between looking and writing for a
+  concurrent run to slip through, because there is no looking: the
+  create either wins the name outright or loses it, and the loser goes
+  on to the next candidate exactly as it does for a file the student
+  owns.  Nothing learnlog did not create is ever written to.
+\item[A claim belongs to one run] Each run records its own claim, as a
+  file of its own under [[.learnlog/c-invocations/]].  Overlapping runs
+  then describe themselves independently instead of overwriting one
+  shared answer, and the leftovers of several killed runs read as a
+  list rather than as a contradiction.
+\item[A claim carries the digest of what was written] Removing a file
+  is the one destructive act left, and it happens only while the bytes
+  on disk still hash to what the claim recorded.  A leftover the
+  student has edited or replaced does not match, so learnlog leaves it
+  where it is and reports it through the diagnostics
+  (\cref{sec:diagnostics}) rather than deleting something it cannot
+  vouch for.
+\end{description}
+
+One question remains, and it decides whether a claim may be acted on at
+all: is the run that made it still running?
+Nothing written on disk can answer it---a live run's claim and a killed
+run's claim are the same file, which is exactly why the leftover is
+recognisable at all---but a lock can.
+The owner holds an exclusive [[flock]] on its claim file for as long as
+the work-tree file is its own, and the kernel drops that lock when the
+process ends, whichever way it ends.
+A later run that can take the lock is therefore looking at a claim
+whose owner is gone; one that cannot is looking at a run in progress,
+and leaves that run's claim and file alone.
+The instrument is the one the commit lock uses
+(\cref{sec:commit-lock}), and it degrades the same way: with no
+[[fcntl]] there is no telling the two apart, so we decline to remove
+anything rather than guess, and a killed run's file waits for a
+platform that can tell.
+
+<<optional claim locking>>=
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+@
+
+Everything a claim holds fits in its own file name: the digest of the
+source and the name of the file that carries it.
+Keeping it there rather than in the file's contents is not a saving of
+bytes but of states.
+A directory entry appears whole or not at all, so a run killed while
+making a claim leaves no half-written one behind, and the run that
+reads it never has to decide how much of a claim it may believe.
+
+<<functions>>=
+def _c_invocation_record(repo, name, digest):
+    """Return the claim file that records ``name`` and ``digest``."""
+    directory = repo.git_dir / C_INVOCATION_CLAIM_DIR
+    directory.mkdir(exist_ok=True)
+    return directory / f"{digest}.{name}"
+<<constants>>=
+C_INVOCATION_CLAIM_DIR = "c-invocations"
+@
+
+The claims live beside the repository rather than inside the source
+file for the reason they always have: the bytes of that file are the
+program that ran, and a code state that quietly gained a marker comment
+learnlog wrote is no longer a record of the student's code.
+
+The alternatives to the preferred name are numbered and tried in a
+fixed order.
+A run that finishes gives the preferred name back, so an ordinary run
+gets it and the code states of consecutive [[python -c]] runs stay
+comparable---the source appears as a change to one path instead of as a
+new path each time.
+The numbers are for the two cases where it is not free: a name the
+student owns, and a concurrent run that got there first.
+The search is bounded because a directory in which a hundred of these
+names are occupied is not one attempt away from success; there we
+decline to write anything, which costs that run its synthetic code
+state but touches nothing the student owns.
+
+<<functions>>=
+def _c_invocation_names():
+    """Yield the worktree names learnlog may take, in order."""
+    yield C_INVOCATION_NAME
+    for attempt in range(1, C_INVOCATION_MAX_NAMES):
+        yield f"{C_INVOCATION_STEM}-{attempt}.py"
+<<constants>>=
+C_INVOCATION_STEM = "python_c_invocation"
+C_INVOCATION_NAME = f"{C_INVOCATION_STEM}.py"
+C_INVOCATION_MAX_NAMES = 100
+@
+
+The two lock operations differ in what a failure would mean, which is
+why they are separate.
+Taking the lock on a claim we just created exclusively cannot fail for
+a reason worth reporting, since nothing else can be holding it; it can
+only wait, and only for the moment another run needs to look at a claim
+and put it down again.
+Testing another run's lock is entirely a question, and the answer we
+want is the one [[LOCK_NB]] gives: refused means the owner is still
+there.
+
+<<functions>>=
+def _hold_claim(lock):
+    """Mark the run that owns this claim as still running."""
+    if fcntl is not None:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+@
+
+<<functions>>=
+def _claim_is_abandoned(lock):
+    """Say whether the run that made this claim is gone."""
+    if fcntl is None:
+        return False
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+@
+
+The helper hands the claim it took back to its caller, because
+releasing has to remove precisely the file this run wrote---not the one
+the student may own beside it, and not the one another run is using at
+the same moment---and because the lock has to be let go by the run that
+took it.
+It hands the claim back even when the write failed, since a
 half-written file is still learnlog's to clean up.
 Failing to write must not stop the student's program, but it must not
 pass unnoticed either, so the exception we swallow goes to the
@@ -1117,107 +1256,271 @@ diagnostics path (\cref{sec:diagnostics}) like every other one.
 def _persist_c_invocation(repo, script, args):
     """Persist ``python -c`` source as a worktree file.
 
-    Returns the path claimed for this run, or ``None`` when there
-    was nothing to write or no free name to write it under.
+    Returns the claim learnlog holds on the file written for this
+    run, or ``None`` when there was nothing to write or no free name
+    to write it under.
     """
     if script != "<python -c>" or not args:
         return None
-    target = None
     try:
-        target = _claim_c_invocation_path(repo)
-        if target is not None:
-            target.write_text(args[0])
+        return _claim_c_invocation(repo, args[0])
     except Exception as error:
         _report_swallowed_failure("persist -c source", error)
-    return target
+        return None
 @
 
-Claiming is a two-step lookup, and the order between the steps is what
-makes the leftover case work.
-An existing claim wins outright, even when the file it names has since
-been deleted: adopting that name is how the run following a killed one
-takes ownership of the leftover instead of stepping around it and
-claiming a second name beside it.
-Only when no claim exists---the ordinary case, since a run that
-finishes gives its name back---do we go looking for a free one.
+The source goes to disk as UTF-8 bytes rather than through the
+platform's text encoding, and the digest is taken of exactly those
+bytes.
+Hashing the string instead would leave the claim unable to recognise
+its own file whenever the encoding differed, and a student whose
+default encoding cannot represent an accented character in a
+[[python -c]] one-liner would lose the run to a
+[[UnicodeEncodeError]] rather than record it.
+
+Taking a name is then a walk down the candidates, and each step does
+the same three things in an order the failure cases dictate.
 
 <<functions>>=
-def _claim_c_invocation_path(repo):
-    """Return the worktree path learnlog owns for ``-c`` sources."""
-    claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
-    <<reuse the claimed name>>
-    <<claim the first free name>>
+def _claim_c_invocation(repo, source):
+    """Take a worktree file for ``source`` and write it there."""
+    payload = source.encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    for name in _c_invocation_names():
+        <<record the claim, or try the next name>>
+        <<take the name, or give the claim back>>
+        <<write the source and keep the claim>>
+    return None
 @
 
-A claim is a bare file name in the root of the work tree, so anything
-carrying a separator is not a claim we wrote.
-Discarding such a value instead of following it keeps a corrupted or
-hand-edited [[c-invocation]] from redirecting the write to an arbitrary
-path.
+The claim is made before the file exists, because the two ways that can
+go wrong are not equally bad.
+A claim naming a file that was never created costs the next run one
+directory entry, which it drops.
+A file created before anything claimed it costs the student a file
+nobody can ever identify: no later run may touch it, because the claim
+is the only thing that tells learnlog's leftover apart from the
+student's own work.
 
-<<reuse the claimed name>>=
+Creating the claim exclusively matters for one case that is easy to
+miss: two runs of the same [[python -c]] one-liner produce the same
+digest, and so name the same claim.
+The second of them finds the claim taken and moves on, which is the
+right answer---the first run holds that name.
+
+<<record the claim, or try the next name>>=
+record = _c_invocation_record(repo, name, digest)
 try:
-    claimed = claim.read_text().strip()
-except OSError:
-    claimed = ""
-if claimed and "/" not in claimed:
-    return repo.workdir / claimed
+    lock = open(record, "x")
+except FileExistsError:
+    continue
+_hold_claim(lock)
 @
 
-The alternatives are numbered and tried in a fixed order, so a project
-whose preferred name belongs to the student still gets a name of its
-own, and gets the same one on every run.
-The search is bounded because a directory in which a hundred of these
-names are occupied is not one attempt away from success; there we
-decline to write anything, which costs that run its synthetic code
-state but touches nothing the student owns.
+The exclusive create is where the no-clobber guarantee is enforced, and
+enforcing it here instead of in a preceding [[exists]] check is the
+whole point.
+A name that turns out to be occupied---by the student's own module, by
+a run that won the race, by a leftover this run could not prove was
+learnlog's---costs us the claim we just made and nothing else, and we
+try the next name.
 
-<<claim the first free name>>=
-stem = C_INVOCATION_NAME.removesuffix(".py")
-for attempt in range(C_INVOCATION_MAX_NAMES):
-    candidate = C_INVOCATION_NAME
-    if attempt:
-        candidate = f"{stem}-{attempt}.py"
-    if (repo.workdir / candidate).exists():
-        continue
-    claim.write_text(candidate + "\n")
-    return repo.workdir / candidate
-return None
-<<constants>>=
-C_INVOCATION_NAME = "python_c_invocation.py"
-C_INVOCATION_CLAIM_NAME = "c-invocation"
-C_INVOCATION_MAX_NAMES = 100
+<<take the name, or give the claim back>>=
+target = repo.workdir / name
+try:
+    handle = open(target, "xb")
+except FileExistsError:
+    lock.close()
+    record.unlink(missing_ok=True)
+    continue
 @
 
-Releasing is the mirror of claiming, and the order between its two
-steps carries the invariant the leftover story rests on: the file goes
-first and the claim second.
-A failure in the middle then leaves a claim without a file, never a
-file without a claim.
-The first costs nothing---the next run reuses a name whose file
-happens to be missing, which is what every ordinary run does
-anyway---while the second would strand the file for good: with no
-claim to identify it, no later run could tell it apart from something
-the student wrote, and learnlog would have to leave it alone forever.
+Only now is there something to write, and a failure writing it changes
+nothing about who owns the file: the claim goes back to the caller, so
+that this run removes its own half-written file instead of leaving it
+for a later one to puzzle over.
+
+<<write the source and keep the claim>>=
+claimed = _CInvocation(target, record, lock)
+try:
+    with handle:
+        handle.write(payload)
+except OSError as error:
+    _report_swallowed_failure("persist -c source", error)
+return claimed
+@
+
+The three things a run has to keep hold of are the file it took, the
+claim that identifies it, and the open handle whose lock says the run
+is not finished.
+Releasing needs all three, and no one of them is meaningful without the
+others, so they travel together.
+
+<<functions>>=
+class _CInvocation:
+    """The worktree file learnlog owns for one ``python -c`` run.
+
+    Pairs the file with the claim naming it and with the open handle
+    whose lock marks the run as still in progress.
+    """
+
+    def __init__(self, path, record, lock):
+        self.path = path
+        self.record = record
+        self.lock = lock
+@
+
+Reclaiming is what keeps a killed run costing one file rather than a
+growing pile of them, and it happens before every run rather than
+before every [[python -c]] run.
+The old claim could not have supported that: it proved that learnlog
+wrote a file once, not that the bytes on disk are still the ones it
+wrote, which is too thin a warrant for deleting a file in a run that
+had no business writing one.
+A digest is not too thin---and the run that clears a leftover has no
+reason to be a [[python -c]] run, because a leftover sits in the code
+state of \emph{every} run until it is gone.
+The sooner any run clears it, the fewer snapshots carry a file the
+student never wrote.
+
+<<functions>>=
+def _reclaim_c_invocations(repo):
+    """Remove what runs killed mid-``python -c`` left behind."""
+    directory = repo.git_dir / C_INVOCATION_CLAIM_DIR
+    try:
+        records = sorted(directory.iterdir())
+    except FileNotFoundError:
+        return
+    except Exception as error:
+        _report_swallowed_failure("reclaim -c sources", error)
+        return
+    for record in records:
+        try:
+            _reclaim_c_invocation(repo, record)
+        except Exception as error:
+            _report_swallowed_failure("reclaim -c source", error)
+@
+
+The claims are taken one at a time, and one claim that cannot be
+reclaimed says nothing about the next: a run in progress, a file that
+has become a directory and a leftover the student adopted are all
+answers about one claim only.
+Each is therefore reported on its own and the sweep carries on, which
+is also what keeps one unremovable file from stopping every other one
+from being cleared.
+
+A claim that has disappeared between the listing and the opening is
+the exception, and it is not reported at all.
+Two runs starting together sweep the same directory, so the other one
+having got there first is the mechanism working, not failing.
+
+<<functions>>=
+def _reclaim_c_invocation(repo, record):
+    """Act on one claim, if the run that made it is gone."""
+    digest, _, name = record.name.partition(".")
+    try:
+        lock = open(record)
+    except FileNotFoundError:
+        return
+    with lock:
+        if not _claim_is_abandoned(lock):
+            return
+        <<remove the leftover the claim vouches for>>
+        record.unlink(missing_ok=True)
+@
+
+Not every claim has a file to answer for.
+A run killed after removing its file but before removing its claim
+leaves one, and so does a run killed between claiming a name and taking
+it; the claim is dropped and nothing else happens.
+What the digest decides is the third case: a file is there, and it
+either still holds the bytes learnlog wrote or it does not.
+
+The order is the one releasing uses, for the same reason: the file goes
+first and the claim second, so a failure in between leaves a claim
+without a file---which the next run drops---rather than a file without
+a claim, which no run could ever recognise again.
+
+<<remove the leftover the claim vouches for>>=
+leftover = repo.workdir / name
+if _digest_of(leftover) == digest:
+    leftover.unlink()
+elif leftover.exists():
+    _report_swallowed_failure(
+        "reclaim -c source", UnverifiableLeftover(name),
+    )
+@
+
+Reading the file in order to hash it is allowed to fail---the student
+may have made it a directory, or made it unreadable---and the answer we
+want then is the same as for a file whose bytes differ: not ours to
+remove.
+
+<<functions>>=
+def _digest_of(path):
+    """Return the SHA-256 of a file, or ``None`` if unreadable."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+@
+
+Nothing has failed when learnlog declines to remove such a file, so
+there is no exception to swallow.
+The student should still be able to find out why a file with a name
+like that is sitting in their project, and the diagnostics log is where
+answers to that kind of question live, so we build an exception for its
+name alone and hand it to the same path---exactly as [[UnanchoredRun]]
+does for a run learnlog declines to record.
+
+<<functions>>=
+class UnverifiableLeftover(Exception):
+    """A ``-c`` file learnlog wrote but can no longer vouch for.
+
+    Reported rather than raised: nothing has failed, learnlog is
+    declining to remove a file whose bytes are not the ones it
+    wrote.
+    """
+@
+
+Releasing is the mirror of taking, and the order between its steps
+carries the same invariant reclaiming rests on: the file goes first and
+the claim second.
+The first way round costs nothing---the next run finds a claim whose
+file is missing and drops it---while the second would strand the file
+for good: with no claim to identify it, no later run could tell it
+apart from something the student wrote.
 
 Deleting is as much a thing that must not break the program as writing
 was.
 A work tree that has turned read-only, or a file the student removed
-while their own program was running, must not surface as a traceback
-in the middle of their output, so this failure takes the same
-diagnostics path as the write.
+while their own program was running, must not surface as a traceback in
+the middle of their output, so this failure takes the same diagnostics
+path as the write.
 
 <<functions>>=
-def _release_c_invocation(repo, target):
-    """Remove the ``-c`` source file written for this run."""
-    if target is None:
+def _release_c_invocation(claimed):
+    """Give back the ``-c`` file this run wrote, and its claim."""
+    if claimed is None:
         return
     try:
-        target.unlink(missing_ok=True)
-        claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
-        claim.unlink(missing_ok=True)
+        claimed.path.unlink(missing_ok=True)
+        claimed.record.unlink(missing_ok=True)
     except Exception as error:
         _report_swallowed_failure("release -c source", error)
+    <<let go of the claim>>
+@
+
+The lock is let go last, and outside the part that is allowed to fail.
+It answers \enquote{is this run still going?}, and this run is over
+whether or not the removal worked---a claim whose file could not be
+deleted has to be lockable again, or no later run could retry it.
+
+<<let go of the claim>>=
+try:
+    claimed.lock.close()
+except Exception as error:
+    _report_swallowed_failure("release -c claim", error)
 @
 
 Let's verify the property the anchoring exists for: the file follows
@@ -1254,6 +1557,23 @@ def test_does_not_clobber_a_file_it_did_not_write(workdir):
     ).read_text() == "print(1)"
 @
 
+Two runs overlapping in one project is the case a shared name cannot
+survive.
+The second run has to come away with a file of its own, and the first
+run's source has to still be exactly where it left it---nothing here
+waits for anything, so the first run may be about to stage its tree:
+
+<<test functions>>=
+def test_overlapping_runs_never_share_a_name(workdir):
+    """A run in progress keeps the file it wrote."""
+    repo = LearnlogRepo(workdir)
+    first = _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    second = _persist_c_invocation(repo, "<python -c>", ["print(2)"])
+    assert second.path != first.path
+    assert first.path.read_text() == "print(1)"
+    assert second.path.read_text() == "print(2)"
+@
+
 Releasing has to undo both halves of the write, so that what the next
 run finds is a work tree with nothing of learnlog's in it and a name
 that is free again:
@@ -1262,20 +1582,17 @@ that is free again:
 def test_release_removes_the_file_and_the_claim(workdir):
     """Nothing learnlog wrote survives the release."""
     repo = LearnlogRepo(workdir)
-    target = _persist_c_invocation(
+    claimed = _persist_c_invocation(
         repo, "<python -c>", ["print(1)"]
     )
-    _release_c_invocation(repo, target)
-    assert not target.exists()
-    assert not (
-        repo.git_dir / C_INVOCATION_CLAIM_NAME
-    ).exists()
+    _release_c_invocation(claimed)
+    assert not claimed.path.exists()
+    assert not claimed.record.exists()
 
 def test_released_name_is_claimed_again_next_run(workdir):
     """A run after a released one gets the same name back."""
     repo = LearnlogRepo(workdir)
     _release_c_invocation(
-        repo,
         _persist_c_invocation(repo, "<python -c>", ["print(1)"]),
     )
     _persist_c_invocation(
@@ -1289,44 +1606,111 @@ def test_released_name_is_claimed_again_next_run(workdir):
 
 A run that is killed never reaches its release, and the file it wrote
 outlives it.
-The claim it also left behind is what tells the next [[python -c]] run
-that the file is learnlog's own, so that run adopts it instead of
-adding a second one beside it---and hands both back when it is done:
+Closing the claim's handle is what a [[SIGKILL]] does to it---the
+kernel drops the lock the moment the process is gone---so that is how
+the test kills a run.
+What the next run then finds is a claim it can both take and verify,
+and it clears the leftover before staging anything, which gives the
+preferred name back:
 
 <<test functions>>=
-def test_adopts_the_leftover_of_a_killed_run(workdir):
-    """An unreleased file is reused, not stepped around."""
-    _persist_c_invocation(
-        LearnlogRepo(workdir), "<python -c>", ["print(1)"]
-    )
+def test_reclaims_the_leftover_of_a_killed_run(workdir):
+    """A leftover learnlog can vouch for is cleared away."""
     repo = LearnlogRepo(workdir)
-    target = _persist_c_invocation(
-        repo, "<python -c>", ["print(2)"]
+    killed = _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    killed.lock.close()
+    _reclaim_c_invocations(LearnlogRepo(workdir))
+    assert not killed.path.exists()
+    assert not killed.record.exists()
+    claimed = _persist_c_invocation(
+        LearnlogRepo(workdir), "<python -c>", ["print(2)"]
     )
-    assert target == workdir / "python_c_invocation.py"
-    assert target.read_text() == "print(2)"
+    assert claimed.path == workdir / C_INVOCATION_NAME
     assert not (workdir / "python_c_invocation-1.py").exists()
-    _release_c_invocation(repo, target)
-    assert not target.exists()
+@
+
+The same leftover with different bytes in it is the case the digest
+exists for.
+A student who deletes the strange file and writes a module of their own
+under that name owns it, whatever the claim says, so the sweep has to
+leave it alone and the run that follows has to step around it.
+(That it also says so in the diagnostics is checked further down, in a
+real run: the log a swallowed failure goes to is the one belonging to
+the run in progress, and these tests drive the helpers with no run in
+progress at all.)
+
+<<test functions>>=
+def test_leaves_a_leftover_the_student_replaced(workdir):
+    """A file that no longer matches its claim is untouchable."""
+    repo = LearnlogRepo(workdir)
+    killed = _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    killed.lock.close()
+    killed.path.write_text("# the student's own module\n")
+    _reclaim_c_invocations(LearnlogRepo(workdir))
+    assert killed.path.read_text() == "# the student's own module\n"
+    assert not killed.record.exists()
+    claimed = _persist_c_invocation(
+        LearnlogRepo(workdir), "<python -c>", ["print(2)"]
+    )
+    assert claimed.path == workdir / "python_c_invocation-1.py"
+    assert killed.path.read_text() == "# the student's own module\n"
+@
+
+Several killed runs are several claims, which is the whole reason each
+run writes one of its own: they queue up in the directory instead of
+overwriting one another's answer, and one sweep clears the lot.
+
+<<test functions>>=
+def test_reclaims_every_leftover_at_once(workdir):
+    """Killed runs pile up as claims, and go together."""
+    repo = LearnlogRepo(workdir)
+    killed = [
+        _persist_c_invocation(repo, "<python -c>", [f"print({n})"])
+        for n in range(2)
+    ]
+    for claimed in killed:
+        claimed.lock.close()
+    _reclaim_c_invocations(LearnlogRepo(workdir))
+    assert not [c for c in killed if c.path.exists()]
+    assert not [c for c in killed if c.record.exists()]
+@
+
+A run still in progress must survive the same sweep untouched, and the
+lock is the only thing that says it is: the claim and the file look
+exactly like the killed run's above.
+
+<<test functions>>=
+def test_sweeping_spares_a_run_in_progress(workdir):
+    """A live run's file is not a leftover."""
+    repo = LearnlogRepo(workdir)
+    claimed = _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    _reclaim_c_invocations(LearnlogRepo(workdir))
+    assert claimed.path.read_text() == "print(1)"
+    assert claimed.record.exists()
 @
 
 The two release steps are ordered so that the claim outlives the file
 it names, and we can see that by making the deletion fail.
 With a directory standing where the file should be, [[unlink]] raises,
 and the claim has to still be there afterwards---otherwise no later
-run could tell that leftover apart from the student's own work:
+run could tell that leftover apart from the student's own work.
+The lock has to be gone, though: a claim nobody can lock is one no
+later run may retry.
 
 <<test functions>>=
 def test_keeps_the_claim_when_the_file_cannot_be_removed(workdir):
     """A failed deletion leaves the claim that identifies it."""
     repo = LearnlogRepo(workdir)
-    claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
-    claim.write_text(C_INVOCATION_NAME + "\n")
-    target = workdir / C_INVOCATION_NAME
-    target.mkdir()
-    _release_c_invocation(repo, target)
-    assert target.is_dir()
-    assert claim.exists()
+    claimed = _persist_c_invocation(
+        repo, "<python -c>", ["print(1)"]
+    )
+    claimed.path.unlink()
+    claimed.path.mkdir()
+    _release_c_invocation(claimed)
+    assert claimed.path.is_dir()
+    assert claimed.record.exists()
+    with open(claimed.record) as record:
+        assert _claim_is_abandoned(record)
 @
 
 Finally, the point of writing the file at all: it has to be inside the
@@ -1356,15 +1740,15 @@ and [[learnlog git status]] says so:
 def test_released_source_stays_readable_from_the_commit(workdir):
     """The commit keeps the source the work tree gives up."""
     repo = LearnlogRepo(workdir)
-    target = _persist_c_invocation(
+    claimed = _persist_c_invocation(
         repo, "<python -c>", ["print(1)"]
     )
     repo.begin_run(
         "<python -c>", ["print(1)"],
         datetime.datetime(2026, 1, 1, 10, 0),
     )
-    _release_c_invocation(repo, target)
-    assert not target.exists()
+    _release_c_invocation(claimed)
+    assert not claimed.path.exists()
     stored = repo.git("show", "HEAD:python_c_invocation.py").stdout
     assert stored == "print(1)"
     pending = repo.git("status", "--porcelain").stdout
@@ -1379,14 +1763,14 @@ state with nothing synthetic in it.
 def test_later_runs_do_not_carry_the_c_source(workdir):
     """A later run's code state is the student's project again."""
     repo = LearnlogRepo(workdir)
-    target = _persist_c_invocation(
+    claimed = _persist_c_invocation(
         repo, "<python -c>", ["print(1)"]
     )
     repo.begin_run(
         "<python -c>", ["print(1)"],
         datetime.datetime(2026, 1, 1, 10, 0),
     )
-    _release_c_invocation(repo, target)
+    _release_c_invocation(claimed)
     LearnlogRepo(workdir).begin_run(
         "hello.py", [], datetime.datetime(2026, 1, 1, 10, 1),
     )
@@ -1895,19 +2279,35 @@ That is also why the release lives here rather than inside
 [[begin_run]]: [[LearnlogRepo]] stays a generic Git wrapper that knows
 nothing about [[python -c]], exactly as the writing helper does.
 
+Sweeping up after killed runs goes ahead of all three, and ahead of
+[[begin_run]] above all.
+A leftover that is still on disk when the tree is staged joins the code
+state of a run that has nothing to do with it, and this run cannot take
+the preferred name back while a file it can account for is sitting
+under it.
+Both are fixed by clearing first, and this is not a [[python -c]] step:
+every run pays a directory listing---of a directory that usually does
+not exist---and every run can therefore be the one that gives the work
+tree back.
+
 <<create repository and begin run>>=
 repo = LearnlogRepo(workdir)
+<<reclaim what killed runs left behind>>
 <<persist -c source>>
 repo.begin_run(main_script, main_args, start_time)
 <<release -c source>>
 @
 
+<<reclaim what killed runs left behind>>=
+_reclaim_c_invocations(repo)
+@
+
 <<persist -c source>>=
-c_invocation_path = _persist_c_invocation(repo, main_script, main_args)
+c_invocation = _persist_c_invocation(repo, main_script, main_args)
 @
 
 <<release -c source>>=
-_release_c_invocation(repo, c_invocation_path)
+_release_c_invocation(c_invocation)
 @
 
 <<install I/O wrappers>>=
@@ -2347,24 +2747,26 @@ do with it, and its code state must say so:
         assert C_INVOCATION_NAME not in listed.stdout.split()
 @
 
-Finally the case the claim exists for.
+Next, the case the claim exists for.
 A run killed before it could release leaves the file and its claim
 behind; we stage exactly that state by hand, because a [[SIGKILL]] at
 the right microsecond is not something a test can aim for.
-The next [[python -c]] run has to adopt the leftover rather than write
-a second file beside it, and the directory has to be clean again
-afterwards:
+The next run has to clear the leftover rather than write a second file
+beside it, and the directory has to be clean again afterwards:
 
 <<test functions>>=
-    def test_adopts_and_clears_a_leftover_from_a_killed_run(
+    def test_clears_a_leftover_from_a_killed_run(
         self, workdir, test_env,
     ):
         """The run after a killed one cleans up after it."""
         repo = LearnlogRepo(workdir)
         leftover = workdir / C_INVOCATION_NAME
-        leftover.write_text('print("killed run")')
-        claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
-        claim.write_text(C_INVOCATION_NAME + "\n")
+        text = 'print("killed run")'
+        leftover.write_text(text)
+        claim = _c_invocation_record(
+            repo, C_INVOCATION_NAME, digest_of(text),
+        )
+        claim.touch()
         source = 'print("next run")'
         result = run_explicit_import(
             "import learnlog",
@@ -2380,6 +2782,138 @@ afterwards:
         ).exists()
         assert not claim.exists()
         assert committed_c_source(workdir) == source
+@
+
+The other end of that story is the one the digest was added for.
+If the student cleared the leftover away themselves and put a module of
+their own under the name, the claim still points at it and still says
+learnlog wrote it---and the bytes say otherwise.
+Their file has to come through untouched, the run has to record itself
+beside it, and the log has to say what learnlog decided not to do:
+
+<<test functions>>=
+    def test_spares_a_leftover_the_student_took_over(
+        self, workdir, test_env,
+    ):
+        """A leftover the student replaced belongs to them."""
+        repo = LearnlogRepo(workdir)
+        claim = _c_invocation_record(
+            repo, C_INVOCATION_NAME, digest_of('print("killed")'),
+        )
+        claim.touch()
+        theirs = workdir / C_INVOCATION_NAME
+        theirs.write_text("# the student's own module\n")
+        source = 'print("next run")'
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", source],
+        )
+        assert result.returncode == 0
+        assert theirs.read_text() == "# the student's own module\n"
+        assert committed_c_source(
+            workdir, "python_c_invocation-1.py"
+        ) == source
+        log = (repo.git_dir / "errors.log").read_text()
+        assert "UnverifiableLeftover" in log
+@
+
+<<test helpers>>=
+def digest_of(source):
+    """Return the digest a claim on ``source`` would record."""
+    return hashlib.sha256(source.encode()).hexdigest()
+@
+
+Every property above holds within one process, and the one the naming
+rules exist for does not: it needs two real runs writing at the same
+instant.
+Separate processes rather than threads, because a claim's lock is a
+kernel object shared between processes, and because two terminals is
+the situation the students are in.
+
+Each child fakes a [[python -c]] invocation the way the single-process
+tests do, but it has to do so \emph{before} importing learnlog---the
+import is the run---and it has to wait until the others are ready.
+Sleeping until a wall-clock instant the parent picked in advance is
+what lines them up: interpreter startup varies by far more than the
+window between writing the source and staging the tree, so processes
+merely launched in a loop would arrive one after another and the test
+would pass on the broken code.
+
+<<test helpers>>=
+CONCURRENT_C_SOURCE = """\
+import sys
+import time
+
+source, deadline = sys.argv[1], sys.argv[2]
+time.sleep(max(0.0, float(deadline) - time.time()))
+sys.argv = ["-c"]
+sys.orig_argv = [sys.executable, "-c", source]
+import learnlog
+"""
+CONCURRENT_C_PROCESSES = 4
+CONCURRENT_C_BARRIER_SECONDS = 0.5
+@
+
+What must be true afterwards is one thing, and it is the thing a shared
+name breaks: every run's own source is somewhere in the log.
+It cannot be anywhere else---each run writes its source once, into the
+tree its own header commit stages---so a source that is missing from
+every commit was overwritten or deleted by another run before that
+commit was made.
+
+<<test helpers>>=
+def committed_c_sources(workdir):
+    """Return every ``-c`` source recorded anywhere in the log."""
+    repo = LearnlogRepo(workdir)
+    sources = set()
+    for commit in repo.git("rev-list", "--all").stdout.split():
+        listed = repo.git(
+            "ls-tree", "--name-only", commit,
+        ).stdout.split()
+        for name in listed:
+            if name.startswith(C_INVOCATION_STEM):
+                sources.add(
+                    repo.git("show", f"{commit}:{name}").stdout
+                )
+    return sources
+@
+
+The repository is created before the children start, so that the only
+thing they contend on is the name they write under; a first run racing
+three others to create the repository is a different test
+(\cref{sec:init-repo}) and would add its own delays to this one.
+
+<<test functions>>=
+    def test_concurrent_c_runs_each_record_their_own_source(
+        self, workdir, test_env,
+    ):
+        """Overlapping -c runs never write over each other."""
+        LearnlogRepo(workdir)
+        deadline = time.time() + CONCURRENT_C_BARRIER_SECONDS
+        sources = [
+            f'print("concurrent {n}")'
+            for n in range(CONCURRENT_C_PROCESSES)
+        ]
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-S", "-c",
+                 CONCURRENT_C_SOURCE, source, str(deadline)],
+                cwd=str(workdir), env=test_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for source in sources
+        ]
+        for process in processes:
+            out, err = process.communicate(timeout=60)
+            assert process.returncode == 0, err
+        recorded = committed_c_sources(workdir)
+        assert set(sources) <= recorded
+        assert not list(workdir.glob(f"{C_INVOCATION_STEM}*"))
 @
 
 <<test functions>>=
