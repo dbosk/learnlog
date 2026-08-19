@@ -57,10 +57,15 @@ all: unit/conftest.py $(TEST_MODULES)
 # Generate rules for each test
 $(foreach entry,$(TESTS),$(eval $(call def_target,$(entry))))
 
-# Target to run tests after tangling
+# Target to run tests after tangling.  The runner is overridable so
+# the suite works where `poetry run` does not resolve the project's
+# venv -- a git worktree mints a fresh empty venv instead.  E.g.:
+#   make test PYTEST="env PYTHONPATH=$$PWD/../src python -m pytest"
+PYTEST ?= poetry run pytest
+
 .PHONY: test
 test: all compile
-	poetry run pytest -v
+	$(PYTEST) -v
 
 .PHONY: compile
 compile:
