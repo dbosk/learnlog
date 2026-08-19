@@ -56,8 +56,10 @@ import datetime
 
 from learnlog.gitrepo import (
     LearnlogRepo,
+    REVIEW_SUBCOMMANDS,
     RUN_ID_FIELD,
     TRAILER_PREFIX,
+    VIEWED_FIELD,
 )
 @
 
@@ -617,11 +619,11 @@ reader must agree on: the recorder consults it to decide whether to
 log an invocation at all (\cref{learnlog}), and disagreement would
 mean runs that are recorded and then hidden, or filtered and never
 written.
-Shared run-record vocabulary lives with the recorder in
-\cref{gitrepo}---that is where [[RUN_ID_FIELD]] and [[TRAILER_PREFIX]]
-come from---so this definition is the reader's copy until the two
-halves are joined, at which point it becomes another name in the
-import above.
+So [[REVIEW_SUBCOMMANDS]] is not defined here: it comes from
+\cref{gitrepo} through the import above, exactly like
+[[RUN_ID_FIELD]] and [[TRAILER_PREFIX]]---one definition that both
+halves read is what makes disagreement impossible rather than merely
+unlikely (\cref{sec:review-subcommands}).
 
 Only the first two tokens decide.
 Anything after them is options and arguments ([[learnlog list --all]]
@@ -642,8 +644,6 @@ def is_review_command(command):
         and parts[0] == "learnlog"
         and parts[1] in REVIEW_SUBCOMMANDS
     )
-<<commits constants>>=
-REVIEW_SUBCOMMANDS = ("play", "list")
 @
 
 The internal test is the difference between the two: learnlog's own
@@ -1340,9 +1340,13 @@ def parse_view_trace(block_text):
             views.append(tuple(fields))
     return views
 <<commits constants>>=
-VIEWED_FIELD = "Viewed:"
 VIEWED_FIELD_COUNT = 3
 @
+
+The field name itself, [[VIEWED_FIELD]], is the writer's
+(\cref{sec:finalising-a-run}) and arrives through the import above:
+reader and writer sharing one spelling is what lets the parser trust
+[[startswith]] here.
 
 Let's verify that a whole navigation sequence---including the revisit
 that makes it interesting---survives the trip through the trailer:
