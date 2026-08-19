@@ -3606,18 +3606,34 @@ A path with no [[.learnlog/]] subdirectory is treated as stale
 rather than valid-but-empty; this is how we detect moved or
 deleted projects.
 
+An \emph{empty} marker needs its own check before any of that,
+because [[pathlib]] would otherwise hide it: [[Path("")]] is
+[[Path(".")]], so an interrupted write or a full disk that left
+zero bytes behind would make the marker mean \enquote{the current
+directory}---whichever one the student's program happens to run
+in.
+That is precisely the guess the marker exists to override, and it
+would even pass the [[.learnlog/]] validity test whenever the
+student stands inside some project.
+Zero bytes recorded is no recording, so it answers [[None]] like
+the absent file it almost is.
+
 <<project root resolution>>=
 def _read_marker(marker_path):
     """Return the path stored in ``marker_path`` if still valid.
 
-    "Valid" means the file exists, is readable, and points at a
-    directory that still contains a ``.learnlog/`` subdirectory.
-    Returns ``None`` otherwise.
+    "Valid" means the file exists, is readable, holds a
+    non-empty path, and that path names a directory that still
+    contains a ``.learnlog/`` subdirectory.  Returns ``None``
+    otherwise.
     """
     try:
         if not marker_path.exists():
             return None
-        candidate = pathlib.Path(marker_path.read_text().strip())
+        text = marker_path.read_text().strip()
+        if not text:
+            return None
+        candidate = pathlib.Path(text)
         if (candidate / ".learnlog").is_dir():
             return candidate
     except Exception:
@@ -3927,6 +3943,27 @@ wired to a learnlog project; the resolver must silently return
         missing_marker = tmp_path / "nonexistent.txt"
         result = _resolve_project_root(
             marker_path=missing_marker,
+            sys_prefix=no_backup_prefix,
+        )
+        assert result is None
+@
+
+An empty marker must behave like an absent one even when the
+current directory would satisfy the validity test.
+The test therefore runs \emph{from inside} a learnlog project:
+this is the situation in which the [[Path("")]]-is-[[Path(".")]]
+accident would make a truncated marker look valid, so the
+[[None]] here is carried entirely by the emptiness check.
+
+<<autostart test functions>>=
+    def test_empty_marker_reads_as_none(
+        self, tmp_path, project, no_backup_prefix, monkeypatch,
+    ):
+        empty_marker = tmp_path / "empty.txt"
+        empty_marker.write_text("\n")
+        monkeypatch.chdir(project)
+        result = _resolve_project_root(
+            marker_path=empty_marker,
             sys_prefix=no_backup_prefix,
         )
         assert result is None
