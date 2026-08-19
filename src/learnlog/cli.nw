@@ -4856,12 +4856,34 @@ if remote.returncode != 0:
     )
     return
 remote_tip = remote.stdout.strip()
-local_tip = repo.git(
-    "rev-parse", "--verify", branch_ref,
-).stdout.strip()
+local = repo.git(
+    "rev-parse", "--verify", "--quiet", branch_ref,
+    check=False,
+)
+if local.returncode != 0:
+    raise SystemExit(
+        f"The log's branch {branch} has no commits to pull "
+        f"onto.  Use learnlog clone to fetch a remote log "
+        f"into a fresh directory instead."
+    )
+local_tip = local.stdout.strip()
 <<constants>>=
 BRANCH_REF_PREFIX = "refs/heads/"
 @
+
+The local tip is probed with [[check=False]] like the remote one,
+and the probe is defence in depth rather than a reachable branch of
+the ordinary flow.
+An unborn recording branch heals before [[pull]] can see it:
+every command constructs [[LearnlogRepo]] first, and a repository
+whose branch has no commit gets its initial commit right there
+(\cref{sec:init-repo})---verified by trying, since an orphan
+checkout plus a pull comes back as a diverged-histories refusal,
+never as an unborn branch.
+What the probe still catches is a repository damaged past what
+construction repairs, where [[rev-parse]] fails for its own
+reasons---and whoever is standing in one deserves the same kind of
+sentence the other refusals give, not a [[GitError]] traceback.
 
 \paragraph{Three cases, one of which needs a merge.}
 When the remote tip is already an ancestor of ours there is nothing to
@@ -5508,6 +5530,51 @@ def test_pull_without_any_branch_still_refuses(
 
     assert result.exit_code != 0
     assert "not on a branch" in result.output
+@
+
+A branch whose tip cannot be read is the last state left, and no
+repository a command can construct exhibits it---construction heals
+an unborn branch with the initial commit before [[pull]] runs.
+So the test manufactures the failing probe itself: it lets every
+Git call through except the one reading the local tip, which is
+made to fail the way it does in a damaged repository.
+
+<<test functions>>=
+def test_pull_with_unreadable_tip_refuses_plainly(
+    workdir, monkeypatch,
+):
+    """A branch with no readable tip gets a sentence."""
+    from learnlog import gitrepo
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+
+    real_git = gitrepo.LearnlogRepo.git
+
+    def failing_local_probe(self, *args, **kwargs):
+        if (
+            args[:3] == ("rev-parse", "--verify", "--quiet")
+            and args[3].startswith("refs/heads/")
+        ):
+            result = real_git(
+                self, "rev-parse", "--verify", "--quiet",
+                "refs/heads/no-such-branch", check=False,
+            )
+            return result
+        return real_git(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        gitrepo.LearnlogRepo, "git", failing_local_probe,
+    )
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code != 0
+    assert "no commits to pull onto" in result.output
+    if result.exception is not None:
+        assert isinstance(result.exception, SystemExit)
 @
 
 
