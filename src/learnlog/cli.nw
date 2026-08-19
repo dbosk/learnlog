@@ -4,9 +4,11 @@
 The [[learnlog]] command lets students prepare projects for
 logging and lets both students and teachers manage and review
 the development logs that are produced.
-It provides fourteen subcommands: [[init]] prepares a project
+It provides fifteen subcommands: [[init]] prepares a project
 directory (creating [[.learnlog/]] and installing [[learnlog]]
-for the student's chosen language), [[activate]] and
+for the student's chosen language), [[doctor]] reports whether
+the running interpreter still records runs and can repair the
+wiring when it does not, [[activate]] and
 [[deactivate]] emit shell code for entering or leaving the
 project [[.venv/]], [[tutorial]] embeds guided walkthroughs
 for common learnlog workflows, [[list]] gives a compact
@@ -32,7 +34,9 @@ arguments with minimal boilerplate, and the modern
 """Command-line interface for learnlog.
 
 Provides the ``learnlog`` command with subcommands for setting
-up a project to record with learnlog (``init``), emitting
+up a project to record with learnlog (``init``), checking and
+repairing the autostart wiring of the running interpreter
+(``doctor``), emitting
 shell code to activate or deactivate the project ``.venv/``,
 running guided tutorials through pytorial (``tutorial``),
 running Git commands against the log, exporting the log as a
@@ -81,6 +85,18 @@ etc.) live in the [[commits]] module (\cref{commits}).
 The ProgSnap2 exporter lives in [[progsnap2]] (\cref{progsnap2}).
 The interactive viewer lives in [[viewer]] (\cref{viewer}).
 
+Four names are imported from inside learnlog rather than restated
+here, because the CLI has to apply exactly the rules the runtime
+applies.  [[_is_home_or_above]] is the bound that keeps
+repository discovery out of the home directory (\cref{learnlog});
+[[init]] and [[doctor]] apply it to the roots they are asked to
+\emph{create}, where discovery never gets a say
+(\cref{sec:setup-home-guard}).  The three names from
+[[learnlog._autostart]] are what an interpreter itself consults at
+startup to decide whether, and where, to log; [[doctor]] asks them
+the same questions and reports the answers
+(\cref{sec:autostart-diagnosis}).
+
 <<imports>>=
 from __future__ import annotations
 
@@ -100,7 +116,12 @@ from typing import Annotated
 import pytorial
 import typer
 
-from learnlog import find_learnlog_dir
+from learnlog import _is_home_or_above, find_learnlog_dir
+from learnlog._autostart import (
+    _DEFAULT_MARKER_PATH,
+    _is_autostart_wired,
+    _resolve_project_root,
+)
 from learnlog.gitrepo import GIT_TREE_TIMEOUT, LearnlogRepo
 from learnlog.commits import (
     get_commits,
@@ -491,10 +512,130 @@ activated venv) still commit to the right
 (\cref{sec:setup-autostart-hook}).
 
 The helpers that support [[init]] are split across the
-following subsections by concern: choosing a language,
+following subsections by concern: bounding where a project
+may be created at all, choosing a language,
 finding the interpreter, locating [[pip]] and [[python]]
 once a venv exists, writing the autostart hook, and
 finally the pipeline that wires them together.
+
+
+\subsection{Refusing a home-directory project root}
+\label{sec:setup-home-guard}
+
+Repository \emph{discovery} is bounded: the upward walk in
+[[find_learnlog_dir]] stops before the home directory, so no
+misplaced script can make learnlog adopt [[$HOME]] by accident
+(\cref{learnlog}).  [[init]] is the other way a repository comes
+into existence, and it is the more dangerous one, because
+discovery never runs afterwards to correct it.  A student who
+types [[learnlog init python]] one directory too high---in
+[[$HOME]] itself---gets a [[.learnlog/]] there \emph{and} a
+marker file naming it, and the marker is authoritative: every
+later run of that venv reads it and stages the whole home
+directory, from [[.ssh/]] to the browser cache, into the log.
+Nothing in the run path can second-guess it, since the marker's
+whole purpose is to override the guess.
+
+So [[init]] applies discovery's own predicate to the root it is
+about to create.  Importing [[_is_home_or_above]] rather than
+restating the rule is what keeps the two entry points from
+drifting apart: whatever counts as \enquote{too high} for the
+walk counts as too high for [[init]] by construction.
+
+Only that one condition refuses.  A project directory that is
+also a Git checkout is the documented normal layout---the log
+repository is deliberately hidden in [[.learnlog/]] precisely so
+it can live alongside the student's own [[.git/]]---so the Git
+boundary that bounds the \emph{walk} has no business bounding
+[[init]].
+
+The refusal is nevertheless overridable.  \enquote{Never} would
+be a guess about the user's intent, and there are honest reasons
+to want a log rooted at a directory we would otherwise refuse: a
+teacher recording a demo in a scratch account, or an
+investigation into learnlog's own behaviour in that layout.  What
+the guard has to prevent is the \emph{accident}, and a flag the
+user has to type does that: [[--force]] costs one word when it is
+meant, and is never typed by the student who merely forgot to
+[[cd]].
+
+The caller supplies the way out as a hint, because it differs by
+command---[[init]] can offer [[--force]], while [[doctor]] can
+only send the user somewhere else (\cref{sec:doctor-command}).
+Keeping the \emph{reason} in one place and letting the next step
+vary is what makes the helper worth having at all.
+
+<<helper functions>>=
+def refuse_home_root(path, hint):
+    """Refuse ``path`` as a project root if it is $HOME or above.
+
+    Raises ``SystemExit`` with an explanation followed by
+    ``hint``, which should tell the caller how to proceed.
+    Returns ``None`` for any acceptable path.
+    """
+    if not _is_home_or_above(path):
+        return
+    raise SystemExit(
+        f"Refusing to make {path} a learnlog project root: it "
+        f"is your home directory or an ancestor of it, so every "
+        f"run would commit unrelated files into the log.  {hint}"
+    )
+@
+
+Let's verify the boundary from both sides.  The tests point
+[[HOME]] at a temporary directory so they neither depend on nor
+disturb the real one:
+
+<<test functions>>=
+def test_refuse_home_root_rejects_home(tmp_path, monkeypatch):
+    """The home directory itself is refused."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(SystemExit, match="home directory"):
+        refuse_home_root(home, "Pass --force.")
+
+def test_refuse_home_root_rejects_ancestor(tmp_path, monkeypatch):
+    """A directory above the home directory is refused too."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(SystemExit, match="ancestor"):
+        refuse_home_root(tmp_path, "Pass --force.")
+
+def test_refuse_home_root_includes_hint(tmp_path, monkeypatch):
+    """The caller's next step is part of the message."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(SystemExit, match="Pass --force."):
+        refuse_home_root(home, "Pass --force.")
+
+def test_refuse_home_root_allows_project_below_home(
+    tmp_path, monkeypatch,
+):
+    """An ordinary project directory under $HOME is allowed."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    project = home / "lab1"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert refuse_home_root(project, "Pass --force.") is None
+
+def test_refuse_home_root_allows_git_checkout(
+    tmp_path, monkeypatch,
+):
+    """A project that is also a Git checkout is not refused."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    project = home / "lab1"
+    (project / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert refuse_home_root(project, "Pass --force.") is None
+@
 
 
 \subsection{Selecting a language}
@@ -1522,9 +1663,276 @@ def test_init_python_invokes_write_autostart_files(
 @
 
 
+\section{Diagnosing the autostart wiring}
+\label{sec:autostart-diagnosis}
+
+Autostart is the one part of learnlog that is invisible while it
+works, which is precisely what makes it hard to notice when it
+stops.  A venv whose marker names a project the student has since
+deleted, renamed, or unmounted resolves to nothing, and the run
+path answers that by declining to log rather than by inventing a
+repository beside whatever the student happens to be working on
+(\cref{sec:autostart-wired}).  Declining is the right call---the
+alternative is an unbounded repository in the wrong place---but it
+is silent by construction: a student's program must behave
+identically with and without learnlog, so the refusal cannot print
+a word.  Weeks of runs can go missing from a dataset with nothing
+anywhere to say so.
+
+The CLI carries no such obligation.  Nothing a student runs
+depends on what [[learnlog doctor]] prints, so this is the one
+place that can afford to say out loud what the runtime decided in
+silence.
+
+Three states are worth telling apart, because each calls for a
+different response:
+\begin{description}
+\item[Not wired] No marker file sits next to this interpreter's
+    [[site-packages]].  Nothing is broken---the interpreter was
+    simply never prepared by [[learnlog init]], which is also the
+    normal state for a student who writes an explicit
+    \mintinline{python}{import learnlog} line.  The remedy, if one
+    is wanted at all, is [[init]].
+\item[Wired and anchored] The marker, or the [[sys.prefix]]
+    backup, resolves to a project that still holds a
+    [[.learnlog/]].  Runs are being recorded, and the report says
+    into which project---which doubles as the answer to
+    \enquote{why are my runs landing in the wrong log?}
+\item[Wired but dead] A marker exists, so this interpreter was
+    told which project it serves, yet neither the marker nor the
+    backup resolves.  This is the silent-data-loss state, and the
+    only one [[doctor]] can repair.
+\end{description}
+
+Notice what separates the first state from the third: both resolve
+to no project at all, and only the \emph{presence} of the marker
+file tells them apart.  That is the same distinction
+[[initialize()]] draws before refusing to log
+(\cref{sec:autostart-wired}), which is why [[doctor]] asks
+[[_is_autostart_wired]] instead of inspecting the [[.pth]] file
+itself: a diagnosis that used a different test from the runtime's
+would eventually disagree with it, and a diagnosis that disagrees
+with the thing it diagnoses is worse than none.
+
+<<constants>>=
+class AutostartState(enum.Enum):
+    """How the running interpreter is wired for autostart.
+
+    ``unwired`` means no marker file exists, ``anchored`` that
+    the wiring resolves to a project, and ``dead`` that a marker
+    exists but resolves to nothing -- the state in which runs go
+    unrecorded with no sign of it.
+    """
+
+    unwired = "unwired"
+    anchored = "anchored"
+    dead = "dead"
+@
+
+For the dead state, the single most useful fact is the path the
+marker actually holds: [[/home/alice/lab1]] tells a student who
+renamed a directory exactly what happened, whereas \enquote{the
+project could not be resolved} tells them nothing they can act
+on.  We show the raw recorded text rather than anything derived
+from it, because the discrepancy between what is recorded and what
+exists is the whole finding.  A marker that cannot be read at all
+is a different fault with the same consequence, so it reports
+itself in the same slot instead of raising: a diagnostic command
+that crashes on the very file it was asked to explain would leave
+the student worse off than the silence they came to ask about.
+That is also why the [[except]] clause is broad---the marker is
+arbitrary bytes on a disk we do not control, and a permission
+error and a half-written file are the same news here.
+
+<<helper functions>>=
+def marker_contents(marker_path):
+    """Return the marker file's text, or why it cannot be read."""
+    try:
+        return pathlib.Path(marker_path).read_text().strip()
+    except Exception as exc:
+        return f"<unreadable: {exc}>"
+@
+
+The report is a single function so that the command itself has
+nothing left to decide.  It takes the same two overrides as the
+resolver it calls, [[marker_path]] and [[sys_prefix]], and
+defaults both to the running interpreter's values.  Mirroring
+[[_resolve_project_root]]'s signature here is deliberate: the
+defaults keep the command a no-argument call, while the parameters
+let the tests drive every branch against a scratch directory
+instead of building a real venv.
+
+Resolving has one side effect worth naming.  When the marker is
+stale but the [[sys.prefix]] backup still finds the project,
+[[_resolve_project_root]] rewrites the marker (\cref{learnlog}).
+A moved project is therefore repaired by the mere act of asking,
+and---more to the point---the report describes what the next run
+will actually do rather than what the file happened to say a
+moment earlier.
+
+<<helper functions>>=
+def autostart_report(marker_path=None, sys_prefix=None):
+    """Describe how the running interpreter is wired to log.
+
+    Returns a ``(state, lines)`` pair, where ``state`` is an
+    ``AutostartState`` and ``lines`` are ready to print.  Both
+    arguments default to the running interpreter's own marker
+    path and ``sys.prefix``.
+    """
+    <<default the report inputs to this interpreter>>
+    <<report an interpreter nobody wired>>
+    <<report the project the wiring resolves to>>
+    <<report wiring that resolves to nothing>>
+@
+
+Every report opens with the interpreter it is about.  That line is
+not decoration: a student who installed learnlog with [[pipx]], or
+who forgot to activate the project venv, is asking about a
+different environment from the one their programs run in, and
+\enquote{not wired} only becomes intelligible next to the name of
+what was inspected.
+
+<<default the report inputs to this interpreter>>=
+if marker_path is None:
+    marker_path = _DEFAULT_MARKER_PATH
+if sys_prefix is None:
+    sys_prefix = sys.prefix
+marker_path = pathlib.Path(marker_path)
+lines = [f"Interpreter: {sys_prefix}"]
+@
+
+An unwired interpreter still gets a [[Marker]] line, naming the
+directory the marker would have lived in.  It is what turns a bare
+\enquote{not wired} into something checkable: the student who
+expected this environment to be wired can compare that directory
+against the venv they actually ran [[init]] in.
+
+<<report an interpreter nobody wired>>=
+if not _is_autostart_wired(marker_path=marker_path):
+    return AutostartState.unwired, lines + [
+        "Autostart:   not wired -- runs of this interpreter "
+        "are not recorded.",
+        f"Marker:      no {marker_path.name} in "
+        f"{marker_path.parent}",
+        "Run 'learnlog init python' in your project to wire "
+        "this environment.",
+    ]
+@
+
+Past that point the interpreter is wired, and the only remaining
+question is whether the wiring still lands anywhere.  We answer it
+with [[_resolve_project_root]] rather than by reading the marker
+ourselves, so that both of the runtime's sources count: an
+anchored report covers the project named by the marker \emph{and}
+the one recovered from [[sys.prefix]] when the marker has gone
+stale.  Reporting only the first would call a self-healing venv
+broken.
+
+<<report the project the wiring resolves to>>=
+project_root = _resolve_project_root(
+    marker_path=marker_path, sys_prefix=sys_prefix,
+)
+if project_root is not None:
+    return AutostartState.anchored, lines + [
+        "Autostart:   wired",
+        f"Project:     {project_root}",
+        f"Runs of this interpreter are recorded in "
+        f"{pathlib.Path(project_root) / '.learnlog'}.",
+    ]
+@
+
+What falls through is the state the command exists for: a marker
+is present, so somebody ran [[init]] for this interpreter, and
+neither source resolves, so nothing is being recorded.  Both facts
+are already established by the time we get here, which is why this
+last block asserts nothing and simply says what it knows.
+
+<<report wiring that resolves to nothing>>=
+return AutostartState.dead, lines + [
+    "Autostart:   wired, but the project it names is gone -- "
+    "runs are NOT being recorded.",
+    f"Marker:      {marker_path} names "
+    f"{marker_contents(marker_path)}",
+    "Run 'learnlog doctor --repair' from your project "
+    "directory to re-wire this interpreter.",
+]
+@
+
+Let's verify the classification.  A scratch directory stands in
+for [[site-packages]], and the presence and contents of the marker
+file inside it select the state, exactly as they would in a real
+venv:
+
+<<test functions>>=
+def test_autostart_report_unwired_without_marker(tmp_path):
+    """No marker file means nobody wired this interpreter."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    state, lines = autostart_report(
+        marker_path=purelib / "learnlog_project_root.txt",
+        sys_prefix=str(tmp_path / "nowhere" / ".venv"),
+    )
+    assert state is AutostartState.unwired
+
+def test_autostart_report_anchored_via_marker(tmp_path):
+    """A marker naming a live project reports that project."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(project) + "\n")
+    state, lines = autostart_report(
+        marker_path=marker,
+        sys_prefix=str(tmp_path / "nowhere" / ".venv"),
+    )
+    assert state is AutostartState.anchored
+    assert any(str(project) in line for line in lines)
+
+def test_autostart_report_anchored_via_backup(tmp_path):
+    """A stale marker is healed from the sys.prefix backup."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "moved-away") + "\n")
+    state, lines = autostart_report(
+        marker_path=marker,
+        sys_prefix=str(project / ".venv"),
+    )
+    assert state is AutostartState.anchored
+    assert marker.read_text().strip() == str(project)
+
+def test_autostart_report_dead_shows_marker_contents(tmp_path):
+    """A marker naming a vanished project is reported verbatim."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    state, lines = autostart_report(
+        marker_path=marker,
+        sys_prefix=str(tmp_path / "nowhere" / ".venv"),
+    )
+    assert state is AutostartState.dead
+    assert any(
+        str(tmp_path / "deleted-lab") in line for line in lines
+    )
+
+def test_marker_contents_reports_unreadable_marker(tmp_path):
+    """An unreadable marker explains itself instead of raising."""
+    from learnlog.cli import marker_contents
+    assert "unreadable" in marker_contents(tmp_path / "gone.txt")
+@
+
+
 \section{Typer application}
 
-We define the Typer app at module level with fourteen
+We define the Typer app at module level with fifteen
 commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
@@ -1725,7 +2133,14 @@ The optional [[-C]] / [[--dir]] flag mirrors the pattern
 used by [[set-remote]] and [[push]] and makes [[init]]
 scriptable from a parent directory.  The [[--python]]
 option is the [[init]]-specific escape hatch discussed in
-\cref{sec:setup-target-python}.
+\cref{sec:setup-target-python}, and [[--force]] the one
+that overrides the home-directory refusal
+(\cref{sec:setup-home-guard}).
+
+The guard runs before the [[LearnlogRepo]] constructor, not
+after: the constructor is what creates [[.learnlog/]], and a
+refusal that leaves the directory behind would have already done
+the damage it exists to prevent.
 
 <<typer commands>>=
 @app.command(name="init")
@@ -1757,6 +2172,16 @@ def init(
             ),
         ),
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Set up the project even when the directory "
+                "is your home directory or above it."
+            ),
+        ),
+    ] = False,
 ):
     """Set up a project to record with learnlog."""
     workdir = (
@@ -1764,6 +2189,12 @@ def init(
         if directory
         else pathlib.Path.cwd()
     )
+    if not force:
+        refuse_home_root(
+            workdir,
+            "Change to your project directory, or pass "
+            "--force if you really mean this one.",
+        )
     LearnlogRepo(workdir)
     if language is Language.python:
         init_python(workdir, python)
@@ -1819,6 +2250,469 @@ expected [[.learnlog/]] directory.  We stub the Python pipeline rather
 than exercise it here because its behaviour is checked separately, which
 also keeps these tests independent of the network and the local Python
 toolchain.
+
+The home-directory guard needs the same treatment at the command
+level, since that is where [[--force]] lives.  These tests point
+[[HOME]] at a temporary directory and then check every outcome
+that matters: that the refusal fires from the current directory
+and through [[-C]] alike, that nothing is left behind by a
+refused run, that the message names the way out, that
+[[--force]] takes it, and---the one that would catch an
+over-eager guard---that an ordinary project below the home
+directory is unaffected.
+
+<<test functions>>=
+def test_init_refuses_home_directory(tmp_path, monkeypatch):
+    """`init` in $HOME refuses and creates nothing."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(home)
+    result = CliRunner().invoke(app, ["init", "python"])
+    assert result.exit_code != 0
+    assert not (home / ".learnlog").exists()
+
+def test_init_refusal_names_force(tmp_path, monkeypatch):
+    """The refusal tells the student how to override it."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(home)
+    result = CliRunner().invoke(app, ["init", "python"])
+    assert "--force" in result.output
+
+def test_init_refuses_directory_above_home(
+    tmp_path, monkeypatch,
+):
+    """A directory above $HOME is refused through -C too."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    result = CliRunner().invoke(
+        app, ["init", "python", "-C", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    assert not (tmp_path / ".learnlog").exists()
+
+def test_init_force_allows_home_directory(
+    tmp_path, monkeypatch,
+):
+    """`--force` creates the project in $HOME anyway."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(home)
+    result = CliRunner().invoke(
+        app, ["init", "python", "--force"],
+    )
+    assert result.exit_code == 0
+    assert (home / ".learnlog").is_dir()
+
+def test_init_allows_project_under_home(tmp_path, monkeypatch):
+    """An ordinary project below $HOME is untouched by the guard."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    project = home / "lab1"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(project)
+    result = CliRunner().invoke(app, ["init", "python"])
+    assert result.exit_code == 0
+    assert (project / ".learnlog").is_dir()
+@
+
+
+\subsection{The [[doctor]] command}
+\label{sec:doctor-command}
+
+[[doctor]] prints the report of \cref{sec:autostart-diagnosis}
+and, given [[--repair]], acts on it.
+
+The exit status carries the finding too, so the report is usable
+from a script or a lab checklist: dead wiring exits non-zero,
+the other two states exit zero.  \enquote{Not wired} is
+deliberately not a failure---an interpreter nobody prepared is
+behaving exactly as intended---whereas dead wiring is the one
+state in which a student believes their runs are being recorded
+and they are not.
+
+<<typer commands>>=
+@app.command(name="doctor")
+def doctor(
+    repair: Annotated[
+        bool,
+        typer.Option(
+            "--repair",
+            help=(
+                "Re-wire this interpreter for the learnlog "
+                "project in the current directory."
+            ),
+        ),
+    ] = False,
+):
+    """Check whether this interpreter records runs."""
+    <<report the wiring and stop unless repairing>>
+    <<choose the project to re-wire for>>
+    <<refuse an interpreter we must not wire>>
+    <<re-wire and report the result>>
+@
+
+The report is printed first whether or not [[--repair]] was
+given, so that a repair run leaves behind a record of what it
+found as well as what it did.  Without [[--repair]] the finding
+\emph{is} the whole command, so it becomes the exit status and we
+stop.
+
+<<report the wiring and stop unless repairing>>=
+state, lines = autostart_report()
+for line in lines:
+    typer.echo(line)
+if not repair:
+    raise typer.Exit(
+        code=1 if state is AutostartState.dead else 0
+    )
+@
+
+Repair has to settle two questions---which project to wire to,
+and which interpreter to wire---and it refuses to guess at
+either.
+
+The project is whatever the ordinary upward search finds.  When
+there is none, the answer is [[init]] rather than a repository
+invented somewhere plausible: guessing a root from the current
+directory is precisely the behaviour that was removed from the
+run path for creating whole-home repositories, and re-introducing
+it inside a command called \enquote{repair} would be worse than
+leaving it where it was.
+
+That search is already bounded away from the home directory, so a
+student standing in [[$HOME]] is told \enquote{no project found}
+even when [[$HOME/.learnlog]] is sitting right there, forced into
+existence by an earlier [[init --force]]
+(\cref{sec:setup-home-guard}).  Saying that would be actively
+misleading, so the guard answers first and in its own words---and
+its hint is the only honest one available, since a project we
+refuse to search for is also one we refuse to wire.
+
+<<choose the project to re-wire for>>=
+workdir = find_learnlog_dir()
+if workdir is None:
+    cwd = pathlib.Path.cwd()
+    refuse_home_root(
+        cwd,
+        "Re-run 'learnlog init python --force' there if "
+        "that is really the project you want.",
+    )
+    raise SystemExit(
+        f"No .learnlog/ directory found from {cwd}.  Run "
+        f"'learnlog init python' in your project first."
+    )
+@
+
+The interpreter is this one---the process running
+[[doctor]]---because that is the process the report just
+described, and repairing a different environment would leave the
+finding standing.  Two ways of invoking [[doctor]] make
+\enquote{this one} the wrong answer, and both are refused rather
+than merely warned about, because the consequence is invisible
+from where the student stands.
+
+Outside a virtual environment there is no learnlog wiring of ours
+to repair and [[site-packages]] belongs to the system package
+manager; [[sys.prefix == sys.base_prefix]] is CPython's own test
+for that situation.  Inside a virtual environment that is not the
+project's own [[.venv/]]---the shape a [[pipx]] install produces,
+where [[doctor]] runs from learnlog's private environment---the
+marker would wire the tool rather than the student's programs,
+and learnlog would start recording its own invocations into their
+log.  A project that has a [[.venv/]] we are not running from is
+exactly that case, and the fix is to activate it first.
+
+The check is conditioned on the project actually having a
+[[.venv/]], because installing into an already-active environment
+elsewhere is a supported layout (\cref{sec:setup-pipeline}); when
+the project has no venv of its own there is nothing to be
+mismatched with.
+
+<<refuse an interpreter we must not wire>>=
+venv_dir = pathlib.Path(sys.prefix)
+if sys.prefix == sys.base_prefix:
+    raise SystemExit(
+        f"{venv_dir} is not a virtual environment, so there "
+        f"is no learnlog wiring here to repair.  Activate "
+        f"the project's .venv/ and try again."
+    )
+project_venv = workdir / ".venv"
+if (
+    project_venv.is_dir()
+    and venv_dir.resolve() != project_venv.resolve()
+):
+    raise SystemExit(
+        f"This command is running from {venv_dir}, not the "
+        f"project's {project_venv}.  Activate the project "
+        f"venv and run 'learnlog doctor --repair' again."
+    )
+@
+
+The repair itself is [[write_autostart_files]], the same helper
+[[init]] uses (\cref{sec:setup-autostart-hook}); a second way of
+writing the wiring would be a second thing to keep in step with
+the resolver.
+
+That helper turns filesystem failures into a warning instead of
+an abort, which is the right trade for [[init]]---a missing hook
+is a lost feature, not a broken project---but it does mean the
+call cannot tell us whether it worked.  So we ask the report
+again afterwards and let the second answer, rather than the
+write, decide both what the command claims and what it exits
+with.
+
+<<re-wire and report the result>>=
+write_autostart_files(venv_dir, workdir)
+typer.echo("")
+typer.echo(f"Re-wired this interpreter for {workdir}:")
+state, lines = autostart_report()
+for line in lines:
+    typer.echo(line)
+raise typer.Exit(
+    code=0 if state is AutostartState.anchored else 1
+)
+@
+
+Let's verify the three reports and the exit statuses that go with
+them.  Each test substitutes a scratch [[site-packages]] for the
+interpreter's own and moves [[sys.prefix]] somewhere harmless, so
+that the outcome depends only on the fixture and never on how the
+machine running the suite happens to be wired:
+
+<<test functions>>=
+def test_doctor_reports_unwired_interpreter(
+    tmp_path, monkeypatch,
+):
+    """Without a marker, doctor says so and succeeds."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH",
+        purelib / "learnlog_project_root.txt",
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "not wired" in result.output
+    assert "learnlog init python" in result.output
+
+def test_doctor_reports_anchored_project(tmp_path, monkeypatch):
+    """A live marker is reported with the project it names."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(project) + "\n")
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "wired" in result.output
+    assert str(project) in result.output
+
+def test_doctor_reports_dead_wiring(tmp_path, monkeypatch):
+    """Dead wiring names the stale path and exits non-zero."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert "NOT being recorded" in result.output
+    assert str(tmp_path / "deleted-lab") in result.output
+    assert "--repair" in result.output
+@
+
+The repair path is exercised through the same substitution the
+[[write_autostart_files]] tests use---a scratch directory
+standing in for the venv's [[site-packages]]
+(\cref{sec:setup-autostart-hook})---so the whole command runs for
+real without building a virtual environment.  What the test
+checks is what the student cares about: after the repair, the
+marker names the project they were standing in, and the [[.pth]]
+hook that reads it exists.
+
+<<test functions>>=
+def test_doctor_repair_rewires_dead_marker(
+    tmp_path, monkeypatch,
+):
+    """--repair points a dead marker at the current project."""
+    from learnlog import cli
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.setattr(cli, "venv_purelib", lambda d: purelib)
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code == 0
+    assert marker.read_text().strip() == str(project)
+    assert (purelib / "zzz-learnlog-autostart.pth").exists()
+    assert str(project) in result.output
+
+def test_doctor_repair_without_project_points_at_init(
+    tmp_path, monkeypatch,
+):
+    """Outside a project, repair refuses to guess a root."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.chdir(scratch)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "learnlog init python" in result.output
+    assert marker.read_text().strip() == str(
+        tmp_path / "deleted-lab"
+    )
+
+def test_doctor_repair_refuses_home_directory(
+    tmp_path, monkeypatch,
+):
+    """Repair honours the home-directory bound as init does."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    home = tmp_path / "home"
+    (home / ".learnlog").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.chdir(home)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "home directory" in result.output
+    assert marker.read_text().strip() == str(
+        tmp_path / "deleted-lab"
+    )
+
+def test_doctor_repair_refuses_foreign_venv(
+    tmp_path, monkeypatch,
+):
+    """A project with its own .venv/ must be repaired from it."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    (project / ".venv").mkdir()
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(
+        sys, "prefix", str(tmp_path / "elsewhere-venv"),
+    )
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "Activate the project venv" in result.output
+    assert marker.read_text().strip() == str(
+        tmp_path / "deleted-lab"
+    )
+
+def test_doctor_repair_refuses_outside_a_venv(
+    tmp_path, monkeypatch,
+):
+    """There is nothing of ours to repair in a system Python."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "not a virtual environment" in result.output
+@
 
 
 \subsection{The [[activate]] command}
