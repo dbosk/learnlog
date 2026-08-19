@@ -5316,17 +5316,35 @@ def test_pull_merges_without_merge_tree(workdir, monkeypatch):
 \subsection{The [[git]] command}
 \label{sec:git}
 
-Students sometimes need to inspect their development log directly---for
-example, to check what was recorded before exporting, or to search for
-a particular session.
+Sometimes the log has to be inspected or repaired directly---to check
+what was recorded before exporting, to search for a particular
+session, or to untangle a state none of the ordinary commands
+anticipates.
 The natural tool for this is Git itself, but the [[.learnlog/]]
 directory requires setting [[GIT_DIR]] and [[GIT_WORK_TREE]]
-correctly, which is an implementation detail students should not have
-to know.
+correctly, which is an implementation detail nobody should have to
+know.
 
 The [[git]] subcommand hides this: [[learnlog git log --oneline]]
 works exactly like [[git log --oneline]] would if [[.learnlog/]]
 were a normal [[.git/]] directory.
+
+The command itself is hidden from [[learnlog --help]], and the
+audience is why.
+Every ordinary need this command once served has an ordinary command
+of its own---[[list]], [[play]], [[tag]], [[export]]---and each of
+those knows the two-commit protocol it is reading; raw Git does not.
+A student who discovers a general Git passthrough in the help output
+will sooner or later drive the log with advice written for a source
+repository, and \cref{sec:git-guards} is the catalogue of how that
+ends.
+So the escape hatch stays---maintainers and teachers debugging a
+broken log genuinely need it---but it is something one is \emph{told}
+about when the situation calls for it, and whoever types it has
+thereby accepted that they are past the guarantees the ordinary
+commands maintain.
+Hidden is not disabled: the command works exactly as before for
+anyone who knows its name, and the guards below still apply to it.
 We do not capture Git's output---standard input, output, and error
 inherit from the parent process so that pagers, colours, and
 interactive Git commands all work naturally.
@@ -5361,6 +5379,7 @@ stops Typer from rejecting flags it does not recognise,
 after the first positional argument is passed through verbatim.
 
 \paragraph{Two commands the passthrough must not forward as written.}
+\label{sec:git-guards}
 A passthrough inherits its host's assumptions, and this one inherits a
 work tree that is the student's project and a repository that Git
 itself does not recognise as one.
@@ -5399,6 +5418,7 @@ explaining what they were about to lose.
 <<typer commands>>=
 @app.command(
     name="git",
+    hidden=True,
     context_settings={
         "allow_extra_args": True,
         "allow_interspersed_args": False,
@@ -5419,6 +5439,11 @@ def git_command(
     ] = False,
 ):
     """Run a git command on the learnlog repository.
+
+    This is an escape hatch for inspecting or repairing the
+    log; the ordinary commands (list, play, tag, export)
+    are the supported way to work with it, and raw git can
+    leave the log in states they do not expect.
 
     All arguments are forwarded to git, configured to
     operate on the .learnlog/ directory.  For example,
@@ -5620,6 +5645,36 @@ def test_git_command_forwards_exit_code(
         app, ["git", "log", "--invalid-option"]
     )
     assert result.exit_code != 0
+@
+
+Hidden means absent from the catalogue and nothing more, so the test
+asks both halves: the help output must not advertise the command, and
+the command must still answer to its name.
+The help is checked against the word as a command entry rather than
+as a substring, because \enquote{git} appears in other commands' help
+texts legitimately:
+
+<<test functions>>=
+def test_git_command_is_hidden_but_works(workdir, monkeypatch):
+    """The passthrough is absent from --help yet still runs."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+
+    listed = runner.invoke(app, ["--help"])
+    assert listed.exit_code == 0
+    commands = [
+        line.split()[1]
+        for line in listed.output.splitlines()
+        if line.strip().startswith("│") and len(line.split()) > 1
+    ]
+    assert "git" not in commands
+    assert "list" in commands
+
+    result = runner.invoke(app, ["git", "log", "--oneline"])
+    assert result.exit_code == 0
 @
 
 An inherited [[GIT_INDEX_FILE]] is the passthrough's version of the
