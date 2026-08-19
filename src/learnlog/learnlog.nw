@@ -5007,11 +5007,112 @@ def _compute_backup_root(sys_prefix):
     return None
 @
 
-Self-healing writes the backup's path back into the marker.
-We swallow write failures silently: on a read-only site-packages
-(unusual but possible), logging still works via the backup path
-every invocation---the self-heal is a performance optimisation,
-not a correctness requirement.
+Self-healing writes the backup's path back into the marker, and that
+write is not free to be an ordinary one.
+The marker's whole job is to be read at interpreter startup by
+processes that know nothing about each other, and a truncating write
+puts an empty file on disk for as long as it takes to fill it
+again---microseconds, but microseconds that every concurrent startup
+is sampling.
+A run that reads the marker in that window sees zero bytes, which
+[[_read_marker]] correctly reports as no marker
+(\cref{sec:autostart}), and then---because the [[.pth]] file is still
+there---[[_is_autostart_wired]] says the interpreter was meant to log
+somewhere.  Wired with no anchor is the one combination that logs
+nothing at all, so a self-heal in one process silently discards
+another process's run.
+The reader is not wrong about zero bytes; the writer is wrong to
+produce them.
+Writing a sibling temporary file and [[os.replace]]-ing it into place
+removes the state instead of asking every reader to tolerate it:
+[[rename]] within a directory is atomic, so the name holds either the
+old contents or the new ones and never nothing.
+
+<<project root resolution>>=
+def _replace_file(path, text):
+    """Write ``text`` to ``path`` so no reader can see it empty.
+
+    Writes a sibling temporary file and renames it over ``path``.
+    Concurrent readers therefore see either the previous contents or
+    the new ones, never the empty file a truncating write exposes
+    while it is in progress.
+    """
+    path = pathlib.Path(path)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(text)
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+@
+
+The temporary name carries the writer's pid because two processes may
+be self-healing the same marker at the same instant, and a shared
+temporary name would let one of them rename away a file the other was
+still writing.
+Per-process names make the two writes independent; the rename then
+decides which content wins, which is a race with no bad outcome since
+both are writing the same path.
+
+Cleaning up on failure matters for the same directory: a temporary
+file left in [[site-packages]] after a full disk would be there
+forever, since nothing ever reads or removes it.
+The exception is re-raised rather than swallowed here so that the
+callers keep deciding what a failed write means---silence for the
+self-heal below, a warning for [[learnlog init]] (\cref{cli}).
+
+Let's verify the property that the whole exercise is about.
+Hammering the file from several processes and hoping to catch the
+empty window would test the machine's timing rather than the code, so
+we watch the one instant where the contents change instead: at the
+moment of the rename the name must still hold everything it held
+before, which is only possible if nothing ever truncated it.
+
+<<autostart test functions>>=
+class TestReplaceFile:
+    def test_the_new_contents_arrive(self, tmp_path):
+        target = tmp_path / "marker.txt"
+        _replace_file(target, "the new project\n")
+        assert target.read_text() == "the new project\n"
+
+    def test_the_name_is_never_empty(self, tmp_path, monkeypatch):
+        """Up to the rename, the old contents are still there."""
+        target = tmp_path / "marker.txt"
+        target.write_text("the old project\n")
+        observed = []
+        real_replace = os.replace
+
+        def observing_replace(source, destination):
+            observed.append(pathlib.Path(destination).read_text())
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", observing_replace)
+        _replace_file(target, "the new project\n")
+
+        assert observed == ["the old project\n"]
+        assert target.read_text() == "the new project\n"
+
+    def test_a_failed_write_leaves_nothing_behind(
+        self, tmp_path, monkeypatch,
+    ):
+        target = tmp_path / "marker.txt"
+
+        def boom(source, destination):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            _replace_file(target, "the new project\n")
+
+        assert list(tmp_path.iterdir()) == []
+@
+
+The self-heal itself is then one call, and the [[except]] around it is
+what keeps the write optional: on a read-only [[site-packages]]
+(unusual but possible) logging still works through the backup check on
+every invocation, so healing the marker is a performance optimisation
+rather than a correctness requirement.
 
 <<project root resolution>>=
 def _self_heal_marker(marker_path, project_root):
@@ -5022,11 +5123,36 @@ def _self_heal_marker(marker_path, project_root):
     produces correct logging.
     """
     try:
-        marker_path.write_text(
-            str(project_root.resolve()) + "\n"
+        _replace_file(
+            marker_path, str(project_root.resolve()) + "\n"
         )
     except Exception:
         pass
+@
+
+The self-heal is the write that actually happens behind other
+interpreters' backs, so it gets the same assertion as the helper:
+healing a stale marker never lets the name stand empty.
+
+<<autostart test functions>>=
+def test_self_heal_never_empties_the_marker(
+    tmp_path, project, monkeypatch,
+):
+    """A stale marker is replaced, not truncated and refilled."""
+    marker = tmp_path / "marker.txt"
+    marker.write_text(str(tmp_path / "gone") + "\n")
+    observed = []
+    real_replace = os.replace
+
+    def observing_replace(source, destination):
+        observed.append(pathlib.Path(destination).read_text())
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", observing_replace)
+    _self_heal_marker(marker, project)
+
+    assert observed == [str(tmp_path / "gone") + "\n"]
+    assert marker.read_text() == str(project.resolve()) + "\n"
 @
 
 Combining the three pieces: try the marker; on success, stop.
@@ -5217,7 +5343,9 @@ import sysconfig
 
 from learnlog._autostart import (
     _is_autostart_wired,
+    _replace_file,
     _resolve_project_root,
+    _self_heal_marker,
 )
 
 <<autostart test helpers>>

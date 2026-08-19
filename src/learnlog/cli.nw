@@ -120,6 +120,7 @@ from learnlog import _is_home_or_above, find_learnlog_dir
 from learnlog._autostart import (
     _DEFAULT_MARKER_PATH,
     _is_autostart_wired,
+    _replace_file,
     _resolve_project_root,
 )
 from learnlog.gitrepo import GIT_TREE_TIMEOUT, LearnlogRepo
@@ -1196,6 +1197,18 @@ initialised before the rename: if the legacy file is left in
 place, [[site.py]] still reaches it first and the editable
 install problem remains.
 
+Both writes go through [[_replace_file]] (\cref{learnlog}) rather than
+through [[write_text]], and the reason is that neither file is written
+in private.  [[init]] runs in a venv other interpreters may be
+starting in at that very moment, and a truncating write leaves the
+name empty until it is filled: a startup that samples the [[.pth]]
+then is simply not wired, and one that samples the marker sees an
+interpreter wired to nowhere, which logs the run into no repository at
+all.  Writing a sibling temporary file and renaming it over the name
+means the empty state never exists to be read.  Re-running [[init]] in
+an active venv is exactly when that matters, since that is when a
+student is most likely to have another Python running.
+
 The whole body runs inside a [[try/except OSError]]: an
 autostart hook that fails to install is a missed feature,
 not a broken install.  The student can still use
@@ -1221,8 +1234,9 @@ def write_autostart_files(venv_dir, project_root):
       from outside the project.
 
     Writes are idempotent (identical content is left
-    alone).  Filesystem errors are reported as warnings
-    but do not abort ``init``.
+    alone) and atomic, so an interpreter starting concurrently
+    never reads a half-installed file.  Filesystem errors are
+    reported as warnings but do not abort ``init``.
     """
     legacy_path = None
     files = [
@@ -1246,7 +1260,7 @@ def write_autostart_files(venv_dir, project_root):
             path = purelib / name
             if path.exists() and path.read_text() == content:
                 continue
-            path.write_text(content)
+            _replace_file(path, content)
     except OSError as exc:
         typer.echo(
             f"Warning: could not install autostart hook "
@@ -1259,9 +1273,16 @@ To verify, we monkeypatch [[venv_purelib]] to return a
 scratch directory under [[tmp_path]] so the test does not
 depend on a real venv, and then check: both files exist
 with the expected content; a second call with the same
-arguments is a no-op (file mtimes unchanged); and an
-[[OSError]] from [[venv_purelib]] surfaces as a stderr
-warning rather than a crash.
+arguments is a no-op (file mtimes unchanged); that a call
+which does change a file replaces it rather than emptying
+it first; and that an [[OSError]] from [[venv_purelib]]
+surfaces as a stderr warning rather than a crash.
+
+Watching the rename is how the last of those stays a test
+of the code instead of a test of the machine's timing.  At
+the moment the new marker is moved into place the name must
+still hold the old project's path in full---which cannot
+happen if anything truncated it on the way.
 
 <<test functions>>=
 def test_write_autostart_files_creates_both_files(
@@ -1321,6 +1342,35 @@ def test_write_autostart_files_is_idempotent(
     mtime_before = pth.stat().st_mtime_ns
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
     assert pth.stat().st_mtime_ns == mtime_before
+
+def test_write_autostart_files_never_empties_a_file(
+    tmp_path, monkeypatch,
+):
+    """Re-wiring replaces the marker instead of truncating it."""
+    from learnlog import cli
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    monkeypatch.setattr(
+        cli, "venv_purelib", lambda d: purelib,
+    )
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    cli.write_autostart_files(tmp_path / ".venv", old)
+
+    observed = []
+    real_replace = os.replace
+
+    def observing_replace(source, destination):
+        observed.append(pathlib.Path(destination).read_text())
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", observing_replace)
+    cli.write_autostart_files(tmp_path / ".venv", new)
+
+    assert observed == [str(old.resolve()) + "\n"]
+    assert (
+        purelib / "learnlog_project_root.txt"
+    ).read_text() == str(new.resolve()) + "\n"
 
 def test_write_autostart_files_warns_on_oserror(
     tmp_path, monkeypatch, capsys,
