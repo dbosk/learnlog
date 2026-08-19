@@ -2188,18 +2188,13 @@ tree too.
 
 Two details need explicit care.
 First, [[LearnlogRepo(tmpdir / "repo")]] auto-creates an
-initial commit; the first reconstructed commit therefore amends
-that commit instead of adding an extra synthetic one.
-This is the one [[--amend]] left in the program, and it does not
-conflict with the append-only rule of
-\cref{sec:two-commit-protocol}: that rule protects a \emph{live}
-log that overlapping runs, pushes, and tags may be reading while
-it grows, whereas this repository is a private scratch copy that
-one process builds in one pass and deletes after playback.
-Nothing observes its intermediate states, so replacing the
-placeholder is safe---and better than keeping it, since a
-synthetic root commit would show up as a run that never
-happened.
+initial commit, and a reconstruction has no use for it: a live log
+needs somewhere to stand before its first run, whereas a dataset
+already says where the history starts.
+Keeping the placeholder would show up as a run that never happened,
+so we take it down before replaying rather than paint over it
+afterwards---which is also what lets every group be written the same
+way (\cref{sec:reconstructed-commits}).
 Second, ProgSnap2's I/O model merges [[stderr]] into output and
 still cannot recover that distinction.
 We therefore rebuild the header faithfully, preserve end time when
@@ -2259,6 +2254,7 @@ subject_id = commit_groups[0]["events"][0].get(
 ) or "learnlog"
 
 <<configure reconstructed repository identity>>
+<<start the branch over from the dataset>>
 <<replay grouped commits into temporary repository>>
 
 return repo, tmpdir
@@ -2276,13 +2272,34 @@ repo.git(
 )
 @
 
+Taking the placeholder down is a deletion of the \emph{branch}, not
+of the commit it points at.
+The reconstruction is one pass in a directory it owns and deletes, so
+an unreferenced commit costs nothing; what the deletion buys is that
+the first group's commit becomes a root commit, and every group's
+commit is then written the same way.
+
+[[recording_branch]] names the branch rather than assuming it, for the
+reason it does everywhere else (\cref{sec:recording-branch}): the name
+[[LearnlogRepo]] just created is whatever [[init.defaultBranch]] says
+on the machine doing the import, and a reconstruction has no more
+right to guess it than a run does.
+We ask once and keep the answer in [[branch]], because the replay loop
+below needs the same name to commit onto; asking again per group would
+be asking a question whose answer we have just changed.
+
+<<start the branch over from the dataset>>=
+branch = repo.recording_branch()
+repo.git("update-ref", "-d", branch)
+@
+
 Each commit group restores the corresponding snapshot, stages it,
-rebuilds the commit message, and either amends the auto-created
-initial commit or creates a new one.  After the commit exists, we
-add any tags that were exported for that group.
+rebuilds the commit message, and adds the commit to the branch.
+After the commit exists, we add any tags that were exported for that
+group.
 
 <<replay grouped commits into temporary repository>>=
-for index, group in enumerate(commit_groups):
+for group in commit_groups:
     restore_code_state(
         repo.workdir,
         dataset["code_states"].get(group["code_state_id"], {}),
@@ -2347,31 +2364,59 @@ Building the pathspec from [[GIT_DIR_NAME]] rather than spelling
 pattern from it: the directory and the one thing protecting it should
 not be able to disagree.
 
-The first group replaces the placeholder initial commit that
-[[LearnlogRepo]] created during setup.  Later groups become
-ordinary commits.
+\subsection{Writing the reconstructed commit}
+\label{sec:reconstructed-commits}
 
-A reconstructed message contains the same captured I/O as the message
-it was exported from, so it is subject to the same argument-size limit
-(\cref{sec:commit-message-stdin}) and travels the same way: on standard
-input.
-Without that, importing a dataset would silently drop exactly the runs
-that were interesting enough to produce a lot of output.
+A reconstructed message carries the same captured I/O as the message
+it was exported from, and it has to arrive in the new repository
+unchanged.
+That is a stronger requirement than it sounds, because [[git commit]]
+does not treat a message as data: its default cleanup strips trailing
+whitespace from every line and collapses runs of blank lines.
+A learnlog I/O log is made of exactly that---a program printing an
+empty line records the prefix [[stdout:]] followed by a space, and a
+program printing spaces records them---so a log the recorder wrote
+verbatim (\cref{sec:finalising-a-run}) came back tidied, and an
+analysis over a reconstructed repository saw different bytes than the
+student's program had produced.
+
+[[git commit --cleanup=verbatim]] switches the tidying off, and it is
+the smaller change: the loop already stages and commits in one step.
+We route through [[commit_on_branch]] (\cref{sec:commit-on-branch})
+instead, because verbatim is not a property this side should have to
+remember to ask for.
+The recorder's commits are already written by that method, and its
+contract---the message becomes the commit message verbatim, with a
+closing newline supplied when the caller left one off---is what
+defines the bytes a learnlog commit holds.
+Reconstruction wants those bytes, so it should call that code rather
+than reassemble the same guarantee here out of a porcelain flag plus a
+newline convention restated a second time; two statements of one rule
+is how the rule drifts.
+
+What it costs is one command.
+[[commit_on_branch]] takes a tree rather than a work tree, so
+[[git write-tree]] turns the index we have just staged into one, on
+the same tree-sized budget as the [[git add]] that filled it: what
+either command walks is the size of the student's project.
+What it saves is the special case: [[commit-tree]] appends to a branch
+that need not exist yet, so with the placeholder gone the first group
+is no longer an amend and the loop no longer asks which group it is
+on.
+[[--allow-empty]] goes with it, because plumbing has no opinion about
+a commit that changes nothing, and so does [[--reset-author]], because
+a commit built by [[commit-tree]] is authored by the configured
+identity to begin with.
+The message still travels on standard input, as it did before and for
+the reason it did (\cref{sec:commit-message-stdin}): a run loud enough
+to overflow [[argv]] on the way out is equally loud on the way back
+in, and [[commit-tree]] reads it from there too.
 
 <<write reconstructed commit>>=
-if index == 0:
-    repo.git(
-        "commit", "--amend", "--allow-empty",
-        "--reset-author",
-        "--file=-", input=message,
-        timeout=GIT_TREE_TIMEOUT,
-    )
-else:
-    repo.git(
-        "commit", "--allow-empty",
-        "--file=-", input=message,
-        timeout=GIT_TREE_TIMEOUT,
-    )
+tree = repo.git(
+    "write-tree", timeout=GIT_TREE_TIMEOUT,
+).stdout.strip()
+repo.commit_on_branch(branch, tree, message)
 @
 
 Tag recreation must happen after the commit is written because
@@ -3314,8 +3359,85 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
         shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
-What a round trip must not quietly change is which files the code
-state contained.
+That test reads the round trip field by field, which is how it
+survived a version of the import that changed the fields' contents.
+The stronger question is whether the run comes back as the same
+\emph{bytes}, so we ask it that way: the reconstructed message is
+compared against the original one whole.
+
+The two differ in exactly one line, and knowing which is the point of
+the comparison.
+[[Run-Id]] links a header commit to its trailer commit
+(\cref{sec:two-commit-protocol}); it is an artefact of how a live log
+is written, not something ProgSnap2 records, and a reconstructed run
+is one commit that needs no such link.
+Dropping that line and requiring the rest to match exactly is
+therefore the strongest statement the round trip can support---and it
+fails the moment anything tidies the message, because the I/O below is
+a menu prompt padded with spaces followed by two empty lines, and
+Git's default commit cleanup removes both.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_keeps_the_message_verbatim(
+    workdir,
+):
+    """A round trip alters no byte of a recorded run block."""
+    import shutil
+    from learnlog.commits import (
+        get_commits,
+        get_run_trailers,
+        merge_run_trailers,
+    )
+    from learnlog.gitrepo import RUN_ID_FIELD
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "menu.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log=(
+            "stdout: choose:   \n"
+            "stdout: \n"
+            "stdout: \n"
+            "stdout: done\n"
+        ),
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+
+    recorded = repo.git(
+        "log", "-1", "--format=%B",
+        get_commits(repo)[-1]["hash"],
+    ).stdout.rstrip("\n")
+    expected = "\n".join(
+        line
+        for line in merge_run_trailers(
+            recorded, get_run_trailers(repo),
+        ).split("\n")
+        if not line.startswith(RUN_ID_FIELD)
+    )
+
+    output = workdir / "verbatim.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        rebuilt = reconstructed.git(
+            "log", "-1", "--format=%B",
+            get_commits(reconstructed)[-1]["hash"],
+        ).stdout
+        assert rebuilt.rstrip("\n") == expected
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+The other thing a round trip must not quietly change is which files
+the code state contained.
 A dataset old enough to predate learnlog's export patterns can carry
 a file named like one of learnlog's own exports---the student
 downloaded a classmate's dataset into the project directory, and the
