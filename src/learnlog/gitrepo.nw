@@ -118,11 +118,9 @@ class LearnlogRepo:
     def __init__(self, workdir):
         self.workdir = pathlib.Path(workdir)
         self.git_dir = self.workdir / GIT_DIR_NAME
-        self.env = {
-            **os.environ,
-            "GIT_DIR": str(self.git_dir),
-            "GIT_WORK_TREE": str(self.workdir),
-        }
+        self.env = git_environment(
+            self.git_dir, self.workdir,
+        )
         self.run_id = None
         self.run_script = None
         self.run_args = []
@@ -150,6 +148,171 @@ three string literals.
 
 <<constants>>=
 GIT_DIR_NAME = ".learnlog"
+@
+
+
+\section{The environment Git runs in}
+\label{sec:git-environment}
+
+Every Git command learnlog runs is told which repository to work on
+through the environment rather than through arguments, so building
+that environment is a decision of its own.
+It used to be built by copying the process environment and overriding
+[[GIT_DIR]] and [[GIT_WORK_TREE]] in it.
+Overriding two variables answers the two questions those variables
+ask, and leaves every other [[GIT_]] variable the parent process
+exported pointing wherever it pointed.
+
+That is not a hypothetical parent.
+Git exports [[GIT_INDEX_FILE]] to the hooks it runs, so a project
+whose [[pre-commit]] hook happens to run a logged program hands
+learnlog's [[git add .]] the path of the \emph{student's own}
+repository's index---and learnlog then stages the whole working
+directory into it, replacing whatever the student had deliberately
+staged.
+The variables that name an object store
+([[GIT_OBJECT_DIRECTORY]], [[GIT_ALTERNATE_OBJECT_DIRECTORIES]],
+[[GIT_QUARANTINE_PATH]]) are the same class one level down: learnlog's
+commits would be written into somebody else's store and vanish when it
+is discarded.
+So are [[GIT_AUTHOR_NAME]] and its relatives, which would attribute a
+run record to whatever commit was being made when the hook fired, and
+[[GIT_CONFIG]], which redirects the writes of [[git config]]---the
+command that configures the repository below---into a file we were
+never asked to touch.
+
+The list of variables that must not survive is therefore open-ended,
+and an override list can only ever name the ones we thought of.
+Inverting it closes the question: strip every [[GIT_]] variable, then
+add back the few that cannot decide what Git writes or where it goes.
+
+Three groups earn a place on that list.
+The transport variables---[[GIT_SSH]], [[GIT_SSH_COMMAND]],
+[[GIT_SSH_VARIANT]], [[GIT_ASKPASS]], [[GIT_TERMINAL_PROMPT]]---say
+how the student reaches a remote, which is exactly what [[push]] and
+[[pull]] need and exactly what a student is likely to have set in a
+shell profile rather than in a config file; they run through this
+environment (\cref{sec:push}), and stripping them would break the
+sharing commands for everyone who configures Git that way.
+The config-file selectors [[GIT_CONFIG_GLOBAL]], [[GIT_CONFIG_SYSTEM]]
+and [[GIT_CONFIG_NOSYSTEM]] say which files hold the student's
+configuration, and learnlog's identity and signing policy is built on
+reading it (\cref{sec:ensure-configured}): dropping them would make
+learnlog commit under its fallback identity for everyone whose Git is
+configured through those variables---containers, sandboxes, CI.
+[[GIT_TRACE]] and its variants only ask Git to narrate what it is
+doing, which is what somebody debugging learnlog's Git calls needs and
+which changes no outcome, so a prefix test lets all of them through
+without enumerating a moving target.
+
+<<functions>>=
+def git_environment(git_dir, workdir):
+    """Return the environment learnlog runs Git commands in.
+
+    Copies the process environment without any ``GIT_*`` variable
+    that could redirect what Git writes, keeps the few that only
+    describe how to reach a remote or which config files to read,
+    and points Git at the learnlog repository.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(GIT_VAR_PREFIX)
+        or key in INHERITED_GIT_VARS
+        or key.startswith(GIT_TRACE_PREFIX)
+    }
+    env["GIT_DIR"] = str(git_dir)
+    env["GIT_WORK_TREE"] = str(workdir)
+    return env
+<<constants>>=
+GIT_VAR_PREFIX = "GIT_"
+GIT_TRACE_PREFIX = "GIT_TRACE"
+INHERITED_GIT_VARS = frozenset({
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_ASKPASS",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+})
+@
+
+The environment is built once per [[LearnlogRepo]] and then handed to
+every command, which is what lets [[run_index]] below say \enquote{this
+index, for this run} by writing one key into it.
+That only works because the key is not there to begin with: with the
+parent's [[GIT_INDEX_FILE]] stripped, the variable is set in exactly
+one place in this module, and one [[grep]] confirms it.
+
+Let's verify that the variables that could redirect a write are gone
+while the ones that describe the student's setup survive:
+
+<<test functions>>=
+def test_git_environment_drops_a_redirecting_variable(
+        workdir, monkeypatch):
+    """An inherited index or object store is not ours to use."""
+    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/somebody-elses")
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", "/tmp/quarantine")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Hook")
+    monkeypatch.setenv("GIT_CONFIG", "/tmp/their-config")
+    repo = LearnlogRepo(workdir)
+    assert "GIT_INDEX_FILE" not in repo.env
+    assert "GIT_OBJECT_DIRECTORY" not in repo.env
+    assert "GIT_AUTHOR_NAME" not in repo.env
+    assert "GIT_CONFIG" not in repo.env
+    assert repo.env["GIT_DIR"] == str(workdir / ".learnlog")
+
+def test_git_environment_keeps_the_student_setup(
+        workdir, monkeypatch):
+    """Transport and configuration variables must survive."""
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i mykey")
+    monkeypatch.setenv("GIT_TRACE_PACKET", "1")
+    repo = LearnlogRepo(workdir)
+    assert repo.env["GIT_SSH_COMMAND"] == "ssh -i mykey"
+    assert repo.env["GIT_TRACE_PACKET"] == "1"
+@
+
+The variable this began with deserves the whole story rather than a
+dictionary lookup, because what it costs is somebody else's work.
+We build the situation the hook does: a student's repository with one
+file staged out of two, and [[GIT_INDEX_FILE]] naming its index the
+way Git names it for a hook.
+A logged run then happens inside that environment, and what must
+still be staged afterwards is the one file the student chose.
+
+<<test functions>>=
+def test_run_leaves_an_inherited_index_alone(
+        workdir, monkeypatch):
+    """A hook's staging survives a run that happens inside it."""
+    subprocess.run(
+        ["git", "init", "--quiet", str(workdir)],
+        check=True, capture_output=True,
+    )
+    (workdir / "staged.txt").write_text("staged\n")
+    (workdir / "unstaged.txt").write_text("unstaged\n")
+    subprocess.run(
+        ["git", "add", "staged.txt"],
+        cwd=str(workdir), check=True, capture_output=True,
+    )
+    monkeypatch.setenv(
+        "GIT_INDEX_FILE", str(workdir / ".git" / "index"),
+    )
+
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", [], now)
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=now, exit_code=0,
+    )
+
+    staged = subprocess.run(
+        ["git", "ls-files", "--cached"],
+        cwd=str(workdir), capture_output=True, text=True,
+    )
+    assert staged.stdout.split() == ["staged.txt"]
 @
 
 
@@ -786,15 +949,30 @@ The rule \enquote{no message content in [[argv]]} is only useful if it
 holds without exception: an occurrence of [[-m]] then means a bug, and
 one [[grep]] settles it.
 
+The staging happens in a private index, the same way a run's does.
+Named indexes are how learnlog keeps concurrent snapshots apart, but
+here the point is the other one \cref{sec:git-environment} makes: the
+index Git writes must be one this module chose, and saying so in every
+place that stages leaves no path where the answer comes from
+somewhere else.
+There is nothing to seed it from---this is the first index this
+repository has---so it is built from scratch and then published as the
+shared one, which is what leaves the stat cache warm for the first run.
+
 <<initial commit>>=
-self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
-self.git(
-    "commit",
-    "--allow-empty",
-    "--file=-",
-    input="learnlog: initial commit",
-    timeout=GIT_TREE_TIMEOUT,
-)
+shared_index = self.git_dir / SHARED_INDEX_NAME
+with self.run_index(INITIAL_INDEX_NAME) as index_path:
+    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    self.git(
+        "commit",
+        "--allow-empty",
+        "--file=-",
+        input="learnlog: initial commit",
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    <<publish the private index as the shared one>>
+<<constants>>=
+INITIAL_INDEX_NAME = "init"
 @
 
 Let's verify that initialisation creates a working repository with
