@@ -3,8 +3,8 @@
 
 This tutorial gives a student's first end-to-end pass through
 [[learnlog]]: initialise a project, activate the project-local
-environment, run a program, and inspect the recorded commit in batch
-mode.
+environment, confirm that the environment records runs, run a program,
+and inspect the recorded commit in batch mode.
 
 \ltnote{%
   The object of learning is the basic learnlog workflow as a connected
@@ -15,6 +15,20 @@ mode.
   The critical aspects are that [[learnlog init]] anchors the project at
   the root, [[learnlog activate]] selects the project [[.venv/]], and
   [[learnlog play -b]] reveals the resulting commit history.
+}
+
+\ltnote{%
+  [[learnlog doctor]] enters where the learner has just wired a project
+  and has nothing yet to look at, so the step asks them to run it and
+  read the report before the prose names the three states it can
+  report.
+  Reading the answer to \enquote{are my runs recorded?} from the tool,
+  rather than being told, is what makes the invisible wiring an object
+  the learner can inspect later on their own.
+  The home-directory refusal is stated as an expectation on \emph{where}
+  to run [[init]] rather than demonstrated: making the learner trip the
+  guard would teach [[--force]] as a step in the workflow, when it is
+  the exception to it.
 }
 
 The woven chapter records the teaching rationale; the tangled Markdown
@@ -37,6 +51,12 @@ hint: Run `learnlog init python` in an empty project directory.
 
 Start in a new directory for a throwaway practice project and initialise
 it with `learnlog init python`.
+Make it a directory of its own, not your home directory: `learnlog init`
+refuses to make `~` (or anything above it) a project root, because every
+later run would then commit unrelated files, from `.ssh/` to your
+browser cache, into the log.
+The refusal names a `--force` escape hatch for the rare case where you
+really mean it; you do not need it here.
 
 This creates the hidden `.learnlog/` repository and prepares a local
 `.venv/` for the project.
@@ -51,6 +71,31 @@ hint: Use `eval "$(learnlog activate)"` to enter the project `.venv/`.
 
 Run `eval "$(learnlog activate)"` so that the project's own Python and
 packages are the ones you use in the next steps.
+
+# Confirm that runs are being recorded
+
+```tutorial-step
+pre_command: |
+  eval "$(learnlog activate)"
+required_patterns:
+  - learnlog doctor
+  - Runs of this interpreter are recorded in
+hint: The tutorial already re-activated the project environment; run `learnlog doctor` and read where it says runs are recorded.
+```
+
+Run `learnlog doctor` and read what it prints before reading on.
+
+The report is about one Python interpreter, which is why the tutorial
+re-activates the project environment before this step: the answer only
+means something for the Python you are about to run your programs with.
+It says one of three things.
+Either the environment is wired and `Runs of this interpreter are
+recorded in ...` names the log it writes to, or it is not wired at all,
+or it is wired to a project that is no longer there.
+Only the first means your next run will be recorded.
+In the other two the last line names the fix: `learnlog init python` for
+an environment nobody wired, and `learnlog doctor --repair`, run from
+inside the project directory, for one whose project has gone.
 
 # Create a small program
 
