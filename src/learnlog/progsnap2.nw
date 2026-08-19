@@ -2209,6 +2209,21 @@ The public entry point returns the reconstructed repository and
 the temporary directory that owns it.  The caller removes that
 directory after playback or listing finishes.
 
+Everything after [[mkdtemp]] therefore runs inside a guard, for the
+reasons spelled out where [[resolve_source]] does the same for
+bundles (\cref{sec:resolve-source}): the directory is ours
+until we hand it back by returning, and once it becomes ours nothing
+but this function knows its name.
+Reconstruction is the slowest thing learnlog does---one Git commit
+per recorded run, each restoring a full code snapshot---so it is
+also the operation a student is most likely to interrupt, and the
+one that leaves the largest thing behind when they do: not an empty
+directory but a complete repository.
+The guard starts at [[mkdtemp]] rather than at the replay loop
+because [[LearnlogRepo]] runs [[git init]] and two [[git config]]
+calls before the first run is replayed, and a directory abandoned
+during setup is just as lost as one abandoned mid-replay.
+
 <<progsnap2 functions>>=
 def read_progsnap2_as_repo(source):
     """Reconstruct a temporary ``LearnlogRepo`` from ProgSnap2.
@@ -2222,22 +2237,30 @@ def read_progsnap2_as_repo(source):
         raise SystemExit("No commits found in ProgSnap2 dataset.")
 
     tmpdir = tempfile.mkdtemp(prefix="learnlog-ps2-play-")
-    repo_path = pathlib.Path(tmpdir) / "repo"
-    repo_path.mkdir()
-    repo = LearnlogRepo(repo_path)
-    subject_id = commit_groups[0]["events"][0].get(
-        "SubjectID", "learnlog"
-    ) or "learnlog"
-
-    <<configure reconstructed repository identity>>
-
     try:
-        <<replay grouped commits into temporary repository>>
-    except Exception:
+        <<reconstruct the repository under [[tmpdir]]>>
+    except BaseException:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
+@
 
-    return repo, tmpdir
+The [[except Exception]] this replaces caught the reconstruction
+failures---a malformed dataset, a snapshot Git refused---and by
+construction could not catch [[KeyboardInterrupt]], which is how the
+leak was reported in the first place.
+
+<<reconstruct the repository under [[tmpdir]]>>=
+repo_path = pathlib.Path(tmpdir) / "repo"
+repo_path.mkdir()
+repo = LearnlogRepo(repo_path)
+subject_id = commit_groups[0]["events"][0].get(
+    "SubjectID", "learnlog"
+) or "learnlog"
+
+<<configure reconstructed repository identity>>
+<<replay grouped commits into temporary repository>>
+
+return repo, tmpdir
 @
 
 We preserve the student's identity in the temporary history so
@@ -3238,6 +3261,62 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
         assert missing.returncode != 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+Every test above receives the temporary directory and frees it
+itself, which is the successful path and says nothing about the
+failing one.
+For that we interrupt the replay at [[restore_code_state]]---the
+first thing the loop does per commit, so the repository exists and
+the reconstruction is genuinely under way---and then look at where
+[[mkdtemp]] would have put the directory.
+That location is ours for the duration of the test, so the
+assertion is about an otherwise empty directory rather than about a
+[[/tmp]] full of other people's files, and the test can tell
+\enquote{cleaned up} from \enquote{someone else cleaned up}.
+Raising [[KeyboardInterrupt]] rather than a plain [[Exception]] is
+the point of the test: the old handler caught the latter and would
+still pass, which is how the leak survived the tests it had.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_cleans_up_on_interrupt(
+    workdir, monkeypatch,
+):
+    """Ctrl-C mid-reconstruction leaves no temp repository."""
+    import tempfile
+    from learnlog import progsnap2
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    repo = LearnlogRepo(workdir)
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], moment)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=moment,
+        exit_code=0,
+    )
+    output = workdir / "interrupted.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    scratch = workdir.parent / "ps2-reconstruct-tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        progsnap2, "restore_code_state", interrupt
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        read_progsnap2_as_repo(output)
+
+    assert list(scratch.glob("learnlog-ps2-play-*")) == []
 @
 
 The reconstruction rebuilds a message from the exported I/O, so a run
