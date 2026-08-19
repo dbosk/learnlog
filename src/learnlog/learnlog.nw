@@ -532,7 +532,11 @@ import threading
 import traceback
 
 from learnlog.capture import IOLog, StreamCapture, InputCapture
-from learnlog.gitrepo import LearnlogRepo, report_error
+from learnlog.gitrepo import (
+    REVIEW_SUBCOMMANDS,
+    LearnlogRepo,
+    report_error,
+)
 from learnlog._autostart import (
     _is_autostart_wired,
     _resolve_project_root,
@@ -573,12 +577,14 @@ import pathlib
 import sys
 import time
 import pytest
+import learnlog
 from learnlog import (
     C_INVOCATION_NAME,
     C_INVOCATION_STEM,
     _c_invocation_record,
     _claim_is_abandoned,
     _is_opted_out,
+    _learnlog_cli_subcommand,
     _persist_c_invocation,
     _reclaim_c_invocations,
     _release_c_invocation,
@@ -847,35 +853,69 @@ There is also a fourth possible answer, \enquote{nowhere}: some
 invocations must not be logged at all rather than logged in the wrong
 place, and [[_resolve_workdir]] says so by raising.
 
-The invocation name is normalised rather than copied from
-[[sys.argv[0]]] verbatim.
-Raw values such as the empty string or [[-c]] are faithful to CPython,
-but poor commit headers for humans.
-We map those sentinel forms to labels that explain how Python was
-started while leaving ordinary filenames and entry-point basenames
-unchanged.
-
-For [[python -c]] there is a second wrinkle: real interpreters do not
-keep the source in [[sys.argv]].
-At runtime [[sys.argv]] starts with [[-c]] and then contains only the
-student's extra arguments, while [[sys.orig_argv]] still remembers the
-full interpreter command line including the source string.
-If we only inspect [[sys.argv]], explicit-import tests can pass while the
-real autostart path still records [[Arguments: (none)]]---and, worse,
-[[python -c "code" extra]] would record [[extra]] as if it were the
-source.
-We therefore let the normaliser consult [[sys.orig_argv]] first when it
-recognises the [[-c]] sentinel: that path recovers the real source from
-[[sys.orig_argv[2]]] and preserves the student's extra arguments from
-[[sys.argv[1:]]].
-The bare [[sys.argv]] fast path remains only as a fallback for callers
-that do not supply [[sys.orig_argv]].
+\subsection{Whether to log this invocation at all}
+\label{sec:veto}
 
 Before any of that, [[initialize]] must decide whether this invocation
 should be logged \emph{at all}.
 Two conditions veto it: the [[LEARNLOG_SKIP_AUTOSTART]] escape hatch,
-and the [[learnlog init]] bootstrap invocation, which is busy creating
-the repository and so has none to commit into yet.
+and---for all but two subcommands---learnlog's own command line.
+
+The second condition used to be the other way round.
+The tool logged every [[learnlog]] subcommand except [[init]], on the
+argument that how a student interacts with their own log is
+research-valuable data.
+That argument was half right and the half it got wrong was expensive.
+
+What it got right is that reflection matters, and reflection is what
+[[learnlog play]] and [[learnlog list]] are: the student reading their
+own history back.
+Those two stay recorded---indeed they become \emph{visible} records
+rather than hidden ones (\cref{commits})---because a log that shows
+only writing and never reading tells half the story of how someone
+learns to program.
+
+What it got wrong is that the remaining subcommands are not
+interactions with a log at all; they are the commands that
+\emph{administer} it, and recording an administrative command means
+recording it inside the thing it is administering.
+The consequences were not subtle.
+[[learnlog clone]] refuses to clone into a directory that already
+holds a [[.learnlog/]]---and it could never do anything else, because
+[[initialize]] created that very directory microseconds before the
+command's own guard ran: cloning into an empty directory, the entire
+purpose of the command, was impossible for as long as the policy
+stood.
+[[learnlog tag]] tagged the [[learnlog tag]] run rather than the
+student's work.
+[[learnlog pull]] committed a header before fetching, so every pull
+was a non-fast-forward, and then finalised its own merge with a
+trailer.
+[[learnlog export]] wrote a bundle into the work tree that its own
+trailer would have committed, so each export grew the next one.
+One policy, four defects, all of the same shape: a command cannot
+safely be a participant in the history it is manipulating.
+
+So the allow-list is inverted.
+[[play]] and [[list]] are recorded (\cref{sec:review-subcommands}
+names them, since the readers need the same list); everything
+else---[[init]], [[tutorial]], [[tag]], [[clone]], [[pull]],
+[[push]], [[set-remote]], [[export]], [[git]], [[activate]],
+[[deactivate]], [[doctor]], [[analyse]]---leaves no trace whatsoever.
+\enquote{No trace} is stronger than \enquote{no run record}: the veto
+is answered before [[_resolve_workdir]] is consulted, so a vetoed
+command does not even create the repository it would have committed
+into.
+That single ordering constraint is what makes [[clone]] into an empty
+directory work at all.
+
+Being an allow-list rather than a deny-list is what keeps the policy
+honest as the CLI grows.
+An unrecognised subcommand---a future one, a typo, [[learnlog --help]],
+the bare [[learnlog]] with no subcommand---falls outside [[play]] and
+[[list]] and is therefore not recorded, which is the safe direction:
+the cost of a missing record is a gap in research data, while the cost
+of an unwanted one is a corrupted repository.
 
 The veto has to be evaluated \emph{here} rather than in the startup
 hook, and the reason is subtle enough that it caused a real bug: the
@@ -913,46 +953,98 @@ runs it is testing.
 def _is_opted_out(argv, env=None):
     """True iff this invocation must not be logged at all.
 
-    Covers the ``LEARNLOG_SKIP_AUTOSTART`` escape hatch and the
-    ``learnlog init`` bootstrap invocation.
+    Covers the ``LEARNLOG_SKIP_AUTOSTART`` escape hatch and every
+    learnlog subcommand outside ``REVIEW_SUBCOMMANDS``.
     """
     if env is None:
         env = os.environ
     if env.get("LEARNLOG_SKIP_AUTOSTART"):
         return True
-    return _is_learnlog_init(argv)
+    subcommand = _learnlog_cli_subcommand(argv)
+    return (
+        subcommand is not None
+        and subcommand not in REVIEW_SUBCOMMANDS
+    )
 @
 
-Detecting the bootstrap invocation is a matter of reading [[argv]].
-[[argv[0]]] is either the [[learnlog]] entry-point script installed in
-the venv's [[bin/]], or a path to the package's [[__main__.py]] when
-the student ran [[python -m learnlog init]]; both carry [[learnlog]] as
-a path component, which is why one predicate covers both spellings.
-Only [[init]] is excluded---every other [[learnlog]] subcommand is
-research-valuable data about how a student interacts with their own log
-and is captured like any other program.
+The classifier returns three answers rather than a boolean, because
+the caller above asks two questions of it and \cref{sec:review-runs}
+asks a third: is this the learnlog CLI, and if so which subcommand?
+[[None]] means \enquote{not our command line} and is what every
+student program gets; a name means that subcommand; the empty string
+means the CLI was started without naming one.
+
+Skipping words that begin with a dash is what lets one answer serve
+both spellings of \enquote{no subcommand}.
+Bare [[learnlog]] and [[learnlog --help]] are the same case as far as
+this decision goes---neither is [[play]] or [[list]]---and folding
+them together keeps a future global option from silently turning a
+review into a vetoed run.
+Argument \emph{values} that follow an option are read as subcommand
+names by this rule, which is harmless: an unrecognised name is vetoed,
+and vetoing is the safe answer.
+
+Recognising the CLI by [[argv[0]]]'s basename alone is a deliberate
+narrowing.
+The predicate this replaces also accepted any [[argv[0]]] with
+[[learnlog]] among its path components, so that [[python -m learnlog
+init]] would be caught through the package's [[__main__.py]].
+That spelling does not exist---the package ships no [[__main__.py]],
+so the path could never appear---while the breadth of the test is now
+dangerous in a way it was not when only [[init]] was affected: under a
+veto that covers thirteen subcommands, a student whose project lives
+in a directory called [[learnlog]] would have
+[[/home/x/learnlog/mine.py]] silently unrecorded for every argument
+that happens to look like a subcommand.
+Trading an unreachable spelling for that risk is not a trade worth
+making.
 
 <<functions>>=
-def _is_learnlog_init(argv):
-    """True iff ``argv`` looks like a ``learnlog init`` invocation.
+def _learnlog_cli_subcommand(argv):
+    """Return the learnlog subcommand ``argv`` invokes.
 
-    Recognises the installed ``learnlog`` entry-point script and
-    ``python -m learnlog`` (in which case ``argv[0]`` contains
-    ``learnlog`` as a path component).
+    Returns the subcommand name, the empty string when the CLI was
+    invoked without naming one (including ``--help``), or ``None``
+    when this is not the learnlog CLI at all.
     """
-    if len(argv) < 2 or argv[1] != "init":
-        return False
-    basename = os.path.basename(argv[0])
-    if basename == "learnlog":
-        return True
-    return "learnlog" in pathlib.PurePath(argv[0]).parts
+    if not argv or os.path.basename(argv[0]) != "learnlog":
+        return None
+    for word in argv[1:]:
+        if not word.startswith("-"):
+            return word
+    return ""
 @
 
-Let's verify that the veto fires for exactly the invocations it should.
-The ordinary shapes---a script, the bare REPL, [[python -c]],
-[[python -m]], console entry points, and non-[[init]] [[learnlog]]
-subcommands---must all pass through, while the two spellings of
-[[learnlog init]] and the escape hatch must all stop.
+Let's verify the classifier on its three answers, with the two
+directory-shaped [[argv[0]]] values that must \emph{not} be mistaken
+for the CLI:
+
+<<test functions>>=
+class TestLearnlogCliSubcommand:
+    @pytest.mark.parametrize("argv,expected", [
+        (["/venv/bin/learnlog", "play"], "play"),
+        (["learnlog", "list", "--all"], "list"),
+        (["/venv/bin/learnlog", "tutorial", "getting-started"],
+         "tutorial"),
+        (["/venv/bin/learnlog", "--help"], ""),
+        (["/venv/bin/learnlog"], ""),
+        (["/home/x/learnlog/mine.py", "play"], None),
+        (["/home/x/learnlog/", "play"], None),
+        (["script.py", "play"], None),
+        ([], None),
+    ])
+    def test_classifies_argv(self, argv, expected):
+        assert _learnlog_cli_subcommand(argv) == expected
+@
+
+Now the veto itself.
+The recorded cases are the two review subcommands, in the spellings a
+student's [[PATH]] actually produces; the vetoed cases are every other
+subcommand the CLI defines, plus the two no-subcommand shapes.
+The ordinary program shapes---a script, the bare REPL, [[python -c]],
+[[python -m]], console entry points for other tools---must all pass
+through untouched, and so must a student script that merely lives
+under a directory named [[learnlog]].
 
 <<test functions>>=
 class TestIsOptedOut:
@@ -963,28 +1055,75 @@ class TestIsOptedOut:
         ["-m", "foo"],
         ["/venv/bin/pip", "install", "foo"],
         ["/venv/bin/pytest", "--version"],
-        ["learnlog", "play"],
-        ["learnlog", "export"],
+        ["/home/x/learnlog/mine.py"],
+        ["/home/x/learnlog/mine.py", "init"],
     ])
     def test_ordinary_invocations_are_logged(self, argv):
+        assert not _is_opted_out(argv, env={})
+
+    @pytest.mark.parametrize("argv", [
+        ["learnlog", "play"],
+        ["/venv/bin/learnlog", "play", "--batch"],
+        ["learnlog", "list"],
+        ["/venv/bin/learnlog", "list", "--all"],
+    ])
+    def test_review_subcommands_are_logged(self, argv):
         assert not _is_opted_out(argv, env={})
 
     def test_skip_env_var_vetoes_any_invocation(self):
         assert _is_opted_out(
             ["script.py"], env={"LEARNLOG_SKIP_AUTOSTART": "1"},
         )
+        assert _is_opted_out(
+            ["learnlog", "play"],
+            env={"LEARNLOG_SKIP_AUTOSTART": "1"},
+        )
+
+    @pytest.mark.parametrize("subcommand", [
+        "init", "tutorial", "tag", "clone", "pull", "push",
+        "set-remote", "export", "git", "activate", "deactivate",
+        "doctor", "analyse",
+    ])
+    def test_administrative_subcommands_are_vetoed(self, subcommand):
+        assert _is_opted_out(
+            ["/venv/bin/learnlog", subcommand], env={},
+        )
 
     @pytest.mark.parametrize("argv", [
-        ["/venv/bin/learnlog", "init"],
-        [
-            "/venv/lib/python3.10/site-packages"
-            "/learnlog/__main__.py",
-            "init",
-        ],
+        ["/venv/bin/learnlog"],
+        ["/venv/bin/learnlog", "--help"],
+        ["/venv/bin/learnlog", "no-such-command"],
     ])
-    def test_learnlog_init_is_vetoed(self, argv):
+    def test_unnamed_and_unknown_subcommands_are_vetoed(self, argv):
         assert _is_opted_out(argv, env={})
 @
+
+\subsection{Normalising the invocation}
+
+An invocation that survives the veto still has to be given a name.
+The invocation name is normalised rather than copied from
+[[sys.argv[0]]] verbatim.
+Raw values such as the empty string or [[-c]] are faithful to CPython,
+but poor commit headers for humans.
+We map those sentinel forms to labels that explain how Python was
+started while leaving ordinary filenames and entry-point basenames
+unchanged.
+
+For [[python -c]] there is a second wrinkle: real interpreters do not
+keep the source in [[sys.argv]].
+At runtime [[sys.argv]] starts with [[-c]] and then contains only the
+student's extra arguments, while [[sys.orig_argv]] still remembers the
+full interpreter command line including the source string.
+If we only inspect [[sys.argv]], explicit-import tests can pass while the
+real autostart path still records [[Arguments: (none)]]---and, worse,
+[[python -c "code" extra]] would record [[extra]] as if it were the
+source.
+We therefore let the normaliser consult [[sys.orig_argv]] first when it
+recognises the [[-c]] sentinel: that path recovers the real source from
+[[sys.orig_argv[2]]] and preserves the student's extra arguments from
+[[sys.argv[1:]]].
+The bare [[sys.argv]] fast path remains only as a fallback for callers
+that do not supply [[sys.orig_argv]].
 
 <<functions>>=
 def _normalize_main_invocation(argv, orig_argv=None):
@@ -2030,8 +2169,9 @@ def initialize():
     try:
         <<detect main script>>
         <<create repository and begin run>>
-        <<install I/O wrappers>>
-        <<install REPL capture>>
+        if not review_run:
+            <<install I/O wrappers>>
+            <<install REPL capture>>
         <<install exception hook>>
         <<install exit status hook>>
         atexit.register(on_exit)
@@ -2111,9 +2251,23 @@ def run_without_git(self, workdir, env):
     )
 @
 
+Detection begins with the veto, and its position in this chunk is the
+whole of \cref{sec:veto}'s \enquote{no trace} promise: everything a
+vetoed command must not do---resolving a project, creating a
+repository, committing a header---is written below the [[return]].
+
+An invocation that survives the veto and \emph{is} the learnlog CLI
+can only be [[play]] or [[list]], so the same classifier answers the
+second question this chunk needs: is this a review run
+(\cref{sec:review-runs})?
+Asking it twice rather than threading a value out of [[_is_opted_out]]
+keeps that predicate a predicate; the classifier is a few string
+comparisons on a list that is never long.
+
 <<detect main script>>=
 if _is_opted_out(sys.argv):
     return
+review_run = _learnlog_cli_subcommand(sys.argv) in REVIEW_SUBCOMMANDS
 main_script, main_args = _normalize_main_invocation(
     sys.argv, getattr(sys, "orig_argv", None)
 )
@@ -2330,6 +2484,105 @@ builtins.input = _wrap_input(original_input, iolog)
     repl_capture_skip_input,
 ) = _install_repl_capture(main_script, iolog)
 @
+
+
+\subsection{Review runs}
+\label{sec:review-runs}
+
+Both capture chunks above sit under [[if not review_run]], and the
+reason is quantitative.
+Everything [[learnlog play]] and [[learnlog list]] print \emph{is} the
+log: commit subjects, code diffs, captured output of earlier runs.
+Capturing that output back into the trailer would copy the history
+into itself, and since the copy is committed, the next review copies
+the copy---a log that grows quadratically in the number of times the
+student looks at it.
+The rest of initialisation is unchanged: [[begin_run]] still
+snapshots the work tree and commits a header, so a review is a run
+like any other, just a silent one.
+
+Leaving [[iolog]] as [[None]] is what makes the silence work end to
+end rather than needing a second flag.
+[[on_exit]] already reads \mintinline{python}{iolog.getvalue() if
+iolog else ""}, so the trailer records [[(no I/O)]] by the path that
+was always there, and nothing in the exit handler has to know what
+kind of run it is finishing.
+
+What a review run \emph{has} to say instead is which commits the
+student looked at and how they moved between them.
+Back-and-forth is the interesting part: a student who steps forward
+through five runs and then returns twice to one of them has told us
+something a set of distinct commits would throw away.
+So the trace is an append-only list of events, and a revisit is
+recorded again rather than deduplicated.
+
+<<module state>>=
+view_trace = []
+@
+
+The viewer (\cref{viewer}) reports each commit it puts on screen
+through [[record_view]], which is why the function is public and
+carries a docstring aimed at callers rather than at readers of this
+document.
+Keeping it a module-level function over module state, rather than
+handing the viewer an object, is what lets the call site stay a single
+unconditional line: the CLI runs inside the very process whose run
+[[initialize]] started, so \enquote{the current run} is a global
+already and needs no plumbing.
+
+The no-op case is not an edge case, it is most of the callers.
+[[learnlog play -f bundle.git]] under [[LEARNLOG_SKIP_AUTOSTART]], a
+playback from an unwired interpreter, a unit test driving the viewer
+directly---none of these have a run to record into.
+Guarding on [[repo]] rather than asking the caller to check means the
+viewer never has to know whether it is being logged, which is the same
+transparency bargain the stream wrappers make with the student's
+program.
+
+<<functions>>=
+def record_view(commit_hash, action):
+    """Record that the current run displayed ``commit_hash``.
+
+    ``action`` names how the student arrived there, e.g. ``open``,
+    ``next``, ``prev`` or ``batch``.  Does nothing when no run is
+    being recorded, so callers need not check.
+    """
+    if repo is None:
+        return
+    view_trace.append(
+        (datetime.datetime.now(), commit_hash, action)
+    )
+@
+
+Let's verify both halves: that a caller with no live run is left
+alone, and that a live one accumulates the events in order, revisits
+included.
+
+<<test functions>>=
+class TestRecordView:
+    def test_is_a_noop_without_a_run(self, monkeypatch):
+        monkeypatch.setattr(learnlog, "repo", None)
+        monkeypatch.setattr(learnlog, "view_trace", [])
+        learnlog.record_view("abc123", "open")
+        assert learnlog.view_trace == []
+
+    def test_appends_hash_and_action_in_order(self, monkeypatch):
+        monkeypatch.setattr(learnlog, "repo", object())
+        monkeypatch.setattr(learnlog, "view_trace", [])
+        learnlog.record_view("aaa", "open")
+        learnlog.record_view("bbb", "next")
+        learnlog.record_view("aaa", "prev")
+        assert [
+            (commit, action)
+            for _, commit, action in learnlog.view_trace
+        ] == [("aaa", "open"), ("bbb", "next"), ("aaa", "prev")]
+        assert all(
+            isinstance(moment, datetime.datetime)
+            for moment, _, _ in learnlog.view_trace
+        )
+@
+
+\subsection{Tests for initialisation}
 
 Let's verify that initialisation creates the repository and wraps
 streams.
@@ -2941,19 +3194,79 @@ three others to create the repository is a different test
         )
         msg = git_result.stdout
         assert msg.count("stdin: hello\n") == 1
+@
 
-    def test_skips_learnlog_init_bootstrap(self, tmp_path, test_env):
+The veto of \cref{sec:veto} is worth checking through [[initialize]]
+itself and not only through [[_is_opted_out]], because the property it
+promises is about a \emph{side effect} that a predicate cannot have:
+an empty directory must stay empty.
+The three subcommands below are the ones for which that matters
+most---[[init]] has no repository yet, [[clone]] must be able to make
+one where none exists, and [[doctor]] is expected to diagnose a
+project without changing it---and each is asked for both halves of the
+promise: no run object, and nothing on disk.
+
+<<test functions>>=
+    @pytest.mark.parametrize("argv", [
+        ["/venv/bin/learnlog", "init", "python"],
+        ["/venv/bin/learnlog", "clone", "git@host:log.git"],
+        ["/venv/bin/learnlog", "doctor"],
+    ])
+    def test_administrative_subcommands_leave_no_trace(
+        self, tmp_path, test_env, argv,
+    ):
         result = run_explicit_import(
             "import learnlog\n"
             "print(learnlog.repo)",
             cwd=tmp_path,
             env=test_env,
-            argv=['/venv/bin/learnlog', 'init', 'python'],
+            argv=argv,
         )
         assert result.returncode == 0
         assert result.stdout.strip() == "None"
         assert not (tmp_path / ".learnlog").exists()
+@
 
+A review subcommand is the mirror image, and needs all three of its
+distinguishing properties checked at once: the repository \emph{is}
+created and the two-commit protocol \emph{does} run, while the
+streams are left alone.
+The stream assertion is the one that is easy to get wrong, since a
+wrapped [[sys.stdout]] still prints correctly---so the test asks the
+subprocess what type its stdout actually is, which is the only
+observation that tells the two apart.
+
+<<test functions>>=
+    def test_review_subcommand_is_recorded_without_io(
+        self, workdir, test_env,
+    ):
+        result = run_explicit_import(
+            "import learnlog\n"
+            "print('viewer output')\n"
+            "print(type(sys.stdout).__name__)\n",
+            cwd=workdir,
+            env=test_env,
+            argv=['/venv/bin/learnlog', 'play'],
+        )
+        assert result.returncode == 0
+        assert (workdir / ".learnlog").is_dir()
+        printed = result.stdout.split("\n")
+        assert printed[0] == "viewer output"
+        assert "Capture" not in printed[1]
+
+        git_result = subprocess.run(
+            ["git", "--git-dir=.learnlog",
+             "--work-tree=.", "log", "--format=%B"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        history = git_result.stdout
+        assert "Run: learnlog play" in history
+        assert "Run-End: learnlog play" in history
+        assert "(no I/O)" in history
+        assert "viewer output" not in history
+
+<<test functions>>=
     def test_uses_existing_repo_from_subdirectory(
         self, workdir, test_env
     ):
@@ -3985,6 +4298,12 @@ had their chance to fire, so [[_resolve_exit_code]]
 (\cref{sec:exit-status}) is looking at all the evidence there will ever
 be.
 
+The view trace goes in unconditionally, for the same reason [[io_log]]
+does: a run that recorded nothing hands over an empty list, and
+[[finalize_run]] then writes the trailer it always wrote
+(\cref{sec:finalising-a-run}).
+No branch here has to know whether this was a review.
+
 <<finalise the run>>=
 end_time = datetime.datetime.now()
 io_text = iolog.getvalue() if iolog else ""
@@ -3993,6 +4312,7 @@ repo.finalize_run(
     exception_info=exception_info,
     end_time=end_time,
     exit_code=_resolve_exit_code(),
+    view_trace=view_trace,
 )
 @
 
@@ -5385,6 +5705,13 @@ shapes as the installed entry points.
 That keeps the test focused on autostart's gate and script-name
 normalisation without turning it into a second packaging test.
 
+The [[learnlog]] wrapper is run twice, and the pair is what makes the
+veto observable end to end: [[play]] and [[export]] differ in nothing
+a name-normaliser can see---same [[argv[0]]], same basename, same
+program---so a history that grows for one and not for the other can
+only be \cref{sec:veto} at work.
+The installed launcher then repeats the check for a real entry point.
+
 <<autostart test functions>>=
 def test_autostart_captures_named_entry_points(tmp_path):
     project, venv_dir = _prepare_autostart_project(tmp_path)
@@ -5420,6 +5747,17 @@ def test_autostart_captures_named_entry_points(tmp_path):
     after_play = _latest_run_record(project)
     assert "Script: learnlog" in after_play
     assert "Arguments: play" in after_play
+
+    subprocess.run(
+        [str(python), str(learnlog_script), "export"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert _latest_run_record(project) == after_play
 
     subprocess.run(
         [str(learnlog), "init", "python", "--help"],
