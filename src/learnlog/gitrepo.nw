@@ -1537,14 +1537,27 @@ except ImportError:  # pragma: no cover - Windows has no fcntl
 <<repo methods>>=
 @contextlib.contextmanager
 def commit_lock(self):
-    """Hold an exclusive lock while writing one commit."""
+    """Hold an exclusive lock while writing one commit.
+
+    Yields the locked handle, or ``None`` where no lock could be
+    taken and the commit therefore proceeds unserialised.
+    """
     handle = self._acquire_lock()
     try:
-        yield
+        yield handle
     finally:
         if handle is not None:
             handle.close()
 @
+
+The handle comes back out of the context manager because one caller has
+to know whether the exclusion it is standing on is real
+(\cref{sec:reclaim-run-indexes}).
+For every other caller the answer changes nothing---a commit is made
+either way---but an operation that is only safe while nobody else is
+committing cannot treat \enquote{locked} and \enquote{could not lock}
+as the same situation, and [[None]] is how this method says which one
+happened.
 
 Closing the file releases the lock, which also means the kernel releases
 it if the process dies mid-commit---no stale lock can wedge the next
@@ -1687,6 +1700,7 @@ def test_lock_gives_up_on_a_file_that_keeps_moving(workdir, monkeypatch):
 
 
 \subsection{A private index per run}
+\label{sec:private-index}
 
 Staging with [[git add .]] writes the repository's shared index.
 Two concurrent runs sharing that file do not merely collide on
@@ -1701,10 +1715,27 @@ stays a plain Git runner.
 A [[LearnlogRepo]] instance serves a single run, so no two commits share
 this dict.
 
-The file is removed when the commit is done.
-A process killed in the middle leaves its index behind, but the name
-contains the run id, so nothing ever reuses it, and Git ignores every
-file in its directory that it did not ask for.
+Two files come off again when the commit is done, and it is the second
+one that makes this more than tidiness.
+Git writes an index the way it writes everything it must not corrupt:
+it creates the index's own name with [[.lock]] appended, builds the new
+index in that file, and renames it into place.
+A private index therefore has a private lock file beside it for as long
+as Git is writing it, and a run killed in that window---the window a
+[[git add .]] over a large project holds open the longest---leaves the
+pair behind.
+
+An index left behind on its own would be harmless: the name carries the
+run id, so nothing ever reuses it, and Git ignores every file in its
+directory that it did not ask for.
+Its [[.lock]] is not harmless, and what makes it dangerous is not what
+it does but what it looks like.
+A stray [[.lock]] file is the one piece of Git housekeeping every
+student eventually meets, and what they are told to do with it is
+delete it; done with a wildcard over the directory it takes
+[[learnlog.lock]] along with it, which is precisely the accident
+\cref{sec:commit-lock} goes to some trouble to survive.
+Surviving the trap is worth having, but leaving the bait out is not.
 
 <<repo methods>>=
 @contextlib.contextmanager
@@ -1716,12 +1747,56 @@ def run_index(self, name):
         yield index_path
     finally:
         self.env.pop("GIT_INDEX_FILE", None)
-        try:
-            index_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        <<remove the private index and its lock file>>
 <<constants>>=
 RUN_INDEX_PREFIX = "index-"
+@
+
+The suffix is Git's rather than ours, and naming it once is what keeps
+the shared [[index.lock]] that the publish below takes and the private
+locks Git makes here from becoming two independent spellings of the
+same protocol.
+
+<<functions>>=
+def git_lock_path(path):
+    """Return the lock file Git writes ``path`` through."""
+    return path.with_name(path.name + GIT_LOCK_SUFFIX)
+<<constants>>=
+GIT_LOCK_SUFFIX = ".lock"
+@
+
+Removing the two is best effort in the same sense as everything else on
+this path: a run may not fail because its cleanup did.
+Best effort has never meant silent, though, so what we decline to raise
+we still write down (\cref{sec:diagnostics})---a [[.learnlog/]] that
+keeps filling up with private indexes is a symptom worth being able to
+read about afterwards.
+
+<<remove the private index and its lock file>>=
+for leftover in (index_path, git_lock_path(index_path)):
+    try:
+        leftover.unlink(missing_ok=True)
+    except OSError as error:
+        report_error(
+            "remove run index", error, self.workdir,
+        )
+@
+
+Let us kill a run inside the block---an exception is as far as a test
+can go, and it exercises the same [[finally]]---and check that neither
+file outlives it:
+
+<<test functions>>=
+def test_run_index_cleanup_removes_the_lock_file_too(workdir):
+    """A run that dies inside the block leaves neither file."""
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(RuntimeError):
+        with repo.run_index("deadbeef-begin") as index_path:
+            index_path.write_text("")
+            git_lock_path(index_path).write_text("")
+            raise RuntimeError("killed mid-add")
+    assert not index_path.exists()
+    assert not git_lock_path(index_path).exists()
 @
 
 
@@ -1995,7 +2070,7 @@ def begin_run(self, script, args, start_time):
         script, args, start_time, self.run_id,
     )
 
-    with self.commit_lock():
+    with self.commit_lock() as lock:
         <<commit the code state with the run header>>
 
     return header
@@ -2012,6 +2087,7 @@ index into the object [[commit_on_branch]] needs
 
 <<commit the code state with the run header>>=
 branch = self.recording_branch()
+self.reclaim_run_indexes(lock)
 with self.run_index(f"{self.run_id}-begin") as index_path:
     <<seed the private index from the shared one>>
     unfinished = self.unfinished_operation()
@@ -2026,7 +2102,217 @@ with self.run_index(f"{self.run_id}-begin") as index_path:
         <<publish the private index as the shared one>>
 @
 
+\subsection{Indexes a killed run left behind}
+\label{sec:reclaim-run-indexes}
+
+The [[finally]] of \cref{sec:private-index} covers a run that dies of
+something Python can see.
+It covers nothing of a run that is killed outright: [[SIGKILL]] is not
+deliverable, the interpreter never reaches another line, and the index
+and its lock stay on disk with nobody left to remove them.
+That is the case a student actually meets---a program stopped from the
+window manager, a terminal closed, a container torn down---so some
+later run has to do it instead.
+
+Sweeps like this one live or die on how they decide which files are
+finished with, and the usual instruments are guesses.
+An age threshold has to name a duration that nothing legitimate
+exceeds, and there is none to name here: a seeded index carries the
+modification time of the index it was copied from
+(\cref{sec:stat-cache}), so its age says nothing at all about the run
+holding it.
+A naming convention proves only who created a file, never whether they
+are done with it.
+
+There is a fact available instead of a guess.
+A private index exists only inside a [[run_index]] block; both blocks
+in this module---the initial commit (\cref{sec:init-repo}) and the
+header commit above---run inside a [[commit_lock]]
+(\cref{sec:commit-lock}); and the kernel drops that lock however its
+holder dies, killed or not.
+A process that holds the commit lock is therefore looking at a
+directory in which no [[run_index]] block is live anywhere, so every
+file the prefix matches is a leftover.
+Nothing has to be timed, and nothing has to be assumed about how the
+owner died.
+
+That is a constraint on future call sites as much as an observation
+about the present ones.
+A [[run_index]] opened outside the commit lock would be a private index
+this sweep is entitled to delete while Git is writing it, and the
+damage would not be a lost run but a wrong one: [[git write-tree]] over
+an index that has gone missing writes the empty tree, and the header
+commit would record a project with no files in it.
+
+Which is why the sweep is handed the lock rather than told to take one.
+[[_acquire_lock]] answers \enquote{no lock} the same way it answers
+every other failure---with [[None]]---so a method that took its own
+could not tell holding the lock from having given up on it, and giving
+up is precisely when it must not sweep.
+Requiring the handle makes the precondition something the caller has to
+produce.
+Where [[fcntl]] is missing it is [[None]] always, and that platform
+keeps its leftovers rather than gambling with them, which is the trade
+every other user of this lock makes.
+
+One case is left over: a run that could not take the lock and made an
+index anyway.
+It is already committing unserialised (\cref{sec:commit-lock}), and it
+now also runs without the cover that holding the lock is what conveys.
+What answers it is how narrow the case is.
+[[_acquire_lock]] comes back empty-handed only where the filesystem
+refuses the lock outright---in which case nothing here sweeps either---
+or where something is recreating [[learnlog.lock]] faster than
+[[LOCK_ATTEMPTS]] tries can catch it, and that is not a repository in
+which any of the guarantees hanging off this lock still hold.
+
+<<repo methods>>=
+def reclaim_run_indexes(self, lock):
+    """Remove private index files that killed runs left behind.
+
+    Does nothing unless ``lock`` is a held commit lock: without
+    one, a file found here may belong to a run that is writing
+    it right now.
+    """
+    if lock is None:
+        return
+    for leftover in sorted(
+        self.git_dir.glob(f"{RUN_INDEX_PREFIX}*")
+    ):
+        try:
+            leftover.unlink(missing_ok=True)
+        except OSError as error:
+            report_error(
+                "reclaim run index", error, self.workdir,
+            )
+@
+
+One glob finds both halves of a pair, because Git appends its suffix to
+the index's own name and the prefix is still at the front of the
+result.
+The shared index and its lock are [[index]] and [[index.lock]], and the
+prefix matches neither---the hyphen that made the private names
+readable is what keeps them out of reach here.
+A file that disappears between the listing and the unlink is not a
+failure but a run's own [[finally]] having got there first, which is
+why it is asked for with [[missing_ok]] rather than reported.
+Anything else is reported and the sweep goes on, so one file that
+cannot be removed does not keep the others.
+
+The call sits at the top of the header commit, inside the lock and
+before this run makes an index of its own, which is what lets
+\enquote{every file the prefix matches} be read without an exception
+for ours.
+
+Let us leave behind what a killed run leaves behind---an index and the
+lock Git was writing it through---and check that the next run clears
+both:
+
+<<test functions>>=
+def test_a_run_reclaims_what_a_killed_run_left(workdir):
+    """A run sweeps the index files an earlier kill left."""
+    repo = LearnlogRepo(workdir)
+    orphan = repo.git_dir / f"{RUN_INDEX_PREFIX}deadbeef-begin"
+    orphan.write_text("")
+    git_lock_path(orphan).write_text("")
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    assert not orphan.exists()
+    assert not git_lock_path(orphan).exists()
+@
+
+Without the lock the same files are none of our business, and the sweep
+has to leave them exactly as it found them:
+
+<<test functions>>=
+def test_reclaim_without_the_lock_touches_nothing(workdir):
+    """No lock means no way to tell a leftover from a live run."""
+    repo = LearnlogRepo(workdir)
+    live = repo.git_dir / f"{RUN_INDEX_PREFIX}live-begin"
+    live.write_text("")
+    git_lock_path(live).write_text("")
+    repo.reclaim_run_indexes(None)
+    assert live.exists()
+    assert git_lock_path(live).exists()
+@
+
+The property the whole argument rests on needs a second process, since
+the lock it turns on is a kernel object shared between processes and
+not between threads of one.
+The roles are split across the two: here we are the run in progress,
+holding the commit lock with a private index of our own on disk, and
+there is a second run started into exactly that situation.
+A whole run rather than a bare call to the sweep, because where the
+call sits is half of what is under test---a sweep moved outside the
+lock, or one that stopped asking for it, would still pass a test that
+called it correctly by hand.
+
+The child announces itself once its imports are done, which keeps
+interpreter startup---by far the most variable thing in this test---out
+of the window we measure.
+After that a run that swept without the lock would need milliseconds to
+take the pair.
+So two things are asked at once: that the child is still running a
+second later, and that both files are still there.
+Then the lock comes off, and the same child is expected to finish and
+to have taken both files with it.
+
+<<test functions>>=
+RECLAIM_SWEEP_SOURCE = """\
+import datetime
+import pathlib
+import sys
+
+from learnlog.gitrepo import LearnlogRepo
+
+print("ready", flush=True)
+repo = LearnlogRepo(pathlib.Path(sys.argv[1]))
+repo.begin_run(
+    "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+)
+"""
+RECLAIM_BLOCKED_SECONDS = 1.0
+@
+
+<<test functions>>=
+def test_a_live_runs_index_survives_the_reclaim(workdir):
+    """The sweep waits for the lock a run in progress holds."""
+    repo = LearnlogRepo(workdir)
+    live = repo.git_dir / f"{RUN_INDEX_PREFIX}live-begin"
+    live.write_text("")
+    git_lock_path(live).write_text("")
+    env = os.environ.copy()
+    checkout = pathlib.Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = str(checkout / "src")
+    env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    env.pop("LEARNLOG_PROJECT_ROOT", None)
+
+    with repo.commit_lock() as lock:
+        assert lock is not None
+        sweeper = subprocess.Popen(
+            [
+                sys.executable, "-S", "-c",
+                RECLAIM_SWEEP_SOURCE, str(workdir),
+            ],
+            cwd=str(workdir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert sweeper.stdout.readline() == "ready\n"
+        with pytest.raises(subprocess.TimeoutExpired):
+            sweeper.wait(timeout=RECLAIM_BLOCKED_SECONDS)
+        assert live.exists()
+        assert git_lock_path(live).exists()
+
+    _, err = sweeper.communicate(timeout=60)
+    assert sweeper.returncode == 0, err
+    assert not live.exists()
+    assert not git_lock_path(live).exists()
+@
+
 \subsection{Keeping the stat cache warm}
+\label{sec:stat-cache}
 
 An index is also a stat cache: Git re-hashes a file only when its
 [[stat]] data differs from what the index recorded.
@@ -2155,7 +2441,7 @@ else:
     <<move the index into place and drop the lock>>
 <<constants>>=
 SHARED_INDEX_NAME = "index"
-SHARED_INDEX_LOCK_NAME = "index.lock"
+SHARED_INDEX_LOCK_NAME = SHARED_INDEX_NAME + GIT_LOCK_SUFFIX
 INDEX_LOCK_FLAGS = os.O_CREAT | os.O_EXCL | os.O_WRONLY
 @
 
