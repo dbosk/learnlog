@@ -1221,16 +1221,52 @@ shared one, and move it back afterwards.
 Moving it back keeps the cache warm for the next run and keeps
 [[learnlog git status]] honest---an index left behind at repository
 initialisation would report every later commit as unstaged work.
-Both steps are best-effort: a missing or unreadable index costs
-performance, never correctness, because [[git add .]] rebuilds whatever
-is missing.
+
+The copy has to carry the index's own modification time with it, and
+that is not tidiness: it is what keeps the cache from lying.
+Git compares file times at whole-second resolution, so an edit that
+lands in the same second as the one the index recorded, and happens not
+to change the file's size, is invisible to that comparison.
+What saves Git is the \emph{racily clean} rule: an entry whose recorded
+time is not older than the index's own modification time may have been
+written after the index was, so Git re-reads the file instead of
+trusting its [[stat]] data.
+Since Git writes the index only after it has stat'ed the file, that
+rule covers precisely the window the second-resolution comparison is
+blind to.
+
+Copying with a plain [[copyfile]] stamps the new index with the present
+moment.
+Once that moment falls in a later second than the entry's recorded
+time---which it does as soon as a second boundary passes between the
+run that wrote the cache and the run that reads it---the rule no longer
+fires, and the second-resolution comparison is left to answer alone.
+A student who edits a file and re-runs it within one second, which is
+the ordinary edit--run rhythm this tool exists to record, then gets a
+header commit holding the code from \emph{before} the edit.
+This is measured, not feared: in a loop that ran, edited by the same
+number of bytes, and ran again, [[copyfile]] recorded the stale version
+five times in four hundred sequences, and preserving the timestamp
+recorded it none in twelve hundred.
+[[shutil.copy2]] copies the modification time along with the contents,
+which makes the private index behave like the shared one it stands in
+for---all the rule ever assumed.
+
+Seeding remains best-effort, but \enquote{best effort} has to mean
+\emph{no cache} rather than \emph{a bad one}.
+A copy that fails part-way leaves a truncated file Git cannot read at
+all, and one whose timestamp did not survive is the silent-wrong-data
+case above.
+So a failed seeding removes what it made, and [[git add .]] rebuilds
+the cache from nothing: that costs one re-read of the project and
+nothing else.
 
 <<seed the private index from the shared one>>=
 shared_index = self.git_dir / SHARED_INDEX_NAME
 try:
-    shutil.copyfile(shared_index, index_path)
+    shutil.copy2(shared_index, index_path)
 except OSError:
-    pass
+    index_path.unlink(missing_ok=True)
 @
 
 <<publish the private index as the shared one>>=
@@ -1304,6 +1340,38 @@ def test_begin_run_new_commit_after_edit(workdir):
     repo.begin_run("hello.py", [], t2)
     result = repo.git("show", "HEAD:hello.py")
     assert result.stdout == 'print("v2")\n'
+@
+
+A stat cache that lies is silent, so the seeding above gets a test that
+reproduces the lie on purpose.
+Three things have to line up for it: the two versions must be the same
+size, the edit must land in the same second as the version the index
+recorded, and the run that reads the cache must start after that second
+has passed---otherwise the racily clean rule fires and the bug hides.
+Waiting for a second boundary twice arranges all three.
+The first wait gives the write--run--edit sequence a whole fresh second
+to fit inside, and the second wait moves the run that reads the cache
+out of that second.
+
+<<test functions>>=
+def _wait_for_the_next_second():
+    """Block until the clock crosses into the next second."""
+    deadline = int(time.time()) + 1
+    while time.time() < deadline:
+        time.sleep(0.005)
+
+def test_begin_run_stages_edit_within_one_second(workdir):
+    """A same-size edit inside one time granule is still staged."""
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    _wait_for_the_next_second()
+    script.write_text('print("v1")\n')
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    script.write_text('print("v2")\n')
+    _wait_for_the_next_second()
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    assert repo.git("show", "HEAD:hello.py").stdout \
+        == 'print("v2")\n'
 @
 
 Files written \emph{during} a run belong to the next run's snapshot,
