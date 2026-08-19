@@ -5262,6 +5262,34 @@ def format_io_latex(io_events, resources):
     return "\n".join(parts).rstrip()
 @
 
+Let's verify that the report shows a transcript line that names no
+stream, since a truncated log is exactly the run whose report must not
+look complete:
+
+<<progsnap2 test functions>>=
+def test_format_io_latex_shows_notes():
+    """A note reaches the report as the line it is."""
+    from learnlog.progsnap2 import format_io_latex
+    notice = "[learnlog: I/O log truncated at 5 bytes]"
+    io_events = [
+        {
+            "EventType": "X-Run.Output",
+            "ProgramOutput": "Resources/io_2.txt",
+        },
+        {
+            "EventType": "X-Run.Note",
+            "ProgramOutput": "",
+            "X-Note": "Resources/io_3.txt",
+        },
+    ]
+    resources = {
+        "Resources/io_2.txt": "hello",
+        "Resources/io_3.txt": notice,
+    }
+    assert format_io_latex(io_events, resources) == \
+        f"hello\n{notice}"
+@
+
 \subsection{\LaTeX{} escaping}
 
 We need a minimal escaping function for text that
