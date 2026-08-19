@@ -123,7 +123,11 @@ from learnlog._autostart import (
     _replace_file,
     _resolve_project_root,
 )
-from learnlog.gitrepo import GIT_TREE_TIMEOUT, LearnlogRepo
+from learnlog.gitrepo import (
+    GIT_TREE_TIMEOUT,
+    LearnlogRepo,
+    git_environment,
+)
 from learnlog.commits import (
     get_commits,
     get_run_trailers,
@@ -5154,6 +5158,22 @@ For the same reason as [[push]] (\cref{sec:push}), this command does
 not go through [[LearnlogRepo.git]]: capturing the output is exactly
 what a passthrough must not do.
 
+Staying outside the wrapper does not mean staying outside its
+environment discipline.
+The passthrough (and [[learnlog tag]] below, which is the same
+mechanism with [[tag]] pre-filled) builds its environment with
+[[git_environment]] (\cref{sec:git-environment}), because the
+redirecting [[GIT_*]] variables reach it the same way they reach a
+run: a pre-commit hook exports [[GIT_INDEX_FILE]], and a
+[[learnlog git add]] issued from inside that hook would rewrite the
+student's own repository's index with it.
+What the allow-list costs here is deliberate: a student who sets
+[[GIT_AUTHOR_NAME]] in the environment and commits through the
+passthrough gets the configured identity instead---the same answer
+every learnlog commit gives since the allow-list was introduced,
+which is the consistency a student debugging an identity surprise
+needs.
+
 Typer normally parses options like [[--oneline]] as its own flags.
 We prevent this with three context settings: [[ignore_unknown_options]]
 stops Typer from rejecting flags it does not recognise,
@@ -5238,11 +5258,7 @@ def git_command(
     )
 
     learnlog_dir = workdir / ".learnlog"
-    env = {
-        **os.environ,
-        "GIT_DIR": str(learnlog_dir),
-        "GIT_WORK_TREE": str(workdir),
-    }
+    env = git_environment(learnlog_dir, workdir)
 
     result = subprocess.run(
         ["git"] + args,
@@ -5427,6 +5443,29 @@ def test_git_command_forwards_exit_code(
     assert result.exit_code != 0
 @
 
+An inherited [[GIT_INDEX_FILE]] is the passthrough's version of the
+hook scenario: were it forwarded, [[git add]] would write the index
+at that path---the student's repository's---instead of the log's.
+The hijacked path staying absent is the whole assertion, because Git
+creates the file it is told to write:
+
+<<test functions>>=
+def test_git_command_ignores_inherited_index(
+    workdir, monkeypatch, tmp_path,
+):
+    """A hook's GIT_INDEX_FILE does not reach the passthrough."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    (workdir / "junk.txt").write_text("untracked\n")
+    hijacked = tmp_path / "hijacked-index"
+    monkeypatch.setenv("GIT_INDEX_FILE", str(hijacked))
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["git", "add", "."])
+    assert result.exit_code == 0
+    assert not hijacked.exists()
+@
+
 The two guarded shapes each need a test with two halves: the log
 survives, and the command the student actually asked for still
 happens.
@@ -5598,11 +5637,7 @@ def tag_command(
         )
 
     learnlog_dir = workdir / ".learnlog"
-    env = {
-        **os.environ,
-        "GIT_DIR": str(learnlog_dir),
-        "GIT_WORK_TREE": str(workdir),
-    }
+    env = git_environment(learnlog_dir, workdir)
 
     result = subprocess.run(
         ["git", "tag"] + ctx.args,
