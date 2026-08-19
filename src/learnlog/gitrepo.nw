@@ -1165,17 +1165,258 @@ RUN_INDEX_PREFIX = "index-"
 @
 
 
+\section{Where a run's commits land}
+\label{sec:recording-branch}
+
+Both commits of \cref{sec:two-commit-protocol} were made with
+[[git commit]], and that single choice handed Git two decisions this
+module has to make for itself.
+
+\subsection{A half-finished merge is not ours to finish}
+\label{sec:unfinished-operations}
+
+Learnlog is not the only writer of the log repository.
+The student drives it directly through [[learnlog git]] (\cref{cli}),
+and does so most often when moving between machines: pull, and---when
+both machines recorded runs---merge.
+A merge that stops on a conflict leaves the repository half-finished:
+[[MERGE_HEAD]] names the other side, the index holds every conflicted
+path in two or three versions at once, and Git waits for the student
+to conclude or abandon the operation.
+
+[[git commit]] is the command that concludes it.
+That is documented behaviour and students depend on it; it is simply
+not what a recorder that happens to fire in that window wants.
+Such a run committed the work tree---conflict markers and all---as a
+two-parent merge commit, cleared [[MERGE_HEAD]], and left the student
+holding a merge Git now considered finished with a resolution nobody
+had chosen.
+Cherry-pick, revert and rebase park their state in the same place and
+came apart in the same way; the cherry-pick even lent the run header
+the author date of the commit being picked, so the record was
+timestamped wrong as well.
+
+What fixes this is the mechanism rather than a check.
+[[git commit-tree]] builds a commit from a tree and the parents we
+name, so there is no rule by which it could adopt [[MERGE_HEAD]] as a
+second parent, and it cleans nothing up afterwards.
+The student's half-finished operation survives the run exactly as they
+left it.
+
+A rebase is the honest limit of this, because it is the operation that
+rewrites the branch rather than adding to it: commits a run makes
+while one is in progress land on the branch as it stands, and the
+rebase then replaces that branch with its own result.
+The run record is lost and the student's rebase is not, which is the
+right way round---a recorder that survived by interfering is the
+failure this section is about.
+
+\subsection{A run belongs to the branch, not to [[HEAD]]}
+
+Git's other decision is where the commit goes: [[git commit]] moves
+whatever [[HEAD]] points at.
+That is right for a person and wrong for us, because [[HEAD]] is
+another thing the student can move.
+[[learnlog git checkout HEAD~4]] is a natural way to look at what a
+program used to be, and it detaches [[HEAD]].
+Runs recorded afterwards piled onto that detached head: the branch
+never moved, so nothing that reads the branch saw them; and since
+[[git push --all]] pushes [[refs/heads/*]], it pushed none of them.
+The only thing keeping them alive was the reflog.
+
+[[git commit-tree]] moves no ref at all.
+We move one ourselves, by name, with [[git update-ref]], and the name
+is the branch the log is recorded on rather than wherever [[HEAD]]
+happens to be pointing.
+Re-attaching [[HEAD]] would have been the other way to make the branch
+move again, and we deliberately do not: the student asked to stand at
+an older commit, and a recorder that undoes an explicit checkout is
+interfering with the very work it exists to observe.
+A run made from a detached head is recorded on the branch, [[HEAD]]
+stays where the student put it, and the two facts are independent.
+
+\subsection{Which branch that is}
+
+Ordinarily it is the branch [[HEAD]] points at, and
+[[git symbolic-ref]] names it in full.
+Asking per commit rather than remembering the answer is what lets a
+student who works on a branch of their own have their runs recorded
+there, which is what making a branch asks for.
+
+When [[HEAD]] is detached there is no such answer, so we ask the refs
+instead: among the repository's branches, the one committed to most
+recently is the one the log has been growing on, because a log grows
+one run at a time and nothing else commits here.
+Learnlog never makes a second branch---[[init]] and [[clone]] leave
+exactly one, whatever it is called---so the sort only has to choose
+between branches the student made.
+A repository with no branch left at all is past guessing; there we
+fall back to [[HEAD]] and record the run where the old code did.
+
+This is also why the branch is discovered rather than assumed: a
+[[.learnlog]] made by [[git init]] and one made by [[git clone]] from
+a classmate's remote need not agree on what the branch is called, and
+neither has to match this machine's [[init.defaultBranch]].
+
+<<repo methods>>=
+def recording_branch(self):
+    """Return the full ref of the branch runs are recorded on.
+
+    That is the branch ``HEAD`` points at or, when ``HEAD`` is
+    detached, the branch carrying the log's most recent commit.
+    """
+    head = self.git(
+        "symbolic-ref", "--quiet", "HEAD", check=False,
+    )
+    if head.returncode == 0 and head.stdout.strip():
+        return head.stdout.strip()
+    <<name the branch the log grew on>>
+@
+
+Both probes run with [[check=False]], and they are the successors of
+the ones \cref{sec:init-repo} counts: a detached [[HEAD]] is not a
+failure of [[symbolic-ref]] but the answer we came for, and a
+repository with no branches is likewise information rather than
+trouble.
+
+<<name the branch the log grew on>>=
+listing = self.git(
+    "for-each-ref", "--count=1", "--sort=-committerdate",
+    "--format=%(refname)", "refs/heads/", check=False,
+)
+return listing.stdout.strip() or "HEAD"
+@
+
+\subsection{Adding one commit to a branch}
+\label{sec:commit-on-branch}
+
+Three commands replace the one: a [[rev-parse]] reads the tip the new
+commit will build on, [[commit-tree]] writes the commit object, and
+[[update-ref]] moves the branch to it.
+
+Naming the parent turns the append-only protocol of
+\cref{sec:two-commit-protocol} from something inherited into something
+stated---and, more usefully, into something checkable.
+[[git update-ref]] takes the value the ref is expected to still have
+and refuses to move it otherwise.
+Every learnlog commit holds the lock of \cref{sec:commit-lock}, so the
+only writer that guard can catch is the student's own Git: a
+[[learnlog git commit]] or [[learnlog git pull]] landing between our
+two commands.
+Losing a run to that would be the wrong answer, so we read the tip
+again and rebuild the commit on top of whatever they wrote.
+
+<<repo methods>>=
+def commit_on_branch(self, branch, tree, message):
+    """Add a commit holding ``tree`` to the end of ``branch``.
+
+    ``tree`` may be any tree-ish; it is resolved afresh on each
+    attempt, so a caller may name it relative to the branch.
+    ``message`` becomes the commit message verbatim.  Returns the
+    new commit's hash.
+    """
+    if not message.endswith("\n"):
+        message += "\n"
+    for _ in range(BRANCH_UPDATE_ATTEMPTS):
+        <<build one commit and try to move [[branch]] to it>>
+    raise GitError(update, moved.returncode, moved.stderr)
+<<constants>>=
+BRANCH_UPDATE_ATTEMPTS = 3
+@
+
+Re-resolving [[tree]] on every attempt is what makes the retry safe
+for a caller that names a tree relative to the branch: the trailer of
+\cref{sec:finalising-a-run} wants \emph{the tree at the end of the
+log}, and after a lost race that is a different tree than it was.
+A caller passing a concrete hash gets the same hash each time, so the
+two kinds of caller need no second method.
+
+An attempt that exhausts the retries raises rather than returning
+quietly, because the caller is a run that has just been recorded
+half-way; \cref{sec:diagnostics} is where that ends up.
+
+<<build one commit and try to move [[branch]] to it>>=
+parent = self.branch_tip(branch)
+commit = self.git(
+    "commit-tree", tree, *(("-p", parent) if parent else ()),
+    input=message,
+).stdout.strip()
+update = (
+    "update-ref", "-m", RUN_REFLOG_MESSAGE,
+    branch, commit, parent or "",
+)
+moved = self.git(*update, check=False)
+if moved.returncode == 0:
+    return commit
+<<constants>>=
+RUN_REFLOG_MESSAGE = "learnlog: record run"
+@
+
+The empty string is how [[update-ref]] is told that the ref must not
+exist yet, so the same call covers the first commit on a branch and
+every one after it.
+Neither command needs the tree budget of
+\cref{sec:commit-message-stdin}: [[commit-tree]] writes one object and
+[[update-ref]] writes one ref, and neither walks the work tree however
+large the project is.
+
+The reflog message is a constant.
+It carries no message text, which keeps it clear of the argument-size
+limit that put commit messages on standard input, and the commit it
+describes says which half of which run it is anyway.
+
+<<repo methods>>=
+def branch_tip(self, branch):
+    """Return the commit ``branch`` points at, or ``None``."""
+    probe = self.git(
+        "rev-parse", "--verify", "--quiet", branch, check=False,
+    )
+    return probe.stdout.strip() or None
+@
+
+\subsection{What [[git commit]] did that we now do not}
+
+[[commit-tree]] is plumbing, so it is worth being explicit about what
+stops happening around the commit.
+Identity is not among it: the same [[user.name]] and [[user.email]]
+apply, so a run is still authored by the student
+(\cref{sec:init-repo}).
+Signing is: [[commit.gpgsign]] is a porcelain setting and plumbing
+never consults it.
+Initialisation switches signing off in any case, so nothing changes in
+practice---but it changes from a setting that could be switched back
+into a property of the mechanism.
+
+Message cleanup goes too.
+[[git commit]] strips trailing whitespace, collapses runs of blank
+lines and drops leading and trailing ones; the trailer sends the
+program's captured output through that filter, so a program printing
+two blank lines had one recorded.
+Verbatim is what a log of program output ought to be, which makes this
+the second thing the change improves by accident---the first being the
+cherry-picked author date above.
+The one thing we add is a closing newline when the message lacks one,
+because a commit object without it makes [[git log]] run the following
+line into the message.
+
+Finally, the reflog: [[update-ref]] writes one, so the safety net that
+kept the lost commits of the detached-head case findable is still
+there for the commits that now do not need it.
+
+
 \section{Beginning a run}
 \label{sec:beginning-a-run}
 
 At the start of each program execution, [[begin_run]] snapshots the work
 tree and commits it together with the run header.
 
-The change detection is the third and last place in this module where
-a non-zero exit is data rather than trouble.
-[[git diff --cached --quiet]] answers \enquote{is the index different
-from [[HEAD]]?} with its exit status, so it runs with [[check=False]]
-while everything around it does not.
+Whether the code changed is no longer part of that: every run gets its
+own header commit (\cref{sec:two-commit-protocol}), so the
+[[git diff --cached --quiet]] probe that this section used to describe
+as the third place in this module where a non-zero exit is data rather
+than trouble went away with the commit folding it served.
+The probes that fill its place are the ref lookups of
+\cref{sec:recording-branch}.
 
 <<repo methods>>=
 def begin_run(self, script, args, start_time):
@@ -1200,21 +1441,32 @@ def begin_run(self, script, args, start_time):
     return header
 @
 
-The commit is always made, with [[--allow-empty]] for the common case
-where the student re-runs unchanged code.
-Its tree is the work tree as it looks now, which is the state the
-program is about to execute.
+The commit is always made, including for the common case where the
+student re-runs unchanged code: [[commit-tree]] has no notion of an
+empty commit to refuse, so the [[--allow-empty]] that used to say so
+has nothing left to say.
+The tree is the work tree as it looks now, which is the state the
+program is about to execute, and [[git write-tree]] turns the staged
+index into the object [[commit_on_branch]] needs
+(\cref{sec:commit-on-branch}).
 
 <<commit the code state with the run header>>=
+branch = self.recording_branch()
 with self.run_index(f"{self.run_id}-begin") as index_path:
     <<seed the private index from the shared one>>
+    unfinished = self.unfinished_operation()
+    if unfinished:
+        <<clear the half-finished operation from the private index>>
     self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
-    self.git(
-        "commit", "--allow-empty", "--file=-", input=header,
-        timeout=GIT_TREE_TIMEOUT,
-    )
-    <<publish the private index as the shared one>>
+    tree = self.git(
+        "write-tree", timeout=GIT_TREE_TIMEOUT,
+    ).stdout.strip()
+    self.commit_on_branch(branch, tree, header)
+    if not unfinished:
+        <<publish the private index as the shared one>>
 @
+
+\subsection{Keeping the stat cache warm}
 
 An index is also a stat cache: Git re-hashes a file only when its
 [[stat]] data differs from what the index recorded.
@@ -1279,6 +1531,110 @@ except OSError:
     pass
 <<constants>>=
 SHARED_INDEX_NAME = "index"
+@
+
+
+\subsection{Snapshotting around a half-finished operation}
+
+Seeding brings more than the stat cache across when the student is in
+the middle of a merge (\cref{sec:unfinished-operations}).
+The index a conflicted merge leaves behind holds each conflicted path
+in several versions with no decision between them, and
+[[git write-tree]]---which is how the staged index becomes the tree we
+commit---refuses to write anything at all while that is so.
+
+[[git add .]] would resolve most of it on the way past: staging a file
+replaces its unmerged entries with the one version now in the work
+tree.
+Depending on that is the wrong bet twice over.
+It makes the header commit contingent on [[git add]] reaching every
+conflicted path, and a path it does not reach costs the run its
+header; and it leaves the base of the snapshot to be decided by
+accident.
+
+[[read-tree --reset]] settles both.
+It is the form that discards unmerged entries instead of failing on
+them, and what it reads in is the recording branch's tree, so the
+snapshot demonstrably starts from the last thing the log recorded and
+[[git add .]] then brings it up to the work tree exactly as it does on
+any other run.
+
+The other half is what must \emph{not} happen.
+Publishing this index as the shared one would hand the student back an
+index in which Git considers their conflict resolved---the same damage
+as the merge commit of \cref{sec:unfinished-operations}, done to the
+index instead of to the history.
+So during a half-finished operation the copy stays private and is
+thrown away with the rest, at the price of one cold cache on the next
+run, and the merge the student is in the middle of---[[MERGE_HEAD]],
+the message, the unmerged index, the work tree---is left as they left
+it.
+
+The work tree we do read, and we record what is there: conflict
+markers included.
+That is the code the program ran, and
+\cref{sec:two-commit-protocol}'s answer to which code state belongs to
+a run has no exception for code the student is unhappy with.
+Recording the pre-merge state instead would be the misleading
+option---it would show a run failing on a syntax error in a file that,
+as recorded, contains no syntax error.
+
+<<clear the half-finished operation from the private index>>=
+self.git(
+    "read-tree", "--reset", branch, timeout=GIT_TREE_TIMEOUT,
+)
+report_error(
+    "begin_run",
+    UnfinishedOperation(
+        f"{unfinished} in {self.git_dir}: recorded the run "
+        f"without touching it"
+    ),
+    self.workdir,
+)
+@
+
+The diagnostic is the transparency half of the decision: a run that
+quietly behaves differently is worse than one that says so, and
+[[.learnlog/errors.log]] is where learnlog says the things it must not
+say on the student's terminal (\cref{sec:diagnostics}).
+That channel renders the exception's type name, which is what a class
+of our own buys here: a line naming an unfinished operation rather
+than a line naming [[RuntimeError]].
+It is never raised.
+
+<<classes>>=
+class UnfinishedOperation(RuntimeError):
+    """A Git operation was left in progress in the log repository.
+
+    Reported, never raised: a run records itself around a merge,
+    cherry-pick, revert or rebase rather than disturbing it.
+    """
+@
+
+Git parks that state in files whose names are part of its
+interface---[[git status]] reads the same ones to tell the student
+what is in progress---so asking the filesystem answers the question
+without a subprocess at all.
+
+<<repo methods>>=
+def unfinished_operation(self):
+    """Return the name of a Git operation left in progress.
+
+    ``None`` when the repository is not in the middle of a merge,
+    cherry-pick, revert or rebase.
+    """
+    for name in UNFINISHED_OPERATION_FILES:
+        if (self.git_dir / name).exists():
+            return name
+    return None
+<<constants>>=
+UNFINISHED_OPERATION_FILES = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+)
 @
 
 Let's verify that each run gets its own commit, that the header
@@ -1733,82 +2089,67 @@ def finalize_run(self, io_log, exception_info,
         <<commit the trailer without touching the tree>>
 @
 
-Reading HEAD's tree into the private index is what keeps the trailer
-free of code changes.
-Staging the work tree instead would attribute to the finished run both
-the files it wrote and any edit the student made while it was running.
-The tree we read is the \emph{current} HEAD's, not the header's: if
-another run committed in between, reverting to the header's tree would
-undo that run's snapshot.
+The trailer records results, not code, so the tree it needs is one the
+log already has: the tree at the end of the recording branch.
+Naming it is all there is to it, because [[commit-tree]] takes any
+tree-ish and [[refs/heads/...^{tree}]] is one.
 
 <<commit the trailer without touching the tree>>=
-with self.run_index(f"{run_id}-end") as index_path:
-    <<seed the private index from the shared one>>
-    self.git(
-        "read-tree", "--reset", "HEAD", timeout=GIT_TREE_TIMEOUT,
-    )
-    self.git(
-        "commit", "--allow-empty", "--file=-", input=message,
-        timeout=GIT_TREE_TIMEOUT,
-    )
+branch = self.recording_branch()
+self.commit_on_branch(branch, f"{branch}^{{tree}}", message)
 @
 
-Reading the tree is not what costs anything here; committing it is.
-Every commit begins by refreshing the index, and an index that
-[[read-tree]] has just written into an empty file carries no [[stat]]
-data at all---each entry's size and timestamps are zeros.
-Zeros tell Git nothing about whether the file on disk still matches, so
-it falls back on the answer that is always right and re-hashes the
-whole work tree.
-That is a second full read of the project, on top of the one
-[[begin_run]] paid for, and it buys a commit that records no code
-change whatsoever.
-Measured on a project of five hundred files of 64\,KiB, the trailer
-took a median 105\,ms against the header's 8\,ms: the half of the run
-that records nothing was the expensive half, by more than a factor of
-ten.
+We name the \emph{branch's} tree rather than this run's header's, and
+the difference is a concurrent run.
+Two programs can be in flight at once
+(\cref{sec:two-commit-protocol}), and if the other one's header
+committed while ours ran, the branch has moved on; a trailer built
+from our own header's tree would put that run's snapshot back the way
+it was before---a code change, a revert, recorded by the commit that
+is supposed to record none.
+Naming the branch means the trailer copies whatever stands at the end
+of the log at the moment it lands, and names it again if the ref moved
+between reading the tip and moving it
+(\cref{sec:commit-on-branch}).
 
-So we seed the private index from the shared one exactly as
-\cref{sec:beginning-a-run} does---same chunk, same [[copy2]], same
-reason---and the entries arrive carrying the [[stat]] data Git recorded
-when it last hashed those files.
-Seeding alone does not survive a plain [[read-tree]] though: that form
-replaces the index outright, and the entries it puts there come from
-the tree with their [[stat]] fields zeroed, which is where we started.
-The [[strace]] counts confirm it---identical to not seeding at all.
+That this is now one line is worth dwelling on, because it used to be
+the expensive half of a run.
+[[git commit]] commits an index, so a trailer that had to record no
+change had to first build an index holding [[HEAD]]'s tree---and then
+pay for the refresh with which every commit begins.
+An index written from a tree carries no [[stat]] data at all, each
+entry's size and timestamps zero, and zeros tell Git nothing about
+whether the file on disk still matches, so it re-hashed the whole work
+tree: a second full read of the project, to record nothing.
+Measured on five hundred files of 64\,KiB, that trailer took a median
+105\,ms against the header's 8\,ms.
+Seeding the private index from the shared one and reading the tree in
+with the single-tree \emph{merge} form of [[read-tree]]---which keeps
+the index's [[stat]] data for every path whose blob already matches
+the tree's---brought it back to 9\,ms and the commit's [[openat]]
+calls from 623 to 108.
 
-What preserves the cache is the single-tree \emph{merge} form.
-For a path whose blob in the index already matches the tree's, Git
-keeps the index's entry, [[stat]] data included, and the refresh
-becomes one [[lstat]] per file instead of one full read of it.
-On the same project the trailer falls to 9\,ms---what the header
-costs, which is what a commit that reads nothing new ought to
-cost---and the [[openat]] calls of the commit itself drop from 623 to
-108.
-The saving is the project's bytes, so it shrinks with them: the same
-five hundred files at 4\,KiB take the trailer from 16\,ms to 8\,ms.
+Naming the tree removes the question instead of answering it.
+There is no index to seed, no refresh to keep cheap, and no work that
+grows with the project: the trailer is one object write and one ref
+update whatever the student's directory contains.
+The [[read-tree --reset]] that this section used to argue for lives on
+in [[begin_run]], where an index is genuinely needed
+(\cref{sec:beginning-a-run}), and for the second of the two reasons it
+was chosen here---it is the form that discards unmerged entries rather
+than failing on them.
 
-Seeding means the trailer no longer starts from a blank slate, and the
-index it starts from can disagree with [[HEAD]]: a student can stage
-files by hand through [[learnlog git add]], and a concurrent run
-publishes its own index between our two commits.
-The merge is what makes that harmless.
-Merging against a \emph{single} tree resolves every disagreement the
-same way---the tree wins.
-Paths the index has and the tree does not are dropped, paths the tree
-has and the index does not are added, and paths both have take the
-tree's blob; only the [[stat]] data is borrowed from the index, and
-only where the blobs already agree.
-What comes out is [[HEAD]]'s tree, entry for entry.
+The student's staging area is now neither read nor written by a
+trailer.
+That was the reason the trailer's private index was never published:
+handing back a copy with the student's hand-staged files stripped out
+would have made [[learnlog git status]] lie about work they had done.
+Not having an index at all is the same promise, kept by construction.
 
-Edits made to the work tree during the run cannot leak in either,
-because [[git commit]] commits the index, not the work tree.
-The refresh that opens an edited file does so to answer a question
-about [[stat]] data, and its only power is to write [[stat]] data back
-for entries whose content still matches; an entry whose content has
-changed is left exactly as the merge wrote it.
-Staging is something only [[git add]] and [[git commit -a]] do, and we
-run neither.
+Edits made to the work tree during the run cannot leak in either, and
+that too is now true by construction rather than by argument: the tree
+we commit is one that is already in the log, and nothing between the
+two commits of a run so much as looks at the work tree.
 
 That property started as an accuracy requirement---a finished run must
 not be credited with code it never executed---but the review runs of
@@ -1826,46 +2167,15 @@ Were the trailer ever to stage the work tree, that diff would be
 absorbed into the review session and the connection to the run it
 belongs to would be lost.
 
-We ask for [[--reset]] rather than [[-m]] because the two differ in one
-case, and it is the one we cannot afford.
-An index with unmerged entries---what a conflicted [[learnlog pull]]
-leaves behind---makes [[-m]] refuse with \enquote{you need to resolve
-your current index first}, and since [[git]] raises, a refusal here
-would cost the student the trailer, which is the loss the whole
-two-commit protocol exists to prevent
-(\cref{sec:two-commit-protocol}).
-[[--reset]] discards those entries instead, which is precisely what a
-command whose job is to reproduce [[HEAD]] should do with them.
-Both forms keep the [[stat]] cache.
-
-The index is discarded when the [[with]] block ends, and unlike
-[[begin_run]] we do not publish it as the shared one.
-The shared index is the student's staging area; the trailer only
-borrows it, and handing back a copy with their staged files stripped
-out would make [[learnlog git status]] lie about work they had done.
-
-Committing [[HEAD]]'s tree directly with [[git commit-tree]] would
-avoid the index and its refresh altogether---285 syscalls against
-828---but it also avoids everything [[git commit]] does around the
-tree: finding the identity, honouring the repository's configuration,
-writing the reflog, moving the branch.
-Reimplementing a commit to save one [[lstat]] per file is a poor trade
-when the file count is a student project's.
-
-Finally, [[read-tree]] joins the tree-sized commands on
-[[GIT_TREE_TIMEOUT]].
-It walks the whole tree, so a large project could have spent longer in
-it than the message-sized budget allows, and the penalty for that
-budget is not a slow run but the lost trailer again.
-
-Two tests hold the seeded index to the promises above.
+Two tests hold the trailer to the promises above.
 The first drifts everything that can drift while a run is in
 flight---an artefact appears, the source is edited beneath it, a file
 is staged by hand---and asks for the trailer's tree to still be
 [[HEAD]]'s, entry for entry.
 The second conflicts the shared index the way an interrupted
-[[learnlog pull]] would and asks for a trailer anyway; it is the test
-that fails if [[--reset]] is ever tidied into [[-m]].
+[[learnlog pull]] would and asks for a trailer anyway; it caught the
+older mechanism refusing on an unmerged index, and it now guards the
+promise that a trailer never consults one.
 
 <<test functions>>=
 def test_finalize_records_head_tree_not_the_index(workdir):
@@ -2213,6 +2523,256 @@ def test_run_after_large_run_keeps_both(workdir):
     assert msg.count("x") >= LARGE_IO_BYTES
     assert "Arguments: again" in msg
     assert "stdout: second" in msg
+@
+
+
+\section{Runs against a repository in an awkward state}
+\label{sec:awkward-state}
+
+The two states of \cref{sec:recording-branch} are ones the student
+puts the repository into on purpose, and both used to change what a
+run meant.
+Since a run only sees them by accident---it starts when a program
+starts, not when the repository is ready---the tests here set the
+repository up the way the student would and then run a program
+through it.
+
+The first state is a conflicted merge.
+Building one takes a commit that is not on the branch, which is what
+[[learnlog pull]] fetches from another machine; the helper makes one
+with the same plumbing \cref{sec:commit-on-branch} uses, so no second
+work tree is needed.
+
+<<test functions>>=
+def _conflicted_merge(repo, workdir):
+    """Leave the repository mid-merge, as a conflicted pull does.
+
+    Returns the commit the merge is trying to bring in.
+    """
+    base = repo.git("rev-parse", "HEAD").stdout.strip()
+    (workdir / "hello.py").write_text('print("ours")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 9, 0),
+    )
+    blob = repo.git(
+        "hash-object", "-w", "--stdin",
+        input='print("theirs")\n',
+    ).stdout.strip()
+    tree = repo.git(
+        "mktree", input=f"100644 blob {blob}\thello.py\n",
+    ).stdout.strip()
+    theirs = repo.git(
+        "commit-tree", tree, "-p", base, input="theirs\n",
+    ).stdout.strip()
+    repo.git("update-ref", "refs/heads/other", theirs)
+    merged = repo.git("merge", "--no-edit", "other", check=False)
+    assert merged.returncode != 0
+    return theirs
+@
+
+A run recorded in that window must leave every part of the merge where
+it found it, and its own two commits must have one parent each---a
+second parent is what \enquote{learnlog resolved the conflict} looks
+like in the history.
+The code state it records is the work tree as it stands, conflict
+markers and all, for the reason \cref{sec:beginning-a-run} gives, and
+the diagnostic says so where a student can find it.
+
+<<test functions>>=
+def test_run_during_a_conflicted_merge_adds_one_parent(workdir):
+    """A run must not conclude the student's merge for them."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    theirs = _conflicted_merge(repo, workdir)
+
+    running = LearnlogRepo(workdir)
+    running.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    running.finalize_run(
+        io_log="stderr: SyntaxError\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=1,
+    )
+
+    trailer_parents = repo.git(
+        "log", "-1", "--format=%P", branch,
+    ).stdout.split()
+    header_parents = repo.git(
+        "log", "-1", "--format=%P", f"{branch}~1",
+    ).stdout.split()
+    assert len(trailer_parents) == 1
+    assert len(header_parents) == 1
+
+    assert (workdir / ".learnlog" / "MERGE_HEAD").exists()
+    assert repo.git(
+        "rev-parse", "MERGE_HEAD",
+    ).stdout.strip() == theirs
+    assert repo.git("ls-files", "-u").stdout.strip()
+    assert "<<<<<<<" in (workdir / "hello.py").read_text()
+    assert "<<<<<<<" in repo.git(
+        "show", f"{branch}~1:hello.py",
+    ).stdout
+    errors = (
+        workdir / ".learnlog" / "errors.log"
+    ).read_text()
+    assert "UnfinishedOperation" in errors
+    assert "MERGE_HEAD" in errors
+@
+
+Those are the parts; the whole is whether the student can still
+finish.
+Concluding the merge is [[git commit]] with the conflict resolved, and
+what comes out has to be a real merge commit: two parents, the second
+being the commit that was being merged and the first the run that
+happened in the meantime.
+
+<<test functions>>=
+def test_the_students_merge_can_still_be_concluded(workdir):
+    """The half-finished merge survives a run and completes."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    theirs = _conflicted_merge(repo, workdir)
+
+    running = LearnlogRepo(workdir)
+    running.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    running.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=1,
+    )
+    trailer = repo.git("rev-parse", branch).stdout.strip()
+
+    (workdir / "hello.py").write_text('print("resolved")\n')
+    repo.git("add", "hello.py")
+    repo.git("commit", "--file=-", input="merged\n")
+
+    parents = repo.git(
+        "log", "-1", "--format=%P", branch,
+    ).stdout.split()
+    assert parents == [trailer, theirs]
+    assert not (workdir / ".learnlog" / "MERGE_HEAD").exists()
+@
+
+The second state is a detached [[HEAD]], which is what
+[[learnlog git checkout]] leaves behind when a student goes to look at
+an older version of their code.
+The run afterwards has to reach the branch: [[git log --branches]] is
+the set of commits [[git push --all]] would send, so asking for the
+run's records there is asking whether the run was pushable.
+And [[HEAD]] has to still be where the student left it, because the
+run is not entitled to undo their checkout.
+
+<<test functions>>=
+def test_runs_land_on_the_branch_from_a_detached_head(workdir):
+    """A detached HEAD must not take the run's commits with it."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    (workdir / "hello.py").write_text('print("v1")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    old = repo.git("rev-parse", "HEAD~2").stdout.strip()
+    repo.git("checkout", "--detach", old)
+    before = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+
+    detached = LearnlogRepo(workdir)
+    detached.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    run_id = detached.run_id
+    detached.finalize_run(
+        io_log="stdout: detached\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 11, 0, 1),
+        exit_code=0,
+    )
+
+    after = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+    assert after == before + 2
+    pushable = repo.git(
+        "log", "--branches", "--format=%B",
+    ).stdout
+    assert "stdout: detached" in pushable
+    assert pushable.count(f"Run-Id: {run_id}") == 2
+    assert repo.git("rev-parse", "HEAD").stdout.strip() == old
+    assert repo.git(
+        "symbolic-ref", "--quiet", "HEAD", check=False,
+    ).returncode != 0
+@
+
+Finding the branch from a detached [[HEAD]] is the part of that with
+no obvious answer, so it gets its own test: the branch a run picks
+while detached is the one it would have picked attached.
+A renamed branch checks the other half of \cref{sec:recording-branch}
+---that nothing here knows what the branch is called, which is what a
+clone from a classmate's remote requires.
+
+<<test functions>>=
+def test_recording_branch_survives_a_detached_head(workdir):
+    """Detaching HEAD does not change which branch records runs."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    commit = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("checkout", "--detach", commit)
+    assert repo.recording_branch() == branch
+
+def test_runs_follow_a_renamed_branch(workdir):
+    """The recording branch is whatever the repository calls it."""
+    repo = LearnlogRepo(workdir)
+    repo.git("branch", "-m", "trunk")
+    assert repo.recording_branch() == "refs/heads/trunk"
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: renamed\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    msg = repo.git(
+        "log", "-1", "--format=%B", "refs/heads/trunk",
+    ).stdout
+    assert "stdout: renamed" in msg
+@
+
+Finally, the message the student's program produced now reaches the
+commit unaltered (\cref{sec:recording-branch}), which is worth one
+test of its own: blank lines and trailing spaces are data in a
+transcript, and the porcelain that used to write these commits removed
+both.
+
+<<test functions>>=
+def test_trailer_keeps_the_io_log_verbatim(workdir):
+    """Blank lines and trailing spaces survive into the commit."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    io_log = "stdout: one   \n\n\n\nstdout: two\n"
+    repo.finalize_run(
+        io_log=io_log,
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert io_log in msg
 @
 
 
