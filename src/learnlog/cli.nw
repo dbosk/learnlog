@@ -4348,12 +4348,36 @@ A student who wants their log next to work they already have can clone
 into an empty directory and move the [[.learnlog/]] across, which is a
 decision they made rather than one we made for them.
 
+Creating the target is what turns a typed path into a directory, and
+it is also where a typed path that is \emph{not} a directory arrives.
+Naming an existing file---a mistyped [[-C]], a tab-completion that
+stopped one component short---makes [[mkdir]] raise, and
+[[exist_ok]] does not cover it: that flag forgives a directory that is
+already there, which is precisely what a file is not.
+The same goes for a path whose parent is a file, where the missing
+component cannot be created at all.
+Left alone, both leave the student looking at a [[FileExistsError]]
+traceback for what is, from where they sit, the same mistake the
+non-empty target above gets a sentence for.
+So we translate them into that sentence, and name the path, because
+the whole content of the answer is which path the student got wrong.
+Dropping the original exception rather than chaining it is part of
+that: the operating system's [[File exists]] is the mechanism, and a
+chained traceback is the thing we came here to stop printing.
+
 <<refuse a target we would have to clone over>>=
 if learnlog_dir.exists():
     raise SystemExit(
         f".learnlog/ already exists in {workdir}"
     )
-workdir.mkdir(parents=True, exist_ok=True)
+try:
+    workdir.mkdir(parents=True, exist_ok=True)
+except (FileExistsError, NotADirectoryError):
+    raise SystemExit(
+        f"{workdir} exists and is not a directory. Clone "
+        f"checks the log's files out into the target, so it "
+        f"needs an empty directory."
+    ) from None
 if any(workdir.iterdir()):
     raise SystemExit(
         f"{workdir} is not empty. Clone checks the log's "
@@ -4616,6 +4640,31 @@ def test_clone_refuses_a_target_with_files(
     assert (target / "notes.txt").read_text() == "my work\n"
 @
 
+A target that names a file is the same refusal, and what the test is
+really about is how it is delivered.
+[[CliRunner]] keeps whatever the command raised, so asking for a
+[[SystemExit]] is asking for a sentence rather than the traceback a
+[[FileExistsError]] would have escaped as:
+
+<<test functions>>=
+def test_clone_refuses_a_file_as_the_target(
+    workdir, pushed_log,
+):
+    """A target that is a file is refused, not a traceback."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    target = workdir / "notes.txt"
+    target.write_text("my work\n")
+    result = CliRunner().invoke(
+        app, ["clone", str(pushed_log), "-C", str(target)]
+    )
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    assert str(target) in result.output
+    assert "is not a directory" in result.output
+    assert target.read_text() == "my work\n"
+@
+
 Interrupting the clone must leave the target as it was found, and the
 moment worth interrupting is the one just after the repository has
 been moved into place: that is where a partial [[.learnlog/]] would
@@ -4759,20 +4808,44 @@ if fetched.returncode != 0:
 branch the log is on.
 That is a description of the old behaviour rather than a reduction of
 it: [[.learnlog/]] is created with one branch and only ever grows
-commits on that branch, so the current branch \emph{is} the log.
-A remote that has no such branch is not an error---a teacher may have
-created the destination repository moments ago---so we say so and
-stop.
+commits on that branch, so that branch \emph{is} the log.
+
+The recorder already answers the question of which branch that is,
+and [[pull]] has to answer it the same way or it stops working
+exactly when the student needs it.
+[[recording_branch]] (\cref{sec:recording-branch}) reads
+[[symbolic-ref]] when [[HEAD]] is attached and, when it is not, the
+branch the log's newest commit sits on.
+A student who runs \mintinline{bash}{learnlog git checkout HEAD~4} to
+look at an older version detaches [[HEAD]], and runs made afterwards
+keep landing on the branch---so a [[pull]] that asked [[HEAD]] instead
+would refuse to sync a log that is still being written to.
+Syncing must work wherever recording works, so both ask the same
+question.
+
+Asking it also decides which commit the pull builds on.
+With [[HEAD]] detached the branch tip and [[HEAD]] are different
+commits, and it is the branch we are about to move: reading the tip
+from [[HEAD]] would hand [[update-ref]] below an expected old value
+that the branch has not had since the student detached, and every pull
+would report a race that never happened.
+
+The one state left over is a repository with no branches at all, which
+is what [[recording_branch]] reports by falling back to [[HEAD]]---the
+answer that is not a branch name.
+There is nothing to fast-forward there and nothing to name in
+[[update-ref]], so this is where the old refusal still belongs.
+A remote that has no such branch is a different matter and not an
+error---a teacher may have created the destination repository moments
+ago---so we say so and stop.
 
 <<find the local and remote tips>>=
-head = repo.git(
-    "symbolic-ref", "--short", "HEAD", check=False,
-)
-if head.returncode != 0:
+branch_ref = repo.recording_branch()
+if not branch_ref.startswith(BRANCH_REF_PREFIX):
     raise SystemExit(
         "The log is not on a branch; cannot pull."
     )
-branch = head.stdout.strip()
+branch = branch_ref.removeprefix(BRANCH_REF_PREFIX)
 remote = repo.git(
     "rev-parse", "--verify", "--quiet",
     f"refs/remotes/origin/{branch}", check=False,
@@ -4784,8 +4857,10 @@ if remote.returncode != 0:
     return
 remote_tip = remote.stdout.strip()
 local_tip = repo.git(
-    "rev-parse", "--verify", "HEAD",
+    "rev-parse", "--verify", branch_ref,
 ).stdout.strip()
+<<constants>>=
+BRANCH_REF_PREFIX = "refs/heads/"
 @
 
 \paragraph{Three cases, one of which needs a merge.}
@@ -4846,7 +4921,7 @@ commit.
 <<advance the branch under the commit lock>>=
 with repo.commit_lock():
     advanced = repo.git(
-        "update-ref", f"refs/heads/{branch}",
+        "update-ref", branch_ref,
         new_tip, local_tip, check=False,
     )
 if advanced.returncode != 0:
@@ -5310,6 +5385,129 @@ def test_pull_merges_without_merge_tree(workdir, monkeypatch):
     assert not (
         target / ".learnlog" / "index-pull-merge"
     ).exists()
+@
+
+The three tests that follow are all the same situation seen from
+different sides: the student detached [[HEAD]] to look at an older
+version and never re-attached.
+The first is the one the student notices, because it is the one that
+used to fail outright---the pull that has something to bring in:
+
+<<test functions>>=
+def test_pull_fast_forwards_from_a_detached_head(
+    workdir, monkeypatch,
+):
+    """A detached HEAD does not stop a pull."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    cloned = LearnlogRepo(target)
+    branch = cloned.recording_branch()
+    detached_at = cloned.git("rev-parse", "HEAD").stdout.strip()
+    cloned.git("checkout", "--detach")
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert cloned.git(
+        "rev-parse", branch,
+    ).stdout.strip() != detached_at
+    assert 'print("theirs")' in cloned.git(
+        "show", f"{branch}:hello.py",
+    ).stdout
+    assert cloned.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip() == detached_at
+@
+
+The last assertion above is the other half of the bargain: the pull
+moved the branch and left [[HEAD]] where the student put it, which is
+the same division of labour a run makes
+(\cref{sec:recording-branch}).
+
+The second side is quieter, and getting it wrong would produce a
+wrong answer rather than a refusal.
+Here the log has grown past what origin knows---runs recorded from
+the detached [[HEAD]] land on the branch---so the honest report is
+that there is nothing to pull.
+Measuring from [[HEAD]] instead would find the remote ahead of it,
+try to fast-forward the branch on top of a value it lost several runs
+ago, and blame a race that never happened:
+
+<<test functions>>=
+def test_pull_measures_from_the_branch_not_the_head(
+    workdir, monkeypatch,
+):
+    """A detached HEAD is not the commit a pull compares against."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    cloned = LearnlogRepo(target)
+    branch = cloned.recording_branch()
+    cloned.git("checkout", "--detach")
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+    monkeypatch.chdir(target)
+    runner.invoke(app, ["pull"])
+    (target / "mine.py").write_text('print("mine")\n')
+    cloned.begin_run(
+        "mine.py", [], datetime.datetime(2026, 1, 1, 12, 0),
+    )
+    ahead = cloned.git("rev-parse", branch).stdout.strip()
+
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert "up to date" in result.output.lower()
+    assert cloned.git(
+        "rev-parse", branch,
+    ).stdout.strip() == ahead
+@
+
+The third side is the state that really has no branch to pull onto.
+Deleting the branch a detached [[HEAD]] left behind is an odd thing
+for a student to do deliberately, but it is the one arrangement in
+which there is nothing for [[update-ref]] to name, and the refusal
+that used to greet every detached [[HEAD]] belongs to it alone:
+
+<<test functions>>=
+def test_pull_without_any_branch_still_refuses(
+    workdir, monkeypatch,
+):
+    """A log with no branch left cannot be pulled onto."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    cloned = LearnlogRepo(target)
+    branch = cloned.recording_branch()
+    cloned.git("checkout", "--detach")
+    cloned.git(
+        "branch", "--delete", "--force",
+        branch.removeprefix("refs/heads/"),
+    )
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code != 0
+    assert "not on a branch" in result.output
 @
 
 
