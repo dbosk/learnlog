@@ -559,6 +559,7 @@ verifying the full pipeline from import to commit:
 
 <<test [[learnlog.py]]>>=
 """Integration tests for the learnlog package."""
+import datetime
 import io
 import tempfile
 import subprocess
@@ -566,7 +567,11 @@ import os
 import pathlib
 import sys
 import pytest
-from learnlog import _is_opted_out
+from learnlog import (
+    _claim_c_invocation_path,
+    _is_opted_out,
+    _persist_c_invocation,
+)
 from learnlog.gitrepo import LearnlogRepo
 
 <<test helpers>>
@@ -1012,22 +1017,182 @@ only the Python-facing initialisation code knows that
 [[<python -c>]] means [[args[0]]] is source code, whereas
 [[LearnlogRepo]] should stay a generic Git wrapper.
 
-The trade-off is that [[python_c_invocation.py]] is visible in [[ls]]
-after such a run.
-That is acceptable because it serves as a discoverable record of the
-most recent [[python -c]] source, and any failure to write it must not
-stop the student's program.
+\emph{Which} worktree is the part that is easy to get wrong, and
+getting it wrong turns the record into litter.
+The directory the student happens to stand in is not the answer: an
+anchored run---one pointed at a project by [[LEARNLOG_PROJECT_ROOT]] or
+by a venv that [[learnlog init]] wired---is logged into that project no
+matter where it was launched from, so a file written next to the
+student would land outside the tree [[begin_run]] stages and outside
+the repository that records the run.
+The helper therefore takes the [[LearnlogRepo]] instead of a directory
+of its own and writes under [[repo.workdir]].
+Passing the repository rather than a second copy of the path is what
+makes the two impossible to disagree about: the file is written into
+exactly the directory Git is about to commit from.
+
+The file name is the second hazard.
+A student may already own a [[python_c_invocation.py]], and overwriting
+it would destroy their work---a far worse breach than the one we are
+recording.
+So learnlog writes only to a name it has claimed, and claims a name
+only while nothing occupies it.
+The claim is recorded in [[.learnlog/c-invocation]] rather than inside
+the file.
+It has to outlive the process, or the next [[python -c]] run would find
+its own previous file in the way and claim yet another name; and it
+must not be a marker line in the source file, because the bytes of that
+file are the program that ran---a code state that quietly gained a
+comment learnlog wrote is not a record of the student's code.
+
+The trade-off is unchanged: [[python_c_invocation.py]] is visible in
+[[ls]] after such a run.
+That is acceptable because it is a discoverable record of the most
+recent [[python -c]] source, in the project the run belongs to, and
+because it stays one file that later runs update in place.
+Failing to write it must not stop the student's program, but it must
+not pass unnoticed either, so the exception we swallow goes to the
+diagnostics path (\cref{sec:diagnostics}) like every other one.
 
 <<functions>>=
-def _persist_c_invocation(workdir, script, args):
+def _persist_c_invocation(repo, script, args):
     """Persist ``python -c`` source as a worktree file."""
     if script != "<python -c>" or not args:
         return
     try:
-        target = pathlib.Path(workdir) / "python_c_invocation.py"
-        target.write_text(args[0])
-    except Exception:
-        pass
+        target = _claim_c_invocation_path(repo)
+        if target is not None:
+            target.write_text(args[0])
+    except Exception as error:
+        _report_swallowed_failure("persist -c source", error)
+@
+
+Claiming is a two-step lookup, and the order between the steps is what
+keeps the name stable.
+An existing claim wins outright, even when the file it names has since
+been deleted: re-creating the name learnlog used last time turns
+consecutive [[python -c]] runs into a one-file diff instead of a
+growing pile of near-identical files.
+Only when no claim exists do we go looking for a free name.
+
+<<functions>>=
+def _claim_c_invocation_path(repo):
+    """Return the worktree path learnlog owns for ``-c`` sources."""
+    claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
+    <<reuse the claimed name>>
+    <<claim the first free name>>
+@
+
+A claim is a bare file name in the root of the work tree, so anything
+carrying a separator is not a claim we wrote.
+Discarding such a value instead of following it keeps a corrupted or
+hand-edited [[c-invocation]] from redirecting the write to an arbitrary
+path.
+
+<<reuse the claimed name>>=
+try:
+    claimed = claim.read_text().strip()
+except OSError:
+    claimed = ""
+if claimed and "/" not in claimed:
+    return repo.workdir / claimed
+@
+
+The alternatives are numbered and tried in a fixed order, so a project
+whose preferred name is taken still ends up with one stable file rather
+than a new one per run.
+The search is bounded because a directory in which a hundred of these
+names are occupied is not one attempt away from success; there we
+decline to write anything, which costs that run its synthetic code
+state but touches nothing the student owns.
+
+<<claim the first free name>>=
+stem = C_INVOCATION_NAME.removesuffix(".py")
+for attempt in range(C_INVOCATION_MAX_NAMES):
+    candidate = C_INVOCATION_NAME
+    if attempt:
+        candidate = f"{stem}-{attempt}.py"
+    if (repo.workdir / candidate).exists():
+        continue
+    claim.write_text(candidate + "\n")
+    return repo.workdir / candidate
+return None
+<<constants>>=
+C_INVOCATION_NAME = "python_c_invocation.py"
+C_INVOCATION_CLAIM_NAME = "c-invocation"
+C_INVOCATION_MAX_NAMES = 100
+@
+
+Let's verify the property the anchoring exists for: the file follows
+the repository, not the caller.
+
+<<test functions>>=
+def test_persists_c_source_under_the_repo_workdir(
+    workdir, tmp_path_factory, monkeypatch,
+):
+    """The source lands in the logged project, not in the cwd."""
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    monkeypatch.chdir(elsewhere)
+    repo = LearnlogRepo(workdir)
+    _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    assert (
+        workdir / "python_c_invocation.py"
+    ).read_text() == "print(1)"
+    assert not (elsewhere / "python_c_invocation.py").exists()
+@
+
+A file learnlog never claimed must survive a [[python -c]] run
+untouched, and the source still has to be recorded somewhere:
+
+<<test functions>>=
+def test_does_not_clobber_a_file_it_did_not_write(workdir):
+    """A student's own file of that name is left alone."""
+    theirs = workdir / "python_c_invocation.py"
+    theirs.write_text("# the student's own module\n")
+    repo = LearnlogRepo(workdir)
+    _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    assert theirs.read_text() == "# the student's own module\n"
+    assert (
+        workdir / "python_c_invocation-1.py"
+    ).read_text() == "print(1)"
+@
+
+The claim is what stops that fallback from happening again on every
+later run.
+Two runs in the same project must share one file, even though each run
+builds its own [[LearnlogRepo]]:
+
+<<test functions>>=
+def test_reuses_the_claimed_name_across_runs(workdir):
+    """A later run updates the claimed file instead of adding one."""
+    _persist_c_invocation(
+        LearnlogRepo(workdir), "<python -c>", ["print(1)"]
+    )
+    _persist_c_invocation(
+        LearnlogRepo(workdir), "<python -c>", ["print(2)"]
+    )
+    assert (
+        workdir / "python_c_invocation.py"
+    ).read_text() == "print(2)"
+    assert not (workdir / "python_c_invocation-1.py").exists()
+@
+
+Finally, the point of writing the file at all: it has to be inside the
+tree that [[begin_run]] commits, not merely on disk beside it.
+
+<<test functions>>=
+def test_c_source_joins_the_run_code_state(workdir):
+    """The header commit's tree carries the synthetic source."""
+    repo = LearnlogRepo(workdir)
+    _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    repo.begin_run(
+        "<python -c>", ["print(1)"],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    listed = repo.git("ls-tree", "--name-only", "HEAD").stdout
+    assert "python_c_invocation.py" in listed.split()
+    stored = repo.git("show", "HEAD:python_c_invocation.py").stdout
+    assert stored == "print(1)"
 @
 
 [[InputCapture]] handles piped stdin because [[input()]] eventually
@@ -1513,6 +1678,9 @@ At this point we already know which worktree the run belongs to.
 If the invocation was [[python -c]], we must write the synthetic source
 file before [[begin_run]], because [[begin_run]] is the step that stages
 the current worktree into the run commit.
+The repository is built first and handed to the helper for the same
+reason: the directory Git commits from is then, by construction, the
+directory the file is written to.
 
 <<create repository and begin run>>=
 repo = LearnlogRepo(workdir)
@@ -1521,7 +1689,7 @@ repo.begin_run(main_script, main_args, start_time)
 @
 
 <<persist -c source>>=
-_persist_c_invocation(workdir, main_script, main_args)
+_persist_c_invocation(repo, main_script, main_args)
 @
 
 <<install I/O wrappers>>=
@@ -1821,6 +1989,40 @@ class TestInitialize:
         assert (
             workdir / "python_c_invocation.py"
         ).read_text() == source
+@
+
+The last hazard is one no test above can see, because every run so far
+was launched from inside the project it belongs to.
+An anchored run is not: under [[LEARNLOG_PROJECT_ROOT]] the student may
+stand anywhere at all, and that directory has to come out of the run
+exactly as it went in, while the source stays recoverable from the
+project that logged it.
+
+<<test functions>>=
+    def test_anchored_python_c_leaves_the_cwd_alone(
+        self, workdir, test_env, tmp_path_factory,
+    ):
+        """An anchored run records into its project, not the cwd."""
+        elsewhere = tmp_path_factory.mktemp("elsewhere")
+        source = 'print("anchored")'
+        env = dict(test_env, LEARNLOG_PROJECT_ROOT=str(workdir))
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=elsewhere,
+            env=env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", source],
+        )
+        assert result.returncode == 0
+        assert list(elsewhere.iterdir()) == []
+        committed = subprocess.run(
+            ["git", "--git-dir=.learnlog", "--work-tree=.",
+             "show", "HEAD:python_c_invocation.py"],
+            cwd=str(workdir),
+            capture_output=True, text=True,
+        )
+        assert committed.returncode == 0
+        assert committed.stdout == source
 
     def test_input_calls_are_logged_once_for_piped_stdin(
         self, workdir, test_env,
