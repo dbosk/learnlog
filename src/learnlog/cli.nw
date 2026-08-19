@@ -128,7 +128,7 @@ from learnlog.commits import (
     get_run_trailers,
     merge_run_trailers,
     parse_run_summary,
-    filter_learnlog_runs,
+    filter_internal_runs,
     resolve_record_commit,
     commit_outcomes,
 )
@@ -3100,7 +3100,7 @@ def list_commits(
         if not commits:
             raise SystemExit("No commits found.")
 
-        filter_lr = not show_all
+        filter_internal = not show_all
         trailers = get_run_trailers(repo)
         <<build wanted outcome set>>
         for commit in commits:
@@ -3126,7 +3126,7 @@ if failure:
 
 For each commit we fetch the full message body, merge in the
 trailers of the runs it records (\cref{sec:run-join}), optionally
-filter out learnlog's own runs using [[filter_learnlog_runs]],
+filter out learnlog's internal runs using [[filter_internal_runs]],
 drop commits that do not match the outcome filter, and then
 extract the summary with [[parse_run_summary]].
 Commits whose runs are all filtered out (or that have no run
@@ -3143,8 +3143,8 @@ body = repo.git(
     "log", "-1", "--format=%B", commit["hash"],
 ).stdout.rstrip("\n")
 body = merge_run_trailers(body, trailers)
-if filter_lr:
-    body = filter_learnlog_runs(body)
+if filter_internal:
+    body = filter_internal_runs(body)
 <<skip commits that do not match the outcome filter>>
 summary = parse_run_summary(body)
 if summary is None:
@@ -3251,8 +3251,8 @@ def test_list_command_counts_runs_in_one_commit(workdir):
     assert result.exit_code == 0
     assert "(2 runs)" in result.output
 
-def test_list_command_filters_learnlog(workdir):
-    """Learnlog runs are hidden by default."""
+def test_list_shows_review_runs(workdir):
+    """Review runs are listed without asking for --all."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -3265,28 +3265,28 @@ def test_list_command_filters_learnlog(workdir):
     )
     assert result.exit_code == 0
     assert "hello.py" in result.output
-    assert "learnlog" not in result.output
+    assert "learnlog play" in result.output
 
-def test_list_command_all_shows_learnlog(workdir):
-    """The --all flag lists learnlog runs too."""
+def test_list_command_all_shows_internal(workdir):
+    """The --all flag lists learnlog's internal runs too."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
-    repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("learnlog", ["export", "out.bundle"], t1)
     runner = CliRunner()
-    # Without --all, the learnlog run is filtered out.
+    # Without --all, the internal run is filtered out.
     filtered = runner.invoke(
         app, ["list", "--from", str(workdir)]
     )
-    assert "learnlog play" not in filtered.output
+    assert "learnlog export" not in filtered.output
     # With --all, it is listed as its own record.
     unfiltered = runner.invoke(
         app, ["list", "--all", "--from", str(workdir)]
     )
     assert unfiltered.exit_code == 0
-    assert "learnlog play" in unfiltered.output
+    assert "learnlog export" in unfiltered.output
 
 def test_list_command_hides_pip_install_of_learnlog(workdir):
     """Installing learnlog is setup noise, not development."""
@@ -4465,17 +4465,17 @@ we fall back to TTY detection via [[sys.stdout.isatty()]].
 An explicit [[--batch]] or [[--no-batch]] always wins.
 
 <<choose playback mode>>=
-filter_learnlog = not show_all
+filter_internal = not show_all
 use_batch = (
     batch if batch is not None
     else not sys.stdout.isatty()
 )
 if use_batch:
     play_batch(repo, commits, start_index,
-               filter_learnlog)
+               filter_internal)
 else:
     viewer = PlaybackViewer(
-        repo, commits, start_index, filter_learnlog,
+        repo, commits, start_index, filter_internal,
     )
     viewer.run()
 @
@@ -4500,33 +4500,36 @@ def test_play_batch_via_cli(workdir):
     assert "diff --git" in result.output
 @
 
-We verify that learnlog's own runs are filtered from playback by
-default and that [[--all]] restores them:
+We verify that review runs reach playback without [[--all]], while
+learnlog's internal runs are filtered from it by default and [[--all]]
+restores them:
 
 <<test functions>>=
-def test_play_hides_learnlog_runs(workdir):
-    """Learnlog runs are filtered from batch output."""
+def test_play_shows_review_runs(workdir):
+    """Review runs are played back like student runs."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("learnlog", ["export", "out.bundle"], t1)
     runner = CliRunner()
     result = runner.invoke(
         app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
     assert "Script: hello.py" in result.output
-    assert "Script: learnlog" not in result.output
+    assert "Run: learnlog play" in result.output
+    assert "Run: learnlog export" not in result.output
 
 def test_play_keeps_student_run_intact(workdir):
     """A learnlog run overlapping a student run stays separate.
 
     The student starts a program; while it runs, ``learnlog
     play`` is invoked and finishes first.  The student's output
-    must be attributed to the student's run---not swallowed by
-    the learnlog block that is hidden from playback.
+    must be attributed to the student's run---each record keeps
+    its own I/O rather than absorbing the other's.
     """
     from learnlog.cli import app
     from typer.testing import CliRunner
@@ -4552,17 +4555,18 @@ def test_play_keeps_student_run_intact(workdir):
         app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
-    assert "stdout: hello" in result.output
-    assert "CURSES SCREEN" not in result.output
+    review_start = result.output.index("Run: learnlog play")
+    assert result.output.index("stdout: hello") < review_start
+    assert result.output.index("CURSES SCREEN") > review_start
 
-def test_play_all_shows_learnlog_runs(workdir):
-    """The --all flag includes learnlog runs."""
+def test_play_all_shows_internal_runs(workdir):
+    """The --all flag includes learnlog's internal runs."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
-    repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("learnlog", ["export", "out.bundle"], t1)
     runner = CliRunner()
     result = runner.invoke(
         app,
@@ -4570,7 +4574,7 @@ def test_play_all_shows_learnlog_runs(workdir):
     )
     assert result.exit_code == 0
     assert "Script: hello.py" in result.output
-    assert "Script: learnlog" in result.output
+    assert "Run: learnlog export" in result.output
 @
 
 We resolve the starting ref through [[git rev-parse]], which

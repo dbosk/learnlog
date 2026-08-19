@@ -96,12 +96,12 @@ class PlaybackViewer:
     """
 
     def __init__(self, repo, commits, start_index=0,
-                 filter_learnlog=True, trailers=None):
+                 filter_internal=True, trailers=None):
         self.repo = repo
         self.commits = commits
         self.index = start_index
         self.scroll = 0
-        self.filter_learnlog = filter_learnlog
+        self.filter_internal = filter_internal
         self.trailers = trailers
         self._detail_cache = {}
 
@@ -192,11 +192,22 @@ def _get_detail(self, commit_hash):
         self._detail_cache[commit_hash] = \
             get_commit_detail(
                 self.repo, commit_hash,
-                self.filter_learnlog,
+                self.filter_internal,
                 self._get_trailers(),
             )
     return self._detail_cache[commit_hash]
 @
+
+[[get_commit_detail]] answers [[None]] for a commit whose every run
+block was filtered away (\cref{sec:filter-learnlog}), but the viewer
+still has to draw something: the commit list it pages through was built
+before filtering, and silently drawing the neighbour instead would make
+the position counter disagree with the [[H]]/[[L]] keys.
+So we draw a placeholder in its place.
+Since review runs are shown like any other run, that placeholder is
+reserved for genuine plumbing---the [[pip]] install from
+[[learnlog init]], and records of other subcommands left by older
+versions.
 
 <<player methods>>=
 def _draw(self, stdscr):
@@ -410,11 +421,12 @@ changed as a result in a single continuous stream.
 
 <<viewer functions>>=
 def play_batch(repo, commits, start_index=0,
-               filter_learnlog=True, trailers=None):
+               filter_internal=True, trailers=None):
     """Print commit details sequentially to stdout.
 
-    When ``filter_learnlog`` is ``True``, learnlog's own run
-    blocks are stripped and all-learnlog commits are skipped.
+    When ``filter_internal`` is ``True``, learnlog's internal
+    run blocks are stripped and commits that hold nothing else
+    are skipped.  Review runs are printed like any other run.
     ``trailers`` is the map from ``get_run_trailers``; it is
     read from ``repo`` when not supplied.
     """
@@ -423,7 +435,7 @@ def play_batch(repo, commits, start_index=0,
     for index in range(start_index, len(commits)):
         commit = commits[index]
         detail = get_commit_detail(
-            repo, commit["hash"], filter_learnlog, trailers,
+            repo, commit["hash"], filter_internal, trailers,
         )
         if detail is None:
             continue
@@ -483,6 +495,38 @@ def test_play_batch_shows_one_record_per_run(workdir, capsys):
     assert "Exit-Code: 0" in captured
     assert "stdout: hello" in captured
     assert "Run-End:" not in captured
+@
+
+A review run needs no special case to be readable: it is a run block
+like any other, and the filter that used to remove it now lets it
+through.  What we check is exactly that---the record renders in full,
+and the placeholder that stands in for filtered-away commits is
+nowhere in sight:
+
+<<viewer test functions>>=
+def test_play_batch_renders_review_run(workdir, capsys):
+    """A review run is a record like any other."""
+    import datetime
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "learnlog", ["play"],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 20),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    captured = capsys.readouterr().out
+    assert "Run: learnlog play" in captured
+    assert "Exit-Code: 0" in captured
+    assert "(learnlog internal run)" not in captured
 @
 
 The gap line should appear from the second run onward, never on the first.
