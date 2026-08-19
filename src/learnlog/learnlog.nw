@@ -5839,3 +5839,316 @@ def test_autostart_captures_repl_history_and_traceback(tmp_path):
     assert "stdin: >>> exit()\n" in history
     assert "RuntimeError" in history
 @
+
+
+\subsection{The share cycle, end to end}
+\label{subsec:share-cycle-tests}
+
+The tests above drive learnlog through a student's \emph{program}.
+The ones below drive it through learnlog's own command line, because
+that is where the veto of \cref{sec:veto} either holds or does not,
+and because the four defects it removes were all invisible to unit
+tests.
+They were invisible for one reason: [[tests/Makefile]] exports
+[[LEARNLOG_SKIP_AUTOSTART]], so every [[CliRunner]] test in
+\cref{cli} runs with logging switched off and therefore cannot see a
+command log itself.
+A test that must observe a command's effect on the repository it
+operates on has to run in a subprocess that is genuinely being
+recorded, which is exactly the machinery this section already has.
+
+What the CLI needs beyond that machinery is a launcher that actually
+runs the CLI.
+The one [[_prepare_autostart_project]] installs is a stub whose whole
+body is \mintinline{python}{import learnlog}, which is all the
+naming tests want from it; a command-line test additionally needs
+[[typer]] and [[pytorial]], which the scratch venv has never had.
+Both come from the interpreter running this suite, appended after the
+source tree so that [[learnlog]] itself still resolves to the code
+under test.
+Site initialisation reads [[.pth]] files in name order and appends
+each path in turn, which is what makes the numeric prefixes
+load-bearing rather than decorative.
+
+<<autostart test helpers>>=
+def _wire_cli_into_venv(venv_dir):
+    """Give the venv a launcher that runs the real CLI."""
+    from learnlog import cli
+
+    purelib = cli.venv_purelib(venv_dir)
+    (purelib / "001-learnlog-deps.pth").write_text(
+        sysconfig.get_paths()["purelib"] + "\n"
+    )
+    python = cli.find_in_venv(venv_dir, "python")
+    launcher = python.parent / "learnlog"
+    launcher.write_text(
+        f"#!{python}\n"
+        "import sys\n"
+        "from learnlog.cli import app\n"
+        "sys.exit(app())\n"
+    )
+    launcher.chmod(0o755)
+    return launcher
+@
+
+Building a virtual environment is the expensive part of all of this,
+and every test below wants the same one, so the fixture is
+module-scoped and the tests share a project.
+Sharing it costs them independence unless they are written for it, so
+each test creates whatever it needs---its own remote, its own clone
+target, its own run---and none asserts anything about the project's
+total history.
+What they assert instead is what changed across the one command they
+are about.
+
+<<autostart test helpers>>=
+@pytest.fixture(scope="module")
+def cli_project(tmp_path_factory):
+    """A wired project whose venv runs the real CLI."""
+    project, venv_dir = _prepare_autostart_project(
+        tmp_path_factory.mktemp("share-cycle")
+    )
+    return project, venv_dir, _wire_cli_into_venv(venv_dir)
+
+
+def _run_cli(launcher, args, *, cwd, env=None, check=True):
+    """Run the venv's learnlog CLI in ``cwd``."""
+    return subprocess.run(
+        [str(launcher), *args],
+        cwd=str(cwd),
+        env=_autostart_env() if env is None else env,
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=120,
+    )
+
+
+def _run_student_program(venv_dir, project, source):
+    """Run a small program in ``project`` as the student would."""
+    script = project / "quick.py"
+    script.write_text(source)
+    subprocess.run(
+        [str(_venv_binary(venv_dir, "python")), str(script)],
+        cwd=str(project),
+        env=_autostart_env(),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+
+def _commit_body(project, grep):
+    """Return the newest commit body matching ``grep``."""
+    result = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "log", "-1", f"--grep={grep}", "--format=%B"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return result.stdout
+@
+
+The first test states the ordering constraint the whole redesign rests
+on: the veto is answered before [[_resolve_workdir]] is consulted, so
+a vetoed command creates no repository even when it is handed a
+project root on a plate.
+[[LEARNLOG_PROJECT_ROOT]] is that plate.
+Pointing it at an empty directory removes every other reason the run
+might decline---nothing to search for, no bound to refuse at---and
+leaves only the veto standing between [[doctor]] and a
+[[.learnlog/]] of its own.
+
+The second half asks the weaker question in the place where it
+matters, inside a project that does have a repository: an
+administrative command must add nothing to it.
+Comparing whole histories rather than grepping for an absent subject
+is deliberate here too---it catches a command that commits something
+other than what we would have thought to look for.
+
+<<autostart test functions>>=
+def test_administrative_commands_leave_no_trace(
+    cli_project, tmp_path,
+):
+    project, venv_dir, learnlog = cli_project
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    anchored = _autostart_env()
+    anchored["LEARNLOG_PROJECT_ROOT"] = str(empty)
+
+    _run_cli(
+        learnlog, ["doctor"],
+        cwd=empty, env=anchored, check=False,
+    )
+    assert list(empty.iterdir()) == []
+
+    before = _git_history(project)
+    _run_cli(learnlog, ["tag", "-l"], cwd=project)
+    _run_cli(learnlog, ["doctor"], cwd=project, check=False)
+    assert _git_history(project) == before
+@
+
+Next comes the round trip the veto exists for.
+A teacher exports a student's log and clones it somewhere to read it;
+that somewhere is an empty directory, and [[clone]] refuses to clone
+into a directory that already holds a [[.learnlog/]]
+(\cref{sec:clone}).
+While the command logged itself, [[initialize]] created that
+[[.learnlog/]] before the guard ran, so the refusal was unconditional
+and the command could not perform its only function.
+The test is therefore not primarily about equality of histories---it
+is about [[clone]] exiting zero at all, which [[check=True]] is what
+asserts.
+
+The clone runs anchored to its own target, for the same reason as in
+the test above: that is the shape a plain [[pip install learnlog]]
+has, where nothing wires the interpreter and [[_resolve_workdir]]
+answers \enquote{wherever you are standing}.  Anchored to the
+project instead, the old code would have recorded the clone in the
+\emph{sender's} log and let the command succeed---a different defect,
+and the weaker one.
+
+<<autostart test functions>>=
+def test_an_exported_log_clones_into_an_empty_directory(
+    cli_project, tmp_path,
+):
+    project, venv_dir, learnlog = cli_project
+    _run_student_program(
+        venv_dir, project, "print('export me')\n",
+    )
+    bundle = tmp_path / "shared.learnlog"
+    _run_cli(
+        learnlog, ["export", "-o", str(bundle)], cwd=project,
+    )
+    assert bundle.exists()
+
+    target = tmp_path / "clone"
+    target.mkdir()
+    anchored = _autostart_env()
+    anchored["LEARNLOG_PROJECT_ROOT"] = str(target)
+    _run_cli(
+        learnlog,
+        ["clone", str(bundle), "-C", str(target)],
+        cwd=target, env=anchored,
+    )
+
+    assert (target / ".learnlog").is_dir()
+    assert _git_history(target) == _git_history(project)
+@
+
+Receiving works the same way round.
+A [[pull]] that commits a header first has diverged from the remote by
+construction, so every pull was a non-fast-forward; the fix is not in
+[[pull]] at all but in its no longer being a run.
+We push, clone, run one more program, push again, and pull---and the
+clone must end up holding exactly the sender's history, with no record
+of the command that fetched it.
+
+<<autostart test functions>>=
+def test_pull_fast_forwards_without_recording_itself(
+    cli_project, tmp_path,
+):
+    project, venv_dir, learnlog = cli_project
+    bare = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True, timeout=30,
+    )
+    _run_cli(learnlog, ["set-remote", str(bare)], cwd=project)
+    _run_cli(learnlog, ["push"], cwd=project)
+
+    target = tmp_path / "pulled"
+    target.mkdir()
+    _run_cli(
+        learnlog,
+        ["clone", str(bare), "-C", str(target)],
+        cwd=target,
+    )
+    cloned = _git_history(target)
+
+    _run_student_program(
+        venv_dir, project, "print('after the clone')\n",
+    )
+    _run_cli(learnlog, ["push"], cwd=project)
+    assert _git_history(target) == cloned
+
+    _run_cli(learnlog, ["pull"], cwd=target)
+    pulled = _git_history(target)
+    assert pulled == _git_history(project)
+    assert "Run: learnlog pull" not in pulled
+@
+
+Tagging is the case a student meets in the shipped tutorial, and the
+one where the old policy was most quietly wrong: the tag was created,
+[[git tag]] reported success, and it named a commit every view filters
+out.
+Since HEAD when [[tag]] runs is now the trailer of the student's last
+program run, the check is on the tagged commit's subject.
+
+<<autostart test functions>>=
+def test_tag_names_the_newest_student_run(cli_project):
+    project, venv_dir, learnlog = cli_project
+    _run_student_program(venv_dir, project, "print('tag me')\n")
+    _run_cli(learnlog, ["tag", "lab1"], cwd=project)
+
+    subject = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "log", "-1", "--format=%s", "lab1"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
+
+    assert "quick.py" in subject
+    assert "learnlog" not in subject
+@
+
+The last test is the positive half of the policy, and it has to hold
+all three of its parts at once, because each is a way the others could
+be satisfied vacuously.
+[[play]] must be recorded and \emph{shown}---a hidden record would be
+no more use to a teacher than no record.
+Its trailer must name every commit that reached standard output, which
+is what makes the reflection legible rather than merely counted; we
+read the shown hashes out of [[git show]]'s own header lines and
+require set equality, so a trace that over-reports fails as loudly as
+one that under-reports.
+And the trailer must carry no captured playback text: a review that
+copied its own output into the log would embed the history inside
+itself, once per review (\cref{sec:review-runs}).
+
+<<autostart test functions>>=
+def test_batch_playback_is_recorded_and_traced(cli_project):
+    import re
+
+    project, venv_dir, learnlog = cli_project
+    _run_student_program(
+        venv_dir, project, "print('review me')\n",
+    )
+
+    played = _run_cli(learnlog, ["play", "-b"], cwd=project)
+    shown = set(
+        re.findall(
+            r"^commit ([0-9a-f]{40})$", played.stdout, re.M,
+        )
+    )
+    assert shown
+
+    listed = _run_cli(learnlog, ["list"], cwd=project)
+    assert "learnlog play" in listed.stdout
+
+    trailer = _commit_body(project, "^Run-End: learnlog play")
+    assert {
+        line.split()[1]
+        for line in trailer.splitlines()
+        if line.startswith("Viewed:")
+    } == shown
+    assert "--- I/O ---\n(no I/O)" in trailer
+    assert "diff --git" not in trailer
+@

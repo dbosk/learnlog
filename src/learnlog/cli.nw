@@ -2525,9 +2525,11 @@ manager; [[sys.prefix == sys.base_prefix]] is CPython's own test
 for that situation.  Inside a virtual environment that is not the
 project's own [[.venv/]]---the shape a [[pipx]] install produces,
 where [[doctor]] runs from learnlog's private environment---the
-marker would wire the tool rather than the student's programs,
-and learnlog would start recording its own invocations into their
-log.  A project that has a [[.venv/]] we are not running from is
+marker would wire the tool rather than the student's programs.
+The log would then fill with [[learnlog play]] and [[learnlog list]]
+runs, the two the veto lets through (\cref{sec:veto}), and with
+nothing the student ever wrote: a record of reading a history that
+was never written.  A project that has a [[.venv/]] we are not running from is
 exactly that case, and the fix is to activate it first.
 
 The check is conditioned on the project actually having a
@@ -3065,8 +3067,9 @@ def list_commits(
         typer.Option(
             "--all", "-a",
             help=(
-                "Include learnlog's own runs in the "
-                "output."
+                "Include learnlog's internal runs "
+                "(e.g. the pip install from "
+                "learnlog init)."
             ),
         ),
     ] = False,
@@ -3751,10 +3754,16 @@ def push(
 We test [[push]] by creating a bare repository as the remote target,
 configuring [[origin]] to point at it, and verifying that the commits
 arrive.
-Pushing twice deserves its own test: it used to fail, because
-finishing the first [[push]] rewrote the very commit it had just
-sent (\cref{sec:two-commit-protocol})---which is why [[--force]]
-looked necessary for an ordinary second push.
+Pushing twice deserves its own test, because it used to fail twice
+over.
+Finishing the first [[push]] rewrote the very commit it had just sent
+(\cref{sec:two-commit-protocol}), and even once that was fixed the
+push still committed a header and a trailer of its own, so the
+sending side moved every time it sent.
+Neither happens now---[[push]] is not a recorded run at all
+(\cref{sec:veto})---so the second push is an ordinary fast-forward
+over whatever the student ran in between, which is what the test
+plays out.
 
 <<test functions>>=
 def test_push_command(workdir, monkeypatch):
@@ -3837,10 +3846,9 @@ def test_push_to_divergent_remote(workdir, monkeypatch):
 def test_push_twice_succeeds(workdir, monkeypatch):
     """Pushing twice in a row works.
 
-    Running ``learnlog push`` is itself a captured run, so the
-    push is bracketed by a header and a trailer commit.  As long
-    as neither rewrites what the first push already sent, the
-    second push is an ordinary fast-forward.
+    The student runs their program between the two pushes, so
+    the second one has something to send.  Nothing the push
+    itself does may rewrite what the first one already sent.
     """
     from learnlog.cli import app
     from typer.testing import CliRunner
@@ -3855,15 +3863,15 @@ def test_push_twice_succeeds(workdir, monkeypatch):
     runner.invoke(app, ["set-remote", str(bare)])
     for minute in (0, 5):
         moment = datetime.datetime(2026, 1, 1, 10, minute)
-        repo.begin_run("learnlog", ["push"], moment)
-        result = runner.invoke(app, ["push"])
-        assert result.exit_code == 0
+        repo.begin_run("hello.py", [], moment)
         repo.finalize_run(
             io_log="",
             exception_info=None,
             end_time=moment,
             exit_code=0,
         )
+        result = runner.invoke(app, ["push"])
+        assert result.exit_code == 0
 
 def test_push_no_remote_fails(workdir, monkeypatch):
     """Push fails when no remote is configured."""
@@ -3899,6 +3907,21 @@ user sees clone progress and can respond to credential prompts.
 We deliberately avoid constructing a [[LearnlogRepo]] before the
 clone completes, because its constructor auto-initialises an empty
 repository when [[.learnlog/]] is absent.
+
+The guard that refuses to clone over an existing [[.learnlog/]] is
+worth a note, because for most of this command's life it was
+unreachable and its refusal was the only thing it ever did.
+Cloning into an empty directory is the whole point of [[clone]]---a
+teacher fetching a student's pushed log, a student moving machines---
+and every invocation used to be a recorded run, so [[initialize]]
+had already created the very directory the guard then found
+(\cref{sec:veto}).
+The command could report nothing but the state it had itself just
+produced.
+Now that an administrative subcommand leaves no trace, an empty
+directory is still empty when the guard looks, and the check finally
+means what it says: it fires only when the user really is about to
+clone over a log that is already there.
 
 <<typer commands>>=
 @app.command()
@@ -4259,6 +4282,17 @@ The implementation mirrors the [[git]] passthrough
 set the Git environment, and forward all arguments to
 [[git tag]].
 
+[[git tag]] with no ref tags HEAD, and which commit that is depends
+on something outside this command: whether [[learnlog tag]] is itself
+recorded.
+It is not (\cref{sec:veto}), and that is what makes the shipped
+workflow work.
+The tag lands on the last thing the student ran, so [[learnlog play
+lab1]] starts where they think they left off.
+While administrative commands still logged themselves, HEAD at this
+moment was the header commit of the [[learnlog tag]] run---so the tag
+named the act of tagging, on a commit that every view filters out.
+
 <<typer commands>>=
 @app.command(
     name="tag",
@@ -4299,8 +4333,9 @@ def tag_command(
     raise typer.Exit(code=result.returncode)
 @
 
-Let's verify that the command creates and lists tags, and
-reports an error when no repository exists:
+Let's verify that the command creates and lists tags, that the tag
+names the student's run and stays on the history as later runs append,
+and that it reports an error when no repository exists:
 
 <<test functions>>=
 def test_tag_command_creates_tag(workdir, monkeypatch):
@@ -4326,13 +4361,15 @@ def test_tag_command_lists_tags(workdir, monkeypatch):
     result = runner.invoke(app, ["tag", "-l"])
     assert result.exit_code == 0
 
-def test_tag_stays_on_the_history(workdir, monkeypatch):
-    """A tag survives the tagging command finishing.
+def test_tag_lands_on_the_students_own_run(
+    workdir, monkeypatch,
+):
+    """The tag names the student's work, not learnlog's.
 
-    ``learnlog tag`` is a captured run, so a trailer commit
-    lands after the tag is created.  The tag must still be an
-    ancestor of HEAD afterwards, or playback and bundles see a
-    forked history.
+    Tagging is not a recorded run, so HEAD when the tag is
+    created is still the student's last run.  Later runs append,
+    which must leave the tag an ancestor of HEAD rather than
+    forking the history playback and bundles read.
     """
     from learnlog.cli import app
     from typer.testing import CliRunner
@@ -4340,14 +4377,26 @@ def test_tag_stays_on_the_history(workdir, monkeypatch):
     monkeypatch.chdir(workdir)
     runner = CliRunner()
     moment = datetime.datetime(2026, 1, 1, 10, 0)
-    repo.begin_run("learnlog", ["tag", "lab1"], moment)
-    result = runner.invoke(app, ["tag", "lab1"])
-    assert result.exit_code == 0
+    repo.begin_run("hello.py", [], moment)
     repo.finalize_run(
         io_log="",
         exception_info=None,
         end_time=moment,
         exit_code=0,
+    )
+
+    result = runner.invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0
+    subject = repo.git(
+        "log", "-1", "--format=%s", "lab1",
+    ).stdout
+    assert "hello.py" in subject
+    assert "learnlog" not in subject
+
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 5),
     )
     ancestor = repo.git(
         "merge-base", "--is-ancestor", "lab1", "HEAD",
@@ -4390,11 +4439,17 @@ standard output is not a terminal (for example when piped to
 This means [[learnlog play | less]] just works without the user
 having to remember the flag.
 
-By default, learnlog's own runs are filtered from the output
-(\cref{sec:filter-learnlog}).
-The [[--all]] / [[-a]] flag disables this filter, showing every
-run block including those from [[learnlog play]] and
-[[learnlog export]] invocations.
+What playback shows by default is the student's own history: their
+program runs, and the [[play]] and [[list]] runs in which they read
+it back (\cref{sec:filter-learnlog}).
+What it leaves out is learnlog's plumbing---the [[pip]] install that
+[[learnlog init]] performs, and whatever an older version recorded of
+the administrative subcommands that no longer log themselves at all
+(\cref{sec:veto}).
+The [[--all]] / [[-a]] flag disables that filter.
+It is a debugging and archaeology switch rather than a reading one:
+the material it restores is setup noise and history from a policy that
+no longer applies, which is exactly why the default hides it.
 
 <<typer commands>>=
 @app.command()
@@ -4435,8 +4490,9 @@ def play(
         typer.Option(
             "--all", "-a",
             help=(
-                "Include learnlog's own runs in the "
-                "output."
+                "Include learnlog's internal runs "
+                "(e.g. the pip install from "
+                "learnlog init)."
             ),
         ),
     ] = False,
