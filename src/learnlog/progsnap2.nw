@@ -117,10 +117,13 @@ from learnlog.commits import (
     BLOCK_SEP,
 )
 from learnlog.gitrepo import (
+    EXCEPTION_SECTION_MARKER,
     GIT_DIR_NAME,
     GIT_TREE_TIMEOUT,
     GitError,
+    IO_SECTION_MARKER,
     LearnlogRepo,
+    NO_IO_PLACEHOLDER,
     format_run_header,
     format_run_trailer,
     parse_run_arguments,
@@ -137,6 +140,7 @@ PROGSNAP2_VERSION = 8
 
 
 \section{Parsing individual run blocks}
+\label{sec:parse-run-block}
 
 The existing [[parse_run_summary]] (\cref{commits}) extracts
 just enough for the [[list]] command: command string, start time,
@@ -214,30 +218,68 @@ for line in block_text.split("\n"):
         )
 @
 
-The I/O and exception sections use [[--- I/O ---]] and
-[[--- exception ---]] as delimiters.
-We extract the text between these markers, treating [[None]] and
-[[(no I/O)]] as empty values.
+The I/O and exception sections are delimited by the markers
+[[format_run_trailer]] writes (\cref{sec:io-section}), and the I/O
+section is read back by cutting exactly at them.
+The parser this replaced took the text between the markers and
+[[strip]]ped it, which is the natural thing to write and wrong for
+this format: a captured log is a transcript, so spaces at the start of
+its first line and at the end of its last are output the program
+produced, and an export that removed them showed an analysis different
+bytes than the student saw.
+
+Cutting exactly means naming both edges as the writer writes them.
+The log begins on the line after the [[--- I/O ---]] marker, so the
+opening delimiter carries the newline that ends the marker line.
+It ends one blank line above [[--- exception ---]], and that blank
+line belongs to the layout rather than to the log
+(\cref{sec:io-section}), so the closing cut drops exactly one
+newline---[[removesuffix]] rather than [[rstrip]], because a run of
+newlines at the end of the section would be output too, and only the
+last of them is the separator.
+
+Anchoring both delimiters between newlines is what keeps a run's own
+text from being mistaken for one: a program that prints
+[[--- exception ---]] has that line recorded as [[stdout: ]] plus the
+text, which the anchor does not match.
+An \emph{unprefixed} line could still say it (\cref{sec:io-notes}),
+and no anchor can settle that---the format has one way of spelling
+both---so we take the first closing marker, as this has always done.
 
 <<parse trailer fields>>=
-if "--- I/O ---" in block_text:
-    io_start = block_text.index("--- I/O ---")
-    io_text = block_text[io_start + len("--- I/O ---"):]
-    if "--- exception ---" in io_text:
-        exc_marker = io_text.index("--- exception ---")
-        io_content = io_text[:exc_marker].strip()
+io_start = block_text.find(IO_SECTION_OPEN)
+if io_start >= 0:
+    io_text = block_text[io_start + len(IO_SECTION_OPEN):]
+    exc_start = io_text.find(EXCEPTION_SECTION_OPEN)
+    if exc_start < 0:
+        io_content = io_text.rstrip("\n")
+    else:
+        io_content = io_text[:exc_start].removesuffix("\n")
         exc_content = io_text[
-            exc_marker + len("--- exception ---"):
+            exc_start + len(EXCEPTION_SECTION_OPEN):
         ].strip()
-        if io_content and io_content != "(no I/O)":
-            result["io_log"] = io_content
         if exc_content and exc_content != "None":
             result["exception_info"] = exc_content
-    else:
-        io_content = io_text.strip()
-        if io_content and io_content != "(no I/O)":
-            result["io_log"] = io_content
+    if io_content and io_content != NO_IO_PLACEHOLDER:
+        result["io_log"] = io_content
+<<progsnap2 constants>>=
+IO_SECTION_OPEN = f"\n{IO_SECTION_MARKER}\n"
+EXCEPTION_SECTION_OPEN = f"\n{EXCEPTION_SECTION_MARKER}\n"
 @
+
+The exception section keeps its [[strip]], and the asymmetry is in the
+format rather than in our attention: the I/O section has a marker
+below it to cut at, while the exception text runs to the end of the
+block and therefore ends in whatever the commit message ended
+in---Git's closing newline included.
+There is nothing there to preserve it against, so preserving it would
+be preserving punctuation the recorder never wrote.
+
+A block whose I/O section has no [[--- exception ---]] below it is not
+something [[format_run_trailer]] can produce; it is what a hand-made
+or truncated message looks like.
+We read the section to the end of the block and drop the trailing
+newlines, which is the same cut the writer would have made.
 
 Let's verify the parser handles complete blocks, header-only
 blocks (crash), and blocks with exceptions:
@@ -307,6 +349,36 @@ def test_parse_run_block_exception():
     assert result["exit_code"] == "1"
     assert result["io_log"] is None
     assert "SyntaxError" in result["exception_info"]
+@
+
+The parser's real contract is stronger than any of those blocks can
+say, and it is easiest to state by asking the writer for the block:
+whatever [[format_run_trailer]] puts in the section comes back out of
+it unchanged, spaces at both ends included.
+
+<<progsnap2 test functions>>=
+def test_parse_run_block_keeps_io_verbatim():
+    """The I/O section reads back exactly as it was written."""
+    from learnlog.gitrepo import format_run_trailer
+    from learnlog.progsnap2 import parse_run_block
+    io_log = (
+        "   [session start]   \n"
+        "stdout: padded   \n"
+        "stdout: \n"
+        "stdout: "
+    )
+    block = "\n".join([
+        "Run: menu.py (none)",
+        "",
+        "Script: menu.py",
+        "Arguments: (none)",
+        "Start-Time: 2026-01-01T10:00:00",
+        format_run_trailer(
+            io_log, None,
+            datetime.datetime(2026, 1, 1, 10, 0, 5), 0,
+        ),
+    ])
+    assert parse_run_block(block)["io_log"] == io_log
 @
 
 A review run's block reaches the exporter with its navigation intact,
@@ -545,17 +617,106 @@ Each chunk is a tuple of [[(event_type, text)]]:
   ProgSnap2 does not distinguish them).
 \item[ [[X-Run.Input]] ] contains the text of a single
   [[stdin]] line.
+\item[ [[X-Run.Note]] ] contains the joined lines that name
+  no stream at all (\cref{sec:io-notes}).
 \end{description}
+
+\subsection{Lines that name no stream}
+\label{sec:io-notes}
+
+A log line normally begins with the stream it came from, but not every
+line does, and what happens to the ones that do not is a decision this
+side has to make rather than assume away.
+The chunker this replaced dropped them: a line matching none of the
+three prefixes fell through the branches and was never written to the
+dataset, so an export quietly reported a shorter transcript than the
+one the run recorded.
+
+The tempting answer is that this cannot happen---[[IOLog]] prefixes
+every line it writes (\cref{capture})---and it is wrong for exactly
+the line that matters most.
+When a run exceeds the log's size cap, the capture layer appends a
+bracketed [[learnlog: I/O log truncated at N bytes]] line of its own,
+with no prefix, and that is the one line in the log a reader must not
+lose: it is the log saying that it is incomplete.
+Rejecting unprefixed input at [[finalize_run]] would refuse learnlog's
+own marker, and prefixing it would attribute learnlog's words to the
+student's program.
+
+So we keep such a line as itself.
+It becomes a chunk of its own kind, [[X-Run.Note]], grouped like
+output because consecutive notes are as much one block as consecutive
+output lines are, and it comes back with no prefix added, which is
+what makes the round trip exact rather than merely lossless-looking.
+
+<<progsnap2 functions>>=
+def classify_io_line(line):
+    """Split one I/O log line into an event type and its text.
+
+    ``stdout:`` and ``stderr:`` lines are output, ``stdin:``
+    lines are input, and a line carrying none of those prefixes
+    is a note and keeps its text whole.
+    """
+    for prefix, event_type in IO_LINE_PREFIXES:
+        if line.startswith(prefix):
+            return event_type, line[len(prefix):]
+    return "X-Run.Note", line
+<<progsnap2 constants>>=
+IO_LINE_PREFIXES = (
+    ("stdout: ", "X-Run.Output"),
+    ("stderr: ", "X-Run.Output"),
+    ("stdin: ", "X-Run.Input"),
+)
+@
+
+Turning a dataset back into a log reads the same correspondence
+backwards (\cref{sec:rebuild-io-log}), and needs one thing more than
+the prefix: which column of the event holds the text.
+A second table says both, and saying them in one place is what keeps
+export and import inverses of each other rather than two hand-written
+descriptions of the same correspondence---the export side picks the
+column from it as well.
+
+[[X-Run.Note]] gets a column of its own rather than borrowing
+[[ProgramOutput]], because that column is the ProgSnap2 spec's and
+means \enquote{what the program printed}; a note is learnlog talking
+about the run, and filing it as program output would be the same kind
+of silent lie as dropping it.
+The [[X-]] namespace is where a format keeps what the spec has no word
+for.
+
+Note that this table is not the inverse of the one above: two prefixes
+map to output and only one comes back, which is the [[stderr]]
+distinction ProgSnap2 cannot express and learnlog therefore loses at
+export.
+That loss is in the spec's shape, not in this code, and it is the only
+one left in this direction.
+
+<<progsnap2 constants>>=
+IO_EVENT_COLUMNS = {
+    "X-Run.Output": ("ProgramOutput", "stdout: "),
+    "X-Run.Input": ("ProgramInput", "stdin: "),
+    "X-Run.Note": ("X-Note", ""),
+}
+@
+
+\subsection{Grouping the lines into chunks}
+
+With the line vocabulary named, the chunker is a grouping loop over
+it.
+An input line is its own chunk---a student's answer is one act, and
+merging two of them would invent a conversation that did not
+happen---while output and notes accumulate until the kind changes.
 
 <<progsnap2 functions>>=
 def chunk_io_log(io_log):
-    """Chunk an I/O log into output/input event pairs.
+    """Chunk an I/O log into output, input, and note events.
 
     Returns a list of ``(event_type, text)`` tuples where
-    ``event_type`` is ``"X-Run.Output"`` or
-    ``"X-Run.Input"``.  Consecutive output lines are
-    grouped into a single output chunk; each input line
-    becomes its own chunk.
+    ``event_type`` is ``"X-Run.Output"``, ``"X-Run.Input"``, or
+    ``"X-Run.Note"``.  Consecutive output lines are grouped into
+    a single output chunk, as are consecutive notes; each input
+    line becomes its own chunk.
 
     Returns an empty list if ``io_log`` is empty or None.
     """
@@ -563,36 +724,34 @@ def chunk_io_log(io_log):
         return []
 
     chunks = []
-    output_buf = []
+    buffered = []
+    buffered_type = None
 
     for line in io_log.split("\n"):
-        if line.startswith("stdin: "):
-            if output_buf:
-                chunks.append((
-                    "X-Run.Output",
-                    "\n".join(output_buf),
-                ))
-                output_buf = []
-            chunks.append((
-                "X-Run.Input",
-                line[len("stdin: "):],
-            ))
-        elif line.startswith("stdout: "):
-            output_buf.append(
-                line[len("stdout: "):]
-            )
-        elif line.startswith("stderr: "):
-            output_buf.append(
-                line[len("stderr: "):]
-            )
+        event_type, text = classify_io_line(line)
+        if event_type == "X-Run.Input":
+            <<flush the buffered lines>>
+            chunks.append((event_type, text))
+            continue
+        if event_type != buffered_type:
+            <<flush the buffered lines>>
+            buffered_type = event_type
+        buffered.append(text)
 
-    if output_buf:
-        chunks.append((
-            "X-Run.Output",
-            "\n".join(output_buf),
-        ))
+    <<flush the buffered lines>>
 
     return chunks
+@
+
+The flush asks whether the buffer is empty, not whether its text is,
+and that is what keeps a blank entry from vanishing: a program that
+printed an empty line leaves a buffer holding one empty string, and a
+list holding an empty string is not an empty list.
+
+<<flush the buffered lines>>=
+if buffered:
+    chunks.append((buffered_type, "\n".join(buffered)))
+    buffered = []
 @
 
 <<progsnap2 test functions>>=
@@ -659,6 +818,38 @@ def test_chunk_io_log_only_input():
     log = "stdin: yes"
     chunks = chunk_io_log(log)
     assert chunks == [("X-Run.Input", "yes")]
+@
+
+The lines that name no stream have two things to prove: that they
+reach the dataset at all, and that they arrive whole---prefix-shaped
+text at the start of such a line is text, not a prefix, and a line
+that merely resembles one is still a note.
+
+<<progsnap2 test functions>>=
+def test_chunk_io_log_keeps_unprefixed_lines():
+    """A line naming no stream becomes a note, kept whole."""
+    from learnlog.progsnap2 import chunk_io_log
+    log = (
+        "stdout: working\n"
+        "[learnlog: I/O log truncated at 10 bytes]\n"
+        "   stdout: not a prefix"
+    )
+    chunks = chunk_io_log(log)
+    assert chunks == [
+        ("X-Run.Output", "working"),
+        (
+            "X-Run.Note",
+            "[learnlog: I/O log truncated at 10 bytes]\n"
+            "   stdout: not a prefix",
+        ),
+    ]
+
+def test_chunk_io_log_keeps_blank_output_entries():
+    """Trailing blank entries are entries, not padding."""
+    from learnlog.progsnap2 import chunk_io_log
+    log = "stdout: hi\nstdout: \nstdout: "
+    chunks = chunk_io_log(log)
+    assert chunks == [("X-Run.Output", "hi\n\n")]
 @
 
 
@@ -1095,10 +1286,8 @@ for evt_type, text in io_chunks:
         "X-CommitHash": commit_hash,
     }
     resource_path = f"Resources/io_{order}.txt"
-    if evt_type == "X-Run.Output":
-        io_event["ProgramOutput"] = resource_path
-    else:
-        io_event["ProgramInput"] = resource_path
+    column, _ = IO_EVENT_COLUMNS[evt_type]
+    io_event[column] = resource_path
     resource_files.append((resource_path, text))
     events.append(io_event)
 @
@@ -1291,6 +1480,9 @@ time without changing the meaning of [[ServerTimestamp]] and
 The [[X-ViewedCommit]] and [[X-ViewAction]] columns carry the view
 trace of a review run (\cref{sec:review-events}); only
 [[X-Review.View]] events fill them.
+The [[X-Note]] column references the resource file of an
+[[X-Run.Note]] event, the transcript lines that name no stream
+(\cref{sec:io-notes}), and is empty everywhere else.
 Older datasets remain valid because the reader keeps whatever columns
 the CSV provides.
 
@@ -1314,6 +1506,7 @@ main_columns = [
     "X-ExceptionType", "X-ExceptionMessage",
     "ProgramOutput",
     "ProgramInput",
+    "X-Note",
     "X-Tag",
     "X-CommitHash",
     "X-ViewedCommit",
@@ -2845,14 +3038,20 @@ def build_reconstructed_run_block(event, io_log, view_trace=None):
     if io_log or exception_info:
         parts.extend([
             "",
-            "--- I/O ---",
-            io_log.rstrip("\n") if io_log else "(no I/O)",
+            IO_SECTION_MARKER,
+            (io_log or "").rstrip("\n") or NO_IO_PLACEHOLDER,
             "",
-            "--- exception ---",
+            EXCEPTION_SECTION_MARKER,
             exception_info or "None",
         ])
     return "\n".join(parts)
 @
+
+The fallback writes the section the way [[format_run_trailer]] does,
+down to the placeholder for a log that is nothing but newlines
+(\cref{sec:io-section}), because a block this function produces is
+read back by the same parser as any other and there is only one form
+for it to read.
 
 The exception text stored in ProgSnap2 is split into type and
 message columns.
@@ -2870,10 +3069,16 @@ def rebuild_exception_info(event):
     return exc_type or exc_msg or None
 @
 
+\subsection{Turning the events back into a log}
+\label{sec:rebuild-io-log}
+
 ProgSnap2 stores child I/O events separately from the parent run.
 We rebuild learnlog's textual I/O log by walking the matching
-child events in order and reattaching the original [[stdout:]]/
-[[stdin:]] prefixes.
+child events in order and putting each one's lines back under the
+prefix its kind is written with---which is the second reading of
+[[IO_EVENT_COLUMNS]] (\cref{sec:io-notes}), so the log comes back
+under the prefixes it went in with by construction rather than by two
+lists agreeing.
 The [[stderr]] distinction is already lost at export time, so all
 output is reconstructed as [[stdout:]].
 
@@ -2883,6 +3088,14 @@ which becomes a trailing newline in the resource text.
 Reconstruction therefore has to use [[split("\n")]] rather than
 [[splitlines()]]: the trailing empty element is not a stray artifact,
 but the representation of the student's actual blank line.
+
+For the same reason the joined log is returned as it is.
+An earlier version ended with [[rstrip("\n")]], which was harmless
+only as long as every line carried a prefix: prefixed lines cannot end
+in a newline, so the strip could never fire except on a note
+(\cref{sec:io-notes})---that is, except on data.
+Trimming the log is [[format_run_trailer]]'s decision to make
+(\cref{sec:io-section}), and it makes it either way.
 
 <<progsnap2 functions>>=
 def rebuild_io_log(events, parent_event_id, resources):
@@ -2896,24 +3109,20 @@ def rebuild_io_log(events, parent_event_id, resources):
         key=lambda event: int(event["Order"]),
     )
     for event in children:
-        if event["EventType"] == "X-Run.Output":
-            resource = event.get("ProgramOutput", "")
-            prefix = "stdout: "
-        elif event["EventType"] == "X-Run.Input":
-            resource = event.get("ProgramInput", "")
-            prefix = "stdin: "
-        else:
+        columns = IO_EVENT_COLUMNS.get(event["EventType"])
+        if columns is None:
             continue
-        text = resources.get(resource, "")
+        column, prefix = columns
+        text = resources.get(event.get(column, ""), "")
         lines.extend(
             f"{prefix}{line}" for line in text.split("\n")
         )
-    return "\n".join(lines).rstrip("\n")
+    return "\n".join(lines)
 @
 
-The [[else: continue]] above is what makes the two child kinds
+The unknown-type skip above is what makes the child kinds
 independent: a run's children are whatever events name it as parent,
-and the loop reads only the ones it recognises.
+and the loop reads only the ones the table names.
 An [[X-Review.View]] among them is therefore not a case to handle but a
 case already handled, which is the same tolerance the pairing loop
 (\cref{sec:group-pairs}) relies on.
@@ -3372,10 +3581,19 @@ the comparison.
 is written, not something ProgSnap2 records, and a reconstructed run
 is one commit that needs no such link.
 Dropping that line and requiring the rest to match exactly is
-therefore the strongest statement the round trip can support---and it
-fails the moment anything tidies the message, because the I/O below is
-a menu prompt padded with spaces followed by two empty lines, and
-Git's default commit cleanup removes both.
+therefore the strongest statement the round trip can support.
+
+The log it makes that statement about is built to break every way the
+path has been observed to lose a byte, because a fidelity test is only
+as good as the ugliest transcript it carries.
+Its first line is padded with spaces on the left and its prompt padded
+on the right, which is where Git's default commit cleanup used to
+strike and where the export's [[strip]] struck after that; its blank
+entries come in runs, including at the very end, where the trailer's
+last newline and the resource encoding's meet
+(\cref{sec:io-section}); and a note sits in the middle of it, so the
+lines that name no stream (\cref{sec:io-notes}) are covered by the
+same equality rather than by a promise.
 
 <<progsnap2 test functions>>=
 def test_read_progsnap2_as_repo_keeps_the_message_verbatim(
@@ -3400,10 +3618,13 @@ def test_read_progsnap2_as_repo_keeps_the_message_verbatim(
     )
     repo.finalize_run(
         io_log=(
+            "   [session start]   \n"
             "stdout: choose:   \n"
             "stdout: \n"
             "stdout: \n"
             "stdout: done\n"
+            "stdout: \n"
+            "stdout: \n"
         ),
         exception_info=None,
         end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
@@ -3432,6 +3653,61 @@ def test_read_progsnap2_as_repo_keeps_the_message_verbatim(
             get_commits(reconstructed)[-1]["hash"],
         ).stdout
         assert rebuilt.rstrip("\n") == expected
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+That equality would also hold if the export dropped a note and the
+import invented an identical one, so the policy for lines that name no
+stream (\cref{sec:io-notes}) is pinned where it is decided: in the
+dataset.
+The line under test is the one that made keeping them the only
+honest choice---learnlog's truncation marker---and the assertion is
+that it arrives as a note event carrying its own text, not as
+program output and not as nothing.
+
+<<progsnap2 test functions>>=
+def test_export_progsnap2_keeps_unprefixed_lines(workdir):
+    """A line naming no stream is exported as a note event."""
+    import shutil
+    from learnlog.commits import get_commits
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    notice = "[learnlog: I/O log truncated at 10 bytes]"
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "noisy.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log=f"stdout: hello\n{notice}\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+
+    output = workdir / "notes.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    dataset = read_progsnap2(output)
+    notes = [
+        event for event in dataset["events"]
+        if event["EventType"] == "X-Run.Note"
+    ]
+    assert len(notes) == 1
+    assert notes[0]["ProgramOutput"] == ""
+    assert dataset["resources"][notes[0]["X-Note"]] == notice
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        rebuilt = reconstructed.git(
+            "log", "-1", "--format=%B",
+            get_commits(reconstructed)[-1]["hash"],
+        ).stdout
+        assert f"stdout: hello\n{notice}\n" in rebuilt
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 @
@@ -3920,8 +4196,12 @@ for sid in by_subject:
 For each subject we walk the sorted events.
 A [[File.Edit]] starts a new pair accumulator.
 A [[Run.Program]] completes the current pair.
-I/O events ([[X-Run.Output]], [[X-Run.Input]]) are attached
-to the most recent [[Run.Program]] via [[ParentEventID]].
+The child events of a run---output, input, and the notes that name no
+stream (\cref{sec:io-notes})---are attached to the most recent
+[[Run.Program]] via [[ParentEventID]].
+Asking [[IO_EVENT_COLUMNS]] which types those are keeps this loop
+correct for free when the vocabulary grows: a transcript line the
+exporter learns to keep is one the report learns to show.
 When a [[Run.Program]] appears without a preceding
 [[File.Edit]], we create a pair with [[edit=None]]---this
 happens when the student re-runs without editing.
@@ -3957,9 +4237,7 @@ for sid, subj_events in by_subject.items():
             current_tag = tag
         elif etype == "Run.Program":
             <<create pair from edit and run>>
-        elif etype in (
-            "X-Run.Output", "X-Run.Input"
-        ):
+        elif etype in IO_EVENT_COLUMNS:
             <<attach I/O to parent run>>
 
     <<flush final pending edit>>
@@ -4952,6 +5230,10 @@ I/O events are stored as resource files in the zip.
 We read each resource and concatenate them, prefixing
 input lines with [[>~]] so the reader can distinguish
 what the student typed from what the program printed.
+Which column holds an event's resource is again the table's answer
+(\cref{sec:io-notes}), so a note reaches the report as the line it
+is---and a report of a run whose log was truncated says so, which is
+the whole reason those lines are kept.
 
 <<progsnap2 functions>>=
 def format_io_latex(io_events, resources):
@@ -4967,11 +5249,10 @@ def format_io_latex(io_events, resources):
     parts = []
     for event in io_events:
         etype = event["EventType"]
-        res_path = (
-            event.get("ProgramOutput", "")
-            or event.get("ProgramInput", "")
+        column, _ = IO_EVENT_COLUMNS.get(
+            etype, ("ProgramOutput", ""),
         )
-        text = resources.get(res_path, "")
+        text = resources.get(event.get(column, ""), "")
         if etype == "X-Run.Input":
             for line in text.split("\n"):
                 parts.append(f"> {line}")
@@ -4979,6 +5260,34 @@ def format_io_latex(io_events, resources):
             parts.append(text)
 
     return "\n".join(parts).rstrip()
+@
+
+Let's verify that the report shows a transcript line that names no
+stream, since a truncated log is exactly the run whose report must not
+look complete:
+
+<<progsnap2 test functions>>=
+def test_format_io_latex_shows_notes():
+    """A note reaches the report as the line it is."""
+    from learnlog.progsnap2 import format_io_latex
+    notice = "[learnlog: I/O log truncated at 5 bytes]"
+    io_events = [
+        {
+            "EventType": "X-Run.Output",
+            "ProgramOutput": "Resources/io_2.txt",
+        },
+        {
+            "EventType": "X-Run.Note",
+            "ProgramOutput": "",
+            "X-Note": "Resources/io_3.txt",
+        },
+    ]
+    resources = {
+        "Resources/io_2.txt": "hello",
+        "Resources/io_3.txt": notice,
+    }
+    assert format_io_latex(io_events, resources) == \
+        f"hello\n{notice}"
 @
 
 \subsection{\LaTeX{} escaping}
