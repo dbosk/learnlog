@@ -4738,6 +4738,42 @@ stops Typer from rejecting flags it does not recognise,
 [[allow_interspersed_args]] set to [[False]] ensures that everything
 after the first positional argument is passed through verbatim.
 
+\paragraph{Two commands the passthrough must not forward as written.}
+A passthrough inherits its host's assumptions, and this one inherits a
+work tree that is the student's project and a repository that Git
+itself does not recognise as one.
+Two ordinary Git commands become destructive under those assumptions,
+and neither of them looks dangerous to the student typing it.
+
+[[git clean -xdf]] is the command every student is eventually told to
+run to get rid of build output.
+[[.learnlog/]] survives an ordinary [[git clean]] only because it is
+listed in [[info/exclude]], and [[-x]] is precisely the flag that says
+\enquote{ignore the exclude rules}.
+Git's own safety net does not apply either: it protects a directory
+named [[.git]], and this one is not.
+So the command deletes the entire log---and the lock file with
+it---and exits zero without a word.
+
+[[git reset --hard]] is the command students are told to run to undo a
+mess.
+Under [[--work-tree=.]] the mess it undoes is their source code:
+every uncommitted edit in the project, reverted to whatever the last
+run happened to record.
+With [[HEAD~n]] it rewinds the log and the source together.
+
+What both need is not a smaller passthrough but a corrected one.
+For [[clean]] we add an exclusion, because Git applies exclusions
+cumulatively: [[-e .learnlog]] leaves every legitimate use of
+[[clean -xdf]] working exactly as the student expects, and only puts
+the log out of reach.
+For [[reset --hard]] no argument can make the command safe---discarding
+uncommitted work \emph{is} what it does---so we refuse it, say what it
+would have destroyed, and offer the flag that permits it anyway.
+A student who really means it types [[--allow-destructive]]; a student
+who has been handed the incantation by a forum post gets a sentence
+explaining what they were about to lose.
+
 <<typer commands>>=
 @app.command(
     name="git",
@@ -4749,18 +4785,34 @@ after the first positional argument is passed through verbatim.
 )
 def git_command(
     ctx: typer.Context,
+    allow_destructive: Annotated[
+        bool,
+        typer.Option(
+            "--allow-destructive",
+            help=(
+                "Permit git commands that throw away "
+                "uncommitted work, such as reset --hard."
+            ),
+        ),
+    ] = False,
 ):
     """Run a git command on the learnlog repository.
 
     All arguments are forwarded to git, configured to
     operate on the .learnlog/ directory.  For example,
     ``learnlog git log`` lists the recorded commits.
+    ``git clean`` is always given an extra exclusion so it
+    cannot delete the log, and ``git reset --hard`` is
+    refused unless ``--allow-destructive`` precedes it.
     """
     workdir = find_learnlog_dir()
     if workdir is None:
         raise SystemExit(
             "No .learnlog/ directory found."
         )
+    args = guard_passthrough(
+        ctx.args, workdir, allow_destructive,
+    )
 
     learnlog_dir = workdir / ".learnlog"
     env = {
@@ -4770,11 +4822,146 @@ def git_command(
     }
 
     result = subprocess.run(
-        ["git"] + ctx.args,
+        ["git"] + args,
         env=env,
         cwd=str(workdir),
     )
     raise typer.Exit(code=result.returncode)
+@
+
+Both rules key off the Git subcommand, which is not simply the first
+argument: [[git -C dir clean -xdf]] is a perfectly ordinary
+invocation.
+The subcommand is the first argument that is neither an option nor the
+value of one, so finding it means knowing which of Git's own options
+take a value.
+
+<<helper functions>>=
+def git_subcommand_index(args):
+    """Return the position of the Git subcommand in ``args``.
+
+    Returns ``None`` when the arguments name no subcommand.
+    """
+    skip = False
+    for position, argument in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if argument.startswith("-"):
+            skip = argument in GIT_OPTIONS_WITH_VALUES
+            continue
+        return position
+    return None
+<<constants>>=
+GIT_OPTIONS_WITH_VALUES = (
+    "-C", "-c", "--git-dir", "--work-tree",
+    "--namespace", "--config-env",
+)
+@
+
+<<helper functions>>=
+def guard_passthrough(args, workdir, allow_destructive):
+    """Return the arguments to forward to Git.
+
+    Adds the exclusion that keeps ``git clean`` away from the log,
+    and raises ``SystemExit`` on a ``git reset --hard`` that the
+    student has not explicitly permitted.
+    """
+    position = git_subcommand_index(args)
+    if position is None:
+        return list(args)
+    if args[position] == "clean":
+        return protect_log_from_clean(args, position)
+    if args[position] == "reset" and not allow_destructive:
+        if has_hard_flag(args[position + 1:]):
+            raise SystemExit(describe_reset_refusal(workdir))
+    return list(args)
+@
+
+The exclusion has to be inserted immediately after [[clean]] rather
+than appended, because everything after a [[--]] is a path and an
+option there would be read as one.
+
+Which pattern to insert depends on a flag, and the reason is worth
+spelling out because the two look contradictory.
+Under [[-x]] Git removes everything untracked except what the exclude
+patterns match, so the log is saved by \emph{being} excluded.
+Under [[-X]] Git removes exactly the files the exclude patterns match,
+so the same pattern would order its deletion; what saves the log there
+is the negated pattern [[!.learnlog]], which cancels the
+[[info/exclude]] entry and takes the log out of the set [[-X]] acts
+on.
+One flag needs the log ignored and the other needs it un-ignored, so
+we look at which one is present.
+
+<<helper functions>>=
+def protect_log_from_clean(args, position):
+    """Insert the exclusion that keeps ``git clean`` off the log."""
+    options = list(args[position + 1:])
+    pattern = (
+        CLEAN_UNIGNORE_LOG if clean_removes_ignored_only(options)
+        else CLEAN_EXCLUDE_LOG
+    )
+    return list(args[:position + 1]) + ["-e", pattern] + options
+<<constants>>=
+CLEAN_EXCLUDE_LOG = ".learnlog"
+CLEAN_UNIGNORE_LOG = "!.learnlog"
+@
+
+[[-X]] has no long form, so it can only arrive as a short option,
+possibly bundled with others ([[-Xdf]]).
+Scanning the bundle stops at an [[e]], because the rest of that bundle
+is [[--exclude]]'s pattern rather than more flags.
+
+<<helper functions>>=
+def clean_removes_ignored_only(options):
+    """Return whether a ``git clean`` argument list carries ``-X``."""
+    pattern_follows = False
+    for argument in options:
+        if pattern_follows:
+            pattern_follows = False
+            continue
+        if argument == "--":
+            break
+        if not argument.startswith("-") or argument.startswith("--"):
+            continue
+        for offset, letter in enumerate(argument[1:], start=1):
+            if letter == "e":
+                pattern_follows = offset == len(argument) - 1
+                break
+            if letter == "X":
+                return True
+    return False
+@
+
+[[--hard]] is looked for only before a [[--]], since after one it is a
+file name.
+
+<<helper functions>>=
+def has_hard_flag(options):
+    """Return whether ``--hard`` appears among ``git reset`` options."""
+    for argument in options:
+        if argument == "--":
+            return False
+        if argument == "--hard":
+            return True
+    return False
+@
+
+The refusal names the directory whose contents were at stake, because
+the student's mental model of [[learnlog git]] is \enquote{something
+about the log}, and the surprise worth removing is that this
+particular command was about their source code.
+
+<<helper functions>>=
+def describe_reset_refusal(workdir):
+    """Explain why a ``git reset --hard`` was not forwarded."""
+    return (
+        f"Refusing git reset --hard: it would discard every "
+        f"uncommitted change under {workdir} and rewind the log to "
+        f"match.  Re-run it as 'learnlog git --allow-destructive "
+        f"reset --hard ...' if that is really what you want."
+    )
 @
 
 Let's verify that the command forwards to Git correctly, reports
@@ -4815,6 +5002,124 @@ def test_git_command_forwards_exit_code(
         app, ["git", "log", "--invalid-option"]
     )
     assert result.exit_code != 0
+@
+
+The two guarded shapes each need a test with two halves: the log
+survives, and the command the student actually asked for still
+happens.
+A guard that stopped [[clean]] from removing anything would pass the
+first half and be useless:
+
+<<test functions>>=
+def test_git_clean_spares_the_log(workdir, monkeypatch):
+    """clean -xdf removes untracked files but not the log."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    junk = workdir / "junk.txt"
+    junk.write_text("build output\n")
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["git", "clean", "-xdf"]
+    )
+    assert result.exit_code == 0
+    assert not junk.exists()
+    assert (workdir / ".learnlog" / "HEAD").is_file()
+
+def test_git_clean_ignored_only_spares_the_log(
+    workdir, monkeypatch,
+):
+    """clean -Xdf removes ignored files but not the log."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    stale = workdir / "hello.pyc"
+    stale.write_text("stale bytecode\n")
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["git", "clean", "-Xdf"]
+    )
+    assert result.exit_code == 0
+    assert not stale.exists()
+    assert (workdir / ".learnlog" / "HEAD").is_file()
+
+def test_git_reset_hard_is_refused(workdir, monkeypatch):
+    """reset --hard is refused, and changes nothing."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    script.write_text('print("uncommitted")\n')
+    monkeypatch.chdir(workdir)
+    before = repo.git("rev-parse", "HEAD").stdout.strip()
+    result = CliRunner().invoke(
+        app, ["git", "reset", "--hard"]
+    )
+    assert result.exit_code != 0
+    assert "--allow-destructive" in result.output
+    assert script.read_text() == 'print("uncommitted")\n'
+    assert repo.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip() == before
+
+def test_git_reset_hard_with_opt_in(workdir, monkeypatch):
+    """The opt-in flag lets reset --hard through."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    script.write_text('print("uncommitted")\n')
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app,
+        ["git", "--allow-destructive", "reset", "--hard"],
+    )
+    assert result.exit_code == 0
+    assert script.read_text() == 'print("hello")\n'
+@
+
+The argument-scanning helpers deserve tests of their own, because the
+shapes they have to get right---a global option before the
+subcommand, a bundled [[-X]], a [[--]] separator---are exactly the
+ones that are awkward to provoke through the CLI:
+
+<<test functions>>=
+def test_git_subcommand_index_skips_global_options():
+    """The subcommand is found past Git's own options."""
+    from learnlog.cli import git_subcommand_index
+    assert git_subcommand_index(["clean", "-xdf"]) == 0
+    assert git_subcommand_index(
+        ["-C", "sub", "clean", "-xdf"]
+    ) == 2
+    assert git_subcommand_index(["--no-pager", "log"]) == 1
+    assert git_subcommand_index(["--version"]) is None
+
+def test_clean_exclusion_follows_the_subcommand():
+    """The exclusion is inserted before any -- separator."""
+    from learnlog.cli import protect_log_from_clean
+    assert protect_log_from_clean(
+        ["clean", "-xdf", "--", "src"], 0
+    ) == ["clean", "-e", ".learnlog", "-xdf", "--", "src"]
+    assert protect_log_from_clean(["clean", "-Xdf"], 0) == [
+        "clean", "-e", "!.learnlog", "-Xdf",
+    ]
+
+def test_clean_ignored_only_detection():
+    """-X is recognised bundled, but not as an -e pattern."""
+    from learnlog.cli import clean_removes_ignored_only
+    assert clean_removes_ignored_only(["-Xdf"])
+    assert clean_removes_ignored_only(["-d", "-X"])
+    assert not clean_removes_ignored_only(["-xdf"])
+    assert not clean_removes_ignored_only(["-xdf", "-e", "X"])
+    assert not clean_removes_ignored_only(["-xdf", "-eX"])
+    assert not clean_removes_ignored_only(["-xdf", "--", "-X"])
+
+def test_hard_flag_after_separator_is_a_path():
+    """--hard past a -- separator is a file name."""
+    from learnlog.cli import has_hard_flag
+    assert has_hard_flag(["--hard", "HEAD~1"])
+    assert not has_hard_flag(["--soft", "HEAD~1"])
+    assert not has_hard_flag(["--", "--hard"])
 @
 
 
