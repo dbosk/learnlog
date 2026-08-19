@@ -3790,6 +3790,7 @@ def test_trailer_keeps_the_io_log_verbatim(workdir):
 
 
 \section{Formatting the run trailer}
+\label{sec:io-section}
 
 The trailer contains the end time, exit code, I/O log, and exception
 information.
@@ -3809,6 +3810,37 @@ search for.
 A run with nothing to report writes no lines at all, which is why the
 ordinary program run's trailer is byte-for-byte what it always was.
 
+Everything downstream reads the log from between these two markers,
+not from the argument the recorder passed in: the exporter parses the
+section (\cref{sec:parse-run-block}), and the importer writes a new
+one.
+So this function does not merely print the log, it \emph{defines} the
+form the log is kept in, and every reader has to be able to reproduce
+that form exactly---which it can only do if there is one form to
+reproduce.
+
+Two rules give it one.
+The log's trailing newlines come off, because the section is a
+sequence of lines and the newline that ends its last line is written
+by the join, not by the log; leaving the log's own would make the
+section end with a blank line that is also the separator before
+[[--- exception ---]], and nothing could later tell the two apart.
+And a log that this leaves empty---one that was newlines and nothing
+else---is written as [[(no I/O)]] rather than as an empty section, so
+\enquote{nothing was captured} has a single spelling.
+The second rule is what the first one costs: without it the
+placeholder and the empty section mean the same thing in different
+bytes, and a reader that has to choose one of them when it writes the
+section back---which the ProgSnap2 importer does---returns a trailer
+that differs from the one it was given, in a run that captured
+nothing.
+
+Naming the markers as constants serves the same end.
+It lets the parser be written as this function's inverse rather than
+as a second description of the same layout
+(\cref{sec:parse-run-block}), so the two can disagree only if someone
+changes the constant---and then they change together.
+
 <<functions>>=
 def format_run_trailer(io_log, exception_info,
                        end_time, exit_code, view_trace=None):
@@ -3818,6 +3850,10 @@ def format_run_trailer(io_log, exception_info,
     information.  ``view_trace``, when given, is a sequence of
     ``(time, commit, action)`` triples written out as ``Viewed:``
     lines.
+
+    The I/O section holds the log verbatim apart from its trailing
+    newlines; a log with nothing left after those is written as the
+    ``(no I/O)`` placeholder.
     """
     parts = [
         f"End-Time: {end_time.isoformat()}",
@@ -3828,16 +3864,20 @@ def format_run_trailer(io_log, exception_info,
     )
     parts.extend([
         "",
-        "--- I/O ---",
-        io_log.rstrip("\n") if io_log else "(no I/O)",
+        IO_SECTION_MARKER,
+        (io_log or "").rstrip("\n") or NO_IO_PLACEHOLDER,
         "",
-        "--- exception ---",
+        EXCEPTION_SECTION_MARKER,
     ])
     if exception_info:
         parts.append(exception_info)
     else:
         parts.append("None")
     return "\n".join(parts)
+<<constants>>=
+IO_SECTION_MARKER = "--- I/O ---"
+EXCEPTION_SECTION_MARKER = "--- exception ---"
+NO_IO_PLACEHOLDER = "(no I/O)"
 @
 
 Each line answers three questions in the order a reader asks them:
@@ -3894,6 +3934,22 @@ def test_format_run_trailer_with_exception():
     )
     assert "Exit-Code: 1" in trailer
     assert "ValueError: oops" in trailer
+@
+
+The rule that keeps the section round-trippable is worth stating as a
+test of its own, because it is invisible in any log that captured
+something: a log of newlines and an absent log are the same run to a
+reader, so they must be the same bytes to a writer.
+
+<<test functions>>=
+def test_format_run_trailer_writes_no_io_once():
+    """A log left empty by the rstrip is the empty log."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    assert format_run_trailer("\n\n", None, end, 0) == \
+        format_run_trailer("", None, end, 0)
+    assert NO_IO_PLACEHOLDER in format_run_trailer(
+        "\n\n", None, end, 0,
+    )
 @
 
 The view trace has two things to prove, and the second is the one that
