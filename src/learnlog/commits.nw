@@ -337,17 +337,45 @@ Since a trailer commit exists only to complete the run before it,
 we treat such a ref as naming that run, and step back to its
 header commit.
 
+The hash reaching this function is whatever a ref or a caller
+supplied, so the subject probe can fail, and its failing is not an
+error here.
+Git refuses a hash the object database no longer has, and a ref may
+name an object it will not walk as a commit at all; the probe then
+exits non-zero and [[git()]] would raise [[GitError]]
+(\cref{sec:diagnostics}).
+That failure is itself the answer to the question being asked: a hash
+Git cannot read as a commit is certainly not a trailer commit.
+So the probe opts out of [[check]] and such a hash resolves to
+itself---the same answer the [[rev-parse]] probe below already gives
+when it cannot step back to a parent.
+
+Reporting \enquote{not a commit} to the caller instead, as [[None]] or
+as an exception, has no shape that suits the callers.
+Both of them are read paths that have to degrade rather than abort:
+[[get_tag_map]] (\cref{sec:tag-resolution}), whose own [[git tag -l]]
+already falls back to an empty map, and [[play --from]]
+(\cref{sec:play}), which turns a hash it cannot find in the commit
+list into a message naming the ref the user typed.
+Handing them back the hash unchanged leads each of them to the answer
+it already has for a hash that names no run, whereas a second return
+shape would give both of them a new failure mode to handle for
+nothing gained.
+
 <<commits functions>>=
 def resolve_record_commit(repo, commit_hash):
     """Return the commit that carries ``commit_hash``'s record.
 
     Trailer commits resolve to the header commit they complete;
-    every other commit resolves to itself.
+    every other hash resolves to itself, including one that Git
+    will not read as a commit.
     """
-    subject = repo.git(
-        "log", "-1", "--format=%s", commit_hash,
-    ).stdout.strip()
-    if not subject.startswith(TRAILER_PREFIX):
+    probe = repo.git(
+        "log", "-1", "--format=%s", commit_hash, check=False,
+    )
+    if probe.returncode != 0:
+        return commit_hash
+    if not probe.stdout.strip().startswith(TRAILER_PREFIX):
         return commit_hash
 
     parent = repo.git(
@@ -375,6 +403,21 @@ def test_resolve_record_commit_maps_trailer_to_header(workdir):
     trailer = repo.git("rev-parse", "HEAD").stdout.strip()
     assert resolve_record_commit(repo, trailer) == header
     assert resolve_record_commit(repo, header) == header
+@
+
+The all-zero hash stands in for every object the probe cannot read:
+it is well formed, so it reaches Git rather than being rejected on
+the way, and no repository has it.
+Answering with the hash rather than raising is what the callers above
+depend on.
+
+<<commits test functions>>=
+def test_resolve_record_commit_tolerates_unreadable_hash(workdir):
+    """A hash Git cannot read as a commit resolves to itself."""
+    from learnlog.commits import resolve_record_commit
+    repo = LearnlogRepo(workdir)
+    absent = "0" * 40
+    assert resolve_record_commit(repo, absent) == absent
 @
 
 
@@ -1541,9 +1584,37 @@ emits the peeled hash when there is one and the direct
 hash otherwise.
 Reading both fields and choosing in Python would work
 equally well, but doing it in the format string keeps
-every line one hash and one name---the shape the loop
-below already parses---so the difference between the two
-kinds of tag never leaves Git.
+the difference between the two kinds of tag inside Git,
+rather than making the loop below reason about it.
+
+\subsection{A tag need not name a commit at all}
+
+Peeling says which object a ref arrives at; it does not
+promise that object is a commit.
+A tag can name any object in the database:
+[[git tag notes $(git hash-object -w notes.txt)]] tags a
+blob, [[git tag base HEAD^{tree}]] tags a tree, and both
+are ordinary Git that the [[learnlog git]] passthrough
+forwards untouched.
+
+Such a hash belongs to no run, and a key that is not a
+commit hash is worse for this map than no key at all:
+every caller looks the map up by the hash of a commit it
+is displaying, so the entry can never be found, and it
+sits in the map claiming otherwise.
+We therefore ask Git for the object's type in the same
+call---[[%(objecttype)]] and, for what a tag object peels
+to, [[%(*objecttype)]]---and keep only commits.
+Asking here rather than leaving the odd hashes to
+[[resolve_record_commit]] costs no extra process and
+keeps the two questions apart: that function decides what
+a hash \emph{means}, while which hashes are worth asking
+about is this map's own business.
+
+Each line now carries three fields, and only the last of
+them can contain a space, because Git forbids spaces in
+ref names---so splitting twice from the left recovers all
+three.
 
 <<commits functions>>=
 def get_tag_map(repo):
@@ -1554,11 +1625,13 @@ def get_tag_map(repo):
     commit.  Annotated tags are reported on the commit
     their tag object names, and tags on a trailer commit
     are reported on the run's header commit instead.
+    Tags whose object is not a commit are left out.
     """
     result = repo.git(
         "tag", "-l",
         "--format=%(if)%(*objectname)%(then)"
-        "%(*objectname)%(else)%(objectname)%(end)"
+        "%(*objectname) %(*objecttype)%(else)"
+        "%(objectname) %(objecttype)%(end)"
         " %(refname:short)",
         check=False,
     )
@@ -1566,15 +1639,18 @@ def get_tag_map(repo):
         return {}
     tag_map = {}
     for line in result.stdout.strip().split("\n"):
-        if not line:
+        parts = line.split(" ", 2)
+        if len(parts) != 3:
             continue
-        parts = line.split(" ", 1)
-        if len(parts) == 2:
-            commit_hash, tag_name = parts
-            tag_map.setdefault(
-                resolve_record_commit(repo, commit_hash), []
-            ).append(tag_name)
+        commit_hash, object_type, tag_name = parts
+        if object_type != COMMIT_OBJECT_TYPE:
+            continue
+        tag_map.setdefault(
+            resolve_record_commit(repo, commit_hash), []
+        ).append(tag_name)
     return tag_map
+<<commits constants>>=
+COMMIT_OBJECT_TYPE = "commit"
 @
 
 Let's verify that the tag map correctly associates commits
@@ -1654,4 +1730,39 @@ def test_get_tag_map_annotated_tag(workdir):
     names = get_tag_map(repo)[header]
     assert "lab1" in names
     assert "submitted" in names
+@
+
+The odd tags get the same treatment, from the other side:
+we put a blob tag and a tree tag next to a good one and
+require the good one to survive them.
+The assertion has to look through the whole map rather
+than at one commit's entry, because the failure being
+pinned is not a wrong name under the right hash but an
+entry filed under a hash no caller will ever look up.
+
+<<commits test functions>>=
+def test_get_tag_map_skips_non_commit_tags(workdir):
+    """Tags on a blob or a tree stay out of the map."""
+    from learnlog.commits import get_tag_map
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    header = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("tag", "lab1", header)
+    blob = repo.git(
+        "hash-object", "-w", "hello.py",
+    ).stdout.strip()
+    repo.git("tag", "notes", blob)
+    tree = repo.git(
+        "rev-parse", "HEAD^{tree}",
+    ).stdout.strip()
+    repo.git("tag", "base", tree)
+
+    tag_map = get_tag_map(repo)
+
+    assert tag_map[header] == ["lab1"]
+    tagged = [name for names in tag_map.values() for name in names]
+    assert tagged == ["lab1"]
 @

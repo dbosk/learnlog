@@ -2202,7 +2202,9 @@ def restore_code_state(workdir, code_state):
         rel = path.relative_to(workdir)
         if is_learnlog_path(rel):
             continue
-        if path.is_dir():
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
             if any(rel in item.parents for item in expected):
                 continue
             path.rmdir()
@@ -2217,6 +2219,39 @@ def restore_code_state(workdir, code_state):
         else:
             target.write_text(content)
 @
+
+The symbolic-link branch of the deletion pass exists because [[Path]]
+answers the question above it the wrong way for us.
+[[rglob]] yields links alongside real entries, and [[is_dir]] follows
+them, so a link pointing at a directory says yes---and [[rmdir]] then
+refuses that same link with [[NotADirectoryError]], because the link
+is not a directory, it only points at one.
+Removing a link is [[unlink]] whatever it points at, and that is also
+the only removal that leaves the far end alone: [[rmdir]] here would
+have been a request to delete somebody else's directory.
+
+We remove links without asking whether the snapshot claims the name.
+A code state records file contents, so restoring an entry means
+creating a file under that name, whereas a link left in place would
+make the write pass follow it and overwrite whatever is at the other
+end.
+That is the substitution [[safe_snapshot_path]] already refuses when
+it judges a name; arriving at it from the tree instead of from the
+name does not make it a different thing, and deleting the link first
+is what makes the two passes agree---the name is created, not
+followed.
+
+No caller reaches this today.
+[[restore_code_state]] rebuilds into a temporary tree that playback
+creates for it (\cref{sec:reconstruct}), and a code state carries file
+contents rather than links, so nothing puts a symbolic link in the
+tree being walked.
+The branch is here because the loop is written against the filesystem
+and not against that single caller: a restore over a directory that
+already existed, or a dataset that does carry a link, turns a missing
+predicate into an exception raised halfway through deleting, leaving a
+tree that is neither the old one nor the new one.
+A pass that empties a directory has to be one that finishes.
 
 Vetting happens before either pass, and both passes then work from its
 result.
@@ -2512,6 +2547,71 @@ def test_restore_code_state_refuses_absolute_names(
     assert victim.read_text() == "original\n"
     assert (workdir / "main.py").exists()
     assert str(victim) in capsys.readouterr().err
+@
+
+The deletion pass needs the same scrutiny from the other side, where
+the danger arrives as a link in the tree rather than as a name in the
+dataset.
+We hang two links in the working directory, one at a directory and one
+at a file, both pointing outside it, and claim neither in the
+snapshot.
+Restoring has to remove both links and run to the end, and everything
+they pointed at has to survive---which is precisely the difference
+between the [[unlink]] this branch performs and the [[rmdir]] it
+avoids:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_removes_symlinks_not_targets(tmp_path):
+    from learnlog.progsnap2 import restore_code_state
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("keep\n")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "dirlink").symlink_to(
+        outside, target_is_directory=True,
+    )
+    (workdir / "filelink").symlink_to(outside / "secret.txt")
+
+    restore_code_state(workdir, {"main.py": "print('main')\n"})
+
+    assert not (workdir / "dirlink").is_symlink()
+    assert not (workdir / "filelink").is_symlink()
+    assert (workdir / "main.py").read_text() == "print('main')\n"
+    assert (outside / "secret.txt").read_text() == "keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == \
+        ["secret.txt"]
+@
+
+A link whose name the snapshot \emph{does} claim is what the
+unconditional removal is for.
+The link has to point inside the working directory for the test to
+reach the write pass at all, since a name resolving outside is refused
+before then, so we aim it at a second file that the same snapshot also
+claims.
+Restoring both names must leave two files: if the link survived the
+deletion pass, [[main.py]] would still be a link and the content meant
+for it would have landed in [[real.py]]:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_replaces_a_claimed_symlink(tmp_path):
+    from learnlog.progsnap2 import restore_code_state
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "real.py").write_text("real\n")
+    (workdir / "main.py").symlink_to(workdir / "real.py")
+
+    restore_code_state(workdir, {
+        "main.py": "print('main')\n",
+        "real.py": "print('real')\n",
+    })
+
+    assert not (workdir / "main.py").is_symlink()
+    assert (workdir / "main.py").read_text() == "print('main')\n"
+    assert (workdir / "real.py").read_text() == "print('real')\n"
 @
 
 The name checks are worth testing directly too, because
