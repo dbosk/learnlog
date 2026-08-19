@@ -459,10 +459,15 @@ was even started, and a program printing more than about 128\,KB lost
 its entire trailer---exit code, I/O and exception alike.
 
 Standard input has no such limit, so [[git commit --file=-]] takes the
-message the same way an editor session would.
-The two forms are otherwise equivalent: with neither an editor nor an
-explicit [[--cleanup]], Git applies the [[whitespace]] cleanup mode in
-both cases, so messages are stored exactly as before.
+message the same way an editor session would, and [[-m]] and
+[[--file=-]] agree on everything except the length cap: with neither
+an editor nor an explicit [[--cleanup]], porcelain applies the
+[[whitespace]] cleanup mode to both.
+That cleanup is itself a lossy filter---it strips trailing spaces and
+collapses blank-line runs---which is one of the reasons run commits
+moved to [[commit-tree]] (\cref{sec:recording-branch}), where the
+message is stored verbatim; the reconstruction side commits the same
+way (\cref{progsnap2}) so the fidelity survives a round trip.
 
 The rule this leaves us with is simple enough to apply without thinking
 about lengths at each call site: \emph{message content never travels in
