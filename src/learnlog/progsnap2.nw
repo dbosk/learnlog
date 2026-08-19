@@ -66,7 +66,7 @@ from learnlog.gitrepo import GitError, LearnlogRepo
 
 The export needs CSV writing, temporary directories for code state
 extraction, and zip file creation.
-We import [[get_commits]], [[filter_learnlog_runs]],
+We import [[get_commits]], [[filter_internal_runs]],
 [[BLOCK_SEP]], and [[get_tag_map]] from the commits module
 rather than reimplementing the commit-walking logic.
 The tag map lets us populate the [[X-Tag]] column in the
@@ -101,9 +101,10 @@ from learnlog.commits import (
     get_commits,
     get_run_trailers,
     get_tag_map,
-    filter_learnlog_runs,
-    is_learnlog_run,
+    filter_internal_runs,
+    is_internal_run,
     merge_run_trailers,
+    parse_view_trace,
     BLOCK_SEP,
 )
 from learnlog.gitrepo import (
@@ -145,20 +146,29 @@ the raw text for I/O and exception sections.  Missing trailer
 fields are represented as [[None]]---this lets callers distinguish
 \enquote{program crashed} from \enquote{exit code was zero}.
 
+A review run's trailer carries a further section, the [[Viewed:]]
+lines naming the commits the student looked at.
+Reading it is [[parse_view_trace]]'s job (\cref{sec:view-trace}); we
+call it here so that every consumer of a parsed block sees the trace
+as just another field, and so that ordinary runs---which have no such
+lines---come back with an empty list rather than a missing key.
+
 <<progsnap2 functions>>=
 def parse_run_block(block_text):
     """Parse a single run block into a dict.
 
     Returns a dict with keys ``script``, ``arguments``,
     ``start_time``, ``end_time``, ``exit_code``,
-    ``io_log``, and ``exception_info``.
-    Missing trailer fields are ``None``.
+    ``io_log``, ``exception_info``, and ``viewed``.
+    Missing trailer fields are ``None``; ``viewed`` is the
+    view trace, empty for everything but a review run.
     """
     result = {
         "script": None, "arguments": None,
         "start_time": None, "end_time": None,
         "exit_code": None, "io_log": None,
         "exception_info": None,
+        "viewed": parse_view_trace(block_text),
     }
 
     <<parse key-value fields>>
@@ -287,6 +297,42 @@ def test_parse_run_block_exception():
     assert result["exit_code"] == "1"
     assert result["io_log"] is None
     assert "SyntaxError" in result["exception_info"]
+@
+
+A review run's block reaches the exporter with its navigation intact,
+while an ordinary run reports an empty trace rather than nothing at
+all---so a consumer never has to test for the key's presence:
+
+<<progsnap2 test functions>>=
+def test_parse_run_block_exposes_viewed():
+    from learnlog.progsnap2 import parse_run_block
+    first, second = "a" * 40, "b" * 40
+    block = (
+        "Run: learnlog play\n"
+        "\n"
+        "Script: learnlog\n"
+        "Arguments: play\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "End-Time: 2026-01-01T10:00:20\n"
+        "Exit-Code: 0\n"
+        f"Viewed: {first} 2026-01-01T10:00:01 open\n"
+        f"Viewed: {second} 2026-01-01T10:00:05 next\n"
+        "\n--- I/O ---\n(no I/O)\n"
+        "\n--- exception ---\nNone"
+    )
+    result = parse_run_block(block)
+    assert result["viewed"] == [
+        (first, "2026-01-01T10:00:01", "open"),
+        (second, "2026-01-01T10:00:05", "next"),
+    ]
+
+def test_parse_run_block_without_views():
+    from learnlog.progsnap2 import parse_run_block
+    result = parse_run_block(
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "Start-Time: 2026-01-01T10:00:00"
+    )
+    assert result["viewed"] == []
 @
 
 
@@ -799,7 +845,7 @@ lifetime of that temporary data.
 
 <<progsnap2 functions>>=
 def do_export_progsnap2(repo, output_path,
-                        filter_learnlog_flag=True):
+                        filter_internal_flag=True):
     """Export the learnlog repository as a ProgSnap2 zip.
 
     Creates a zip file at ``output_path`` containing
@@ -909,8 +955,8 @@ trailer merged back in, so a run that finished contributes its exit
 code, timing, and I/O to the same event as its header---the
 [[Run.Program]] event stays anchored to the commit that holds the
 code state the run executed.
-When [[filter_learnlog_flag]] is set, we skip blocks that record
-learnlog's own activity (the same test as [[filter_learnlog_runs]],
+When [[filter_internal_flag]] is set, we skip blocks that record
+learnlog's internal activity (the same test as [[filter_internal_runs]],
 but at the parsed-block level rather than raw text).
 
 After emitting the [[Run.Program]] event, we generate
@@ -929,7 +975,7 @@ body = merge_run_trailers(body, trailers)
 
 runs = parse_commit_runs(body)
 for run in runs:
-    if filter_learnlog_flag and is_learnlog_run(run):
+    if filter_internal_flag and is_internal_run(run):
         continue
 
     order += 1
@@ -1317,25 +1363,34 @@ def test_progsnap2_unfinished_run_has_empty_end_time(workdir):
     assert len(run_events) >= 1
     assert run_events[0]["X-EndTime"] == ""
 
-def test_progsnap2_filters_learnlog_runs(workdir):
+def test_progsnap2_filters_internal_runs(workdir):
+    """Plumbing is dropped; the student's review is exported.
+
+    The review run is still emitted as a ``Run.Program``
+    event here; giving it its own ``X-Review`` event type is
+    the next step in the export redesign.
+    """
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("pip", ["install", "learnlog"], t1)
     output = workdir / "test.progsnap2"
     do_export_progsnap2(repo, output)
     with zipfile.ZipFile(str(output)) as zf:
         main = zf.read("MainTable.csv").decode("utf-8")
     reader = csv_mod.DictReader(io.StringIO(main))
     events = list(reader)
-    scripts = [
-        e["X-Script"] for e in events
+    commands = [
+        f"{e['X-Script']} {e['X-Arguments']}"
+        for e in events
         if e["EventType"] == "Run.Program"
     ]
-    assert "hello.py" in scripts
-    assert "learnlog" not in scripts
+    assert any(c.startswith("hello.py") for c in commands)
+    assert any(c == "learnlog play" for c in commands)
+    assert not any("pip" in c for c in commands)
 
 def test_progsnap2_file_edit_event(workdir):
     import csv as csv_mod
@@ -1560,12 +1615,12 @@ def test_progsnap2_tag_column(workdir):
     assert len(untagged) >= 1
 
 def test_progsnap2_no_duplicate_edit_when_filtered(workdir):
-    """Filtered learnlog runs do not create duplicate edits."""
+    """Filtered internal runs do not create duplicate edits."""
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
-    repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("pip", ["install", "learnlog"], t1)
     output = workdir / "filtered.progsnap2"
     do_export_progsnap2(repo, output)
     with zipfile.ZipFile(str(output)) as zf:
