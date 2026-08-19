@@ -118,11 +118,9 @@ class LearnlogRepo:
     def __init__(self, workdir):
         self.workdir = pathlib.Path(workdir)
         self.git_dir = self.workdir / GIT_DIR_NAME
-        self.env = {
-            **os.environ,
-            "GIT_DIR": str(self.git_dir),
-            "GIT_WORK_TREE": str(self.workdir),
-        }
+        self.env = git_environment(
+            self.git_dir, self.workdir,
+        )
         self.run_id = None
         self.run_script = None
         self.run_args = []
@@ -150,6 +148,171 @@ three string literals.
 
 <<constants>>=
 GIT_DIR_NAME = ".learnlog"
+@
+
+
+\section{The environment Git runs in}
+\label{sec:git-environment}
+
+Every Git command learnlog runs is told which repository to work on
+through the environment rather than through arguments, so building
+that environment is a decision of its own.
+It used to be built by copying the process environment and overriding
+[[GIT_DIR]] and [[GIT_WORK_TREE]] in it.
+Overriding two variables answers the two questions those variables
+ask, and leaves every other [[GIT_]] variable the parent process
+exported pointing wherever it pointed.
+
+That is not a hypothetical parent.
+Git exports [[GIT_INDEX_FILE]] to the hooks it runs, so a project
+whose [[pre-commit]] hook happens to run a logged program hands
+learnlog's [[git add .]] the path of the \emph{student's own}
+repository's index---and learnlog then stages the whole working
+directory into it, replacing whatever the student had deliberately
+staged.
+The variables that name an object store
+([[GIT_OBJECT_DIRECTORY]], [[GIT_ALTERNATE_OBJECT_DIRECTORIES]],
+[[GIT_QUARANTINE_PATH]]) are the same class one level down: learnlog's
+commits would be written into somebody else's store and vanish when it
+is discarded.
+So are [[GIT_AUTHOR_NAME]] and its relatives, which would attribute a
+run record to whatever commit was being made when the hook fired, and
+[[GIT_CONFIG]], which redirects the writes of [[git config]]---the
+command that configures the repository below---into a file we were
+never asked to touch.
+
+The list of variables that must not survive is therefore open-ended,
+and an override list can only ever name the ones we thought of.
+Inverting it closes the question: strip every [[GIT_]] variable, then
+add back the few that cannot decide what Git writes or where it goes.
+
+Three groups earn a place on that list.
+The transport variables---[[GIT_SSH]], [[GIT_SSH_COMMAND]],
+[[GIT_SSH_VARIANT]], [[GIT_ASKPASS]], [[GIT_TERMINAL_PROMPT]]---say
+how the student reaches a remote, which is exactly what [[push]] and
+[[pull]] need and exactly what a student is likely to have set in a
+shell profile rather than in a config file; they run through this
+environment (\cref{sec:push}), and stripping them would break the
+sharing commands for everyone who configures Git that way.
+The config-file selectors [[GIT_CONFIG_GLOBAL]], [[GIT_CONFIG_SYSTEM]]
+and [[GIT_CONFIG_NOSYSTEM]] say which files hold the student's
+configuration, and learnlog's identity and signing policy is built on
+reading it (\cref{sec:ensure-configured}): dropping them would make
+learnlog commit under its fallback identity for everyone whose Git is
+configured through those variables---containers, sandboxes, CI.
+[[GIT_TRACE]] and its variants only ask Git to narrate what it is
+doing, which is what somebody debugging learnlog's Git calls needs and
+which changes no outcome, so a prefix test lets all of them through
+without enumerating a moving target.
+
+<<functions>>=
+def git_environment(git_dir, workdir):
+    """Return the environment learnlog runs Git commands in.
+
+    Copies the process environment without any ``GIT_*`` variable
+    that could redirect what Git writes, keeps the few that only
+    describe how to reach a remote or which config files to read,
+    and points Git at the learnlog repository.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(GIT_VAR_PREFIX)
+        or key in INHERITED_GIT_VARS
+        or key.startswith(GIT_TRACE_PREFIX)
+    }
+    env["GIT_DIR"] = str(git_dir)
+    env["GIT_WORK_TREE"] = str(workdir)
+    return env
+<<constants>>=
+GIT_VAR_PREFIX = "GIT_"
+GIT_TRACE_PREFIX = "GIT_TRACE"
+INHERITED_GIT_VARS = frozenset({
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_ASKPASS",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+})
+@
+
+The environment is built once per [[LearnlogRepo]] and then handed to
+every command, which is what lets [[run_index]] below say \enquote{this
+index, for this run} by writing one key into it.
+That only works because the key is not there to begin with: with the
+parent's [[GIT_INDEX_FILE]] stripped, the variable is set in exactly
+one place in this module, and one [[grep]] confirms it.
+
+Let's verify that the variables that could redirect a write are gone
+while the ones that describe the student's setup survive:
+
+<<test functions>>=
+def test_git_environment_drops_a_redirecting_variable(
+        workdir, monkeypatch):
+    """An inherited index or object store is not ours to use."""
+    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/somebody-elses")
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", "/tmp/quarantine")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Hook")
+    monkeypatch.setenv("GIT_CONFIG", "/tmp/their-config")
+    repo = LearnlogRepo(workdir)
+    assert "GIT_INDEX_FILE" not in repo.env
+    assert "GIT_OBJECT_DIRECTORY" not in repo.env
+    assert "GIT_AUTHOR_NAME" not in repo.env
+    assert "GIT_CONFIG" not in repo.env
+    assert repo.env["GIT_DIR"] == str(workdir / ".learnlog")
+
+def test_git_environment_keeps_the_student_setup(
+        workdir, monkeypatch):
+    """Transport and configuration variables must survive."""
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i mykey")
+    monkeypatch.setenv("GIT_TRACE_PACKET", "1")
+    repo = LearnlogRepo(workdir)
+    assert repo.env["GIT_SSH_COMMAND"] == "ssh -i mykey"
+    assert repo.env["GIT_TRACE_PACKET"] == "1"
+@
+
+The variable this began with deserves the whole story rather than a
+dictionary lookup, because what it costs is somebody else's work.
+We build the situation the hook does: a student's repository with one
+file staged out of two, and [[GIT_INDEX_FILE]] naming its index the
+way Git names it for a hook.
+A logged run then happens inside that environment, and what must
+still be staged afterwards is the one file the student chose.
+
+<<test functions>>=
+def test_run_leaves_an_inherited_index_alone(
+        workdir, monkeypatch):
+    """A hook's staging survives a run that happens inside it."""
+    subprocess.run(
+        ["git", "init", "--quiet", str(workdir)],
+        check=True, capture_output=True,
+    )
+    (workdir / "staged.txt").write_text("staged\n")
+    (workdir / "unstaged.txt").write_text("unstaged\n")
+    subprocess.run(
+        ["git", "add", "staged.txt"],
+        cwd=str(workdir), check=True, capture_output=True,
+    )
+    monkeypatch.setenv(
+        "GIT_INDEX_FILE", str(workdir / ".git" / "index"),
+    )
+
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", [], now)
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=now, exit_code=0,
+    )
+
+    staged = subprocess.run(
+        ["git", "ls-files", "--cached"],
+        cwd=str(workdir), capture_output=True, text=True,
+    )
+    assert staged.stdout.split() == ["staged.txt"]
 @
 
 
@@ -642,21 +805,22 @@ finds one, and returns without writing anything.
 
 <<repo methods>>=
 def init_repo(self):
-    """Initialise a new ``.learnlog/`` Git repository.
+    """Make sure the ``.learnlog/`` repository is ready to use.
 
-    Creates the repository, sets a fallback committer identity
-    (only if the student has none configured globally), sets up
-    exclusion patterns, and makes an initial commit of all files.
+    Creates the repository and makes an initial commit of all
+    files when there is none.  Configures it (committer identity,
+    signing, exclusion patterns) whether it created the
+    repository or found one, so a cloned log is configured too.
 
-    Returns without doing anything when the repository already
-    has a commit, so that concurrent first runs share one initial
+    Creating is skipped when the repository already has a
+    commit, so that concurrent first runs share one initial
     commit instead of making a root commit each.
     """
-    if self.has_commit():
-        return
-    self.git_dir.mkdir(parents=True, exist_ok=True)
-    with self.commit_lock():
-        <<initialise unless another process got there first>>
+    if not self.has_commit():
+        self.git_dir.mkdir(parents=True, exist_ok=True)
+        with self.commit_lock():
+            <<create the repository unless another process got there first>>
+    self.ensure_configured()
 @
 
 The check before the lock is the one that runs on every later
@@ -664,24 +828,45 @@ construction, and it is there to keep the common case---an established
 repository---from queueing behind whatever else is committing.
 The check inside the lock is the one that is authoritative.
 
-<<initialise unless another process got there first>>=
-if self.has_commit():
-    return
-self.git("init")
-<<set fallback identity if needed>>
-
-<<set up exclude patterns>>
-<<initial commit>>
+<<create the repository unless another process got there first>>=
+if not self.has_commit():
+    self.git("init")
+    self.write_configuration()
+    <<initial commit>>
 @
+
+Creation and configuration used to be the same step, and this method
+used to return as soon as it found a commit---which meant that a
+repository learnlog did not create was never configured at all.
+Every clone is such a repository (\cref{sec:clone}), and what it is
+missing is not cosmetic: with no exclude file, the first run in the
+clone stages the log repository into its own history, and with no
+[[commit.gpgsign]] of its own, a student whose global configuration
+turns signing on gets a [[GitError]] from every commit learnlog
+attempts.
+Neither had a repair path, because [[init]] took the same early
+return.
+
+Splitting the two questions is what fixes the whole family: creation
+asks \enquote{does this repository have a commit?}, configuration asks
+\enquote{does this repository have the settings learnlog needs?}, and
+the second question has to be asked on every construction because its
+answer can go stale under a repository that is perfectly established---
+a clone that arrives without them, or a [[.learnlogignore]] the student
+writes after the first run.
+Creation calls [[write_configuration]] itself rather than leaving it
+to the [[ensure_configured]] that follows, because the exclude file has
+to be on disk \emph{before} the initial commit stages the tree---a
+first commit made without it is a log that starts by swallowing the
+student's virtual environment.
 
 \enquote{Has a commit} is the property that matters, rather than
 \enquote{has a Git directory}, because the directory appears at the
 very start of initialisation and the repository only becomes usable at
 the end of it.
-[[git rev-parse --verify]] answers it, and this is the first of the
-three places in this module where a non-zero exit is the answer rather
-than a problem: [[HEAD]] fails to resolve exactly while the branch is
-still unborn.
+[[git rev-parse --verify]] answers it, and this is one of the places in
+this module where a non-zero exit is the answer rather than a problem:
+[[HEAD]] fails to resolve exactly while the branch is still unborn.
 The filesystem answers for free in the one case where it can---a
 directory that is not there cannot hold a commit---but every
 [[LearnlogRepo]] built on an existing log does pay for one
@@ -708,39 +893,118 @@ That is the same trade as for the commit lock itself: a platform
 without [[flock]] gets the protocol without the serialisation, rather
 than no learnlog at all.
 
-The learnlog repository inherits the student's global Git identity and
-GPG signing configuration.
-If a student has not configured Git at all, commits would fail---so we
-set a fallback identity only when no global one exists.
-This means commits are signed with the student's own key when available,
-which is the right thing for a log of \emph{their} work.
+\subsection{Keeping the repository configured}
+\label{sec:ensure-configured}
 
-We check whether Git can resolve a user name; if not, we provide a
-generic fallback.
-This handles lab machines where students have never run
+A configured learnlog repository is one where three things hold: Git
+can resolve a committer identity, [[commit.gpgsign]] is off, and
+[[info/exclude]] lists the patterns that keep the log out of its own
+history.
+[[ensure_configured]] establishes all three, and it has to be safe to
+call on every construction, because that is when the answers can have
+changed since the last one.
+
+It asks before it writes, and takes the lock only when the answer is
+no.
+Taking it unconditionally would put every program start in the queue
+behind whatever commit is in progress, which is the cost
+\cref{sec:commit-lock} refuses to pay for a lock that only means
+\enquote{learnlog is writing}.
+The questions are read-only, and the writes they lead to are the same
+writes any other process would make from the same answers, so a lost
+race costs a second write of identical content and never a wrong one.
+
+<<repo methods>>=
+def ensure_configured(self):
+    """Bring the repository's configuration up to date.
+
+    Does nothing when the settings and exclude patterns learnlog
+    needs are already in place, so it is cheap to call on every
+    construction and repairs whatever it finds missing.
+    """
+    if self.is_configured():
+        return
+    with self.commit_lock():
+        self.write_configuration()
+@
+
+Asking costs two [[git config]] probes on top of the [[rev-parse]] of
+[[has_commit]], which is the honest price of not trusting a marker.
+A marker saying \enquote{this repository was configured once} is in
+effect what the old early return believed, and a clone or a
+[[.learnlogignore]] written after the first run is exactly the case
+where that belief is wrong.
+The probes are also the cheapest Git commands there are---they read
+config files and touch no objects.
+Measured on a one-file project, asking costs about 7\,ms against the
+40\,ms the run it precedes spends on its two commits, and that ratio
+only improves on a project with something in it, because the commits
+grow with the tree and the probes do not.
+
+The exclude file is checked first because it is answered by a file
+read rather than by a process, and because it is the setting most
+likely to be stale: it changes whenever the student edits
+[[.learnlogignore]].
+
+<<repo methods>>=
+def is_configured(self):
+    """Return whether our settings are already in place."""
+    try:
+        current = (self.git_dir / EXCLUDE_PATH).read_text()
+    except OSError:
+        return False
+    if current != self.exclude_content():
+        return False
+    identity = self.git(
+        "config", "user.name", check=False,
+    )
+    if identity.returncode != 0:
+        return False
+    signing = self.git(
+        "config", "--bool", "commit.gpgsign", check=False,
+    )
+    return signing.stdout.strip() == "false"
+@
+
+Both probes are among the places in this module where a non-zero exit
+is the answer rather than a problem, so both run with [[check=False]]:
+[[git config user.name]] exits~1 precisely when no scope defines the
+setting.
+Neither asks where the answer came from.
+An identity the student configured globally is the right one for a log
+of \emph{their} work, so learnlog only supplies a fallback when Git can
+resolve none---which is the lab machine where nobody ever ran
 [[git config]].
-We also disable GPG signing---these machine-generated commits do not
-need cryptographic signatures, and students may not have a GPG key
-configured.
+Signing is the mirror image: whatever the student's global
+configuration says, these machine-generated commits must not need a
+key, so learnlog writes the local [[false]] that overrides it.
+Reading the effective value rather than the local one is what makes
+the write happen once instead of on every run.
 
-This probe is the second of those places: [[git config user.name]]
-exits~1 precisely when the setting we are asking about is absent.
-It therefore runs with [[check=False]].
-
-<<set fallback identity if needed>>=
-name_check = self.git("config", "user.name", check=False)
-if name_check.returncode != 0:
-    self.git("config", "user.name", "learnlog")
-    self.git("config", "user.email", "learnlog@localhost")
-self.git("config", "commit.gpgsign", "false")
+<<repo methods>>=
+def write_configuration(self):
+    """Write the Git settings and exclude patterns we need."""
+    identity = self.git("config", "user.name", check=False)
+    if identity.returncode != 0:
+        self.git(
+            "config", "user.name", FALLBACK_USER_NAME,
+        )
+        self.git(
+            "config", "user.email", FALLBACK_USER_EMAIL,
+        )
+    self.git("config", "commit.gpgsign", "false")
+    <<swap the exclude file into place>>
+<<constants>>=
+FALLBACK_USER_NAME = "learnlog"
+FALLBACK_USER_EMAIL = "learnlog@localhost"
 @
 
 The exclude file ([[.learnlog/info/exclude]]) keeps infrastructure
-files out of the log.
-We exclude [[.learnlog]] itself (to prevent recursion),
-[[__pycache__]], virtual environments, and compiled bytecode.
-If the student has a [[.learnlogignore]] file, we append its
-patterns too---this is the only configuration hook, and it is empty by
+files out of the log: [[.learnlog]] itself, [[__pycache__]] and
+compiled bytecode, virtual environments, and the files
+[[learnlog export]] writes.
+If the student has a [[.learnlogignore]] file, its patterns are
+appended---this is the only configuration hook, and it is empty by
 default.
 
 The first pattern carries more weight than it looks: it is the only
@@ -752,26 +1016,189 @@ transcript---is excluded by this line and by nothing else.
 Naming it from [[GIT_DIR_NAME]] keeps the pattern and the path
 inseparable.
 
-<<set up exclude patterns>>=
-exclude_dir = self.git_dir / "info"
-exclude_dir.mkdir(parents=True, exist_ok=True)
-exclude_file = exclude_dir / "exclude"
-patterns = [
+The export patterns are there for a mistake that compounds.
+[[learnlog export]] writes its bundle into the directory it is run
+from, which is normally the work tree (\cref{sec:export}), so without
+these two lines the next run commits the bundle---and the run after
+that exports a bundle containing the previous bundle.
+Each cycle roughly doubles what the log carries, from a file the log
+already contains in full.
+
+The two export extensions are named here rather than imported from the
+modules that write them---[[cli]] and [[progsnap2]] both import this
+one, so the dependency only goes this way---and a test in [[cli]],
+which knows both default names, asserts that they still agree with
+these suffixes (\cref{sec:staged-export}).
+
+<<constants>>=
+BUNDLE_SUFFIX = ".learnlog"
+PROGSNAP2_SUFFIX = ".progsnap2"
+EXCLUDE_PATH = "info/exclude"
+EXCLUDE_PATTERNS = (
     GIT_DIR_NAME,
     "__pycache__",
     "*.pyc",
     ".venv",
     "venv",
     "env",
-]
-ignore_file = self.workdir / ".learnlogignore"
-if ignore_file.exists():
-    patterns.extend(
-        ignore_file.read_text().splitlines()
-    )
-exclude_file.write_text(
-    "\n".join(patterns) + "\n"
+    "*" + BUNDLE_SUFFIX,
+    "*" + PROGSNAP2_SUFFIX,
 )
+LEARNLOGIGNORE_NAME = ".learnlogignore"
+@
+
+Deriving the file's whole content from the patterns, rather than
+appending to whatever is there, is what makes the write idempotent:
+running it twice leaves the same file, and comparing the two answers
+the question [[is_configured]] asks.
+It also means a [[.learnlogignore]] the student edits at any point
+takes effect on the next run instead of being frozen into the file the
+first run wrote.
+
+<<repo methods>>=
+def exclude_content(self):
+    """Return the text the exclude file should hold."""
+    patterns = list(EXCLUDE_PATTERNS)
+    try:
+        extra = (
+            self.workdir / LEARNLOGIGNORE_NAME
+        ).read_text()
+    except FileNotFoundError:
+        extra = ""
+    patterns.extend(extra.splitlines())
+    return "\n".join(patterns) + "\n"
+@
+
+The new content is written beside the exclude file and moved onto it,
+because [[git add .]] reads this file and not every reader is one we
+serialise: [[learnlog git]] hands the student Git itself
+(\cref{sec:git}), and a half-written exclude file is a file that
+excludes nothing.
+[[os.replace]] within one directory is atomic, so a reader sees either
+the old list or the new one.
+
+<<swap the exclude file into place>>=
+exclude_file = self.git_dir / EXCLUDE_PATH
+exclude_file.parent.mkdir(parents=True, exist_ok=True)
+staged = exclude_file.with_name(
+    exclude_file.name + STAGED_SUFFIX
+)
+staged.write_text(self.exclude_content())
+os.replace(staged, exclude_file)
+<<constants>>=
+STAGED_SUFFIX = ".new"
+@
+
+The repository this all exists for is one learnlog did not create, so
+the tests need one.
+A clone is what a student or a teacher actually has
+(\cref{sec:clone}), and it is reproduced here the way the command
+produces it: clone the log, then move the Git directory into an
+otherwise untouched project directory.
+
+<<test functions>>=
+def clone_learnlog(source, target):
+    """Reproduce what ``learnlog clone`` leaves in ``target``."""
+    staging = target.parent / f"{target.name}-staging"
+    subprocess.run(
+        [
+            "git", "clone", "--quiet",
+            str(source / ".learnlog"), str(staging),
+        ],
+        check=True, capture_output=True,
+    )
+    target.mkdir(parents=True, exist_ok=True)
+    (staging / ".git").rename(target / ".learnlog")
+    return target
+@
+
+The first thing such a repository is missing is the exclude file, and
+what that costs is measured in the log itself: with nothing excluding
+it, the very first run stages the Git directory into its own history.
+
+<<test functions>>=
+def test_a_cloned_repository_gets_the_exclude_file(workdir):
+    """Configuration reaches a repository we did not create."""
+    LearnlogRepo(workdir)
+    target = clone_learnlog(workdir, workdir / "clone")
+    (target / "hello.py").write_text('print("hi")\n')
+
+    repo = LearnlogRepo(target)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    tracked = repo.git("ls-files").stdout
+    assert "hello.py" in tracked
+    assert ".learnlog/" not in tracked
+@
+
+The second is the signing setting, and its cost is the whole log: a
+student whose global configuration turns signing on cannot commit at
+all in a repository that does not turn it off locally.
+We build exactly that student with a global config of our own, and
+point it at a signing program that always fails, so the test asks
+whether signing was attempted rather than whether this machine happens
+to hold a usable key.
+
+<<test functions>>=
+SIGNING_GLOBAL_CONFIG = """
+[user]
+    name = Global
+    email = global@example.com
+[commit]
+    gpgsign = true
+[gpg]
+    program = false
+"""
+
+def test_a_cloned_repository_can_commit_when_signing_is_on(
+        workdir, monkeypatch):
+    """A global gpgsign must not stop a cloned log."""
+    LearnlogRepo(workdir)
+    target = clone_learnlog(workdir, workdir / "clone")
+    config = workdir / "global-gitconfig"
+    config.write_text(SIGNING_GLOBAL_CONFIG)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+    repo = LearnlogRepo(target)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert "Run-Id" in repo.git("log", "--format=%B").stdout
+@
+
+The third case needs no clone at all: it is the student who writes a
+[[.learnlogignore]] after the first run, which the old code froze out
+of the exclude file forever.
+
+<<test functions>>=
+def test_learnlogignore_applies_after_the_first_run(workdir):
+    """An ignore file written later still takes effect."""
+    LearnlogRepo(workdir)
+    (workdir / ".learnlogignore").write_text("*.csv\n")
+    (workdir / "big.csv").write_text("a,b,c\n")
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert "big.csv" not in repo.git("ls-files").stdout
+@
+
+The exported bundle is excluded by the same file, and it is worth its
+own test because it is the one pattern whose absence grows the log
+without bound---the bundle the next run commits contains the log that
+committed the bundle before it.
+
+<<test functions>>=
+def test_exports_stay_out_of_the_log(workdir):
+    """An exported bundle is not part of the code state."""
+    (workdir / "learnlog.learnlog").write_bytes(b"bundle")
+    (workdir / "learnlog.progsnap2").write_bytes(b"zip")
+    repo = LearnlogRepo(workdir)
+    tracked = repo.git("ls-files").stdout
+    assert "learnlog.learnlog" not in tracked
+    assert "learnlog.progsnap2" not in tracked
 @
 
 The initial commit stages everything the student already has, which
@@ -786,15 +1213,30 @@ The rule \enquote{no message content in [[argv]]} is only useful if it
 holds without exception: an occurrence of [[-m]] then means a bug, and
 one [[grep]] settles it.
 
+The staging happens in a private index, the same way a run's does.
+Named indexes are how learnlog keeps concurrent snapshots apart, but
+here the point is the other one \cref{sec:git-environment} makes: the
+index Git writes must be one this module chose, and saying so in every
+place that stages leaves no path where the answer comes from
+somewhere else.
+There is nothing to seed it from---this is the first index this
+repository has---so it is built from scratch and then published as the
+shared one, which is what leaves the stat cache warm for the first run.
+
 <<initial commit>>=
-self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
-self.git(
-    "commit",
-    "--allow-empty",
-    "--file=-",
-    input="learnlog: initial commit",
-    timeout=GIT_TREE_TIMEOUT,
-)
+shared_index = self.git_dir / SHARED_INDEX_NAME
+with self.run_index(INITIAL_INDEX_NAME) as index_path:
+    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    self.git(
+        "commit",
+        "--allow-empty",
+        "--file=-",
+        input="learnlog: initial commit",
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    <<publish the private index as the shared one>>
+<<constants>>=
+INITIAL_INDEX_NAME = "init"
 @
 
 Let's verify that initialisation creates a working repository with
@@ -1413,8 +1855,8 @@ tree and commits it together with the run header.
 Whether the code changed is no longer part of that: every run gets its
 own header commit (\cref{sec:two-commit-protocol}), so the
 [[git diff --cached --quiet]] probe that this section used to describe
-as the third place in this module where a non-zero exit is data rather
-than trouble went away with the commit folding it served.
+as one of the places in this module where a non-zero exit is data
+rather than trouble went away with the commit folding it served.
 The probes that fill its place are the ref lookups of
 \cref{sec:recording-branch}.
 

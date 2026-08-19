@@ -454,6 +454,115 @@ def test_do_export_creates_bundle(workdir):
     assert verify.returncode == 0
 @
 
+\subsection{Exports appear all at once}
+\label{sec:staged-export}
+
+Where the export lands is ordinarily the work tree, because that is
+where the student is standing when they run the command.
+That makes the file two things at once: an output, and part of the
+directory the \emph{next} run snapshots.
+The exclude patterns settle whether it is committed
+(\cref{sec:ensure-configured}); this settles what a reader can see
+while it is being written.
+
+A bundle of a term's log takes long enough to write that a run
+starting in the middle of it is not a thought experiment, and a run
+that snapshots a half-written file records a file that never existed.
+Writing beside the destination and renaming solves it the way it is
+always solved: [[os.replace]] within a directory is atomic, so the
+name either does not exist or names a finished export.
+
+The staging file takes the destination's extension rather than a
+neutral one, which is what puts it under the same exclude pattern as
+the result.
+A [[.tmp]] file would be excluded by nothing, so the very run this is
+protecting against would commit the half-written bundle under its
+temporary name instead.
+
+The two exporters differ only in what they write, so the staging is
+written once and takes the writer as an argument.
+
+<<export functions>>=
+def write_export_atomically(export, repo, output):
+    """Write an export through a file beside ``output``.
+
+    Calls ``export(repo, path)`` on a temporary file in the
+    destination's directory and moves it onto ``output``, so that
+    the destination never names a partial export.
+    """
+    try:
+        handle, name = tempfile.mkstemp(
+            dir=output.parent,
+            prefix=EXPORT_STAGING_PREFIX,
+            suffix=output.suffix,
+        )
+    except OSError as error:
+        raise SystemExit(f"Cannot write to {output}: {error}")
+    os.close(handle)
+    staged = pathlib.Path(name)
+    try:
+        export(repo, staged)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    os.replace(staged, output)
+<<constants>>=
+EXPORT_STAGING_PREFIX = ".learnlog-export-"
+@
+
+Cleaning up on [[BaseException]] rather than [[Exception]] is what
+covers the interruption this is about: a student who gives up on a
+slow export with [[Ctrl-C]] should be left with the export they had
+before, not with a staging file the next run has to be told to ignore.
+Re-raising keeps the interruption an interruption.
+
+Let's verify that the destination is written by a rename and not by
+the exporter itself:
+
+<<test functions>>=
+def test_export_goes_through_a_staging_file(
+    workdir, monkeypatch,
+):
+    """The destination appears complete or not at all."""
+    from learnlog.cli import app
+    from learnlog import cli
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    renames = []
+    real_replace = cli.os.replace
+
+    def record(source, destination):
+        renames.append((source, destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(cli.os, "replace", record)
+    monkeypatch.chdir(workdir)
+    bundle = workdir / "out.learnlog"
+    result = CliRunner().invoke(
+        app, ["export", "-o", str(bundle)]
+    )
+    assert result.exit_code == 0
+    staged = [
+        source for source, destination in renames
+        if str(destination) == str(bundle)
+    ]
+    assert len(staged) == 1
+    assert str(staged[0]) != str(bundle)
+    assert pathlib.Path(staged[0]).suffix == ".learnlog"
+    assert bundle.exists()
+
+def test_export_names_match_the_excluded_patterns(workdir):
+    """The exclude patterns must cover what export writes."""
+    from learnlog.cli import (
+        DEFAULT_BUNDLE_NAME, DEFAULT_PROGSNAP2_NAME,
+    )
+    from learnlog.gitrepo import (
+        BUNDLE_SUFFIX, PROGSNAP2_SUFFIX,
+    )
+    assert DEFAULT_BUNDLE_NAME.endswith(BUNDLE_SUFFIX)
+    assert DEFAULT_PROGSNAP2_NAME.endswith(PROGSNAP2_SUFFIX)
+@
+
 
 \section{Setting up a project for learnlog}
 \label{sec:setup}
@@ -3562,17 +3671,27 @@ def export(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    if progsnap2:
-        if output == pathlib.Path(DEFAULT_BUNDLE_NAME):
-            output = pathlib.Path(
-                DEFAULT_PROGSNAP2_NAME
-            )
-        do_export_progsnap2(repo, output.resolve())
-    else:
-        do_export(repo, output.resolve())
+    if progsnap2 and output == pathlib.Path(
+        DEFAULT_BUNDLE_NAME
+    ):
+        output = pathlib.Path(DEFAULT_PROGSNAP2_NAME)
+
+    write_export_atomically(
+        do_export_progsnap2 if progsnap2 else do_export,
+        repo,
+        output.resolve(),
+    )
 
     typer.echo(f"Exported to {output}")
 @
+
+Both formats go out through [[write_export_atomically]]
+(\cref{sec:staged-export}) rather than only the bundle, because both
+land in the work tree and a half-written ProgSnap2 zip is no better a
+thing to commit than a half-written bundle.
+Choosing the writer before staging, rather than staging inside each
+writer, also keeps the rule where a reader can see it: everything this
+command writes appears at its destination in one step.
 
 <<test functions>>=
 def test_export_command(workdir, monkeypatch):
@@ -3620,6 +3739,32 @@ def test_export_progsnap2_custom_output(
     )
     assert result.exit_code == 0
     assert out.exists()
+@
+
+The export lands in the work tree, so the run after it decides whether
+the log now carries a copy of itself.
+This is the whole cycle in one test: export, then run, then ask what
+the run recorded.
+
+<<test functions>>=
+def test_exported_bundle_is_not_committed_by_the_next_run(
+    workdir, monkeypatch,
+):
+    """A run after an export must not commit the export."""
+    from learnlog.cli import app, DEFAULT_BUNDLE_NAME
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["export"])
+    assert result.exit_code == 0
+    assert (workdir / DEFAULT_BUNDLE_NAME).exists()
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert DEFAULT_BUNDLE_NAME not in \
+        repo.git("ls-files").stdout
 @
 
 
@@ -3945,10 +4090,11 @@ A teacher cloning a student's pushed learnlog to review it, or a
 student moving to a new machine, both need a way to get the
 [[.learnlog/]] data from the remote.
 
-The command takes a remote URL, performs a standard [[git clone]] into a
-temporary directory, and then moves the resulting [[.git/]] directory
-to [[.learnlog/]] in the target working directory.
-We use a temporary directory rather than [[git clone --bare]] because
+The command takes a remote URL, performs a standard [[git clone]] into
+a staging directory, moves the resulting [[.git/]] directory to
+[[.learnlog/]] in the target working directory, and checks the log's
+files out there.
+We use a staging directory rather than [[git clone --bare]] because
 a standard clone produces a properly configured repository with remote
 tracking branches---so subsequent [[push]] and [[pull]]
 (\cref{sec:pull}) operations work without additional setup.
@@ -3958,6 +4104,8 @@ user sees clone progress and can respond to credential prompts.
 We deliberately avoid constructing a [[LearnlogRepo]] before the
 clone completes, because its constructor auto-initialises an empty
 repository when [[.learnlog/]] is absent.
+Once the repository \emph{is} in place, constructing one is the point:
+that is what configures it.
 
 The guard that refuses to clone over an existing [[.learnlog/]] is
 worth a note, because for most of this command's life it was
@@ -3995,34 +4143,125 @@ def clone(
     ] = None,
 ):
     """Clone a remote learnlog repository into .learnlog/."""
-    import shutil
-
     workdir = pathlib.Path(
         directory or os.getcwd()
     ).resolve()
     learnlog_dir = workdir / ".learnlog"
 
-    if learnlog_dir.exists():
-        raise SystemExit(
-            f".learnlog/ already exists in {workdir}"
-        )
-
-    tmpdir = tempfile.mkdtemp(prefix="learnlog-clone-")
-    try:
-        result = subprocess.run(
-            ["git", "clone", url, tmpdir],
-            cwd=str(workdir),
-        )
-        if result.returncode != 0:
-            raise SystemExit("Clone failed.")
-        shutil.move(
-            str(pathlib.Path(tmpdir, ".git")),
-            str(learnlog_dir),
-        )
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    <<refuse a target we would have to clone over>>
+    <<clone into the target and move the repository into place>>
+    <<check the cloned files out into the work tree>>
 
     typer.echo(f"Cloned into {learnlog_dir}")
+@
+
+The target has to be empty, and not merely free of a [[.learnlog/]],
+because the clone brings files with it.
+A log holds the student's source as it was, and the last thing a clone
+may do is write those versions over a directory where somebody is
+working: an empty directory makes \enquote{check the log's files out}
+a safe operation with nothing to weigh against.
+A student who wants their log next to work they already have can clone
+into an empty directory and move the [[.learnlog/]] across, which is a
+decision they made rather than one we made for them.
+
+<<refuse a target we would have to clone over>>=
+if learnlog_dir.exists():
+    raise SystemExit(
+        f".learnlog/ already exists in {workdir}"
+    )
+workdir.mkdir(parents=True, exist_ok=True)
+if any(workdir.iterdir()):
+    raise SystemExit(
+        f"{workdir} is not empty. Clone checks the log's "
+        f"files out into the target, so it needs an empty "
+        f"directory."
+    )
+@
+
+The clone itself goes into a directory inside the target rather than
+into the system temporary directory, and that is what makes it
+atomic.
+The repository has to end up as [[.learnlog/]] inside the target, and
+what moves it there is a rename---which is atomic only within one
+filesystem.
+[[/tmp]] is routinely a different one, where [[shutil.move]] quietly
+degrades into copy-then-delete: an interrupted clone then leaves
+behind half a repository, which the guard above reads as a log that is
+already there and refuses to replace.
+A staging directory beside the destination cannot be on another
+filesystem, so [[os.rename]] applies, and either the repository is
+there in full or it is not there at all.
+
+Cleaning up catches [[BaseException]] so that [[Ctrl-C]] during a slow
+clone is included---an interruption is exactly when a partial
+repository would be left---and re-raises, because the user asked for
+the command to stop, not for it to report success.
+
+<<clone into the target and move the repository into place>>=
+staging = pathlib.Path(
+    tempfile.mkdtemp(
+        prefix=CLONE_STAGING_PREFIX, dir=workdir,
+    )
+)
+try:
+    result = subprocess.run(
+        ["git", "clone", url, str(staging)],
+        cwd=str(workdir),
+    )
+    if result.returncode != 0:
+        raise SystemExit("Clone failed.")
+    os.rename(staging / ".git", learnlog_dir)
+except BaseException:
+    shutil.rmtree(learnlog_dir, ignore_errors=True)
+    raise
+finally:
+    shutil.rmtree(staging, ignore_errors=True)
+<<constants>>=
+CLONE_STAGING_PREFIX = ".learnlog-clone-"
+@
+
+Moving the repository is where the command used to stop, and what it
+left was a work tree with nothing in it.
+Git had checked the files out into the staging directory we then
+deleted, so every file in the log read as deleted, and the first run
+in the clone committed that deletion as the student's work.
+Checking them out is therefore not a convenience: it is what makes the
+cloned log describe the directory it now lives in.
+
+Constructing the [[LearnlogRepo]] before the checkout does the other
+half of the same job.
+A cloned repository arrives with none of learnlog's configuration, and
+the constructor is what supplies it (\cref{sec:ensure-configured})---
+including the exclude file, without which this checkout's own
+[[.learnlog/]] would be the first thing the next run staged.
+
+A checkout that fails leaves the log itself intact, so it is reported
+rather than cleaned up after: the repository is complete, and the
+files can be produced from it at any time with
+\mintinline{bash}{learnlog git checkout .}.
+Like the bundle writer (\cref{sec:export}), it opts out of [[check]]
+so the user gets a sentence instead of a traceback.
+
+A log that holds no files is asked about first, because
+\mintinline{bash}{git checkout .} on an empty index is an error and
+not a no-op---and cloning a remote that nobody has pushed to yet is
+the ordinary way to reach one.
+That is a clone with nothing to report, not a clone that went wrong.
+
+<<check the cloned files out into the work tree>>=
+repo = LearnlogRepo(workdir)
+if repo.git("ls-files").stdout.strip():
+    checkout = repo.git(
+        "checkout", ".", check=False,
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    if checkout.returncode != 0:
+        typer.echo(
+            f"Cloned, but could not check out the files: "
+            f"{checkout.stderr.strip()}",
+            err=True,
+        )
 @
 
 We test [[clone]] by first pushing a learnlog repository to a bare
@@ -4111,6 +4350,139 @@ def test_clone_with_dir_option(workdir, monkeypatch):
     )
     assert result.exit_code == 0
     assert (target / ".learnlog").is_dir()
+@
+
+The three properties this command gained have the same shape of test,
+so they share a fixture: a log pushed to a bare remote that the clone
+can be run against for real.
+
+<<test functions>>=
+@pytest.fixture
+def pushed_log(workdir, monkeypatch):
+    """A learnlog pushed to a bare remote, and the remote."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    bare = workdir / "pushed-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    runner = CliRunner()
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    return bare
+@
+
+What a clone has to leave behind is a project, not a bare repository
+in an empty directory.
+The run that follows the clone is what makes the difference visible:
+with no files checked out, every file in the log reads as deleted, and
+that deletion is what the run commits as the student's code state.
+
+<<test functions>>=
+def test_clone_checks_out_the_work_tree(
+    workdir, pushed_log, monkeypatch,
+):
+    """The clone leaves a usable project behind."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    target = workdir / "checked-out"
+    target.mkdir()
+    result = CliRunner().invoke(
+        app, ["clone", str(pushed_log), "-C", str(target)]
+    )
+    assert result.exit_code == 0
+    assert (target / "hello.py").read_text() == \
+        'print("hello")\n'
+    assert (
+        target / ".learnlog" / "info" / "exclude"
+    ).exists()
+
+    cloned = LearnlogRepo(target)
+    cloned.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert "hello.py" in cloned.git("ls-files").stdout
+    changes = cloned.git(
+        "show", "--name-status", "--format=", "HEAD",
+    ).stdout
+    assert "D\thello.py" not in changes
+@
+
+A target with files in it is refused, and the test has to use a
+remote that would otherwise clone successfully---a refusal is only
+interesting where the command could have gone ahead.
+
+<<test functions>>=
+def test_clone_refuses_a_target_with_files(
+    workdir, pushed_log,
+):
+    """Clone will not write over somebody's working directory."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    target = workdir / "occupied"
+    target.mkdir()
+    (target / "notes.txt").write_text("my work\n")
+    result = CliRunner().invoke(
+        app, ["clone", str(pushed_log), "-C", str(target)]
+    )
+    assert result.exit_code != 0
+    assert not (target / ".learnlog").exists()
+    assert (target / "notes.txt").read_text() == "my work\n"
+@
+
+Interrupting the clone must leave the target as it was found, and the
+moment worth interrupting is the one just after the repository has
+been moved into place: that is where a partial [[.learnlog/]] would
+survive, and a surviving [[.learnlog/]] is what makes the next attempt
+refuse.
+The command is called directly rather than through the runner, so the
+interruption arrives as itself.
+
+<<test functions>>=
+def test_clone_interrupted_leaves_nothing_behind(
+    workdir, pushed_log, monkeypatch,
+):
+    """A cancelled clone leaves no half-finished log."""
+    from learnlog import cli
+    target = workdir / "interrupted"
+    target.mkdir()
+    real_rename = cli.os.rename
+
+    def rename_then_interrupt(source, destination):
+        real_rename(source, destination)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        cli.os, "rename", rename_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        cli.clone(url=str(pushed_log), directory=target)
+    assert list(target.iterdir()) == []
+@
+
+A remote nobody has pushed to yet clones into a log with no files in
+it, and that is a success with nothing to check out rather than a
+checkout that failed:
+
+<<test functions>>=
+def test_clone_of_an_empty_remote_reports_no_failure(
+    workdir, capsys,
+):
+    """An empty remote is not a checkout that went wrong."""
+    from learnlog import cli
+    bare = workdir / "empty-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    target = workdir / "empty-clone"
+    target.mkdir()
+    cli.clone(url=str(bare), directory=target)
+    assert (target / ".learnlog").is_dir()
+    assert "check out" not in capsys.readouterr().err
 @
 
 
