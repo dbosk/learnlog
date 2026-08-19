@@ -205,6 +205,7 @@ def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
 
 
 \section{Resolving the source}
+\label{sec:resolve-source}
 
 The [[play]], [[list]], and [[analyse]] commands accept an
 optional source that can be a directory (containing
@@ -285,6 +286,42 @@ if verify.returncode != 0:
     )
 
 tmpdir = tempfile.mkdtemp(prefix="learnlog-play-")
+try:
+    <<clone the bundle into the temporary directory>>
+except BaseException:
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    raise
+@
+
+Ownership of that directory changes hands halfway through the branch,
+and the guard exists to make the handover total.
+Once we return, the directory is the caller's---the return value says
+so---and the caller frees it in its own [[finally]].
+Until then nobody else knows the name, so if we leave by any other
+route than [[return]], the directory becomes unreachable garbage in
+[[/tmp]] that no later run will recognise or collect.
+Cloning a bundle is slow enough for the student to change their mind
+about, and [[Ctrl-C]] is how they say so; the clone can also fail
+on a bundle Git could list but not resolve.
+
+\paragraph{Why the broad net.}
+
+[[except BaseException]] is normally a warning sign, and deserves the
+argument for why it is the right net here rather than the usual
+[[except Exception]].
+The three things it catches beyond [[except Exception]]---
+[[KeyboardInterrupt]], [[SystemExit]], [[GeneratorExit]]---are exactly
+the ones a program must not quietly absorb, which is what makes the
+broad net a bad habit in general.
+What disarms the objection is the bare [[raise]]: the handler decides
+nothing about the exception, it frees a resource on the way past and
+lets the exception continue to whoever it was for.
+Catching less would not be safer, only leakier.
+And catching less would miss the case that actually happens:
+[[Ctrl-C]] is the one exit from here a person takes deliberately, and
+it is precisely the one [[except Exception]] is defined not to see.
+
+<<clone the bundle into the temporary directory>>=
 tmppath = pathlib.Path(tmpdir)
 
 subprocess.run(
@@ -382,6 +419,53 @@ def test_resolve_source_progsnap2(workdir):
         assert result.returncode == 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+The leak is only observable in the directory [[mkdtemp]] chose, so
+the test chooses it: pointing [[tempfile.tempdir]] at a directory of
+our own makes \enquote{nothing was left behind} a statement about
+one empty directory rather than about a [[/tmp]] shared with every
+other process on the machine.
+We interrupt the [[git clone]] specifically---the [[git bundle
+list-heads]] before it must still run, or the branch would fail
+before it ever created the directory whose fate we are testing.
+The [[pytest.raises]] is half the assertion: cleaning up is only
+correct if the interruption still gets through, and a handler that
+swallowed it would leave no temporary directory either.
+
+<<test functions>>=
+def test_resolve_source_bundle_cleans_up_on_interrupt(
+    workdir, monkeypatch,
+):
+    """Ctrl-C during unbundling leaves no temporary directory."""
+    import tempfile
+    from learnlog import cli
+
+    repo = LearnlogRepo(workdir)
+    bundle_path = workdir / "test.bundle"
+    repo.git(
+        "bundle", "create", str(bundle_path), "--all"
+    )
+
+    scratch = workdir.parent / "resolve-source-tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    real_run = subprocess.run
+
+    def interrupt_the_clone(cmd, *args, **kwargs):
+        if "clone" in cmd:
+            raise KeyboardInterrupt
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(
+        cli.subprocess, "run", interrupt_the_clone
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.resolve_source(str(bundle_path))
+
+    assert list(scratch.glob("learnlog-play-*")) == []
 @
 
 
