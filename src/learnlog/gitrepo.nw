@@ -1663,7 +1663,7 @@ another thing the student can move.
 program used to be, and it detaches [[HEAD]].
 Runs recorded afterwards piled onto that detached head: the branch
 never moved, so nothing that reads the branch saw them; and since
-[[git push --all]] pushes [[refs/heads/*]], it pushed none of them.
+[[learnlog push]] sends [[refs/heads/*]], it pushed none of them.
 The only thing keeping them alive was the reflog.
 
 [[git commit-tree]] moves no ref at all.
@@ -3104,7 +3104,7 @@ The second state is a detached [[HEAD]], which is what
 [[learnlog git checkout]] leaves behind when a student goes to look at
 an older version of their code.
 The run afterwards has to reach the branch: [[git log --branches]] is
-the set of commits [[git push --all]] would send, so asking for the
+the set of commits [[learnlog push]] would send, so asking for the
 run's records there is asking whether the run was pushable.
 And [[HEAD]] has to still be where the student left it, because the
 run is not entitled to undo their checkout.
