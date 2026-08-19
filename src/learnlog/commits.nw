@@ -102,11 +102,11 @@ Trailer commits themselves are dropped from the listings---they
 carry no code state and no new command, only the results of a run
 that is already in the list.
 
-Joining takes three steps: recognising a trailer commit,
-collecting all trailers by run id, and merging a trailer into the
-header block that asks for it.
+Joining takes three steps: recognising the two commits of a run,
+indexing the log by run id, and merging a trailer into the header
+block that asks for it.
 
-\subsection{Recognising a trailer commit}
+\subsection{Recognising the two commits of a run}
 
 A trailer commit is identified by its subject keyword, and its
 body starts with the run id it completes.
@@ -158,7 +158,25 @@ def test_parse_trailer_message_rejects_header():
     assert parse_trailer_message("") is None
 @
 
-\subsection{Collecting the trailers}
+The header side of the pairing is the same field read from the
+other end: a run block carries its own id on a line of its own,
+and that is the line a trailer commit points back to.
+We give it a name here, next to the trailer it pairs with, because
+both the indexing below and the merging further down ask the same
+question of a block---which run is this?---and neither should have
+to know how the recorder spells the field.
+
+<<commits functions>>=
+def run_block_id(block):
+    """Return the run id recorded in ``block``, or ``None``."""
+    for line in block.split("\n"):
+        if line.startswith(RUN_ID_FIELD):
+            return line[len(RUN_ID_FIELD):].strip()
+    return None
+@
+
+\subsection{Indexing the log by run id}
+\label{sec:run-index}
 
 A reader needs the trailer of a run before it can show that run,
 and it cannot know which commit holds it without looking.
@@ -169,26 +187,92 @@ As in [[get_commits]], an empty history makes [[git log]] exit
 non-zero; that is no trailers rather than an error, so the call opts
 out of [[check]] (\cref{gitrepo}).
 
-<<commits functions>>=
-def get_run_trailers(repo):
-    """Map run ids to the trailer text recorded for them.
+The same pass answers the opposite question for free.
+Refs land on trailer commits (\cref{sec:trailer-refs}), and
+resolving such a ref means going from a trailer commit \emph{back}
+to the header that carries its run's record---the same pairing by
+run id, read in the other direction.
+Every message needed for it is already in hand here, so we come
+away with two maps: run id to trailer text, and trailer commit to
+the header commit of the same run.
 
-    Reads every commit message once.  Commits that are not
-    trailer commits are ignored.
+<<commits functions>>=
+def scan_run_commits(repo):
+    """Index the log by run id in a single pass.
+
+    Returns ``(trailers, records)``.  ``trailers`` maps a run id
+    to the trailer text recorded for it; ``records`` maps the hash
+    of a trailer commit to the header commit that carries the same
+    run's record.  Commits that belong to no run are ignored.
     """
     result = repo.git(
         "log", "-z", "--format=%H%n%B", check=False,
     )
     if result.returncode != 0:
-        return {}
+        return {}, {}
 
     trailers = {}
-    for message in iter_log_messages(result.stdout):
+    headers = {}
+    trailer_runs = {}
+    for commit_hash, message in iter_log_commits(result.stdout):
         parsed = parse_trailer_message(message)
-        if parsed is not None:
-            run_id, trailer = parsed
-            trailers[run_id] = trailer
+        if parsed is None:
+            <<note which commit holds each header block>>
+            continue
+        run_id, trailer = parsed
+        trailers[run_id] = trailer
+        trailer_runs[commit_hash] = run_id
+    <<pair each trailer commit with its header commit>>
+    return trailers, records
+@
+
+A header commit usually holds one run block, but not always: older
+repositories grouped consecutive runs of unchanged code into one
+message, and so does ProgSnap2 reconstruction
+(\cref{sec:block-sep}).
+Splitting first means each of those runs is indexed on the commit
+that really carries it, rather than only the first one being
+found.
+
+<<note which commit holds each header block>>=
+for block in message.split(BLOCK_SEP):
+    run_id = run_block_id(block)
+    if run_id:
+        headers[run_id] = commit_hash
+@
+
+The two halves are joined at the end rather than as they are met,
+because [[git log]] hands us the trailer commit first: it is the
+younger of the pair, and its header is still several messages
+ahead in the walk.
+A trailer whose header never turns up is left out of the map, so
+that the caller can tell \enquote{this run's header is over there}
+from \enquote{this trailer names a run this history does not
+have}, and fall back accordingly.
+
+<<pair each trailer commit with its header commit>>=
+records = {
+    commit_hash: headers[run_id]
+    for commit_hash, run_id in trailer_runs.items()
+    if run_id in headers
+}
+@
+
+Each map has a caller that wants only that half, and asking for
+one should not make the other one's name appear at the call site.
+The two accessors below are what the rest of the program uses;
+[[scan_run_commits]] is the shared walk behind them.
+
+<<commits functions>>=
+def get_run_trailers(repo):
+    """Map run ids to the trailer text recorded for them."""
+    trailers, _ = scan_run_commits(repo)
     return trailers
+<<commits functions>>=
+def get_record_commits(repo):
+    """Map trailer commits to the header commit of their run."""
+    _, records = scan_run_commits(repo)
+    return records
 @
 
 Asking Git for NUL-separated records ([[-z]]) is what makes the
@@ -203,10 +287,16 @@ Each record starts with the commit hash on its own line, and a
 fragment that does not is a piece of the previous message that a
 stray NUL split off; we glue it back rather than reporting half a
 run.
+That leading line is worth keeping rather than dropping: it is the
+only place the walk learns \emph{which} commit a message came
+from, and the index above is built out of exactly those pairs.
 
 <<commits functions>>=
-def iter_log_messages(output):
-    """Yield commit messages from ``git log -z --format=%H%n%B``."""
+def iter_log_commits(output):
+    """Yield ``(hash, message)`` pairs from ``git log``.
+
+    Reads the output of ``git log -z --format=%H%n%B``.
+    """
     records = []
     for fragment in output.split("\0"):
         if not fragment:
@@ -217,7 +307,8 @@ def iter_log_messages(output):
             records.append(fragment)
 
     for record in records:
-        yield record.partition("\n")[2].rstrip("\n")
+        commit_hash, _, message = record.partition("\n")
+        yield commit_hash.strip(), message.rstrip("\n")
 @
 
 <<commits functions>>=
@@ -240,16 +331,17 @@ Let's verify that a NUL inside a commit message does not split a
 record in two:
 
 <<commits test functions>>=
-def test_iter_log_messages_survives_embedded_nul():
-    from learnlog.commits import iter_log_messages
+def test_iter_log_commits_survives_embedded_nul():
+    from learnlog.commits import iter_log_commits
     output = (
         "a" * 40 + "\nRun: hello.py\nstdout: be\0fore\n\0"
         + "b" * 40 + "\nRun: other.py\n\0"
     )
-    messages = list(iter_log_messages(output))
-    assert len(messages) == 2
-    assert "stdout: be\0fore" in messages[0]
-    assert messages[1] == "Run: other.py"
+    commits = list(iter_log_commits(output))
+    assert len(commits) == 2
+    assert commits[0][0] == "a" * 40
+    assert "stdout: be\0fore" in commits[0][1]
+    assert commits[1] == ("b" * 40, "Run: other.py")
 @
 
 \subsection{Merging a trailer into its block}
@@ -280,15 +372,6 @@ def merge_run_trailers(message, trailers):
     return BLOCK_SEP.join(blocks)
 <<commits constants>>=
 END_TIME_FIELD = "End-Time:"
-@
-
-<<commits functions>>=
-def run_block_id(block):
-    """Return the run id recorded in ``block``, or ``None``."""
-    for line in block.split("\n"):
-        if line.startswith(RUN_ID_FIELD):
-            return line[len(RUN_ID_FIELD):].strip()
-    return None
 @
 
 <<commits test functions>>=
@@ -329,15 +412,44 @@ def test_merge_run_trailers_does_not_duplicate():
 @
 
 \subsection{Refs that land on a trailer commit}
+\label{sec:trailer-refs}
 
 Tags and other refs are created by whatever is at HEAD when the
 user asks, and HEAD is a trailer commit for as long as no new run
 has started.
 A tag created just after a run finished therefore points at a
 commit that no listing contains.
-Since a trailer commit exists only to complete the run before it,
-we treat such a ref as naming that run, and step back to its
-header commit.
+Since a trailer commit exists only to complete one run, we treat
+such a ref as naming that run, and answer with that run's header
+commit.
+
+Which run that is has to be read off the run id, the way every
+other join in this chapter reads it (\cref{sec:run-index}).
+The commit \emph{before} the trailer is not the pairing but a
+coincidence of it, and it holds only while no two runs are in
+flight at once---which is the very situation the two-commit
+protocol was written to survive (\cref{sec:two-commit-protocol}).
+Let a logged program start another logged program and the inner
+run finishes first, so the log reads
+$H_\text{outer}$, $H_\text{inner}$, $T_\text{inner}$,
+$T_\text{outer}$.
+The commit before $T_\text{outer}$ is then $T_\text{inner}$, a
+trailer commit that no listing contains, so a tag on the newest
+commit resolves to something no caller can find and is lost to
+every view.
+Finish them the other way round---the log reads
+$H_a$, $H_b$, $T_a$, $T_b$---and the commit before $T_a$ is
+$H_b$: a real header, of the wrong run.
+The student tags the run of [[a.py]] and playback shows them
+[[b.py]].
+
+The parent walk stays on as the fallback for a trailer commit the
+index cannot place: one recorded without a run id, or one whose
+header this history does not contain, as in a log assembled from
+part of a bundle.
+For those the topology is the only guess left, and it is the
+guess that was correct back when a log could not hold overlapping
+runs in the first place.
 
 The hash reaching this function is whatever a ref or a caller
 supplied, so the subject probe can fail, and its failing is not an
@@ -364,13 +476,23 @@ it already has for a hash that names no run, whereas a second return
 shape would give both of them a new failure mode to handle for
 nothing gained.
 
+The index is a parameter rather than something this function always
+reads for itself, because [[get_tag_map]] resolves one hash per tag
+and would otherwise walk the whole log once per tag to rebuild the
+same map.
+It builds the map once and hands it over; a caller with a single
+hash to resolve, such as [[play --from]], omits the argument and
+pays for the one walk it needs.
+
 <<commits functions>>=
-def resolve_record_commit(repo, commit_hash):
+def resolve_record_commit(repo, commit_hash, records=None):
     """Return the commit that carries ``commit_hash``'s record.
 
-    Trailer commits resolve to the header commit they complete;
-    every other hash resolves to itself, including one that Git
-    will not read as a commit.
+    Trailer commits resolve to the header commit of the run they
+    complete; every other hash resolves to itself, including one
+    that Git will not read as a commit.  ``records`` is the map
+    from :func:`get_record_commits`, read from ``repo`` when the
+    caller supplies none.
     """
     probe = repo.git(
         "log", "-1", "--format=%s", commit_hash, check=False,
@@ -380,12 +502,20 @@ def resolve_record_commit(repo, commit_hash):
     if not probe.stdout.strip().startswith(TRAILER_PREFIX):
         return commit_hash
 
-    parent = repo.git(
-        "rev-parse", f"{commit_hash}^", check=False,
-    )
-    if parent.returncode != 0:
-        return commit_hash
-    return parent.stdout.strip()
+    if records is None:
+        records = get_record_commits(repo)
+    if commit_hash in records:
+        return records[commit_hash]
+    <<step back to the trailer's parent commit>>
+@
+
+<<step back to the trailer's parent commit>>=
+parent = repo.git(
+    "rev-parse", f"{commit_hash}^", check=False,
+)
+if parent.returncode != 0:
+    return commit_hash
+return parent.stdout.strip()
 @
 
 <<commits test functions>>=
@@ -420,6 +550,128 @@ def test_resolve_record_commit_tolerates_unreadable_hash(workdir):
     repo = LearnlogRepo(workdir)
     absent = "0" * 40
     assert resolve_record_commit(repo, absent) == absent
+@
+
+The two overlaps get a test each, because they fail differently
+and only one of the two failures announces itself.
+Both build the history from two [[LearnlogRepo]] instances, which
+is how an interleaved pair of processes writes it
+(\cref{sec:two-commit-protocol}): each instance carries its own
+run id, so the commits land in the order the calls are made.
+
+An inner run finishing first leaves a trailer commit immediately
+before the outer run's trailer, so a tag on the newest commit used
+to resolve to the inner run's trailer---a commit no listing has.
+The assertion checks both halves of what the callers need---the
+run the tag names, and that the answer is a commit [[get_commits]]
+lists, since that list is what [[play --from]] looks the answer up
+in and what it fails on with \enquote{not in the commit list}.
+
+<<commits test functions>>=
+def test_resolve_record_commit_lifo_overlap(workdir):
+    """A tag on the newest trailer names the run it completes."""
+    from learnlog.commits import (
+        get_commits,
+        resolve_record_commit,
+    )
+    outer = LearnlogRepo(workdir)
+    inner = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    outer.begin_run("outer.py", [], t0)
+    outer_header = outer.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip()
+    inner.begin_run("inner.py", [], t0)
+    inner.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=1),
+        exit_code=0,
+    )
+    outer.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=2),
+        exit_code=0,
+    )
+    newest = outer.git("rev-parse", "HEAD").stdout.strip()
+
+    resolved = resolve_record_commit(outer, newest)
+
+    assert resolved == outer_header
+    assert resolved in [c["hash"] for c in get_commits(outer)]
+@
+
+Finishing in the order the runs started puts a \emph{header}
+immediately before a trailer instead, so the topological answer is
+a commit every listing contains---and it belongs to the wrong run.
+Nothing reports an error in this case: the student tags one run
+and playback shows them another.
+The scripts are named apart so the assertion can say which run was
+found rather than only which hash.
+
+<<commits test functions>>=
+def test_resolve_record_commit_fifo_overlap(workdir):
+    """The first trailer names its own run, not the next one."""
+    from learnlog.commits import resolve_record_commit
+    first = LearnlogRepo(workdir)
+    second = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    first.begin_run("a.py", [], t0)
+    first_header = first.git("rev-parse", "HEAD").stdout.strip()
+    second.begin_run("b.py", [], t0)
+    first.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=1),
+        exit_code=0,
+    )
+    first_trailer = first.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip()
+    second.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=2),
+        exit_code=0,
+    )
+
+    resolved = resolve_record_commit(first, first_trailer)
+
+    assert resolved == first_header
+    message = first.git(
+        "log", "-1", "--format=%B", resolved,
+    ).stdout
+    assert "Script: a.py" in message
+@
+
+The fallback needs a trailer commit the index cannot place, and
+[[finalize_run]] never writes one, so the test writes it with
+plumbing: [[commit-tree]] hangs a message on a chosen parent
+without touching the index or the current branch, and the parent
+link and the message are all this function reads.
+
+<<commits test functions>>=
+def test_resolve_record_commit_without_run_id(workdir):
+    """A trailer with no run id falls back to its parent."""
+    from learnlog.commits import resolve_record_commit
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    header = repo.git("rev-parse", "HEAD").stdout.strip()
+    tree = repo.git(
+        "rev-parse", "HEAD^{tree}",
+    ).stdout.strip()
+    legacy = repo.git(
+        "commit-tree", tree, "-p", header, "-F", "-",
+        input=(
+            "Run-End: hello.py (none)\n"
+            "\n"
+            "End-Time: 2026-01-01T10:00:01\n"
+            "Exit-Code: 0\n"
+        ),
+    ).stdout.strip()
+
+    assert resolve_record_commit(repo, legacy) == header
 @
 
 
@@ -1838,9 +2090,14 @@ of tags is small (typically one per lab session) and a
 single subprocess call is cheaper than one per commit.
 
 Each tagged hash goes through [[resolve_record_commit]]
-(\cref{sec:run-join}) so that a tag created right after a
+(\cref{sec:trailer-refs}) so that a tag created right after a
 run finished---and therefore sitting on that run's trailer
-commit---still lands on a commit the callers can find.
+commit---still lands on the run it marks rather than on a
+commit the callers cannot find.
+Resolving reads the run index (\cref{sec:run-index}), so we
+read it once here and hand the same map to every tag; letting
+each resolution fetch its own would walk the whole log once
+per tag for one identical answer.
 
 \subsection{A tag does not always name a commit directly}
 
@@ -1922,6 +2179,7 @@ def get_tag_map(repo):
     )
     if result.returncode != 0:
         return {}
+    records = get_record_commits(repo)
     tag_map = {}
     for line in result.stdout.strip().split("\n"):
         parts = line.split(" ", 2)
@@ -1931,7 +2189,8 @@ def get_tag_map(repo):
         if object_type != COMMIT_OBJECT_TYPE:
             continue
         tag_map.setdefault(
-            resolve_record_commit(repo, commit_hash), []
+            resolve_record_commit(repo, commit_hash, records),
+            [],
         ).append(tag_name)
     return tag_map
 <<commits constants>>=
@@ -2050,4 +2309,46 @@ def test_get_tag_map_skips_non_commit_tags(workdir):
     assert tag_map[header] == ["lab1"]
     tagged = [name for names in tag_map.values() for name in names]
     assert tagged == ["lab1"]
+@
+
+The map is looked up by the hash of a commit the caller is
+already showing---an event's code state in the ProgSnap2 export
+(\cref{progsnap2}), a listed commit in the viewer---so an entry
+filed under anything else is a tag that no caller will ever see.
+Overlapping runs used to produce exactly that, since
+[[learnlog tag]] marks HEAD and HEAD after an inner run finished
+first is the outer run's trailer commit.
+Asserting on the whole map rather than on one entry is what
+distinguishes the tag landing on its run from it merely landing
+somewhere.
+
+<<commits test functions>>=
+def test_get_tag_map_overlapping_runs(workdir):
+    """A tag on the newest trailer lands on its own run."""
+    from learnlog.commits import get_tag_map
+    outer = LearnlogRepo(workdir)
+    inner = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    outer.begin_run("outer.py", [], t0)
+    outer_header = outer.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip()
+    inner.begin_run("inner.py", [], t0)
+    inner.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=1),
+        exit_code=0,
+    )
+    outer.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=2),
+        exit_code=0,
+    )
+    outer.git("tag", "lab1")
+
+    tag_map = get_tag_map(outer)
+
+    assert list(tag_map) == [outer_header]
+    assert tag_map[outer_header] == ["lab1"]
 @
