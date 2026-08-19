@@ -1496,18 +1496,30 @@ is not finished.
 Releasing needs all three, and no one of them is meaningful without the
 others, so they travel together.
 
+A fourth thing travels with them, and it is the same one the run
+itself carries (\cref{sec:run-owner}): the pid that made the claim.
+\enquote{A claim belongs to one run} has to survive [[fork]] to mean
+anything, and after a fork every one of the three above is duplicated
+into a process that took nothing.
+Recording who took the claim is what lets the release refuse in that
+process, so that the file the parent is still accounting for is not
+deleted out from under it by a child that merely inherited a
+reference to it.
+
 <<functions>>=
 class _CInvocation:
     """The worktree file learnlog owns for one ``python -c`` run.
 
-    Pairs the file with the claim naming it and with the open handle
-    whose lock marks the run as still in progress.
+    Pairs the file with the claim naming it, with the open handle
+    whose lock marks the run as still in progress, and with the pid
+    of the process that took it.
     """
 
     def __init__(self, path, record, lock):
         self.path = path
         self.record = record
         self.lock = lock
+        self.pid = os.getpid()
 @
 
 Reclaiming is what keeps a killed run costing one file rather than a
@@ -1638,10 +1650,21 @@ while their own program was running, must not surface as a traceback in
 the middle of their output, so this failure takes the same diagnostics
 path as the write.
 
+Before any of that, the same ownership question as in
+\cref{sec:run-owner}: only the process that took the claim may give it
+back.
+A claim reached from a forked child names a file the parent is still
+using and a lock the parent still holds, and removing either would
+undo the guarantee the claim exists to provide---the parent's header
+commit would name a file that had vanished before it was staged, and
+the lock would say the run had ended while it was still going.
+Refusing costs the child nothing, since it never had anything to give
+back.
+
 <<functions>>=
 def _release_c_invocation(claimed):
     """Give back the ``-c`` file this run wrote, and its claim."""
-    if claimed is None:
+    if claimed is None or claimed.pid != os.getpid():
         return
     try:
         claimed.path.unlink(missing_ok=True)
@@ -1661,6 +1684,41 @@ try:
     claimed.lock.close()
 except Exception as error:
     _report_swallowed_failure("release -c claim", error)
+@
+
+Let's verify that the release belongs to the process that took the
+claim.
+The child is given the parent's own claim object---which is exactly
+what [[fork]] hands it---and asked to release it; the parent's file
+and claim must both survive that, and the parent must still be able
+to release them itself afterwards.
+The child leaves through [[os._exit]] so that it cannot run the test
+process's exit handlers on its way out.
+
+<<test functions>>=
+@pytest.mark.skipif(
+    not hasattr(os, "fork"), reason="fork is POSIX-only"
+)
+def test_a_forked_child_does_not_release_the_parents_claim(workdir):
+    """Only the process that took the file gives it back."""
+    repo = LearnlogRepo(workdir)
+    claimed = _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    assert claimed is not None
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs in the forked child
+        try:
+            _release_c_invocation(claimed)
+        finally:
+            os._exit(0)
+    os.waitpid(pid, 0)
+
+    assert claimed.path.exists()
+    assert claimed.record.exists()
+
+    _release_c_invocation(claimed)
+    assert not claimed.path.exists()
+    assert not claimed.record.exists()
 @
 
 Let's verify the property the anchoring exists for: the file follows
@@ -2159,7 +2217,7 @@ def initialize():
     Called automatically on import.  Safe to call multiple times;
     subsequent calls are no-ops.
     """
-    global repo, iolog, start_time, main_script, main_args
+    global repo, iolog, start_time, main_script, main_args, run_pid
     global original_stdout, original_stderr, original_stdin
     global original_input, repl_capture_restore
     global repl_capture_flush, repl_capture_skip_input
@@ -2170,12 +2228,8 @@ def initialize():
     try:
         <<detect main script>>
         <<create repository and begin run>>
-        if not review_run:
-            <<install I/O wrappers>>
-            <<install REPL capture>>
-        <<install exception hook>>
-        <<install exit status hook>>
-        atexit.register(on_exit)
+        <<claim the run for this process>>
+        <<install capture, or record without it>>
     except Exception as error:
         _report_swallowed_failure("initialize", error)
 @
@@ -2593,6 +2647,140 @@ c_invocation = _persist_c_invocation(repo, main_script, main_args)
 _release_c_invocation(c_invocation)
 @
 
+
+\subsection{Claiming the run for this process}
+\label{sec:run-owner}
+
+[[begin_run]] has now written a header, and from this moment the run
+exists in the repository with no result attached to it.
+Two questions follow immediately, and both used to be answered too
+late.
+
+The first is \emph{who} will finish it.
+A header is finished by [[on_exit]], and [[atexit]] registrations
+survive [[fork]], so a program that forks reaches interpreter shutdown
+twice with one registration: the child runs [[on_exit]] too, and---
+holding an inherited copy of every global, [[repo.run_id]]
+included---commits a second trailer under the parent's identifier.
+The readers join a header to \emph{a} trailer, so the run then reports
+the child's exit code and the child's output, and the parent's real
+outcome is quietly dropped; three forks produce four trailers.
+A run therefore has an owner, and the owner is a process: we record
+[[os.getpid()]] here and [[on_exit]] does nothing when it finds itself
+in a different one (\cref{sec:exit-handler}).
+That is a refusal, not a loss.
+A forked child is a separate program with a separate exit status, and
+if its work is worth recording it is worth a run of its own---which is
+exactly what it gets when the child [[exec]]s, since the new
+interpreter initialises from scratch.
+The alternative, letting the child finalise, gives one run two
+answers and no way to tell which is real.
+
+The second question is \emph{whether} it will be finished at all.
+The registration used to come last, after every stream wrapper, the
+exception hook and the exit-status hook had been installed---so
+anything raising in between left a header that no [[on_exit]] would
+ever pair with a trailer.
+The trigger did not have to be exotic: a program run with file
+descriptor~0 closed has [[sys.stdin is None]], and asking [[None]]
+whether it [[isatty()]] raised [[AttributeError]] before the
+registration was reached.
+That run lost both its results \emph{and} its capture, when only one
+of the two had actually failed.
+
+So the pair goes in together and goes in first.
+The pid is recorded before the registration for the same reason: an
+[[on_exit]] that ran while [[run_pid]] was still [[None]] would take
+itself for a forked child and orphan the header it was registered to
+close.
+
+<<module state>>=
+run_pid = None
+<<claim the run for this process>>=
+run_pid = os.getpid()
+atexit.register(on_exit)
+@
+
+Let's verify the ownership rule where it was violated: a program that
+forks, lets the child exit normally, and then exits itself with a
+different status.
+The counts are the assertion that matters---one header and one
+trailer, not one header and two---because two trailers are not merely
+untidy, they make the record report whichever of the two a reader
+happens to reach.
+The rest checks that the survivor is the right one: the run has to
+carry the parent's status and the parent's output, and nothing of the
+child's.
+
+<<test functions>>=
+@pytest.mark.skipif(
+    not hasattr(os, "fork"), reason="fork is POSIX-only"
+)
+def test_a_forked_child_does_not_finalise_the_parents_run(
+    workdir, test_env,
+):
+    """A fork leaves one run with the parent's outcome."""
+    script = workdir / "forker.py"
+    script.write_text(
+        "import learnlog\n"
+        "import os\n"
+        "import sys\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    print('CHILD')\n"
+        "    sys.exit(3)\n"
+        "os.waitpid(pid, 0)\n"
+        "print('PARENT')\n"
+        "sys.exit(7)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", str(script)],
+        cwd=str(workdir), env=test_env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 7
+
+    subjects = _log_subjects(workdir)
+    assert subjects.count("Run: forker.py (none)") == 1
+    assert subjects.count("Run-End: forker.py (none)") == 1
+
+    record = _run_records(workdir)["Run: forker.py (none)"]
+    assert "Exit-Code: 7" in record
+    assert "stdout: PARENT" in record
+    assert "CHILD" not in record
+@
+
+With the trailer guaranteed, the capture can be allowed to fail on its
+own.
+Wrapping the streams, the REPL, [[sys.excepthook]] and [[sys.exit]] is
+what makes a record detailed; it is not what makes it exist.
+Its own [[try]] therefore turns \enquote{learnlog could not wrap this
+program's I/O} into a run recorded without I/O rather than into no run
+at all, and the failure goes to the diagnostics path
+(\cref{sec:diagnostics}) so that a missing [[--- I/O ---]] block has a
+written explanation instead of looking like a program that printed
+nothing.
+
+<<install capture, or record without it>>=
+try:
+    if not review_run:
+        <<install I/O wrappers>>
+        <<install REPL capture>>
+    <<install exception hook>>
+    <<install exit status hook>>
+except Exception as error:
+    _report_swallowed_failure("install capture", error)
+@
+
+Closed standard input is a legitimate way to run a program---[[0<&-]]
+in a shell, a daemon that closed its descriptors---and CPython says so
+by setting [[sys.stdin]] to [[None]] rather than by failing.
+We ask the same question the wrapper exists for only when there is
+something to ask it of.
+Reading [[None]] as \enquote{no stdin to capture} also keeps the
+restore path (\cref{sec:exit-handler}) honest, since it already skips
+the streams that were never wrapped.
+
 <<install I/O wrappers>>=
 iolog = IOLog()
 original_stdout = sys.stdout
@@ -2601,7 +2789,7 @@ original_stdin = sys.stdin
 original_input = builtins.input
 sys.stdout = ReplAwareStreamCapture(original_stdout, "stdout", iolog)
 sys.stderr = ReplAwareStreamCapture(original_stderr, "stderr", iolog)
-if not original_stdin.isatty():
+if original_stdin is not None and not original_stdin.isatty():
     sys.stdin = InputCapture(original_stdin, iolog)
 builtins.input = _wrap_input(original_input, iolog)
 @
@@ -2613,6 +2801,86 @@ builtins.input = _wrap_input(original_input, iolog)
     repl_capture_skip_input,
 ) = _install_repl_capture(main_script, iolog)
 @
+
+The degradation the second half promises is easiest to see when the
+wiring is broken deliberately.
+Removing [[builtins.input]] before the import stands in for every
+other way the wrapping can fail---it is the step that reads it,
+[[original_input = builtins.input]], that raises---and what the test
+asks is that only the capture is lost by it.
+The program finishes, the run is complete rather than orphaned, the
+trailer honestly says nothing was captured, and the reason is written
+where a maintainer can find it (\cref{sec:diagnostics}) instead of
+being inferred from the absence of output.
+
+<<test functions>>=
+def test_a_broken_wiring_still_pairs_the_run(workdir, test_env):
+    """Capture may fail; the record still gets its trailer."""
+    script = workdir / "unwirable.py"
+    script.write_text(
+        "import builtins\n"
+        "del builtins.input\n"
+        "import learnlog\n"
+        "print('still running')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", str(script)],
+        cwd=str(workdir), env=test_env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "still running\n"
+
+    subjects = _log_subjects(workdir)
+    assert subjects.count("Run: unwirable.py (none)") == 1
+    assert subjects.count("Run-End: unwirable.py (none)") == 1
+
+    record = _run_records(workdir)["Run: unwirable.py (none)"]
+    assert "(no I/O)" in record
+    assert "install capture" in (
+        workdir / ".learnlog" / "errors.log"
+    ).read_text()
+@
+
+The cheapest real trigger for the same failure needs no sabotage at
+all: a program run with file descriptor~0 closed.
+[[0<&-]] is how a shell says that, so the test says it through a
+shell.
+Closing standard input is not an error---CPython reports it by making
+[[sys.stdin]] be [[None]], which the program can see for itself---so
+this run must be recorded like any other, capture included.
+
+<<test functions>>=
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="0<&- is a POSIX shell redirection"
+)
+def test_a_run_without_standard_input_is_recorded(workdir, test_env):
+    """Closed fd 0 is a way to run a program, not a failure."""
+    script = workdir / "no_stdin.py"
+    script.write_text(
+        "import learnlog\n"
+        "import sys\n"
+        "print('stdin is', sys.stdin)\n"
+    )
+    result = subprocess.run(
+        ["/bin/sh", "-c", "exec {python} -S {script} 0<&-".format(
+            python=shlex.quote(sys.executable),
+            script=shlex.quote(str(script)),
+        )],
+        cwd=str(workdir), env=test_env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "stdin is None\n"
+
+    subjects = _log_subjects(workdir)
+    assert subjects.count("Run: no_stdin.py (none)") == 1
+    assert subjects.count("Run-End: no_stdin.py (none)") == 1
+
+    record = _run_records(workdir)["Run: no_stdin.py (none)"]
+    assert "stdout: stdin is None" in record
+@
+
 
 
 \subsection{Review runs}
@@ -4363,14 +4631,24 @@ being explicit about what the log says for each.
 
 
 \section{Exit handler}
+\label{sec:exit-handler}
 
 The [[on_exit]] function runs when the program terminates (via
 [[atexit]]).
-It restores the original streams---we must do this before running Git
-commands, otherwise our own output would be captured recursively---and
-then finalises the run in the repository.
+It finalises the run in the repository and puts the original streams
+back.
 
-We wrap everything in a [[try]]/[[except]] for the same reason as
+Two guards come before either.
+[[repo is None]] means no run was ever started, and the pid check is
+the other half of \cref{sec:run-owner}: this handler belongs to the
+process that wrote the header, and any other process holding an
+inherited copy of these globals must leave the run alone.
+It is answered first because everything below it writes---a forked
+child that got as far as restoring the streams would already have
+altered the parent's [[sys.stdout]] in its own address space and,
+worse, could go on to delete a file the parent still accounts for.
+
+We wrap the rest in a [[try]]/[[except]] for the same reason as
 [[initialize]]: learnlog must never cause an error at exit.
 It routes to the same diagnostics path too, and this is the handler
 where that matters most: an exception here loses the results of a run
@@ -4379,12 +4657,38 @@ indistinguishable from the one a [[SIGKILL]] leaves behind
 (\cref{gitrepo}).
 The [[errors.log]] entry is what tells those two apart afterwards.
 
+The restore is the last thing the handler does, and it is in a
+[[finally]] so that it is the last thing whether or not the commit
+worked.
+The order used to be the other way round, on the argument that Git had
+to run with the streams already put back or learnlog's own output
+would be captured recursively.
+That argument does not hold: everything [[finalize_run]] runs goes
+through [[subprocess]] with its own pipes (\cref{gitrepo}), so nothing
+learnlog does during the commit passes through [[sys.stdout]] at all.
+What the old order cost was real, though.
+Capture stopped at the restore, so every line the program still
+produced while the trailer was being committed---by a daemon thread,
+by anything still running---went to the terminal through a stream
+learnlog had stopped watching, and the window was the whole duration
+of a Git commit: seconds on a large project.
+Restoring last narrows that window to what remains between the
+snapshot and the commit call, and moving the snapshot down to the last
+statement before that call is what makes the remainder small.
+
+The race cannot be closed, and pretending otherwise would be the
+mistake here: a thread can always print after any snapshot, because
+something has to be the last thing read.
+What we can do is make the unread part short and bounded rather than
+proportional to the size of the student's project.
+
 <<functions>>=
 def on_exit():
     """Finalise the learnlog entry on program exit.
 
-    Restores original streams and commits the I/O log, exception
-    information, and exit status.
+    Commits the I/O log, exception information and exit status, then
+    restores the original streams.  Does nothing in a process that
+    did not start the run, such as a forked child.
     """
     global repo, iolog, exception_info
     global original_stdout, original_stderr, original_stdin
@@ -4393,13 +4697,21 @@ def on_exit():
 
     if repo is None:
         return
+    <<leave the run to the process that owns it>>
 
     try:
-        <<restore original streams>>
-        <<restore REPL capture>>
-        <<finalise the run>>
+        try:
+            <<restore REPL capture>>
+            <<finalise the run>>
+        finally:
+            <<restore original streams>>
     except Exception as error:
         _report_swallowed_failure("on_exit", error)
+@
+
+<<leave the run to the process that owns it>>=
+if os.getpid() != run_pid:
+    return
 @
 
 <<restore original streams>>=
@@ -4428,6 +4740,13 @@ had their chance to fire, so [[_resolve_exit_code]]
 (\cref{sec:exit-status}) is looking at all the evidence there will ever
 be.
 
+The end time and the exit status are settled before the I/O is read,
+so that reading it is the last statement before the trailer is
+composed.
+Neither of them can change while a further line is being printed,
+whereas the I/O can, so leaving the cheap ones ahead of it costs
+nothing and buys every microsecond of them for the log.
+
 The view trace goes in unconditionally, for the same reason [[io_log]]
 does: a run that recorded nothing hands over an empty list, and
 [[finalize_run]] then writes the trailer it always wrote
@@ -4436,14 +4755,122 @@ No branch here has to know whether this was a review.
 
 <<finalise the run>>=
 end_time = datetime.datetime.now()
+exit_code = _resolve_exit_code()
 io_text = iolog.getvalue() if iolog else ""
 repo.finalize_run(
     io_log=io_text,
     exception_info=exception_info,
     end_time=end_time,
-    exit_code=_resolve_exit_code(),
+    exit_code=exit_code,
     view_trace=view_trace,
 )
+@
+
+Both orderings the handler now depends on are cheap to test in
+process, because neither of them needs Git: what they are about is
+which globals are in force at which moment.
+The stand-in repository below answers [[finalize_run]] by writing
+down what it was handed \emph{and} which [[sys.stdout]] was installed
+when it was called, which is the whole of what the two orderings
+promise.
+
+<<test helpers>>=
+class RecordingRepo:
+    """A repository that records how it was finalised."""
+
+    def __init__(self):
+        self.workdir = None
+        self.io_log = None
+        self.stdout_at_commit = None
+
+    def finalize_run(self, io_log, exception_info, end_time,
+                     exit_code, view_trace=None):
+        self.io_log = io_log
+        self.stdout_at_commit = sys.stdout
+@
+
+The fixture puts the module into the state a wrapped run reaches just
+before exit: a repository, an owning pid, an [[IOLog]] and a
+capturing wrapper in front of the real [[sys.stdout]].
+
+Installing that wrapper is left to the tests rather than done here,
+and the reason is pytest rather than learnlog: the framework restores
+its own [[sys.stdout]] between fixture setup and the test body, so a
+swap made in a fixture is gone by the time the test runs.
+
+<<test helpers>>=
+@pytest.fixture
+def finishing_run(monkeypatch):
+    """A run wired up to the point where ``on_exit`` runs."""
+    from learnlog.capture import IOLog
+
+    recorder = RecordingRepo()
+    iolog = IOLog()
+    original_stdout = sys.stdout
+    wrapper = learnlog.ReplAwareStreamCapture(
+        original_stdout, "stdout", iolog,
+    )
+    monkeypatch.setattr(learnlog, "repo", recorder)
+    monkeypatch.setattr(learnlog, "run_pid", os.getpid())
+    monkeypatch.setattr(learnlog, "iolog", iolog)
+    monkeypatch.setattr(learnlog, "original_stdout", original_stdout)
+    monkeypatch.setattr(learnlog, "exception_info", None)
+    monkeypatch.setattr(learnlog, "view_trace", [])
+    return recorder, wrapper, original_stdout
+@
+
+The first test is the ordering of \cref{sec:exit-handler}.
+[[_resolve_exit_code]] is the last call [[on_exit]] makes before it
+reads the I/O, so a print from there stands for anything that writes
+while learnlog is finishing---the daemon thread that has not been
+told the program is over.
+The old order lost such a line twice over: the streams were already
+back, so it was never captured, and the reading had already happened,
+so there was nowhere to put it.
+Now it is in the trailer, and the commit runs with the capture still
+in place---which is what the second assertion pins down, since that
+is the property the whole reordering rests on.
+
+<<test functions>>=
+class TestOnExitOrdering:
+    def test_output_while_finishing_reaches_the_trailer(
+        self, finishing_run, monkeypatch,
+    ):
+        recorder, wrapper, original_stdout = finishing_run
+
+        def still_printing():
+            print("printed while finishing")
+            return 0
+
+        monkeypatch.setattr(sys, "stdout", wrapper)
+        monkeypatch.setattr(
+            learnlog, "_resolve_exit_code", still_printing,
+        )
+
+        learnlog.on_exit()
+
+        assert "printed while finishing" in recorder.io_log
+        assert recorder.stdout_at_commit is wrapper
+        assert sys.stdout is original_stdout
+@
+
+The second is the ownership guard, and what it has to show is that the
+guard comes \emph{before} the handler touches anything: a process that
+does not own the run neither finalises it nor puts back streams it
+never wrapped.
+
+<<test functions>>=
+    def test_a_process_that_does_not_own_the_run_does_nothing(
+        self, finishing_run, monkeypatch,
+    ):
+        recorder, wrapper, _ = finishing_run
+        monkeypatch.setattr(sys, "stdout", wrapper)
+        monkeypatch.setattr(learnlog, "run_pid", os.getpid() + 1)
+
+        learnlog.on_exit()
+
+        assert recorder.io_log is None
+        assert sys.stdout is wrapper
 @
 
 Let's verify the full lifecycle: import, run, exit, and check the
