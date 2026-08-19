@@ -54,15 +54,17 @@ Tutorials follow the same rule: the sources live in
 
 ## Architecture
 
-Five modules, all defined as `.nw` literate source in `src/learnlog/`:
+The core modules, all defined as `.nw` literate source in `src/learnlog/`
+(`commits.nw` and `progsnap2.nw` hold the read and export sides):
 
 | Module | File | Purpose |
 |--------|------|---------|
-| `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup; `find_learnlog_dir()`/`_resolve_workdir()` decide which project a run belongs to |
-| `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the venv's project root (marker file + `sys.prefix`) for `initialize()`, and imports `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs. Must never import `learnlog` at module scope: `import learnlog._autostart` already runs `__init__.py`, so the activation veto (`LEARNLOG_SKIP_AUTOSTART`, `learnlog init`) lives in `initialize()`, not here |
+| `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup; `find_learnlog_dir()`/`_resolve_workdir()` decide which project a run belongs to. `_is_opted_out()`/`_learnlog_cli_subcommand()` implement the recording veto: `LEARNLOG_SKIP_AUTOSTART`, plus **every CLI subcommand except `play`/`list`** (`REVIEW_SUBCOMMANDS`) — the veto returns *before* `_resolve_workdir()`, so a vetoed command creates no repository at all. Review runs skip both capture chunks and instead accumulate `view_trace` via the public `record_view(commit_hash, action)` |
+| `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the venv's project root (marker file + `sys.prefix`) for `initialize()`, and imports `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs. Must never import `learnlog` at module scope: `import learnlog._autostart` already runs `__init__.py`, so the recording veto (`LEARNLOG_SKIP_AUTOSTART`, and every subcommand outside `REVIEW_SUBCOMMANDS`) lives in `initialize()`, not here |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
-| `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; append-only two-commit protocol (header commit with the code state before the run, trailer commit with the results after, linked by `Run-Id`), `flock` + per-run `GIT_INDEX_FILE` around each commit and around repository creation (`init_repo` is idempotent and race-safe); `git()` raises `GitError` on failure and `report_error()` records swallowed failures |
-| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`; refuses `$HOME`-or-above unless `--force`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), `doctor` (reports/repairs the interpreter's autostart wiring; dead wiring exits 1), and `analyse` |
+| `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; append-only two-commit protocol (header commit with the code state before the run, trailer commit with the results after, linked by `Run-Id`), `flock` + per-run `GIT_INDEX_FILE` around each commit and around repository creation (`init_repo` is idempotent and race-safe); `git()` raises `GitError` on failure and `report_error()` records swallowed failures. Owns `REVIEW_SUBCOMMANDS` (the run-record vocabulary both `__init__` and `commits` import) and writes a review run's `Viewed: <hash> <ISO-8601> <action>` trailer lines |
+| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`; refuses `$HOME`-or-above unless `--force`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), `doctor` (reports/repairs the interpreter's autostart wiring; dead wiring exits 1), and `analyse`. Only `play` and `list` are recorded runs; every other subcommand leaves no trace, which is what makes `clone` into an empty directory, a fast-forwarding `pull`, and a `tag` on the student's own run possible |
+| `viewer.py` | `viewer.nw` | `PlaybackViewer` (curses) and `play_batch`; both report each commit they display to `learnlog.record_view` — actions `open`/`next`/`prev`/`jump-first`/`jump-last` interactively, `batch` in batch mode. A keypress that does not change the displayed commit records nothing |
 
 Tutorial sources in `src/learnlog/tutorials/`:
 - `getting-started.nw` — first-run setup, activation, running code, and batch playback
@@ -74,7 +76,7 @@ Tutorial sources in `src/learnlog/tutorials/`:
 
 - **Transparency**: student programs must behave identically with/without learnlog
 - **Crash resilience**: `begin_run()` commits a header before execution, `finalize_run()` commits a trailer after; nothing is ever rewritten (no `--amend`), so overlapping runs, pushes, and tags stay correct
-- **Reading**: `commits.nw` joins each run's two commits by `Run-Id` (`get_run_trailers`/`merge_run_trailers`); `get_commits()` hides trailer commits, so `list`/`play`/ProgSnap2 show one record per run
+- **Reading**: `commits.nw` joins each run's two commits by `Run-Id` (`get_run_trailers`/`merge_run_trailers`); `get_commits()` hides trailer commits, so `list`/`play`/ProgSnap2 show one record per run. Review runs (`learnlog play`/`list`) are shown **by default** — reflection is part of the story; `filter_internal_runs()` hides only learnlog's plumbing (the `pip install learnlog` from `init`, and records of other subcommands left by older versions), which `--all` restores. Predicates: `is_learnlog_*` (all of learnlog's own activity), `is_review_*` (play/list), `is_internal_*` (learnlog activity that is not review)
 - `.learnlog/` in the working directory is the *product's* data (student log repo), not project config
 - **Bounded discovery**: `find_learnlog_dir()` never returns `$HOME` or
   anything above it, and stops at a `.git` boundary (checked after
@@ -118,6 +120,7 @@ Key test patterns:
 - Temporary directories with `tmp_path` fixture for Git operations
 - Subprocess-based integration tests for full import-capture-commit pipeline
 - `CliRunner` from Typer for CLI command testing (note: CliRunner doesn't connect a real TTY)
+- Anything that depends on **whether a command records itself** is invisible to `CliRunner` tests, because the suite exports `LEARNLOG_SKIP_AUTOSTART=1`. Those belong in the share-cycle end-to-end suite in `learnlog.nw` (`cli_project` fixture), which runs the real CLI from a wired scratch venv in subprocesses that are genuinely logged
 
 ## CI
 

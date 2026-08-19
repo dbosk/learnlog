@@ -53,11 +53,27 @@ The [[curses]] import is deferred to inside methods because
 it is unavailable on Windows---we only need it when the user
 actually invokes the interactive viewer.
 
+The package itself comes in as a plain module import rather than as
+\mintinline{python}{from learnlog import record_view}, so that the
+name is resolved when the viewer calls it rather than when the viewer
+is loaded.
+Today both spellings work---the package imports [[capture]],
+[[gitrepo]] and [[_autostart]] and nothing else, so [[viewer]] is
+always reached from the outside through [[cli]], long after
+[[learnlog/__init__.py]] has finished.
+The module import is the spelling that survives that ceasing to be
+true: a [[from]] import inside an import cycle fails at load time with
+an [[ImportError]] naming the wrong culprit, and it would fail in the
+one module whose whole job is to be invisible to the run it reports
+on.
+The cost is an attribute lookup per navigation keystroke.
+
 <<viewer imports>>=
 from __future__ import annotations
 
 import sys
 
+import learnlog
 from learnlog.commits import (
     elapsed_since_previous_run,
     format_elapsed,
@@ -125,6 +141,70 @@ def _get_trailers(self):
 @
 
 
+\subsection{What counts as looking at a commit}
+\label{sec:viewer-view-trace}
+
+Playback is itself a recorded run (\cref{sec:review-runs}), and what
+makes that record worth keeping is the trace of which commits the
+student actually looked at.
+The viewer contributes to it by reporting each commit it puts on
+screen to [[learnlog.record_view]].
+
+The unit of the trace is the commit that ends up \emph{drawn}, not the
+key that produced it, and the two part company often.
+[[j]] and [[k]] scroll within the commit already showing; [[L]] at the
+last commit and [[g]] at the first one move nothing at all.
+A trace built from keystrokes would report six visits to a commit the
+student scrolled through once, and a reader cannot tell that apart
+from six genuine returns---so the derived measure everyone will want,
+\enquote{which run did they keep coming back to}, would be wrong in
+exactly the cases it is asked about.
+Hence the rule: a movement that leaves the position where it was
+records nothing.
+
+Two events are outside the rule for the same reason, that the position
+is not what changed.
+[[open]] is recorded unconditionally, because the first commit is on
+screen through the viewer starting rather than through anything
+moving; and a return to a commit seen before \emph{is} recorded again,
+because the back-and-forth is the signal, not noise to be
+deduplicated.
+
+<<player methods>>=
+def _record_view(self, action):
+    """Report the commit now on screen to the run recorder."""
+    learnlog.record_view(
+        self.commits[self.index]["hash"], action,
+    )
+@
+
+[[record_view]] does nothing when no run is being recorded, so the
+viewer never has to ask whether it is being logged---the same bargain
+the stream wrappers make with a student's program
+(\cref{sec:review-runs}).
+That is what lets [[learnlog play -f bundle.learnlog]] from an unwired
+interpreter, and a unit test driving [[_handle_key]] directly, share
+one unconditional call site with the recorded case.
+
+All movement between commits goes through one method, so that the
+\enquote{only when it changed} rule is stated once instead of in each
+of the four key branches that could get it wrong independently.
+
+<<player methods>>=
+def _go_to(self, index, action):
+    """Show commit ``index``, recording it if it changed."""
+    moved = index != self.index
+    self.index = index
+    self.scroll = 0
+    if moved:
+        self._record_view(action)
+@
+
+Resetting [[scroll]] is outside the [[if]] deliberately: pressing
+[[G]] while already at the last commit still scrolls back to the top
+of it, which is what it always did and what the key means.
+Only the trace treats that keypress as a non-event.
+
 
 \subsection{Running the viewer}
 
@@ -152,6 +232,13 @@ This respects light themes, transparency, and custom colour
 schemes---details that matter when learnlog runs on diverse
 student and teacher machines.
 
+The [[open]] event is recorded here rather than in [[_draw]], because
+[[_draw]] runs again on every scroll keystroke and would turn one
+opening into a stream of them.
+Recording it before the first draw rather than after also keeps the
+trace truthful about a viewer the student quits immediately: the
+commit was on screen, so it belongs in the record.
+
 <<player methods>>=
 def _main_loop(self, stdscr):
     """Main event loop inside curses."""
@@ -159,6 +246,7 @@ def _main_loop(self, stdscr):
     curses.use_default_colors()
     curses.curs_set(0)
     stdscr.clear()
+    self._record_view("open")
 
     while True:
         self._draw(stdscr)
@@ -331,6 +419,17 @@ when the user presses [[q]] to quit.
 We support both the letter keys ([[H]], [[L]], [[j]], [[k]])
 and arrow keys for accessibility.
 
+Each branch names the movement it performs and hands the destination
+to [[_go_to]] (\cref{sec:viewer-view-trace}), which is what gives the
+action words in the trace---[[next]], [[prev]], [[jump-first]],
+[[jump-last]]---a single definition each.
+The step keys keep their guards rather than clamping through
+[[min]]/[[max]], because \enquote{[[H]] at the first commit does
+nothing} and \enquote{[[g]] at the first commit returns to the top of
+it} are genuinely different behaviours and the guard is what
+distinguishes them.
+The scroll keys touch no commit and so pass [[_go_to]] by.
+
 <<player methods>>=
 def _handle_key(self, key):
     """Process a keypress.  Return ``False`` to quit."""
@@ -340,22 +439,20 @@ def _handle_key(self, key):
         return False
     elif key in (ord("h"), ord("H"), curses.KEY_LEFT):
         if self.index > 0:
-            self.index -= 1
-            self.scroll = 0
+            self._go_to(self.index - 1, "prev")
     elif key in (ord("l"), ord("L"), curses.KEY_RIGHT):
         if self.index < len(self.commits) - 1:
-            self.index += 1
-            self.scroll = 0
+            self._go_to(self.index + 1, "next")
     elif key in (ord("j"), curses.KEY_DOWN):
         self.scroll += 1
     elif key in (ord("k"), curses.KEY_UP):
         self.scroll = max(0, self.scroll - 1)
     elif key == ord("g"):
-        self.index = 0
-        self.scroll = 0
+        self._go_to(0, "jump-first")
     elif key == ord("G"):
-        self.index = len(self.commits) - 1
-        self.scroll = 0
+        self._go_to(
+            len(self.commits) - 1, "jump-last",
+        )
 
     return True
 @
@@ -406,6 +503,99 @@ def test_handle_key_jump_endpoints():
     assert viewer.index == 0
 @
 
+A live run is what turns [[record_view]] from a no-op into an
+append, so the tests below supply one: a stand-in [[repo]] object
+and an empty trace, both restored afterwards by [[monkeypatch]].
+Driving [[_handle_key]] with the real key codes rather than calling
+[[_go_to]] directly is the point---the mapping from keys to action
+words is exactly what could rot.
+
+The walk visits [[bbb]] three times by three different routes, so the
+trace has to keep repeats and has to name each arrival for what it
+was:
+
+<<viewer test functions>>=
+def test_navigation_records_view_trace(monkeypatch):
+    """Each arrival is recorded, revisits included."""
+    import learnlog
+    from learnlog.viewer import PlaybackViewer
+    monkeypatch.setattr(learnlog, "repo", object())
+    monkeypatch.setattr(learnlog, "view_trace", [])
+    commits = [
+        {"hash": "aaa"}, {"hash": "bbb"}, {"hash": "ccc"}
+    ]
+    viewer = PlaybackViewer(None, commits, 0)
+
+    viewer._record_view("open")
+    for key in "llhgG":
+        viewer._handle_key(ord(key))
+    viewer._handle_key(ord("h"))
+
+    assert [
+        (commit, action)
+        for _, commit, action in learnlog.view_trace
+    ] == [
+        ("aaa", "open"),
+        ("bbb", "next"),
+        ("ccc", "next"),
+        ("bbb", "prev"),
+        ("aaa", "jump-first"),
+        ("ccc", "jump-last"),
+        ("bbb", "prev"),
+    ]
+@
+
+The complement matters just as much, because it is the half that
+decides whether the trace measures reading or typing.  Scrolling
+inside a commit, and a step or a jump that runs into the end of the
+list, all leave the screen showing what it already showed:
+
+<<viewer test functions>>=
+def test_a_keypress_that_moves_nothing_records_nothing(
+    monkeypatch,
+):
+    """Scrolling and blocked moves are not views."""
+    import learnlog
+    from learnlog.viewer import PlaybackViewer
+    monkeypatch.setattr(learnlog, "repo", object())
+    monkeypatch.setattr(learnlog, "view_trace", [])
+    commits = [{"hash": "aaa"}, {"hash": "bbb"}]
+    viewer = PlaybackViewer(None, commits, 0)
+
+    for key in "hgjk":
+        viewer._handle_key(ord(key))
+    assert learnlog.view_trace == []
+
+    viewer._handle_key(ord("G"))
+    viewer._handle_key(ord("G"))
+    viewer._handle_key(ord("l"))
+    assert [
+        (commit, action)
+        for _, commit, action in learnlog.view_trace
+    ] == [("bbb", "jump-last")]
+@
+
+Nothing about the viewer forces a run to exist, and the ordinary
+case is that none does---[[learnlog play -f]] from an unwired
+interpreter, or these very tests before they patch anything.  The
+navigation must then behave exactly as before:
+
+<<viewer test functions>>=
+def test_navigation_without_a_run_stays_silent(monkeypatch):
+    """Viewing outside a recorded run records nothing."""
+    import learnlog
+    from learnlog.viewer import PlaybackViewer
+    monkeypatch.setattr(learnlog, "repo", None)
+    monkeypatch.setattr(learnlog, "view_trace", [])
+    viewer = PlaybackViewer(
+        None, [{"hash": "aaa"}, {"hash": "bbb"}], 0,
+    )
+    viewer._record_view("open")
+    viewer._handle_key(ord("l"))
+    assert viewer.index == 1
+    assert learnlog.view_trace == []
+@
+
 
 \section{Batch playback}
 \label{sec:play-batch}
@@ -419,6 +609,17 @@ one commit appears just before the diff of the next, so the
 reader sees what the program produced and what the student
 changed as a result in a single continuous stream.
 
+Batch mode has no navigation to trace, so every commit it emits gets
+the same action word, [[batch]], and the order of the trace is the
+order of the log.
+The call sits after the [[detail is None]] test rather than at the top
+of the loop, which is the batch spelling of the rule from
+\cref{sec:viewer-view-trace}: a commit whose every run was filtered
+away never reaches the screen, so it never reaches the trace either.
+That an internal run stays out of the record of the review that
+skipped it is the same consistency the reader sees---what the trailer
+says was looked at is what standard output showed.
+
 <<viewer functions>>=
 def play_batch(repo, commits, start_index=0,
                filter_internal=True, trailers=None):
@@ -429,6 +630,9 @@ def play_batch(repo, commits, start_index=0,
     are skipped.  Review runs are printed like any other run.
     ``trailers`` is the map from ``get_run_trailers``; it is
     read from ``repo`` when not supplied.
+
+    Every commit that is printed is reported to
+    :func:`learnlog.record_view` with the action ``batch``.
     """
     if trailers is None:
         trailers = get_run_trailers(repo)
@@ -439,6 +643,7 @@ def play_batch(repo, commits, start_index=0,
         )
         if detail is None:
             continue
+        learnlog.record_view(commit["hash"], "batch")
         elapsed = format_elapsed(
             elapsed_since_previous_run(commits, index)
         )
@@ -527,6 +732,42 @@ def test_play_batch_renders_review_run(workdir, capsys):
     assert "Run: learnlog play" in captured
     assert "Exit-Code: 0" in captured
     assert "(learnlog internal run)" not in captured
+@
+
+The batch trace must agree with the page, so we give the log one
+commit that batch mode prints and one it drops---the [[pip]] install
+of learnlog is internal in every view (\cref{sec:filter-learnlog})---
+and require the trace to list exactly the printed ones:
+
+<<viewer test functions>>=
+def test_play_batch_records_each_commit(
+    workdir, capsys, monkeypatch,
+):
+    """The trace names the commits batch mode printed."""
+    import datetime
+    import learnlog
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    monkeypatch.setattr(learnlog, "repo", object())
+    monkeypatch.setattr(learnlog, "view_trace", [])
+    repo = LearnlogRepo(workdir)
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], moment)
+    repo.begin_run("pip", ["install", "learnlog"], moment)
+
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    printed = capsys.readouterr().out
+
+    assert [
+        (commit, action)
+        for _, commit, action in learnlog.view_trace
+    ] == [
+        (commits[0]["hash"], "batch"),
+        (commits[1]["hash"], "batch"),
+    ]
+    assert commits[2]["hash"] not in printed
 @
 
 The gap line should appear from the second run onward, never on the first.
