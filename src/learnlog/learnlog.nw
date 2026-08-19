@@ -853,30 +853,6 @@ There is also a fourth possible answer, \enquote{nowhere}: some
 invocations must not be logged at all rather than logged in the wrong
 place, and [[_resolve_workdir]] says so by raising.
 
-The invocation name is normalised rather than copied from
-[[sys.argv[0]]] verbatim.
-Raw values such as the empty string or [[-c]] are faithful to CPython,
-but poor commit headers for humans.
-We map those sentinel forms to labels that explain how Python was
-started while leaving ordinary filenames and entry-point basenames
-unchanged.
-
-For [[python -c]] there is a second wrinkle: real interpreters do not
-keep the source in [[sys.argv]].
-At runtime [[sys.argv]] starts with [[-c]] and then contains only the
-student's extra arguments, while [[sys.orig_argv]] still remembers the
-full interpreter command line including the source string.
-If we only inspect [[sys.argv]], explicit-import tests can pass while the
-real autostart path still records [[Arguments: (none)]]---and, worse,
-[[python -c "code" extra]] would record [[extra]] as if it were the
-source.
-We therefore let the normaliser consult [[sys.orig_argv]] first when it
-recognises the [[-c]] sentinel: that path recovers the real source from
-[[sys.orig_argv[2]]] and preserves the student's extra arguments from
-[[sys.argv[1:]]].
-The bare [[sys.argv]] fast path remains only as a fallback for callers
-that do not supply [[sys.orig_argv]].
-
 \subsection{Whether to log this invocation at all}
 \label{sec:veto}
 
@@ -1121,6 +1097,33 @@ class TestIsOptedOut:
     def test_unnamed_and_unknown_subcommands_are_vetoed(self, argv):
         assert _is_opted_out(argv, env={})
 @
+
+\subsection{Normalising the invocation}
+
+An invocation that survives the veto still has to be given a name.
+The invocation name is normalised rather than copied from
+[[sys.argv[0]]] verbatim.
+Raw values such as the empty string or [[-c]] are faithful to CPython,
+but poor commit headers for humans.
+We map those sentinel forms to labels that explain how Python was
+started while leaving ordinary filenames and entry-point basenames
+unchanged.
+
+For [[python -c]] there is a second wrinkle: real interpreters do not
+keep the source in [[sys.argv]].
+At runtime [[sys.argv]] starts with [[-c]] and then contains only the
+student's extra arguments, while [[sys.orig_argv]] still remembers the
+full interpreter command line including the source string.
+If we only inspect [[sys.argv]], explicit-import tests can pass while the
+real autostart path still records [[Arguments: (none)]]---and, worse,
+[[python -c "code" extra]] would record [[extra]] as if it were the
+source.
+We therefore let the normaliser consult [[sys.orig_argv]] first when it
+recognises the [[-c]] sentinel: that path recovers the real source from
+[[sys.orig_argv[2]]] and preserves the student's extra arguments from
+[[sys.argv[1:]]].
+The bare [[sys.argv]] fast path remains only as a fallback for callers
+that do not supply [[sys.orig_argv]].
 
 <<functions>>=
 def _normalize_main_invocation(argv, orig_argv=None):
@@ -2578,6 +2581,8 @@ class TestRecordView:
             for moment, _, _ in learnlog.view_trace
         )
 @
+
+\subsection{Tests for initialisation}
 
 Let's verify that initialisation creates the repository and wraps
 streams.

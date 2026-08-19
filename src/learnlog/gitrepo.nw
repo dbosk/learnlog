@@ -1429,7 +1429,7 @@ Two subcommands are different in kind: [[learnlog play]] and
 and that act of reflection is behaviour worth recording.
 So those two are logged as ordinary runs and every other subcommand
 leaves no trace at all, not even a repository
-(\cref{sec:initialize}).
+(\cref{sec:veto}).
 
 Naming the two here, rather than in the CLI that implements them, is
 what keeps the dependencies pointing the right way.
@@ -2271,7 +2271,7 @@ Each line answers three questions in the order a reader asks them:
 \emph{what} was on screen, \emph{when}, and \emph{how} the student got
 there.
 The commit therefore comes first even though the recorder
-(\cref{sec:view-trace}) timestamps the event first, and the argument
+(\cref{sec:review-runs}) timestamps the event first, and the argument
 order here follows the recorder so a stored triple can be splatted
 straight in.
 
