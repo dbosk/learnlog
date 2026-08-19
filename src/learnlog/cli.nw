@@ -1143,9 +1143,10 @@ files are placed inside the venv's [[site-packages]]:
     up from its own directory.  [[_autostart]] only
     \emph{resolves} the recorded path; it is
     [[initialize()]] that asks for it, exports the answer
-    as [[LEARNLOG_PROJECT_ROOT]] so child processes
-    inherit the same anchor, and consults it before
-    falling back to the cwd search
+    as [[LEARNLOG_PROJECT_ROOT]]---scoped to this venv by a
+    companion [[LEARNLOG_ANCHOR_PREFIX]]---so that children
+    of the same session inherit the same anchor, and
+    consults it before falling back to the cwd search
     (\cref{sec:initialize}).
     The split keeps [[_autostart]] free of any import of
     the package, which \cref{learnlog} explains is
