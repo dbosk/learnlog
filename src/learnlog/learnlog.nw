@@ -6001,7 +6001,16 @@ While the command logged itself, [[initialize]] created that
 [[.learnlog/]] before the guard ran, so the refusal was unconditional
 and the command could not perform its only function.
 The test is therefore not primarily about equality of histories---it
-is about [[clone]] exiting zero at all.
+is about [[clone]] exiting zero at all, which [[check=True]] is what
+asserts.
+
+The clone runs anchored to its own target, for the same reason as in
+the test above: that is the shape a plain [[pip install learnlog]]
+has, where nothing wires the interpreter and [[_resolve_workdir]]
+answers \enquote{wherever you are standing}.  Anchored to the
+project instead, the old code would have recorded the clone in the
+\emph{sender's} log and let the command succeed---a different defect,
+and the weaker one.
 
 <<autostart test functions>>=
 def test_an_exported_log_clones_into_an_empty_directory(
@@ -6019,10 +6028,12 @@ def test_an_exported_log_clones_into_an_empty_directory(
 
     target = tmp_path / "clone"
     target.mkdir()
+    anchored = _autostart_env()
+    anchored["LEARNLOG_PROJECT_ROOT"] = str(target)
     _run_cli(
         learnlog,
         ["clone", str(bundle), "-C", str(target)],
-        cwd=target,
+        cwd=target, env=anchored,
     )
 
     assert (target / ".learnlog").is_dir()
