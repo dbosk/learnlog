@@ -3684,8 +3684,8 @@ def test_set_remote_updates_existing(workdir, monkeypatch):
 \subsection{The [[push]] command}
 \label{sec:push}
 
-The [[push]] command sends all branches to [[origin]] with tracking
-([[--all -u]]).
+The [[push]] command sends the log to [[origin]] with tracking
+([[-u]]).
 The expected workflow is that the remote repository starts empty, so
 a regular push suffices.
 For the less common case where the remote already contains commits
@@ -3693,6 +3693,40 @@ For the less common case where the remote already contains commits
 [[--force]] / [[-f]] flag overrides the remote's history.
 This is safe because [[.learnlog/]] is a single-writer recording
 artefact---there is no risk of overwriting someone else's work.
+
+\paragraph{What \enquote{the log} has to mean.}
+
+[[push]] and [[export]] (\cref{sec:export}) are two ways to hand the
+same log to the same teacher, so they have to hand over the same
+thing.
+They did not.
+[[export]] bundles [[--all]], which for [[git bundle]] means every
+ref---branches \emph{and} tags---while [[git push --all]] means
+[[refs/heads/*]] and nothing else.
+A student who marked their milestones with [[learnlog tag lab1]]
+(\cref{sec:tag}) and shared by pushing delivered a log in which no
+milestone existed, and had no way of noticing: the push reported
+success, because sending no tags is not an error.
+The same student sharing the same log by [[export]] delivered the
+milestones.
+
+We therefore name both ref namespaces explicitly rather than leaning
+on a shorthand.
+[[--follow-tags]] is the shorthand that looks right and is not: it
+sends only \emph{annotated} tags, and [[learnlog tag]] forwards to
+[[git tag]], whose default is a lightweight tag---a ref with no tag
+object behind it.
+Every milestone the shipped workflow creates is exactly the kind
+[[--follow-tags]] declines to send, so it would have fixed the
+symptom for nobody.
+A refspec pair does not ask how the tag was made.
+
+The cost is that a tag the student moved locally ([[git tag -f]]) now
+makes the push fail instead of quietly disagreeing with the remote,
+which is the same bargain branches have always been on, and
+[[--force]] settles both at once.
+
+\paragraph{Inherited standard I/O.}
 
 [[push]] uses [[subprocess.run]] with inherited standard I/O---the
 same approach as the [[git]] passthrough command (\cref{sec:git})---so
@@ -3738,10 +3772,10 @@ def push(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    cmd = ["git", "push", "--all", "-u"]
+    cmd = ["git", "push", "-u"]
     if force:
         cmd.append("--force")
-    cmd.append("origin")
+    cmd += ["origin", *PUSH_REFSPECS]
 
     result = subprocess.run(
         cmd,
@@ -3749,6 +3783,11 @@ def push(
         cwd=str(repo.workdir),
     )
     raise typer.Exit(code=result.returncode)
+<<constants>>=
+PUSH_REFSPECS = (
+    "refs/heads/*:refs/heads/*",
+    "refs/tags/*:refs/tags/*",
+)
 @
 
 We test [[push]] by creating a bare repository as the remote target,
@@ -3882,6 +3921,62 @@ def test_push_no_remote_fails(workdir, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["push"])
     assert result.exit_code != 0
+@
+
+The milestone test walks the student's own path---run a program, mark
+it with [[learnlog tag]], push---and then asks the \emph{remote} what
+tags it holds, because that is the only place the old behaviour was
+visible.
+Locally the tag was always there; the push always exited zero; only
+the receiving side knew the milestone had not arrived.
+Reading the tag off a commit the student actually ran also keeps the
+test honest about what the tag is for: it has to name the run, not
+merely exist.
+
+<<test functions>>=
+def test_push_delivers_tags(workdir, monkeypatch):
+    """Milestones the student tagged reach the remote.
+
+    ``git push --all`` sends refs/heads/* only, so tags stayed
+    behind while ``export``'s bundle carried them.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir.parent / "tags-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    runner.invoke(app, ["set-remote", str(bare)])
+
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], moment)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=moment,
+        exit_code=0,
+    )
+    assert runner.invoke(app, ["tag", "lab1"]).exit_code == 0
+
+    result = runner.invoke(app, ["push"])
+    assert result.exit_code == 0
+
+    tags = subprocess.run(
+        ["git", "--git-dir", str(bare), "tag", "-l"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "lab1" in tags.stdout.split()
+
+    subject = subprocess.run(
+        ["git", "--git-dir", str(bare),
+         "log", "-1", "--format=%s", "lab1"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "hello.py" in subject.stdout
 @
 
 
