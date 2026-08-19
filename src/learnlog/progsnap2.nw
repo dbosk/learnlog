@@ -3345,11 +3345,15 @@ A review run has to make the same journey.
 The test below follows one out through the export and back in through
 the reconstruction, and then reads the rebuilt repository the way
 [[list]] and [[play]] read it---through [[filter_internal_runs]] and
-[[parse_run_block]]---rather than by matching the message text.
+[[parse_commit_runs]]---rather than by matching the message text.
 That is the property that matters: not that the [[Viewed:]] lines came
 back as characters, but that a reader arriving at the reconstructed log
 with no knowledge of ProgSnap2 finds a review run with its trace,
 indistinguishable from the one the student actually recorded.
+Listing the blocks the parser found, rather than searching them for a
+string, is also what catches the opposite failure: a child event turned
+into a block of its own would show up here as a third run nobody
+performed.
 
 <<progsnap2 test functions>>=
 def test_reconstruction_keeps_review_events(workdir):
@@ -3360,7 +3364,7 @@ def test_reconstruction_keeps_review_events(workdir):
     )
     from learnlog.progsnap2 import (
         do_export_progsnap2,
-        parse_run_block,
+        parse_commit_runs,
         read_progsnap2_as_repo,
     )
     repo = LearnlogRepo(workdir)
@@ -3397,21 +3401,21 @@ def test_reconstruction_keeps_review_events(workdir):
             message = reconstructed.git(
                 "log", "-1", "--format=%B", commit["hash"],
             ).stdout
-            blocks.append(filter_internal_runs(message))
-        reviews = [
-            parse_run_block(block) for block in blocks
-            if "Run: learnlog play" in block
+            blocks.extend(parse_commit_runs(
+                filter_internal_runs(message)
+            ))
+        assert [block["script"] for block in blocks] == [
+            "hello.py", "learnlog",
         ]
-        assert len(reviews) == 1
-        assert reviews[0]["viewed"] == [
+        review = blocks[1]
+        assert review["arguments"] == "play"
+        assert review["viewed"] == [
             (seen, "2026-01-01T10:05:02", "open"),
             (seen, "2026-01-01T10:05:08", "next"),
         ]
-        assert reviews[0]["exit_code"] == "0"
-        assert reviews[0]["end_time"] == "2026-01-01T10:05:30"
-        assert any(
-            "Run: hello.py" in block for block in blocks
-        )
+        assert review["exit_code"] == "0"
+        assert review["end_time"] == "2026-01-01T10:05:30"
+        assert review["io_log"] is None
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 @
