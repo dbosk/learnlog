@@ -33,6 +33,8 @@ import os
 import pathlib
 import datetime
 import contextlib
+import re
+import shlex
 import shutil
 import uuid
 
@@ -1411,6 +1413,164 @@ commit.
 It is optional because reconstructed histories (\cref{progsnap2}) build
 complete blocks that need no partner commit to look for.
 
+
+\subsection{Arguments that fit on one line}
+\label{sec:run-arguments}
+
+A line-oriented format asks two things of a value: that it stay on its
+line, and that it come back out the way it went in.
+Joining the argument list with spaces gives neither.
+
+Two different lists write the same field: one argument reading
+[[alpha beta]] and two arguments reading [[alpha]] and [[beta]] both
+come out as [[Arguments: alpha beta]], and no reader can tell them
+apart afterwards.
+For a [[python -c]] run the field stops meaning anything at all,
+because there the first argument is the program \emph{source} and the
+student's real arguments follow it.
+
+A source may also contain newlines, and then the field is not merely
+ambiguous, it is no longer a field.
+Measured on the format as it was, a run whose source read
+[[import sys]] on one line and [[print("hi")]] on the next gave a
+commit subject ending at [[Run: <python -c> import sys]], an
+[[Arguments:]] value reading [[import sys]], and a remainder that the
+parser (\cref{progsnap2}) scanned as though it were more header
+lines---so a source containing a line [[Exit-Code: 99]] was read back
+as this run's exit code.
+
+The shell answered this question long ago, and the project already
+uses its answer where [[activate]] prints paths into shell code
+(\cref{sec:emit-activation}): [[shlex.quote]] turns any string into one
+word, and [[shlex.split]] turns the words back into the original list.
+Ordinary arguments need no quoting and come through untouched, so
+[[Run: hello.py alpha beta]] still reads like the command line the
+student typed---which is the whole reason the header is plain text.
+
+<<functions>>=
+def format_run_arguments(args):
+    """Format an argument list as one header field value.
+
+    Each argument becomes a single shell word, so the list can be
+    recovered exactly by ``parse_run_arguments``.  An empty list is
+    written as the ``(none)`` marker.
+    """
+    if not args:
+        return NO_ARGUMENTS
+    return " ".join(
+        shlex.quote(_escape_argument(str(arg))) for arg in args
+    )
+<<constants>>=
+NO_ARGUMENTS = "(none)"
+@
+
+What quoting does not do is remove newlines: a quoted string simply
+spans lines.
+So before quoting we replace the two characters that end a line with a
+backslash and a letter, and the backslash itself first, since the
+substitution gives it a meaning it did not have before.
+Backslash, newline, and carriage return are the entire table: no other
+character can break a line, and the one character that could break the
+escaping---a NUL---cannot reach us, because the operating system hands
+over [[argv]] entries as NUL-terminated strings and a NUL inside one is
+therefore not representable.
+
+Deriving the reverse table from the forward one is what keeps the two
+in step: an escape added to one is understood by the other without a
+second edit.
+
+<<functions>>=
+def _escape_argument(text):
+    """Return ``text`` with line-ending characters escaped."""
+    for character, code in ARGUMENT_ESCAPES:
+        text = text.replace(character, "\\" + code)
+    return text
+<<constants>>=
+ARGUMENT_ESCAPES = (
+    ("\\", "\\"),
+    ("\n", "n"),
+    ("\r", "r"),
+)
+ARGUMENT_UNESCAPES = {
+    code: character for character, code in ARGUMENT_ESCAPES
+}
+@
+
+Reading is the same two steps in reverse.
+Both are forgiving, because a header is data we may meet again in a log
+written by an older version of this tool or edited by hand: an
+unbalanced quote falls back to splitting on whitespace, and a backslash
+that escapes nothing we know stays a backslash.
+Neither can raise, and the worst either can do is return the words a
+naive split would have returned anyway.
+
+<<functions>>=
+def parse_run_arguments(value):
+    """Return the argument list recorded in an ``Arguments:`` field.
+
+    Inverts ``format_run_arguments``.  A value not quoted that way
+    is split on whitespace instead.
+    """
+    value = value.strip()
+    if not value or value == NO_ARGUMENTS:
+        return []
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        words = value.split()
+    return [_unescape_argument(word) for word in words]
+
+def _unescape_argument(text):
+    """Return ``text`` with the argument escapes resolved."""
+    return ESCAPED_CHARACTER.sub(
+        lambda match: ARGUMENT_UNESCAPES.get(
+            match.group(1), match.group(0)
+        ),
+        text,
+    )
+<<constants>>=
+ESCAPED_CHARACTER = re.compile(r"\\(.)")
+@
+
+Let's verify that the common case is left alone and that the awkward
+one survives:
+
+<<test functions>>=
+def test_format_run_arguments_leaves_plain_words_alone():
+    """An ordinary command line still reads like one."""
+    assert format_run_arguments(["alpha", "beta"]) \
+        == "alpha beta"
+    assert format_run_arguments([]) == "(none)"
+
+def test_run_arguments_round_trip_plain_words():
+    args = ["--verbose", "input.txt"]
+    assert parse_run_arguments(
+        format_run_arguments(args)
+    ) == args
+
+def test_run_arguments_round_trip_source_and_extras():
+    """A -c source with spaces and newlines comes back whole."""
+    args = ['import sys\nprint("hi there")', "alpha", "beta"]
+    value = format_run_arguments(args)
+    assert "\n" not in value
+    assert parse_run_arguments(value) == args
+
+def test_run_arguments_round_trip_backslashes_and_returns():
+    args = ["c:\\path\\n", "a\r\nb", "", "one two"]
+    value = format_run_arguments(args)
+    assert "\n" not in value and "\r" not in value
+    assert parse_run_arguments(value) == args
+
+def test_parse_run_arguments_tolerates_unquotable_text():
+    """An old or hand-edited value degrades to a plain split."""
+    assert parse_run_arguments("alpha 'beta") == ["alpha", "'beta"]
+    assert parse_run_arguments("(none)") == []
+    assert parse_run_arguments("") == []
+@
+
+
+\subsection{The header block}
+
 <<functions>>=
 def format_run_header(script, args, start_time,
                       run_id=None):
@@ -1420,7 +1580,7 @@ def format_run_header(script, args, start_time,
     the start time.  When ``run_id`` is given, it is recorded as
     the ``Run-Id`` field that links this run to its trailer.
     """
-    args_str = " ".join(args) if args else "(none)"
+    args_str = format_run_arguments(args)
     lines = [
         f"Run: {script} {args_str}",
         "",
@@ -1456,6 +1616,24 @@ def test_format_run_header_with_run_id():
     t = datetime.datetime(2026, 3, 20, 14, 30)
     header = format_run_header("hello.py", [], t, "abc123")
     assert "Run-Id: abc123" in header
+
+def test_format_run_header_keeps_every_field_on_one_line():
+    """A -c source cannot forge header lines of its own."""
+    t = datetime.datetime(2026, 3, 20, 14, 30)
+    source = 'import sys\nExit-Code: 99\nprint("hi")'
+    header = format_run_header(
+        "<python -c>", [source, "alpha"], t, "abc123",
+    )
+    fields = dict(
+        line.split(":", 1) for line in header.split("\n")
+        if ":" in line and not line.startswith("Run:")
+    )
+    assert "Exit-Code" not in fields
+    assert parse_run_arguments(fields["Arguments"]) == [
+        source, "alpha",
+    ]
+    subject = header.split("\n", 1)[0]
+    assert subject.startswith("Run: <python -c> ")
 @
 
 
@@ -1782,6 +1960,11 @@ The run id comes first in the body so that the join key sits at a fixed
 place, and the trailer text follows verbatim: dropping the subject and
 the [[Run-Id:]] line is all a reader needs to do to recover it.
 
+The arguments go through \cref{sec:run-arguments} for the same reason
+they do in the header, and here it is the subject line itself that is
+at stake: a newline in an argument would make Git's idea of the subject
+end in the middle of the command.
+
 <<functions>>=
 def format_trailer_commit(script, args, run_id, trailer):
     """Format the commit message for a run's trailer.
@@ -1790,7 +1973,7 @@ def format_trailer_commit(script, args, run_id, trailer):
     the commit subject is meaningful on its own; ``run_id``
     identifies the run this trailer completes.
     """
-    args_str = " ".join(args) if args else "(none)"
+    args_str = format_run_arguments(args)
     return "\n".join([
         f"{TRAILER_PREFIX}{script or '(unknown)'} {args_str}",
         "",
