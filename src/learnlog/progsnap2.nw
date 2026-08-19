@@ -1171,8 +1171,8 @@ for viewed_commit, viewed_at, action in run["viewed"]:
     })
 @
 
-What the branch above also does is decline to export a review run's own
-captured output, and that is deliberate rather than incidental.
+The branch also declines to export a review run's own captured output,
+which is a decision rather than an oversight.
 Normally there is none: the recorder installs no I/O wrappers for these
 invocations precisely because a batch playback \emph{prints the log},
 and capturing that would file a copy of the history inside the history
@@ -1706,9 +1706,11 @@ def test_progsnap2_no_io_events_when_empty(workdir):
 @
 
 A review run's children are of the other kind.
-The trace below contains a revisit---the student pages forward and then
-comes back---because collapsing it would be the tempting mistake, and
-what makes a trace worth exporting is precisely that it does not:
+The trace below deliberately contains a revisit---the student pages
+forward and then comes back to where they started.
+Collapsing repeated commits into one row is the tempting summary, and
+it would throw away the very thing a trace is for: that the student
+compared two states, twice, is the observation.
 
 <<progsnap2 test functions>>=
 def test_progsnap2_emits_view_events(workdir):
@@ -2615,11 +2617,11 @@ path but the same one applied to a second event type.
 What differs is only which children the block draws on: a
 [[Run.Program]] has I/O chunks and no view trace, an [[X-Review]] the
 reverse.
-Asking for both and letting the empty one come back empty is cheaper
-than branching, and it means a dataset that violates the expectation---
-a review with I/O from an older exporter, say---still round-trips
-whatever it holds instead of losing the half the branch did not
-anticipate.
+Asking for both and letting the empty one come back empty is what makes
+that possible: a branch on the event type would have to be right about
+which kind of child each type has, and a dataset that disagreed---a
+review carrying I/O from an older exporter, say---would lose whatever
+the branch did not expect to find.
 
 Selecting by an explicit tuple rather than by exclusion is what keeps
 the child events out of the block list.
