@@ -1415,6 +1415,37 @@ It is optional because reconstructed histories (\cref{progsnap2}) build
 complete blocks that need no partner commit to look for.
 
 
+\subsection{Which invocations get a header at all}
+\label{sec:review-subcommands}
+
+Before a header can be formatted there has to be a run, and learnlog's
+own command line is the one caller for which that is a judgement call
+rather than a fact.
+Most of what [[learnlog]] does for a student is housekeeping---wiring a
+venv, cloning a repository, pushing, tagging, exporting---and
+housekeeping is not learning data.
+Two subcommands are different in kind: [[learnlog play]] and
+[[learnlog list]] are the student \emph{reading their own history},
+and that act of reflection is behaviour worth recording.
+So those two are logged as ordinary runs and every other subcommand
+leaves no trace at all, not even a repository
+(\cref{sec:initialize}).
+
+Naming the two here, rather than in the CLI that implements them, is
+what keeps the dependencies pointing the right way.
+The list has two consumers and the CLI is neither: the recorder in
+[[learnlog/__init__.py]] reads it before deciding to start a run, and
+the readers of \cref{commits} read it to tell reflection apart from
+learnlog's other activity in a log.
+Both already import this module for the rest of the run-record
+vocabulary---[[RUN_ID_FIELD]], [[TRAILER_PREFIX]]---and both are
+imported \emph{by} [[learnlog.cli]] rather than the other way round.
+
+<<constants>>=
+REVIEW_SUBCOMMANDS = ("play", "list")
+@
+
+
 \subsection{Arguments that fit on one line}
 \label{sec:run-arguments}
 
@@ -1639,6 +1670,7 @@ def test_format_run_header_keeps_every_field_on_one_line():
 
 
 \section{Finalising a run}
+\label{sec:finalising-a-run}
 
 After the program finishes (or crashes), [[finalize_run]] commits the
 I/O log, exception information, end time, and exit code as a new
@@ -1663,21 +1695,35 @@ enters the message, so it was the method that failed on
 [[MAX_ARG_STRLEN]], and it failed by producing exactly the record a
 [[SIGKILL]] leaves behind.
 
+A review run (\cref{sec:review-subcommands}) brings one extra kind of
+result with it, which is why the method takes a [[view_trace]].
+Its I/O is not worth keeping---the output of [[learnlog play]] is the
+log read back, and copying it into the log would nest the history
+inside itself---so what a review run has to say is instead \emph{which
+commits the student looked at, and how they moved between them}.
+The parameter is optional because every other caller has nothing to
+put in it, and an ordinary program run then writes exactly the trailer
+it wrote before.
+
 <<repo methods>>=
 def finalize_run(self, io_log, exception_info,
-                 end_time, exit_code):
+                 end_time, exit_code, view_trace=None):
     """Complete the current run with a trailer commit.
 
     Commits the I/O log, exception information, end time, and
     exit code under the run id from :meth:`begin_run`.  Nothing
     already in the repository is modified, and the commit records
     no code change.
+
+    ``view_trace`` is an optional sequence of
+    ``(time, commit, action)`` triples naming the commits a
+    review run displayed.
     """
     run_id = self.run_id or new_run_id()
     self.run_id = None
 
     trailer = format_run_trailer(
-        io_log, exception_info, end_time, exit_code
+        io_log, exception_info, end_time, exit_code, view_trace,
     )
     message = format_trailer_commit(
         self.run_script, self.run_args, run_id, trailer,
@@ -1763,6 +1809,22 @@ for entries whose content still matches; an entry whose content has
 changed is left exactly as the merge wrote it.
 Staging is something only [[git add]] and [[git commit -a]] do, and we
 run neither.
+
+That property started as an accuracy requirement---a finished run must
+not be credited with code it never executed---but the review runs of
+\cref{sec:review-subcommands} now lean on it for their meaning.
+A [[learnlog play]] session is long, and it is exactly the time when a
+student sits with their history in one window and their editor in the
+other.
+Because the header stages the work tree at the moment playback starts
+and the trailer stages nothing at all, an edit made while reading is
+left uncommitted, and the next commit to pick it up is the header of
+the next program run.
+That is the reading we want: the edit shows up as \enquote{what they
+changed after reviewing} rather than as part of the review itself.
+Were the trailer ever to stage the work tree, that diff would be
+absorbed into the review session and the connection to the run it
+belongs to would be lost.
 
 We ask for [[--reset]] rather than [[-m]] because the two differ in one
 case, and it is the one we cannot afford.
@@ -1938,6 +2000,109 @@ def test_finalize_no_io(workdir):
     assert "(no I/O)" in msg
 @
 
+A review run's whole record is the trace, so it has to survive the
+trip through the commit message intact---order included, since the
+order is what makes it a navigation rather than a set of commits:
+
+<<test functions>>=
+def test_finalize_run_records_view_trace(workdir):
+    """A review run's trailer carries its navigation, in order."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "learnlog", ["play"], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    trace = [
+        (datetime.datetime(2026, 1, 1, 10, 0, 1), "aaa", "open"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 2), "bbb", "next"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 3), "aaa", "prev"),
+    ]
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 4),
+        exit_code=0,
+        view_trace=trace,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert [
+        line for line in msg.split("\n")
+        if line.startswith("Viewed:")
+    ] == [
+        "Viewed: aaa 2026-01-01T10:00:01 open",
+        "Viewed: bbb 2026-01-01T10:00:02 next",
+        "Viewed: aaa 2026-01-01T10:00:03 prev",
+    ]
+    assert "(no I/O)" in msg
+@
+
+The two tests below pin the halves of the review semantics that live
+in this module rather than in the recorder.
+
+The first is the header side: playback begins by snapshotting the work
+tree, so whatever the student changed since their last run is part of
+the state they sat down to review.  Without that, a review of code
+edited an hour ago would be recorded against an hour-old snapshot.
+
+<<test functions>>=
+def test_review_header_snapshots_state_at_start(workdir):
+    """The review run's header holds the code as it is now."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("edited")\n')
+    repo.begin_run(
+        "learnlog", ["play"],
+        datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    assert repo.git(
+        "show", "HEAD:hello.py",
+    ).stdout == 'print("edited")\n'
+@
+
+The second is the trailer side, and it is the property
+\cref{sec:finalising-a-run} argued for: an edit made while a run is in
+flight belongs to the \emph{next} run, not to the one still finishing.
+[[test_finalize_records_head_tree_not_the_index]] above already shows
+such an edit staying out of the trailer's tree; what this test adds is
+the other half, that the edit is not merely dropped but handed on.
+
+<<test functions>>=
+def test_edits_during_a_run_belong_to_the_next_run(workdir):
+    """An edit made mid-run lands in the following run's header."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "learnlog", ["play"],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "hello.py").write_text('print("while reviewing")\n')
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 30),
+        exit_code=0,
+    )
+    assert repo.git(
+        "show", "HEAD:hello.py",
+    ).stdout == 'print("hello")\n'
+
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 1),
+    )
+    assert repo.git(
+        "show", "HEAD:hello.py",
+    ).stdout == 'print("while reviewing")\n'
+    assert repo.git(
+        "log", "-1", "--format=%s",
+    ).stdout.strip() == "Run: hello.py (none)"
+@
+
 The interleaving from \cref{sec:two-commit-protocol} is the case the
 old protocol corrupted: a logged program starts another logged program,
 so the inner run finalises first.
@@ -2060,28 +2225,80 @@ one commit message: a reader that joins the two commits produces
 exactly the block format that older repositories already contain
 (\cref{commits}), so nothing downstream had to learn a second layout.
 
+The view trace of a review run joins that text as [[Viewed:]] lines
+directly below [[Exit-Code:]].
+Putting them among the fields rather than in a section of their own
+is what makes them free: every reader of this format either recognises
+a [[Key: value]] line or ignores it, so a log written by this version
+stays readable to the parsers that predate it, and the [[--- I/O ---]]
+and [[--- exception ---]] markers keep the positions those parsers
+search for.
+A run with nothing to report writes no lines at all, which is why the
+ordinary program run's trailer is byte-for-byte what it always was.
+
 <<functions>>=
 def format_run_trailer(io_log, exception_info,
-                       end_time, exit_code):
+                       end_time, exit_code, view_trace=None):
     """Format the trailer appended by :func:`finalize_run`.
 
     Contains the end time, exit code, I/O log, and exception
-    information.
+    information.  ``view_trace``, when given, is a sequence of
+    ``(time, commit, action)`` triples written out as ``Viewed:``
+    lines.
     """
     parts = [
         f"End-Time: {end_time.isoformat()}",
         f"Exit-Code: {exit_code}",
+    ]
+    parts.extend(
+        format_viewed_line(*entry) for entry in view_trace or ()
+    )
+    parts.extend([
         "",
         "--- I/O ---",
         io_log.rstrip("\n") if io_log else "(no I/O)",
         "",
         "--- exception ---",
-    ]
+    ])
     if exception_info:
         parts.append(exception_info)
     else:
         parts.append("None")
     return "\n".join(parts)
+@
+
+Each line answers three questions in the order a reader asks them:
+\emph{what} was on screen, \emph{when}, and \emph{how} the student got
+there.
+The commit therefore comes first even though the recorder
+(\cref{sec:view-trace}) timestamps the event first, and the argument
+order here follows the recorder so a stored triple can be splatted
+straight in.
+
+All three values are bare tokens---a hexadecimal hash, an ISO-8601
+timestamp, a single lower-case word---so the quoting apparatus of
+\cref{sec:run-arguments} has nothing to do here.
+That is a property of what a trace is rather than luck: the hashes come
+from Git, and the actions come from a fixed vocabulary the viewer
+chooses from, so neither can carry a newline in from outside.
+Recording the full hash rather than an abbreviation costs a few
+characters and buys an unambiguous join against the log later, when the
+history may have grown past the length at which the abbreviation was
+unique.
+
+<<functions>>=
+def format_viewed_line(viewed_at, commit_hash, action):
+    """Format one ``Viewed:`` line of a review run's trailer.
+
+    Arguments come in the order ``learnlog.record_view`` stores
+    them; the line itself leads with the commit that was shown.
+    """
+    return (
+        f"{VIEWED_FIELD} {commit_hash} "
+        f"{viewed_at.isoformat()} {action}"
+    )
+<<constants>>=
+VIEWED_FIELD = "Viewed:"
 @
 
 Let's verify the format:
@@ -2104,6 +2321,45 @@ def test_format_run_trailer_with_exception():
     )
     assert "Exit-Code: 1" in trailer
     assert "ValueError: oops" in trailer
+@
+
+The view trace has two things to prove, and the second is the one that
+protects every existing log: the lines must arrive in the order they
+were recorded---a revisit is data, so identical hashes may repeat---and
+a run that saw nothing must add nothing.
+
+<<test functions>>=
+def test_format_run_trailer_records_the_view_trace():
+    """Viewed: lines follow Exit-Code in navigation order."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trace = [
+        (datetime.datetime(2026, 1, 1, 10, 0, 1), "aaa", "open"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 2), "bbb", "next"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 3), "aaa", "prev"),
+    ]
+    trailer = format_run_trailer("", None, end, 0, trace)
+    viewed = [
+        line for line in trailer.split("\n")
+        if line.startswith("Viewed:")
+    ]
+    assert viewed == [
+        "Viewed: aaa 2026-01-01T10:00:01 open",
+        "Viewed: bbb 2026-01-01T10:00:02 next",
+        "Viewed: aaa 2026-01-01T10:00:03 prev",
+    ]
+    lines = trailer.split("\n")
+    assert lines.index("Exit-Code: 0") < lines.index(viewed[0])
+    assert lines.index(viewed[-1]) < lines.index("--- I/O ---")
+
+@pytest.mark.parametrize("trace", [None, []])
+def test_format_run_trailer_omits_an_empty_view_trace(trace):
+    """A run that viewed nothing writes the trailer it always did."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trailer = format_run_trailer("stdout: hi\n", None, end, 0, trace)
+    assert "Viewed:" not in trailer
+    assert trailer == format_run_trailer(
+        "stdout: hi\n", None, end, 0,
+    )
 @
 
 
