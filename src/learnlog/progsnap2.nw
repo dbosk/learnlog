@@ -117,6 +117,7 @@ from learnlog.commits import (
     BLOCK_SEP,
 )
 from learnlog.gitrepo import (
+    GIT_DIR_NAME,
     GIT_TREE_TIMEOUT,
     GitError,
     LearnlogRepo,
@@ -2275,10 +2276,10 @@ repo.git(
 )
 @
 
-Each commit group restores the corresponding snapshot, rebuilds
-the commit message, and either amends the auto-created initial
-commit or creates a new one.  After the commit exists, we add
-any tags that were exported for that group.
+Each commit group restores the corresponding snapshot, stages it,
+rebuilds the commit message, and either amends the auto-created
+initial commit or creates a new one.  After the commit exists, we
+add any tags that were exported for that group.
 
 <<replay grouped commits into temporary repository>>=
 for index, group in enumerate(commit_groups):
@@ -2286,7 +2287,7 @@ for index, group in enumerate(commit_groups):
         repo.workdir,
         dataset["code_states"].get(group["code_state_id"], {}),
     )
-    repo.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    <<stage the restored code state>>
 
     message = build_reconstructed_commit_message(
         group, dataset["resources"]
@@ -2295,6 +2296,56 @@ for index, group in enumerate(commit_groups):
     <<write reconstructed commit>>
     <<recreate tags for reconstructed commit>>
 @
+
+\subsection{Staging a code state the dataset is the authority on}
+\label{sec:reconstruction-staging}
+
+We are committing into a [[LearnlogRepo]], so it carries learnlog's
+exclude patterns like any other (\cref{sec:ensure-configured}), and
+two of them---[[*.learnlog]] and [[*.progsnap2]]---name the files
+[[learnlog export]] writes.
+Those patterns are a policy about what a \emph{new} run records: a
+bundle sitting in the work tree is the export the log already
+contains, and committing it doubles the log on every cycle.
+They say nothing about what an existing dataset reports, and on this
+side the dataset is the authority.
+Everything in a code state was, by construction, tracked in the log it
+came from---[[git archive]] exports a committed tree
+(\cref{sec:extract-code-state})---so a dataset exported before those
+patterns existed can legitimately carry a file with either suffix.
+Letting the exclude file drop it would make the reconstructed history
+disagree with the dataset it was rebuilt from, and disagree silently,
+because a file Git declines to add is not an error.
+Hence [[-f]]: the restore decides what is in the tree, and staging
+takes all of it.
+
+That leaves the one pattern which is not policy.
+[[.learnlog]] is the Git directory of the very repository we are
+committing into, and it sits inside the work tree, so it is an
+ordinary directory to [[git add]] and is kept out of its own history
+by that pattern and nothing else (\cref{sec:ensure-configured}).
+A bare [[git add -f .]] would stage [[HEAD]], the index, the object
+store and the lock file as project files.
+Naming it as an excluded pathspec is what makes [[-f]] override the
+policy patterns without touching the structural one.
+[[safe_snapshot_path]] already refuses to \emph{write} anything under
+that directory, so the pathspec is the second half of a rule the
+restore states first: nothing the dataset names can land there, and
+nothing learnlog itself put there can be staged out of it.
+
+<<stage the restored code state>>=
+repo.git(
+    "add", "-f", "--", ".", GIT_DIR_PATHSPEC,
+    timeout=GIT_TREE_TIMEOUT,
+)
+<<progsnap2 constants>>=
+GIT_DIR_PATHSPEC = f":(exclude){GIT_DIR_NAME}"
+@
+
+Building the pathspec from [[GIT_DIR_NAME]] rather than spelling
+[[.learnlog]] again is the same reasoning that names the exclude
+pattern from it: the directory and the one thing protecting it should
+not be able to disagree.
 
 The first group replaces the placeholder initial commit that
 [[LearnlogRepo]] created during setup.  Later groups become
@@ -3259,6 +3310,66 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
             "show", "HEAD:hello.py", check=False
         )
         assert missing.returncode != 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+What a round trip must not quietly change is which files the code
+state contained.
+A dataset old enough to predate learnlog's export patterns can carry
+a file named like one of learnlog's own exports---the student
+downloaded a classmate's dataset into the project directory, and the
+run that followed committed it---and importing such a dataset into a
+repository that now excludes those names used to drop the file
+without saying so.
+The test builds that history the only way the current recorder can:
+by staging the file explicitly, which is what an older learnlog did
+by default.
+
+Its second assertion is the other half of forcing the add.
+[[-f]] overrides every exclude pattern, and one of them is the
+repository's own Git directory (\cref{sec:reconstruction-staging}), so
+a reconstruction that forces without excluding it commits [[HEAD]] and
+the object store as project files.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_keeps_export_named_file(workdir):
+    """An export-named file in a code state survives import."""
+    import shutil
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    (workdir / "handout.progsnap2").write_text("classmate\n")
+    repo = LearnlogRepo(workdir)
+    repo.git("add", "-f", "handout.progsnap2")
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hi\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    assert "handout.progsnap2" in repo.git(
+        "ls-tree", "-r", "--name-only", "HEAD",
+    ).stdout
+
+    output = workdir / "old.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        tracked = reconstructed.git(
+            "ls-tree", "-r", "--name-only", "HEAD",
+        ).stdout.split("\n")
+        assert "handout.progsnap2" in tracked
+        assert not [
+            name for name in tracked
+            if name.startswith(".learnlog/")
+        ]
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 @
