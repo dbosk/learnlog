@@ -2229,6 +2229,7 @@ def initialize():
         <<detect main script>>
         <<create repository and begin run>>
         <<claim the run for this process>>
+        <<install the outcome hooks, or record without them>>
         <<install capture, or record without it>>
     except Exception as error:
         _report_swallowed_failure("initialize", error)
@@ -2750,27 +2751,74 @@ def test_a_forked_child_does_not_finalise_the_parents_run(
     assert "CHILD" not in record
 @
 
-With the trailer guaranteed, the capture can be allowed to fail on its
-own.
-Wrapping the streams, the REPL, [[sys.excepthook]] and [[sys.exit]] is
-what makes a record detailed; it is not what makes it exist.
-Its own [[try]] therefore turns \enquote{learnlog could not wrap this
-program's I/O} into a run recorded without I/O rather than into no run
-at all, and the failure goes to the diagnostics path
-(\cref{sec:diagnostics}) so that a missing [[--- I/O ---]] block has a
-written explanation instead of looking like a program that printed
-nothing.
+With the trailer guaranteed, what goes \emph{into} it can be allowed
+to fail on its own---but the two things that can fail here are not
+worth the same, and that is what decides the shape of this step.
+
+The exception hook and the [[sys.exit]] wrapper are the run's only
+witnesses to how it ended.
+Lose them and a trailer is still written, but it says
+[[Exit-Code: 0]] and carries no traceback, so a program that died
+reads as a program that succeeded---and nothing on the record marks
+that zero as unobserved rather than measured.
+[[classify_run_block]] (\cref{sec:classify-run-outcomes}) and the
+ProgSnap2 exporter (\cref{progsnap2}) both take it at face value, so
+the one loss propagates into every later reading of the run.
+
+The stream and REPL wrappers are the witnesses to what the program
+printed, and losing them is damage of a different order: the trailer
+says [[(no I/O)]], and that is an absence a reader can see and the
+diagnostics path (\cref{sec:diagnostics}) can explain.
+
+One [[try]] around both put the cheaper loss in front of the dearer
+one.
+The wrappers ran first, so whatever they raised carried off the hooks
+with them, and \enquote{learnlog could not wrap this program's I/O}
+silently became \enquote{learnlog recorded the wrong outcome}.
+Deleting [[builtins.input]] is enough to reach that state, and any
+other lookup the wrapper chunk makes would do as well---the point is
+that the hooks were never the thing that failed.
+Two [[try]]s make the failures independent, and the hooks go first
+because nothing stops them: [[sys.excepthook]] and [[sys.exit]] are
+attributes of [[sys]] that exist before learnlog is imported, so
+neither of them needs anything the wrappers set up.
+Each half reports under its own context string, so [[errors.log]]
+names which one was lost instead of leaving a maintainer to guess
+from what is missing in the trailer.
+
+<<install the outcome hooks, or record without them>>=
+try:
+    <<install exception hook>>
+    <<install exit status hook>>
+except Exception as error:
+    _report_swallowed_failure("install outcome hooks", error)
+@
+
+The capture half keeps the [[if not review_run]] guard it always had
+(\cref{sec:review-runs}), and the split is what makes that guard
+narrow enough to be honest.
+A review run records no I/O deliberately, but it is a run like any
+other and its exit status belongs in its trailer just the same, which
+is exactly why the hooks above sit outside the guard.
 
 <<install capture, or record without it>>=
 try:
     if not review_run:
         <<install I/O wrappers>>
         <<install REPL capture>>
-    <<install exception hook>>
-    <<install exit status hook>>
 except Exception as error:
     _report_swallowed_failure("install capture", error)
 @
+
+Nothing downstream has to know which half survived.
+Both hooks report through module state that [[on_exit]] reads
+unconditionally---[[exception_info]] directly, and
+[[system_exit_status]] through [[_resolve_exit_code]]
+(\cref{sec:exit-status})---and the I/O comes from [[iolog]], which
+yields the empty string whether it was never created or created and
+never connected to a stream.
+That is why the exit handler (\cref{sec:exit-handler}) needs no branch
+for either failure.
 
 Closed standard input is a legitimate way to run a program---[[0<&-]]
 in a shell, a daemon that closed its descriptors---and CPython says so
@@ -2802,7 +2850,7 @@ builtins.input = _wrap_input(original_input, iolog)
 ) = _install_repl_capture(main_script, iolog)
 @
 
-The degradation the second half promises is easiest to see when the
+The degradation the capture half promises is easiest to see when the
 wiring is broken deliberately.
 Removing [[builtins.input]] before the import stands in for every
 other way the wrapping can fail---it is the step that reads it,
@@ -2840,6 +2888,79 @@ def test_a_broken_wiring_still_pairs_the_run(workdir, test_env):
     assert "install capture" in (
         workdir / ".learnlog" / "errors.log"
     ).read_text()
+@
+
+That program exits cleanly, which is the one thing it therefore cannot
+tell us: a run observed to succeed and a run never observed at all
+leave the same [[Exit-Code: 0]] behind.
+The two tests below sabotage the wiring exactly as above and then end
+the program badly, once through each witness, so the trailer has to
+carry something only the hooks could have supplied.
+
+<<test functions>>=
+def test_a_broken_wiring_still_records_the_exit_status(
+    workdir, test_env,
+):
+    """A lost capture must not cost the exit status."""
+    script = workdir / "unwirable_exit.py"
+    script.write_text(
+        "import builtins\n"
+        "del builtins.input\n"
+        "import learnlog\n"
+        "import sys\n"
+        "print('still running')\n"
+        "sys.exit(5)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", str(script)],
+        cwd=str(workdir), env=test_env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 5
+
+    record = _run_records(workdir)[
+        "Run: unwirable_exit.py (none)"
+    ]
+    assert "Exit-Code: 5" in record
+    assert "(no I/O)" in record
+    assert "install capture" in (
+        workdir / ".learnlog" / "errors.log"
+    ).read_text()
+@
+
+The uncaught exception asks the same of the other hook, and one thing
+more.
+A traceback reaches the trailer through [[exception_info]] rather
+than through the captured [[stderr]], so a run whose streams were
+never wrapped must still explain itself---the [[--- exception ---]]
+block is the only place left that can.
+
+<<test functions>>=
+def test_a_broken_wiring_still_records_the_traceback(
+    workdir, test_env,
+):
+    """A lost capture must not cost the traceback either."""
+    script = workdir / "unwirable_raise.py"
+    script.write_text(
+        "import builtins\n"
+        "del builtins.input\n"
+        "import learnlog\n"
+        "raise ValueError('wiring is gone')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", str(script)],
+        cwd=str(workdir), env=test_env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 1
+    assert "ValueError" in result.stderr
+
+    record = _run_records(workdir)[
+        "Run: unwirable_raise.py (none)"
+    ]
+    assert "Exit-Code: 1" in record
+    assert "ValueError: wiring is gone" in record
+    assert "(no I/O)" in record
 @
 
 The cheapest real trigger for the same failure needs no sabotage at
