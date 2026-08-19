@@ -2022,7 +2022,52 @@ strengthening the learning signal.
 We lock the resulting mixed-mode pattern list in with regression tests
 against the generated tutorial resource.
 
+Those tests reach a step by its title rather than by its position.  A
+tutorial is a document, and a document grows a step in the middle
+sooner or later---adding the [[doctor]] step
+(\cref{tut:getting-started}) shifted every index after it---so an
+assertion keyed on position fails for an edit that is none of its
+business, and reports an integer rather than the thing that changed.
+Order still carries meaning, so one test spells the sequence out in
+full: that keeps the ordering covered while leaving exactly one place
+to update when the walkthrough gains a step.
+
 <<test functions>>=
+def getting_started_tutorial():
+    """Parse the shipped getting-started tutorial resource."""
+    from importlib import resources
+
+    from pytorial.catalog import parse_tutorial_text
+
+    tutorial_path = resources.files("learnlog") / "tutorials"
+    tutorial_path = tutorial_path / "getting-started.md"
+    return parse_tutorial_text(
+        tutorial_path.read_text(),
+        source_path=tutorial_path,
+    )
+
+def getting_started_step(title):
+    """Return the shipped getting-started step called ``title``."""
+    steps = {
+        step.title: step
+        for step in getting_started_tutorial().steps
+    }
+    assert title in steps, sorted(steps)
+    return steps[title]
+
+def test_getting_started_keeps_its_step_order():
+    """The walkthrough sets up, checks, writes, runs, inspects."""
+    assert [
+        step.title for step in getting_started_tutorial().steps
+    ] == [
+        "Create a fresh project",
+        "Activate the project environment",
+        "Confirm that runs are being recorded",
+        "Create a small program",
+        "Run the program",
+        "Inspect the recorded run",
+    ]
+
 def test_tutorial_list_lists_builtin_tutorials():
     """`learnlog tutorial list` includes our shipped tutorials."""
     from learnlog.cli import app
@@ -2044,21 +2089,9 @@ def test_tutorial_list_lists_builtin_tutorials():
     )
 
 def test_getting_started_uses_shell_step_for_file_creation():
-    """Step 3 stays in the shell with pre-activated project Python."""
-    from importlib import resources
+    """File creation stays in the shell, on the project Python."""
+    step = getting_started_step("Create a small program")
 
-    from pytorial.catalog import parse_tutorial_text
-
-    tutorial_path = resources.files("learnlog") / "tutorials"
-    tutorial_path = tutorial_path / "getting-started.md"
-    tutorial = parse_tutorial_text(
-        tutorial_path.read_text(),
-        source_path=tutorial_path,
-    )
-
-    step = tutorial.steps[2]
-
-    assert step.title == "Create a small program"
     assert step.kind is None
     assert step.edit_file is None
     assert step.required_patterns == ()
@@ -2072,21 +2105,9 @@ def test_getting_started_uses_shell_step_for_file_creation():
 
 def test_getting_started_reactivates_and_checks_playback():
     """Later shell steps pre-activate the venv and require playback."""
-    from importlib import resources
+    run_step = getting_started_step("Run the program")
+    play_step = getting_started_step("Inspect the recorded run")
 
-    from pytorial.catalog import parse_tutorial_text
-
-    tutorial_path = resources.files("learnlog") / "tutorials"
-    tutorial_path = tutorial_path / "getting-started.md"
-    tutorial = parse_tutorial_text(
-        tutorial_path.read_text(),
-        source_path=tutorial_path,
-    )
-
-    run_step = tutorial.steps[3]
-    play_step = tutorial.steps[4]
-
-    assert run_step.title == "Run the program"
     assert run_step.kind is None
     assert run_step.edit_file is None
     assert run_step.pre_command == 'eval "$(learnlog activate)"\n'
@@ -2101,7 +2122,6 @@ def test_getting_started_reactivates_and_checks_playback():
     assert "fresh shell" in run_step.instructions
     assert "re-activated the project environment" in run_step.instructions
 
-    assert play_step.title == "Inspect the recorded run"
     assert play_step.pre_command == 'eval "$(learnlog activate)"\n'
     assert tuple(
         (pattern.pattern, pattern.mode)
@@ -2115,6 +2135,59 @@ def test_getting_started_reactivates_and_checks_playback():
     assert play_step.check_command is None
     assert "Script: hello.py" in play_step.instructions
     assert "diff" in play_step.instructions
+@
+
+One step is keyed to learnlog's \emph{output} rather than to what the
+student types.  The [[doctor]] step (\cref{tut:getting-started}) is
+satisfied only by a transcript containing the anchored report's
+\enquote{Runs of this interpreter are recorded in} line
+(\cref{sec:autostart-diagnosis}), which is what makes it a check that
+this interpreter really records runs instead of a check that the
+student typed the command.  That buys a real verification at the price
+of a string shared between a tutorial and a report neither of which
+knows about the other: reword the report, and the shipped tutorial
+stops being passable---silently, and only for students.
+
+So we drive the two against each other.  We build the report for a
+wired interpreter, assemble the transcript the step would record, and
+let [[pytorial]]'s own matcher rule on it; the unwired report goes
+through the same matcher to confirm that the step gates on the wiring
+and not merely on the word [[doctor]] appearing somewhere.
+
+<<test functions>>=
+def test_doctor_step_matches_the_report_it_checks(tmp_path):
+    """The tutorial's doctor step gates on a wired report."""
+    from learnlog.cli import autostart_report
+    from pytorial.run import transcript_matches_patterns
+
+    def transcript(**resolver_args):
+        _, lines = autostart_report(**resolver_args)
+        return "$ learnlog doctor\n" + "\n".join(lines) + "\n"
+
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(project) + "\n")
+    step = getting_started_step(
+        "Confirm that runs are being recorded"
+    )
+
+    assert transcript_matches_patterns(
+        transcript(
+            marker_path=marker,
+            sys_prefix=str(project / ".venv"),
+        ),
+        step.required_patterns,
+    )
+    assert not transcript_matches_patterns(
+        transcript(
+            marker_path=tmp_path / "bare" / "marker.txt",
+            sys_prefix=str(tmp_path / "bare"),
+        ),
+        step.required_patterns,
+    )
 @
 
 
