@@ -55,6 +55,7 @@ from __future__ import annotations
 import datetime
 
 from learnlog.gitrepo import (
+    EXCEPTION_SECTION_MARKER,
     LearnlogRepo,
     REVIEW_SUBCOMMANDS,
     RUN_ID_FIELD,
@@ -1792,7 +1793,7 @@ def classify_run_block(block_text):
     for line in block_text.split("\n"):
         if line.startswith("Exit-Code:"):
             exit_code = line.split(":", 1)[1].strip()
-        elif line.strip() == "--- exception ---":
+        elif line.strip() == EXCEPTION_SECTION_MARKER:
             in_exception = True
         elif in_exception:
             exception_lines.append(line)
