@@ -4067,16 +4067,46 @@ def test_clone_with_dir_option(workdir, monkeypatch):
 \label{sec:pull}
 
 The [[pull]] command is the receiving counterpart to [[push]]: it
-fetches new commits from [[origin]] and updates the local branches.
-Where [[push]] uses [[git push --all -u]], [[pull]] uses
-[[git pull --all]] to mirror the operation in the other direction.
+brings the commits another machine recorded into this copy of the
+log.
 
-Merge conflicts are not a practical concern because [[.learnlog/]]
-is a single-writer recording artefact---the same assumption that
-makes [[--force]] safe on [[push]].
+The obvious implementation is [[git pull]] under the learnlog
+environment, and it is the wrong one.
+That environment is [[--git-dir=.learnlog --work-tree=.]], so the
+work tree Git is asked to update \emph{is the student's project
+directory}, and the index it merges into is the shared index the runs
+commit from.
+Merging there fails in three separate ways, and all of them cost the
+student work rather than merely returning an error:
 
-Like [[push]] and [[clone]], we use inherited I/O for transfer
-progress and credential prompts.
+\begin{description}
+\item[A merge that succeeds] writes the incoming files over the
+  student's source.
+  Synchronising a log has no business rewriting the program the log is
+  about, and an edit overwritten this way was never committed
+  anywhere, so nothing can bring it back.
+\item[A merge that races a run] checks the merged files out first and
+  moves the ref last.
+  A run that commits in between takes the ref, the update fails with
+  [[cannot lock ref 'HEAD']], and the merged files are left in the
+  work tree belonging to no commit at all---so the next run commits
+  them as the student's own work.
+\item[A merge that conflicts] leaves [[MERGE_HEAD]] and an unmerged
+  shared index behind in [[.learnlog/]].
+  The next run's [[git commit]] reads both as its own: it consummates
+  somebody else's half-finished merge, and records a code state full
+  of conflict markers.
+\end{description}
+
+The three share one cause---the merge machinery writes through the
+work tree and the shared index, and both of those belong to the
+runs---so we stop using it.
+[[pull]] writes exactly two kinds of thing: objects, which no reader
+can reach until a ref names them, and one branch ref, moved under the
+commit lock.
+It never writes the work tree, never writes the shared index, and
+never leaves state in [[.learnlog/]] for a run to trip over.
+Everything below follows from that rule.
 
 <<typer commands>>=
 @app.command()
@@ -4092,13 +4122,315 @@ def pull(
     """Pull new commits from the remote."""
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
+    <<fetch the remote branches>>
+    <<find the local and remote tips>>
+    <<decide the new tip, or stop at a conflict>>
+    <<advance the branch under the commit lock>>
+@
 
-    result = subprocess.run(
-        ["git", "pull", "--all"],
-        env=repo.env,
-        cwd=str(repo.workdir),
+\paragraph{Fetching.}
+Fetching is the only part that talks to the network, so it keeps
+inherited standard I/O for transfer progress and credential prompts,
+for the reasons spelled out for [[push]] (\cref{sec:push}).
+It is also the only part that could not damage anything even if we
+wanted it to: [[git fetch]] writes remote-tracking refs and objects,
+and touches neither the work tree nor the index.
+A missing or unreachable [[origin]] surfaces here, and its exit code
+is the one worth reporting, so we stop on it.
+
+<<fetch the remote branches>>=
+fetched = subprocess.run(
+    ["git", "fetch", "origin"],
+    env=repo.env,
+    cwd=str(repo.workdir),
+)
+if fetched.returncode != 0:
+    raise typer.Exit(code=fetched.returncode)
+@
+
+\paragraph{Which branch.}
+[[git pull --all]] updated every branch it could reach; we update the
+branch the log is on.
+That is a description of the old behaviour rather than a reduction of
+it: [[.learnlog/]] is created with one branch and only ever grows
+commits on that branch, so the current branch \emph{is} the log.
+A remote that has no such branch is not an error---a teacher may have
+created the destination repository moments ago---so we say so and
+stop.
+
+<<find the local and remote tips>>=
+head = repo.git(
+    "symbolic-ref", "--short", "HEAD", check=False,
+)
+if head.returncode != 0:
+    raise SystemExit(
+        "The log is not on a branch; cannot pull."
     )
-    raise typer.Exit(code=result.returncode)
+branch = head.stdout.strip()
+remote = repo.git(
+    "rev-parse", "--verify", "--quiet",
+    f"refs/remotes/origin/{branch}", check=False,
+)
+if remote.returncode != 0:
+    typer.echo(
+        f"origin has no {branch} branch; nothing to pull."
+    )
+    return
+remote_tip = remote.stdout.strip()
+local_tip = repo.git(
+    "rev-parse", "--verify", "HEAD",
+).stdout.strip()
+@
+
+\paragraph{Three cases, one of which needs a merge.}
+When the remote tip is already an ancestor of ours there is nothing to
+bring in.
+When ours is an ancestor of the remote's, the histories have not
+diverged and the new tip is simply the remote's---no merge, no tree
+computation, one [[update-ref]].
+That fast-forward is the common case, because the usual shape is one
+machine recording and another reading, and it is worth recognising
+explicitly rather than letting a merge discover it.
+
+<<decide the new tip, or stop at a conflict>>=
+if is_ancestor(repo, remote_tip, local_tip):
+    typer.echo("Already up to date.")
+    return
+if is_ancestor(repo, local_tip, remote_tip):
+    new_tip = remote_tip
+    summary = f"Fast-forwarded {branch} to origin."
+else:
+    new_tip, conflicts = merge_log_histories(
+        repo, local_tip, remote_tip,
+    )
+    if new_tip is None:
+        raise SystemExit(describe_pull_conflict(conflicts))
+    summary = f"Merged origin into {branch}."
+@
+
+<<helper functions>>=
+def is_ancestor(repo, candidate, descendant):
+    """Return whether ``candidate`` is an ancestor of ``descendant``.
+
+    Asks Git the question with ``merge-base --is-ancestor``, whose
+    exit status is the answer.
+    """
+    probe = repo.git(
+        "merge-base", "--is-ancestor",
+        candidate, descendant, check=False,
+    )
+    return probe.returncode == 0
+@
+
+\paragraph{Advancing the branch.}
+Everything above is either a read or a write of objects nobody can
+reach yet.
+The single write that makes a pull real is the branch update, and it
+is the one that must not interleave with a run's commit, so it happens
+under the same [[flock]] the run commits take
+(\cref{sec:commit-lock}).
+The lock cannot cover the merge as well---computing a merge over a
+large tree takes long enough that holding the lock would block the
+student's next program from starting---so we hand [[update-ref]] the
+tip we merged from as the expected old value.
+Git then refuses the update if a run moved the branch while we were
+merging, which turns that window into a retry instead of a lost
+commit.
+
+<<advance the branch under the commit lock>>=
+with repo.commit_lock():
+    advanced = repo.git(
+        "update-ref", f"refs/heads/{branch}",
+        new_tip, local_tip, check=False,
+    )
+if advanced.returncode != 0:
+    raise SystemExit(
+        "The log moved while pulling; nothing was changed. "
+        "Run learnlog pull again."
+    )
+typer.echo(summary)
+@
+
+\paragraph{Merging without a work tree.}
+A three-way merge needs somewhere to put intermediate state, and the
+whole point of this redesign is that the student's directory is not
+it.
+Git offers two ways out, and which one is available depends on the
+version installed.
+[[git merge-tree --write-tree]] (Git 2.38 and later) performs a full
+merge---rename detection, content merging, the lot---entirely in the
+object database, and prints the object name of the merged tree.
+Older versions have no such command, so we fall back to a three-way
+[[read-tree]] into a private index file, which resolves everything
+that can be resolved by path and reports the rest as a conflict.
+The fallback is weaker: it cannot merge two edits inside one file, so
+it declares a conflict where the newer command would have succeeded.
+That is the right way to be wrong here.
+Refusing to merge leaves both logs intact and tells the student to ask
+for help; the alternative---running the content merge in a checkout
+somewhere---brings back the work tree we just removed from the design.
+
+Either way the result is a tree, and a tree is not yet history: we
+turn it into a merge commit with [[commit-tree]], whose two parents
+record that these two logs became one.
+The message travels on standard input, as every commit message in
+learnlog does (\cref{sec:commit-message-stdin}).
+
+<<helper functions>>=
+def merge_log_histories(repo, ours, theirs):
+    """Merge two diverged log histories.
+
+    Returns a ``(commit, conflicts)`` pair.  On success ``commit`` is
+    the object name of a new merge commit and ``conflicts`` is empty;
+    otherwise ``commit`` is ``None`` and ``conflicts`` lists the paths
+    Git could not merge.
+    """
+    if git_merges_trees(repo):
+        tree, conflicts = merge_trees_directly(
+            repo, ours, theirs,
+        )
+    else:
+        tree, conflicts = merge_trees_in_private_index(
+            repo, ours, theirs,
+        )
+    if tree is None:
+        return None, conflicts
+    merged = repo.git(
+        "commit-tree", tree, "-p", ours, "-p", theirs,
+        input=PULL_MERGE_MESSAGE,
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    return merged.stdout.strip(), []
+<<constants>>=
+PULL_MERGE_MESSAGE = "learnlog: merge origin into the local log\n"
+@
+
+We ask [[git --version]] rather than probing [[merge-tree]] itself
+with a trial merge, because a probe would have to invent two commits
+to merge and would then have to tell \enquote{this Git cannot} apart
+from \enquote{those commits conflict}---which is the very distinction
+the caller needs.
+
+<<helper functions>>=
+def git_merges_trees(repo):
+    """Return whether ``git merge-tree --write-tree`` exists."""
+    probe = repo.git("--version", check=False)
+    found = GIT_VERSION_PATTERN.search(probe.stdout)
+    if found is None:
+        return False
+    version = (int(found.group(1)), int(found.group(2)))
+    return version >= MERGE_TREE_VERSION
+<<constants>>=
+GIT_VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)")
+MERGE_TREE_VERSION = (2, 38)
+@
+
+[[merge-tree]] reports a conflict with exit status~1 and still prints
+the (conflicted) tree, so the exit status alone does not separate
+\enquote{conflict} from \enquote{that is not a commit}: both are 1.
+What separates them is the output---a real merge always prints a tree
+on the first line, a rejected argument prints nothing---so that is
+what we test.
+With [[--name-only]] the lines after the tree are the conflicted
+paths, terminated by a blank line before Git's human-readable
+commentary.
+
+<<helper functions>>=
+def merge_trees_directly(repo, ours, theirs):
+    """Merge two commits with ``git merge-tree``.
+
+    Needs no work tree and no index: the merged tree is written
+    straight to the object database.
+    """
+    merged = repo.git(
+        "merge-tree", "--write-tree", "--name-only",
+        ours, theirs, check=False, timeout=GIT_TREE_TIMEOUT,
+    )
+    lines = merged.stdout.splitlines()
+    if not lines:
+        raise SystemExit(
+            f"Merging the logs failed: {merged.stderr.strip()}"
+        )
+    if merged.returncode == 0:
+        return lines[0].strip(), []
+    conflicts = []
+    for line in lines[1:]:
+        if not line.strip():
+            break
+        conflicts.append(line.strip())
+    return None, conflicts
+@
+
+The fallback merges into a file that is not the shared index, using
+the same [[run_index]] machinery a run uses to keep its staging out of
+everyone else's way (\cref{gitrepo}).
+[[read-tree -i]] is what keeps this honest: it tells Git not to
+compare against the work tree, which is both what makes the merge
+possible with a dirty project directory and what guarantees no file is
+written.
+[[--aggressive]] resolves the cases a three-way index merge can decide
+on its own---one side changed a path, both sides made the same change,
+both sides deleted it---and leaves the rest as unmerged stages, which
+is exactly what [[write-tree]] refuses to turn into a tree.
+
+<<helper functions>>=
+def merge_trees_in_private_index(repo, ours, theirs):
+    """Merge two commits in a private index file.
+
+    The path taken when Git is too old for ``merge-tree``; resolves
+    per-path changes only, and reports anything else as a conflict.
+    """
+    base = repo.git("merge-base", ours, theirs, check=False)
+    if base.returncode != 0:
+        return None, []
+    with repo.run_index(PULL_MERGE_INDEX):
+        read = repo.git(
+            "read-tree", "-m", "-i", "--aggressive",
+            base.stdout.strip(), ours, theirs,
+            check=False, timeout=GIT_TREE_TIMEOUT,
+        )
+        if read.returncode != 0:
+            raise SystemExit(
+                f"Merging the logs failed: {read.stderr.strip()}"
+            )
+        written = repo.git(
+            "write-tree", check=False,
+            timeout=GIT_TREE_TIMEOUT,
+        )
+        if written.returncode == 0:
+            return written.stdout.strip(), []
+        unmerged = repo.git(
+            "ls-files", "--unmerged", check=False,
+        )
+    return None, sorted({
+        line.split("\t", 1)[1]
+        for line in unmerged.stdout.splitlines()
+        if "\t" in line
+    })
+<<constants>>=
+PULL_MERGE_INDEX = "pull-merge"
+@
+
+A conflict is where a student most needs to be told that nothing
+happened, because \enquote{it failed} usually means \enquote{something
+was half-done}.
+Here it does not, and the message says so before it says what to try
+next.
+
+<<helper functions>>=
+def describe_pull_conflict(conflicts):
+    """Explain why a pull stopped and that nothing changed."""
+    if conflicts:
+        reason = "the merge conflicts in " + ", ".join(conflicts)
+    else:
+        reason = "they share no common commit to merge from"
+    return (
+        "Pull stopped: the local log and origin have diverged and "
+        f"{reason}.  Nothing was changed: your files and your local "
+        "log are exactly as they were.  Ask your teacher for help, "
+        "or use learnlog clone to fetch the remote log into a fresh "
+        "directory."
+    )
 @
 
 We test [[pull]] by pushing from the original repository, cloning
@@ -4153,6 +4485,225 @@ def test_pull_no_remote_fails(workdir, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["pull"])
     assert result.exit_code != 0
+@
+
+The tests that follow all need the same two-machine situation---one
+log, pushed to a remote, cloned back into a second directory---so we
+build it once.
+The clone's work tree starts empty, which is what [[clone]] leaves
+behind (\cref{sec:clone}); the student's files in it are the ones the
+test writes.
+A cloned repository has never been through [[init_repo]], so it lacks
+the settings that make committing work regardless of the developer's
+global Git configuration; the tests below record runs in the clone, so
+the helper applies the one that matters.
+
+<<test functions>>=
+def _two_machine_log(workdir, runner, monkeypatch):
+    """Push a log to a bare remote and clone it back.
+
+    Returns the clone's directory.
+    """
+    from learnlog.cli import app
+    bare = workdir / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    target = workdir / "clone-target"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    runner.invoke(app, ["clone", str(bare)])
+    LearnlogRepo(target).git(
+        "config", "commit.gpgsign", "false",
+    )
+    return target
+@
+
+The first thing to check is the one the old implementation got wrong
+every time: a student with an uncommitted edit pulls, and the edit
+survives byte for byte even though the incoming commit changes that
+very file.
+Listing the clone directory afterwards is the sharper half of the
+test---a merge into the live work tree would have checked out
+everything the other machine had, so finding nothing but the student's
+own file says the merge went somewhere else entirely:
+
+<<test functions>>=
+def test_pull_leaves_the_work_tree_alone(workdir, monkeypatch):
+    """A fast-forward pull does not write the student's files."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    student = target / "hello.py"
+    student.write_text('print("mine, uncommitted")\n')
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert student.read_text() == 'print("mine, uncommitted")\n'
+    cloned = LearnlogRepo(target)
+    assert 'print("theirs")' in cloned.git(
+        "show", "HEAD:hello.py",
+    ).stdout
+    assert sorted(entry.name for entry in target.iterdir()) == [
+        ".learnlog", "hello.py",
+    ]
+    for artefact in ("MERGE_HEAD", "MERGE_MSG"):
+        assert not (target / ".learnlog" / artefact).exists()
+@
+
+When both machines have changed the same file the merge cannot
+succeed, and the property to check is that failing costs nothing: the
+student's file, the local branch, and [[.learnlog/]] are all as they
+were, and the message says the word the student needs to search for:
+
+<<test functions>>=
+def test_pull_conflict_changes_nothing(workdir, monkeypatch):
+    """A conflicting pull aborts without touching anything."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    student = target / "hello.py"
+    student.write_text('print("mine")\n')
+    cloned = LearnlogRepo(target)
+    monkeypatch.chdir(target)
+    cloned.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    before = cloned.git("rev-parse", "HEAD").stdout.strip()
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 12, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code != 0
+    assert "conflict" in result.output.lower()
+    assert student.read_text() == 'print("mine")\n'
+    assert cloned.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip() == before
+    for artefact in ("MERGE_HEAD", "MERGE_MSG"):
+        assert not (target / ".learnlog" / artefact).exists()
+@
+
+The remaining property is the one a race would violate, and races are
+not something a test can reliably provoke.
+What we can check deterministically is the arrangement that prevents
+it: we wrap [[commit_lock]] and [[git]] on the repository class,
+record whether the lock was held at the moment [[update-ref]] ran, and
+insist it was:
+
+<<test functions>>=
+def test_pull_advances_the_ref_under_the_lock(
+    workdir, monkeypatch,
+):
+    """The branch update runs while the commit lock is held."""
+    import contextlib
+    from learnlog import gitrepo
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    held = []
+    updates = []
+    real_lock = gitrepo.LearnlogRepo.commit_lock
+    real_git = gitrepo.LearnlogRepo.git
+
+    @contextlib.contextmanager
+    def watched_lock(self):
+        held.append(self)
+        try:
+            with real_lock(self):
+                yield
+        finally:
+            held.pop()
+
+    def watched_git(self, *args, **kwargs):
+        if args[:1] == ("update-ref",):
+            updates.append(bool(held))
+        return real_git(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        gitrepo.LearnlogRepo, "commit_lock", watched_lock,
+    )
+    monkeypatch.setattr(gitrepo.LearnlogRepo, "git", watched_git)
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert updates == [True]
+@
+
+Finally, the fallback for older Git needs its own run through the same
+fast-forward-plus-divergence story, because on this machine the
+version check would never choose it.
+Forcing the choice is enough: everything after it is the code under
+test.
+
+<<test functions>>=
+def test_pull_merges_without_merge_tree(workdir, monkeypatch):
+    """The private-index fallback merges divergent logs too."""
+    from learnlog import cli
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    (target / "mine.py").write_text('print("mine")\n')
+    cloned = LearnlogRepo(target)
+    monkeypatch.chdir(target)
+    cloned.begin_run(
+        "mine.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    monkeypatch.chdir(workdir)
+    (workdir / "theirs.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "theirs.py", [], datetime.datetime(2026, 1, 1, 12, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.setattr(cli, "git_merges_trees", lambda repo: False)
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert (target / "mine.py").read_text() == 'print("mine")\n'
+    listed = cloned.git(
+        "ls-tree", "--name-only", "HEAD",
+    ).stdout.split()
+    assert "mine.py" in listed
+    assert "theirs.py" in listed
+    assert not (
+        target / ".learnlog" / "index-pull-merge"
+    ).exists()
 @
 
 
