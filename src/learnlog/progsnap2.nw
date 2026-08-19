@@ -76,6 +76,14 @@ module's job (\cref{sec:run-join}): [[get_run_trailers]] and
 [[merge_run_trailers]] hand us the same complete run block that a
 single-commit log would have contained, so everything below parses
 one format.
+Deciding what a run \emph{is} comes from there too: [[is_internal_run]]
+names the plumbing this export drops, and [[is_review_run]] the
+reflection it exports under an event type of its own
+(\cref{sec:review-events}).
+Importing both rather than testing the command string here is what
+keeps the dataset agreeing with what [[list]] and [[play]] show---the
+three views classify a run by asking the same function
+(\cref{sec:filter-learnlog}).
 Every Git invocation goes through [[LearnlogRepo.git]]
 (\cref{sec:git-bytes}), so nothing here imports [[subprocess]];
 [[sys]] is imported for the single message the restorer writes to
@@ -103,6 +111,7 @@ from learnlog.commits import (
     get_tag_map,
     filter_internal_runs,
     is_internal_run,
+    is_review_run,
     merge_run_trailers,
     parse_view_trace,
     BLOCK_SEP,
@@ -863,7 +872,9 @@ We walk commits in chronological order, parsing each commit
 message into run blocks.
 For each commit we determine the code state and generate events:
 a [[File.Edit]] event when the tree hash changes from the
-previous commit, and a [[Run.Program]] event for each run block.
+previous commit, and one event per run block---[[Run.Program]] for
+the student's own programs, [[X-Review]] for the [[play]] and
+[[list]] invocations with which they looked back at them.
 
 The [[Order]] column provides a global sequence number across
 all events, scoped per subject (the [[EventOrderScope]] metadata
@@ -889,7 +900,7 @@ for commit in commits:
 
     <<get subject and code state for commit>>
     <<optionally emit File.Edit event>>
-    <<emit Run.Program events>>
+    <<emit run events>>
 @
 
 We extract the author name as [[SubjectID]], since each learnlog
@@ -959,15 +970,31 @@ When [[filter_internal_flag]] is set, we skip blocks that record
 learnlog's internal activity (the same test as [[filter_internal_runs]],
 but at the parsed-block level rather than raw text).
 
-After emitting the [[Run.Program]] event, we generate
-chunked I/O events for that run's captured output and input.
+After emitting the run event, we generate its child events---the
+chunked I/O of a program run, or the view trace of a review run.
 The spec recommends [[ParentEventID]] to link child events
-to their parent (v8, \S4.3.6, lines~902--912), so each I/O
-event references its parent [[Run.Program]]'s [[EventID]].
+to their parent (v8, \S4.3.6, lines~902--912), so each child
+event references its parent run's [[EventID]].
 We save that ID in [[run_event_id]] before the order counter
-advances past the I/O events.
+advances past the children.
 
-<<emit Run.Program events>>=
+A review run is a run in every respect this table can see: it has a
+script, arguments, a start and an end, and it either finished or it
+did not.
+So it fills the same columns, and only the [[EventType]] differs.
+That difference is the point.
+The analysis in \cref{sec:group-pairs} reads the stream as an
+alternation of [[File.Edit]] and [[Run.Program]], and a student who
+edits, pages back through yesterday's failures, and then runs would---
+were the review a [[Run.Program]]---have the review credited with the
+edit and the real run recorded as a re-run of unchanged code.
+Marking it [[X-Review]] is the whole fix, because the pairing loop
+dispatches on [[EventType]] and has no branch for anything else: an
+event type it does not know passes through it untouched.
+An analysis tool that has never heard of [[X-Review]] behaves the same
+way, which is the property the [[X-]] prefix exists to promise.
+
+<<emit run events>>=
 body = repo.git(
     "log", "-1", "--format=%B", commit_hash,
 ).stdout.rstrip("\n")
@@ -980,6 +1007,7 @@ for run in runs:
 
     order += 1
     run_event_id = order
+    review = is_review_run(run)
     program_result = classify_run_result(run)
     exc_type, exc_msg = parse_exception_line(
         run["exception_info"]
@@ -988,7 +1016,7 @@ for run in runs:
     timestamp = run["start_time"] or commit["date"]
 
     events.append({
-        "EventType": "Run.Program",
+        "EventType": "X-Review" if review else "Run.Program",
         "EventID": order,
         "Order": order,
         "SubjectID": subject_id,
@@ -1009,7 +1037,10 @@ for run in runs:
         "X-CommitHash": commit_hash,
     })
 
-    <<emit I/O events for run>>
+    if review:
+        <<emit X-Review.View events>>
+    else:
+        <<emit I/O events for run>>
 
 prev_tree = current_tree
 @
@@ -1070,6 +1101,88 @@ for evt_type, text in io_chunks:
     resource_files.append((resource_path, text))
     events.append(io_event)
 @
+
+\subsection{What a review looked at}
+\label{sec:review-events}
+
+The [[X-Review]] event says that a student sat down with their log;
+the [[Viewed:]] lines of its trailer (\cref{sec:view-trace}) say what
+they actually put on screen and in what order.
+That sequence is the research signal---which failure they went back to,
+how far back, how many times---so it must survive into the dataset
+rather than being summarised into a count.
+A sequence does not fit in a cell, which is the same reason the
+captured I/O became child events: we emit one [[X-Review.View]] event
+per line of the trace, in trace order, each pointing at its
+[[X-Review]] parent exactly as an I/O chunk points at its run.
+
+Two columns carry what is new.
+[[X-ViewedCommit]] is the full commit hash the trace recorded, which is
+what makes the trace a \emph{join} rather than a note: it matches the
+[[X-CommitHash]] of the events generated from that commit, so a query
+can go straight from \enquote{the student looked here} to the run and
+the code state they were looking at.
+[[X-ViewAction]] is the word the viewer chose from its fixed
+vocabulary---[[open]], [[next]], [[prev]], [[jump-first]],
+[[jump-last]], [[batch]]---and it is what separates a deliberate jump
+to the beginning from paging past a commit on the way to somewhere
+else.
+
+The timestamps are the trace's own rather than the run's.
+The I/O children leave theirs empty because learnlog has no per-line
+timing to put there, but a view event has exactly that: the moment the
+commit appeared.
+Without it the trace would only record an order, and dwell time---how
+long a student stayed on a failure before moving on---is measured
+between consecutive views, not between runs.
+
+One caveat belongs to the hashes rather than to this code.
+When the review was [[learnlog play -f]] on a bundle or a dataset, the
+commits on screen were the temporary reconstruction's
+(\cref{sec:reconstruct}), so the recorded hashes join within that
+session and against the source named in [[X-Arguments]], not against
+the student's own log.
+
+<<emit X-Review.View events>>=
+for viewed_commit, viewed_at, action in run["viewed"]:
+    order += 1
+    events.append({
+        "EventType": "X-Review.View",
+        "EventID": order,
+        "Order": order,
+        "SubjectID": subject_id,
+        "CodeStateID": code_state_id,
+        "ParentEventID": run_event_id,
+        "ServerTimestamp": viewed_at,
+        "ClientTimestamp": viewed_at,
+        "ProgramResult": "",
+        "X-EndTime": "",
+        "X-ExitCode": "",
+        "X-Script": "",
+        "X-Arguments": "",
+        "X-ExceptionType": "",
+        "X-ExceptionMessage": "",
+        "ProgramOutput": "",
+        "ProgramInput": "",
+        "X-Tag": commit_tags,
+        "X-CommitHash": commit_hash,
+        "X-ViewedCommit": viewed_commit,
+        "X-ViewAction": action,
+    })
+@
+
+The branch also declines to export a review run's own captured output,
+which is a decision rather than an oversight.
+Normally there is none: the recorder installs no I/O wrappers for these
+invocations precisely because a batch playback \emph{prints the log},
+and capturing that would file a copy of the history inside the history
+(\cref{sec:review-runs}).
+A log written before that rule, or one where [[play]] output reached
+the trailer by some other route, would still carry one---and exporting
+it would put every earlier run's output into [[Resources/]] a second
+time, attached to an event that did not produce it.
+Keeping the I/O branch for program runs only is what keeps
+[[Resources/]] a record of what programs printed.
 
 \subsection{Writing the zip file}
 
@@ -1174,8 +1287,19 @@ zip file.
 The optional [[X-EndTime]] column preserves learnlog's run trailer end
 time without changing the meaning of [[ServerTimestamp]] and
 [[ClientTimestamp]].
+The [[X-ViewedCommit]] and [[X-ViewAction]] columns carry the view
+trace of a review run (\cref{sec:review-events}); only
+[[X-Review.View]] events fill them.
 Older datasets remain valid because the reader keeps whatever columns
 the CSV provides.
+
+The column list is the union of what every event type needs, and the
+writer fills the gaps: [[csv.DictWriter]] substitutes its [[restval]],
+the empty string, for any column an event dict omits.
+That is what lets each event above list only the columns it actually
+has something to say about---a [[File.Edit]] carries no [[X-EndTime]],
+a [[Run.Program]] no [[X-ViewedCommit]]---without every new column
+having to be threaded back through every other event type.
 
 <<build main table csv string>>=
 main_columns = [
@@ -1191,6 +1315,8 @@ main_columns = [
     "ProgramInput",
     "X-Tag",
     "X-CommitHash",
+    "X-ViewedCommit",
+    "X-ViewAction",
 ]
 main_buf = io.StringIO()
 main_writer = csv.DictWriter(
@@ -1366,9 +1492,9 @@ def test_progsnap2_unfinished_run_has_empty_end_time(workdir):
 def test_progsnap2_filters_internal_runs(workdir):
     """Plumbing is dropped; the student's review is exported.
 
-    The review run is still emitted as a ``Run.Program``
-    event here; giving it its own ``X-Review`` event type is
-    the next step in the export redesign.
+    The review lands under its own event type, so it is
+    neither hidden like the pip install nor counted as an
+    attempt at the program like ``hello.py``.
     """
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
@@ -1383,14 +1509,19 @@ def test_progsnap2_filters_internal_runs(workdir):
         main = zf.read("MainTable.csv").decode("utf-8")
     reader = csv_mod.DictReader(io.StringIO(main))
     events = list(reader)
-    commands = [
-        f"{e['X-Script']} {e['X-Arguments']}"
-        for e in events
-        if e["EventType"] == "Run.Program"
-    ]
-    assert any(c.startswith("hello.py") for c in commands)
-    assert any(c == "learnlog play" for c in commands)
-    assert not any("pip" in c for c in commands)
+
+    def commands_of(event_type):
+        return [
+            f"{e['X-Script']} {e['X-Arguments']}"
+            for e in events
+            if e["EventType"] == event_type
+        ]
+
+    program_runs = commands_of("Run.Program")
+    assert any(c.startswith("hello.py") for c in program_runs)
+    assert not any("learnlog" in c for c in program_runs)
+    assert not any("pip" in c for c in program_runs)
+    assert commands_of("X-Review") == ["learnlog play"]
 
 def test_progsnap2_file_edit_event(workdir):
     import csv as csv_mod
@@ -1572,6 +1703,144 @@ def test_progsnap2_no_io_events_when_empty(workdir):
     ]
     assert len(io_evts) == 0
     assert len(resources) == 0
+@
+
+A review run's children are of the other kind.
+The trace below deliberately contains a revisit---the student pages
+forward and then comes back to where they started.
+Collapsing repeated commits into one row is the tempting summary, and
+it would throw away the very thing a trace is for: that the student
+compared two states, twice, is the observation.
+
+<<progsnap2 test functions>>=
+def test_progsnap2_emits_view_events(workdir):
+    """Each Viewed: line becomes an ordered child event."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    first, second = "a" * 40, "b" * 40
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("learnlog", ["play"], t1)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 20),
+        exit_code=0,
+        view_trace=[
+            (datetime.datetime(2026, 1, 1, 10, 0, 1),
+             first, "open"),
+            (datetime.datetime(2026, 1, 1, 10, 0, 5),
+             second, "next"),
+            (datetime.datetime(2026, 1, 1, 10, 0, 9),
+             first, "prev"),
+        ],
+    )
+    output = workdir / "views.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+
+    review = [
+        e for e in events if e["EventType"] == "X-Review"
+    ]
+    assert len(review) == 1
+    views = [
+        e for e in events
+        if e["EventType"] == "X-Review.View"
+    ]
+    assert [
+        (v["X-ViewedCommit"], v["X-ViewAction"],
+         v["ServerTimestamp"])
+        for v in views
+    ] == [
+        (first, "open", "2026-01-01T10:00:01"),
+        (second, "next", "2026-01-01T10:00:05"),
+        (first, "prev", "2026-01-01T10:00:09"),
+    ]
+    assert all(
+        v["ParentEventID"] == review[0]["EventID"]
+        for v in views
+    )
+    orders = [int(v["Order"]) for v in views]
+    assert orders == sorted(orders)
+    assert min(orders) > int(review[0]["Order"])
+    assert all(
+        v["ClientTimestamp"] == v["ServerTimestamp"]
+        for v in views
+    )
+@
+
+The two columns are new, so the header must declare them---a
+[[DictWriter]] that has never heard of a key raises rather than
+guessing, and the events that do not fill them must still be
+writable:
+
+<<progsnap2 test functions>>=
+def test_progsnap2_view_columns_declared(workdir):
+    """The view columns exist, and other events leave them empty."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    output = workdir / "columns.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+    assert "X-ViewedCommit" in reader.fieldnames
+    assert "X-ViewAction" in reader.fieldnames
+    assert all(
+        e["X-ViewedCommit"] == "" and e["X-ViewAction"] == ""
+        for e in events
+    )
+@
+
+The I/O of a review run is deliberately not exported, so we hand the
+exporter one anyway---an old log, or a [[play]] whose output reached
+the trailer another way---and check that it neither becomes resource
+files nor attaches children to the review:
+
+<<progsnap2 test functions>>=
+def test_progsnap2_review_event_has_no_io_children(workdir):
+    """A review's captured output is not re-exported."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("learnlog", ["play", "-b"], t1)
+    repo.finalize_run(
+        io_log="stdout: Run: hello.py\nstdout: exit 0\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 3),
+        exit_code=0,
+    )
+    output = workdir / "review-io.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+        resources = [
+            n for n in zf.namelist()
+            if n.startswith("Resources/")
+        ]
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+    review = [
+        e for e in events if e["EventType"] == "X-Review"
+    ]
+    assert len(review) == 1
+    assert not [
+        e for e in events
+        if e["EventType"].startswith("X-Run.")
+    ]
+    assert not [
+        e for e in events
+        if e["ParentEventID"] == review[0]["EventID"]
+    ]
+    assert resources == []
 @
 
 Tags attached to commits appear in the [[X-Tag]] column of
@@ -2339,6 +2608,27 @@ Datasets exported by current learnlog versions also carry
 Older datasets remain readable because a missing [[X-EndTime]] simply
 means the rebuilt block omits the [[End-Time:]] line.
 
+The message is rebuilt from the events that \emph{are} runs, and there
+are two kinds: the student's programs and their reviews.
+Both become the same kind of block---a review run is written to the log
+by the same [[begin_run]] and [[finalize_run]] as any other
+(\cref{sec:review-runs}), so reconstructing it is not a second code
+path but the same one applied to a second event type.
+What differs is only which children the block draws on: a
+[[Run.Program]] has I/O chunks and no view trace, an [[X-Review]] the
+reverse.
+Asking for both and letting the empty one come back empty is what makes
+that possible: a branch on the event type would have to be right about
+which kind of child each type has, and a dataset that disagreed---a
+review carrying I/O from an older exporter, say---would lose whatever
+the branch did not expect to find.
+
+Selecting by an explicit tuple rather than by exclusion is what keeps
+the child events out of the block list.
+An [[X-Review.View]] event sits in the group's event list beside its
+parent, and a loop that skipped only [[X-Run.Output]] and
+[[X-Run.Input]] would try to build a run block out of it.
+
 <<progsnap2 functions>>=
 def build_reconstructed_commit_message(group, resources):
     """Build a learnlog-style commit message from one group."""
@@ -2349,19 +2639,26 @@ def build_reconstructed_commit_message(group, resources):
     )
 
     for event in events:
-        if event["EventType"] != "Run.Program":
+        if event["EventType"] not in RECONSTRUCTED_RUN_EVENTS:
             continue
         io_log = rebuild_io_log(
             group["events"], event["EventID"], resources
         )
+        view_trace = rebuild_view_trace(
+            group["events"], event["EventID"]
+        )
         blocks.append(
-            build_reconstructed_run_block(event, io_log)
+            build_reconstructed_run_block(
+                event, io_log, view_trace
+            )
         )
 
     if not blocks:
         return "learnlog: reconstructed commit"
 
     return BLOCK_SEP.join(blocks)
+<<progsnap2 constants>>=
+RECONSTRUCTED_RUN_EVENTS = ("Run.Program", "X-Review")
 @
 
 We reuse [[format_run_header]] so the first half of each block is
@@ -2380,8 +2677,24 @@ before---turns one argument containing a space into two, and a
 [[python -c]] source into as many arguments as it has words, so the
 block we rebuild would not be the block we exported.
 
+A review run's [[Viewed:]] lines come back the same way its I/O would:
+handed to [[format_run_trailer]], which is the one place that knows
+where in the trailer they go (\cref{sec:finalising-a-run}).
+Reusing the writer rather than assembling the lines here is what makes
+the round trip exact instead of approximately right---a reconstructed
+trailer is byte-identical to the one the run wrote, and stays so if the
+layout ever changes.
+
+The fallback for datasets without [[X-EndTime]] therefore needs no view
+trace of its own.
+[[End-Time:]] and the [[Viewed:]] lines are written by the same
+[[finalize_run]] into the same trailer, so a dataset that lost the one
+never carried the other; anything that did would have to be a hand-made
+file, and the header we still emit for it is the honest reconstruction
+of what it records.
+
 <<progsnap2 functions>>=
-def build_reconstructed_run_block(event, io_log):
+def build_reconstructed_run_block(event, io_log, view_trace=None):
     """Rebuild one run block from a ProgSnap2 run event."""
     script = event.get("X-Script", "") or "(unknown)"
     args = parse_run_arguments(event.get("X-Arguments", ""))
@@ -2403,6 +2716,7 @@ def build_reconstructed_run_block(event, io_log):
             exception_info,
             end_time,
             int(exit_code) if exit_code else 0,
+            view_trace,
         )
         return f"{header}\n{trailer}"
 
@@ -2476,6 +2790,55 @@ def rebuild_io_log(events, parent_event_id, resources):
             f"{prefix}{line}" for line in text.split("\n")
         )
     return "\n".join(lines).rstrip("\n")
+@
+
+The [[else: continue]] above is what makes the two child kinds
+independent: a run's children are whatever events name it as parent,
+and the loop reads only the ones it recognises.
+An [[X-Review.View]] among them is therefore not a case to handle but a
+case already handled, which is the same tolerance the pairing loop
+(\cref{sec:group-pairs}) relies on.
+
+The view trace comes back by the mirror-image walk.
+Where [[rebuild_io_log]] returns text, this returns the triples
+[[format_run_trailer]] expects---the timestamp first, because that is
+the order [[learnlog.record_view]] stores them in and the order the
+writer's parameters take (\cref{gitrepo}), even though the line itself
+leads with the commit.
+
+A view whose timestamp will not parse is dropped rather than
+substituted for, because the substitute would be a lie: an invented
+time in a trace read as a chronology is worse than a shorter trace, and
+the trace is the only thing in the dataset whose timestamps are read as
+the events they describe rather than as metadata about a run.
+
+<<progsnap2 functions>>=
+def rebuild_view_trace(events, parent_event_id):
+    """Rebuild a review run's view trace from its child events.
+
+    Returns ``(time, commit, action)`` triples in event order,
+    ready for :func:`learnlog.gitrepo.format_run_trailer`.
+    Views with an unreadable timestamp are skipped.
+    """
+    trace = []
+    children = sorted(
+        [
+            event for event in events
+            if event.get("ParentEventID") == parent_event_id
+            and event["EventType"] == "X-Review.View"
+        ],
+        key=lambda event: int(event["Order"]),
+    )
+    for event in children:
+        viewed_at = _parse_iso(event.get("ServerTimestamp"))
+        if viewed_at is None:
+            continue
+        trace.append((
+            viewed_at,
+            event.get("X-ViewedCommit", ""),
+            event.get("X-ViewAction", ""),
+        ))
+    return trace
 @
 
 Let's verify the helpers before testing the full CLI path.
@@ -2978,6 +3341,135 @@ def test_build_reconstructed_run_block_without_end_time():
     assert "End-Time:" not in block
 @
 
+A review run has to make the same journey.
+The test below follows one out through the export and back in through
+the reconstruction, and then reads the rebuilt repository the way
+[[list]] and [[play]] read it---through [[filter_internal_runs]] and
+[[parse_commit_runs]]---rather than by matching the message text.
+That is the property that matters: not that the [[Viewed:]] lines came
+back as characters, but that a reader arriving at the reconstructed log
+with no knowledge of ProgSnap2 finds a review run with its trace,
+indistinguishable from the one the student actually recorded.
+Listing the blocks the parser found, rather than searching them for a
+string, is also what catches the opposite failure: a child event turned
+into a block of its own would show up here as a third run nobody
+performed.
+
+<<progsnap2 test functions>>=
+def test_reconstruction_keeps_review_events(workdir):
+    """A review run and its view trace survive the round trip."""
+    import shutil
+    from learnlog.commits import (
+        filter_internal_runs, get_commits,
+    )
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        parse_commit_runs,
+        read_progsnap2_as_repo,
+    )
+    repo = LearnlogRepo(workdir)
+    seen = "d" * 40
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("learnlog", ["play"], t2)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 30),
+        exit_code=0,
+        view_trace=[
+            (datetime.datetime(2026, 1, 1, 10, 5, 2),
+             seen, "open"),
+            (datetime.datetime(2026, 1, 1, 10, 5, 8),
+             seen, "next"),
+        ],
+    )
+
+    output = workdir / "review.progsnap2"
+    do_export_progsnap2(repo, output)
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        blocks = []
+        for commit in get_commits(reconstructed):
+            message = reconstructed.git(
+                "log", "-1", "--format=%B", commit["hash"],
+            ).stdout
+            blocks.extend(parse_commit_runs(
+                filter_internal_runs(message)
+            ))
+        assert [block["script"] for block in blocks] == [
+            "hello.py", "learnlog",
+        ]
+        review = blocks[1]
+        assert review["arguments"] == "play"
+        assert review["viewed"] == [
+            (seen, "2026-01-01T10:05:02", "open"),
+            (seen, "2026-01-01T10:05:08", "next"),
+        ]
+        assert review["exit_code"] == "0"
+        assert review["end_time"] == "2026-01-01T10:05:30"
+        assert review["io_log"] is None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+The child events of the two kinds must also stay out of each other's
+way, which is a property of the two rebuilders rather than of the
+round trip, and is worth asking about directly.
+The I/O event below carries a timestamp, which learnlog's own exporter
+never gives one---that is the point.
+Both rebuilders select their children by event type, and a test whose
+I/O event had no timestamp would pass even if [[rebuild_view_trace]]
+selected by nothing at all, because the missing timestamp would filter
+it out by accident.
+A dataset from a tool that does record per-line timing would then turn
+every output chunk into a view of no commit.
+
+<<progsnap2 test functions>>=
+def test_rebuild_ignores_the_other_kind_of_child():
+    """I/O and view children do not leak into each other."""
+    from learnlog.progsnap2 import (
+        rebuild_io_log, rebuild_view_trace,
+    )
+    events = [
+        {
+            "EventType": "X-Run.Output", "EventID": "2",
+            "Order": "2", "ParentEventID": "1",
+            "ServerTimestamp": "2026-01-01T10:00:02",
+            "ProgramOutput": "Resources/io_2.txt",
+        },
+        {
+            "EventType": "X-Review.View", "EventID": "3",
+            "Order": "3", "ParentEventID": "1",
+            "ServerTimestamp": "2026-01-01T10:00:03",
+            "X-ViewedCommit": "e" * 40,
+            "X-ViewAction": "batch",
+        },
+        {
+            "EventType": "X-Review.View", "EventID": "4",
+            "Order": "4", "ParentEventID": "1",
+            "ServerTimestamp": "not a time",
+            "X-ViewedCommit": "f" * 40,
+            "X-ViewAction": "next",
+        },
+    ]
+    resources = {"Resources/io_2.txt": "hello"}
+
+    assert rebuild_io_log(events, "1", resources) == \
+        "stdout: hello"
+    assert rebuild_view_trace(events, "1") == [
+        (datetime.datetime(2026, 1, 1, 10, 0, 3),
+         "e" * 40, "batch"),
+    ]
+@
+
 The awkward case is the one the export exists for: a [[python -c]] run,
 whose first argument is a program source with spaces and newlines in
 it, followed by the arguments the student actually passed.
@@ -3121,6 +3613,18 @@ to the most recent [[Run.Program]] via [[ParentEventID]].
 When a [[Run.Program]] appears without a preceding
 [[File.Edit]], we create a pair with [[edit=None]]---this
 happens when the student re-runs without editing.
+
+Every other event type falls through the chain of tests without
+touching [[current_edit]], and that silence is load-bearing rather
+than incidental: it is what places the review events
+(\cref{sec:review-events}) outside the edit--run cycle.
+A student who edits, pages back through the log, and then runs still
+produces one pair joining that edit to that run, because the
+[[X-Review]] and [[X-Review.View]] events between them match no branch
+here.
+Were they matched by the [[Run.Program]] branch instead, the review
+would consume the pending edit and the real run would be recorded as a
+re-run of code nobody had touched.
 
 <<walk events to form pairs>>=
 grouped = {}
@@ -4604,7 +5108,118 @@ def test_generate_analysis_latex_title_override():
         in latex
     )
     assert "\\section{anon-1234}" not in latex
+@
 
+The claim that review events leave the analysis alone is easy to state
+and easy to get wrong, so we check it against the shape of the report
+rather than against its text.
+The repository below is the awkward arrangement: the student runs,
+edits, \emph{reviews}, and only then runs again---so a review sits
+exactly where it could steal the pending edit.
+Deleting the review events from the same stream must produce the same
+pairs, which is a stronger statement than \enquote{it did not crash}:
+the report is not merely still generated, it is the report the run
+would have produced.
+The command itself gets the last word, because the pieces can each be
+right while the path a user actually takes is not: the same repository
+goes through [[learnlog analyse]] end to end, and the report it prints
+has to have the same two runs in it.
+
+<<progsnap2 test functions>>=
+def test_analyse_ignores_review_events(workdir, monkeypatch):
+    """A review between an edit and a run changes no table."""
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        generate_analysis_latex,
+        group_edit_run_pairs,
+        read_progsnap2,
+    )
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    repo.finalize_run(
+        io_log="stdout: v1\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "learnlog", ["play"],
+        datetime.datetime(2026, 1, 1, 10, 2),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 2, 30),
+        exit_code=0,
+        view_trace=[(
+            datetime.datetime(2026, 1, 1, 10, 2, 5),
+            "a" * 40, "open",
+        )],
+    )
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5)
+    )
+    repo.finalize_run(
+        io_log="stdout: v2\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+
+    output = workdir / "analyse.progsnap2"
+    do_export_progsnap2(repo, output)
+    dataset = read_progsnap2(output)
+
+    def shape(grouped):
+        return {
+            sid: {
+                tag: [
+                    (
+                        pair["edit"] and pair["edit"]["EventID"],
+                        pair["run"] and pair["run"]["EventID"],
+                    )
+                    for pair in pairs
+                ]
+                for tag, pairs in tags.items()
+            }
+            for sid, tags in grouped.items()
+        }
+
+    grouped = group_edit_run_pairs(dataset["events"])
+    without_reviews = [
+        event for event in dataset["events"]
+        if not event["EventType"].startswith("X-Review")
+    ]
+    assert shape(grouped) == shape(
+        group_edit_run_pairs(without_reviews)
+    )
+
+    pairs = next(iter(grouped.values()))[""]
+    assert len(pairs) == 2
+    assert all(
+        pair["edit"] is not None and pair["run"] is not None
+        for pair in pairs
+    )
+    assert [
+        pair["run"]["X-Script"] for pair in pairs
+    ] == ["hello.py", "hello.py"]
+
+    latex = generate_analysis_latex(dataset, grouped)
+    assert latex.count("\\paragraph{Run ") == 2
+    assert "learnlog" not in latex
+
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["analyse"])
+    assert result.exit_code == 0
+    assert result.output.count("\\paragraph{Run ") == 2
+@
+
+<<progsnap2 test functions>>=
 def test_format_edit_latex_first_edit():
     """First edit shows full file content."""
     from learnlog.progsnap2 import format_edit_latex
