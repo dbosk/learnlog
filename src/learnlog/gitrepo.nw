@@ -1552,19 +1552,137 @@ run.
 Failing to acquire the lock is not worth aborting a run over, so every
 error path here returns [[None]] and the commit proceeds unserialised.
 
+Which file, though?
+[[flock]] locks the open file---the inode---and the path is only how we
+found it.
+The two mean the same thing for exactly as long as nobody replaces the
+file behind the name.
+Delete [[learnlog.lock]] while a run holds it and the name is free
+again: the next process opens the path, creates a new file there, and
+takes an exclusive lock on \emph{that} one.
+Two processes now hold the lock, on two different files, and the kernel
+is right about both.
+
+Nobody deletes that file on purpose, but plenty of housekeeping does.
+A run killed between [[git add]] and its commit leaves behind the
+[[.lock]] file Git was writing its private index through, and the
+standard advice for a stray [[.lock]] in a Git repository is to delete
+it; a student who follows that advice with a wildcard takes
+[[learnlog.lock]] along with it.
+
+The process that suffers is not the one holding the lock---it holds a
+lock on a file, and it finishes its commit---but the one that was
+\emph{waiting} inside [[flock]] while the file was replaced.
+It went to sleep on the old file and wakes up holding a lock nobody
+will ever contend for, because everybody else now opens the new one.
+So once [[flock]] returns we ask whether the file we locked is still
+the file the lock path names, and when it is not we drop it and start
+over.
+Starting over opens the path again---by then the new file---and waits
+for whoever holds that one, which is the serialisation we asked for in
+the first place.
+
+The attempts are bounded because what they wait on is somebody else's
+behaviour: something recreating the file in a loop would otherwise keep
+us here for as long as it runs, and a student's program would wait for
+it.
+Running out of attempts is answered like any other failure to
+acquire---[[None]], and the commit proceeds unserialised.
+
 <<repo methods>>=
 def _acquire_lock(self):
     """Return a locked file handle, or ``None`` if unavailable."""
     if fcntl is None:
         return None
-    try:
-        handle = open(self.git_dir / LOCK_FILE_NAME, "w")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        return None
-    return handle
+    lock_path = self.git_dir / LOCK_FILE_NAME
+    for _ in range(LOCK_ATTEMPTS):
+        try:
+            handle = open(lock_path, "w")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            return None
+        if _is_same_file(handle, lock_path):
+            return handle
+        handle.close()
+    return None
 <<constants>>=
 LOCK_FILE_NAME = "learnlog.lock"
+LOCK_ATTEMPTS = 8
+@
+
+Inode and device number are what \enquote{the same file} means to the
+kernel, and they are the terms [[flock]] is itself defined in.
+Comparing paths would answer a question we already know the answer to,
+and comparing contents would answer none---the file is empty either
+way.
+A [[stat]] that fails means there is no file at the path at all just
+now, which is a mismatch like any other.
+
+<<functions>>=
+def _is_same_file(handle, path):
+    """Say whether ``handle`` is open on the file now at ``path``."""
+    try:
+        held = os.fstat(handle.fileno())
+        named = os.stat(path)
+    except OSError:
+        return False
+    return (held.st_ino, held.st_dev) == (named.st_ino, named.st_dev)
+@
+
+Let us replace the file underneath an acquisition and check that what
+comes back is a lock on the file the next process would open---and that
+the next process therefore cannot have it.
+Driving [[_acquire_lock]] directly, with a stand-in for [[flock]] that
+swaps the file just before it locks, turns the race into a sequence
+instead of a coincidence.
+The tests skip where [[fcntl]] does, for the same reason the module
+degrades there.
+
+<<test functions>>=
+fcntl = pytest.importorskip("fcntl")
+
+def test_lock_survives_a_recreated_lock_file(workdir, monkeypatch):
+    """A lock file swapped mid-acquisition still excludes rivals."""
+    repo = LearnlogRepo(workdir)
+    lock_path = repo.git_dir / LOCK_FILE_NAME
+    real_flock = fcntl.flock
+    swapped = []
+
+    def swap_the_file_then_lock(fd, operation):
+        if not swapped:
+            swapped.append(True)
+            lock_path.unlink(missing_ok=True)
+            lock_path.write_text("")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", swap_the_file_then_lock)
+    handle = repo._acquire_lock()
+    monkeypatch.undo()
+    assert handle is not None
+    assert os.fstat(handle.fileno()).st_ino == lock_path.stat().st_ino
+    with open(lock_path) as rival:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(rival.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    handle.close()
+@
+
+And when the file never stops moving, the loop has to give up rather
+than hold a student's program hostage to whatever keeps moving it:
+
+<<test functions>>=
+def test_lock_gives_up_on_a_file_that_keeps_moving(workdir, monkeypatch):
+    """An endlessly recreated lock file ends in no lock, not a hang."""
+    repo = LearnlogRepo(workdir)
+    lock_path = repo.git_dir / LOCK_FILE_NAME
+    real_flock = fcntl.flock
+
+    def swap_the_file_then_lock(fd, operation):
+        lock_path.unlink(missing_ok=True)
+        lock_path.write_text("")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", swap_the_file_then_lock)
+    assert repo._acquire_lock() is None
 @
 
 
@@ -1966,13 +2084,113 @@ except OSError:
     index_path.unlink(missing_ok=True)
 @
 
+Moving the index back is a write to [[.learnlog/index]], and that file
+comes with a protocol we were ignoring.
+Every Git command that writes the index first creates
+[[.learnlog/index.lock]] with [[O_EXCL]], builds the new index there,
+and renames it into place; the [[O_EXCL]] is what makes a second writer
+fail loudly instead of interleaving.
+A bare [[os.replace]] takes part in none of it.
+Run alongside a [[learnlog git add]] the student typed, both writers
+prepare a whole index out of what they read, and whichever [[rename]]
+lands second is the one that survives---the other's work is gone, with
+nothing anywhere to say so.
+
+So we take the lock Git would have taken.
+Creating [[index.lock]] with [[O_CREAT]] and [[O_EXCL]] \emph{is} the
+protocol: holding it is what makes a concurrent Git command fail rather
+than interleave, and failing to create it is how a concurrent Git
+command tells us it is already writing the index.
+Readers take no lock at all, and need none: we still install the file
+with a single [[rename]], so a reader sees the old index or the new
+one, never a half-written one.
+
+A lock we cannot get means we skip the publish, and that is a choice
+rather than a resignation.
+What we are publishing is a stat cache and nothing more---the header
+commit is already made, out of the private index, and stands whatever
+happens here.
+Losing the cache costs the next run one [[git add .]] that re-reads the
+project, which is what the first run does anyway.
+Waiting for the lock would trade that cost for making a student's
+program wait on the student's own Git command, and
+\cref{sec:commit-lock} has already said what we think of that trade.
+
+The lock file has to come off again in every case, because left behind
+it is not our problem but the student's: the next [[git add]] in that
+repository fails with \enquote{Unable to create index.lock}, and a
+repository that refuses to stage anything is exactly the damage this
+tool must never do.
+Hence the [[finally]]---and hence that only the process whose
+[[O_EXCL]] succeeded removes it.
+Removing a lock we found rather than made would hand the index to two
+writers at once, which is the one thing the lock is there to prevent.
+
 <<publish the private index as the shared one>>=
+shared_lock = self.git_dir / SHARED_INDEX_LOCK_NAME
+try:
+    lock_fd = os.open(shared_lock, INDEX_LOCK_FLAGS, 0o666)
+except OSError:
+    pass
+else:
+    <<move the index into place and drop the lock>>
+<<constants>>=
+SHARED_INDEX_NAME = "index"
+SHARED_INDEX_LOCK_NAME = "index.lock"
+INDEX_LOCK_FLAGS = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+@
+
+<<move the index into place and drop the lock>>=
 try:
     os.replace(index_path, shared_index)
 except OSError:
     pass
-<<constants>>=
-SHARED_INDEX_NAME = "index"
+finally:
+    os.close(lock_fd)
+    try:
+        shared_lock.unlink()
+    except OSError:
+        pass
+@
+
+Let us hold [[index.lock]] the way a Git command would, and check that
+the run is recorded all the same and the student's index is left as it
+was:
+
+<<test functions>>=
+def test_publish_skipped_while_the_index_lock_is_held(workdir):
+    """A locked index is left alone; the run is recorded anyway."""
+    repo = LearnlogRepo(workdir)
+    shared = repo.git_dir / SHARED_INDEX_NAME
+    lock = repo.git_dir / SHARED_INDEX_LOCK_NAME
+    before = shared.read_bytes()
+    lock.write_text("")
+    (workdir / "extra.py").write_text("x = 1\n")
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert f"Run-Id: {repo.run_id}" in msg
+    assert shared.read_bytes() == before
+    assert lock.exists()
+@
+
+With nobody holding the lock the publish goes through, and---just as
+important---leaves no lock file behind for the student's next
+[[git add]] to trip over.
+Staging a file at the end of the test is how we ask about both at once:
+it fails if what we published is not an index Git will read, and it
+fails if a lock of ours is still in the way.
+
+<<test functions>>=
+def test_publish_replaces_the_index_and_leaves_no_lock(workdir):
+    """A publish that runs unopposed also cleans up after itself."""
+    repo = LearnlogRepo(workdir)
+    shared = repo.git_dir / SHARED_INDEX_NAME
+    before = shared.read_bytes()
+    (workdir / "extra.py").write_text("x = 1\n")
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    assert shared.read_bytes() != before
+    assert not (repo.git_dir / SHARED_INDEX_LOCK_NAME).exists()
+    repo.git("add", "extra.py")
 @
 
 
