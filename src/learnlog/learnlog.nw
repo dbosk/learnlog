@@ -568,9 +568,12 @@ import pathlib
 import sys
 import pytest
 from learnlog import (
+    C_INVOCATION_CLAIM_NAME,
+    C_INVOCATION_NAME,
     _claim_c_invocation_path,
     _is_opted_out,
     _persist_c_invocation,
+    _release_c_invocation,
 )
 from learnlog.gitrepo import LearnlogRepo
 
@@ -1031,49 +1034,111 @@ Passing the repository rather than a second copy of the path is what
 makes the two impossible to disagree about: the file is written into
 exactly the directory Git is about to commit from.
 
-The file name is the second hazard.
+That file has to exist only long enough to be committed.
+[[begin_run]] stages the whole work tree into the header commit
+(\cref{sec:two-commit-protocol}), so the instant that commit exists the
+source is in Git for good and the copy on disk is a duplicate.
+Learnlog therefore takes its own file away again as soon as the header
+commit has been made, and hands the student's program a work tree that
+looks exactly like the one they left behind.
+
+An earlier version kept the file, and defended it as a discoverable
+record: [[ls]] would show the most recent [[python -c]] source.
+That argument does not survive contact with the rest of the design.
+A file the student never wrote is a change to their project, and not
+changing their project is the property the whole tool is built around.
+The damage does not stop at [[ls]] either: once committed the file is
+\emph{tracked}, so every later run---plain script runs that have
+nothing to do with [[python -c]] among them---snapshots a code state
+containing a module that was never part of the program, and every
+diff, checked-out code state and ProgSnap2 [[CodeState]] export
+inherits that fiction.
+Giving up the [[ls]] entry costs nothing in exchange, because the
+record is not lost: it sits in the run's own header commit, which is
+where [[learnlog play]] and [[learnlog git show]] already look for
+everything else the run is made of.
+
+Taking the file away after the header commit leaves its deletion
+staged for whatever runs next, and that is the point rather than a
+side effect.
+The run that wrote the file keeps it in its code state, because at
+that instant the file really was in the work tree; the next run's
+header commit records that it is gone, and from there on the code
+states are the student's project again.
+In between, [[learnlog git status]] reports the pending deletion,
+which is an honest description of a work tree that no longer matches
+the last commit.
+
+The file name is the remaining hazard.
 A student may already own a [[python_c_invocation.py]], and overwriting
 it would destroy their work---a far worse breach than the one we are
 recording.
 So learnlog writes only to a name it has claimed, and claims a name
 only while nothing occupies it.
-The claim is recorded in [[.learnlog/c-invocation]] rather than inside
-the file.
-It has to outlive the process, or the next [[python -c]] run would find
-its own previous file in the way and claim yet another name; and it
-must not be a marker line in the source file, because the bytes of that
-file are the program that ran---a code state that quietly gained a
-comment learnlog wrote is not a record of the student's code.
 
-The trade-off is unchanged: [[python_c_invocation.py]] is visible in
-[[ls]] after such a run.
-That is acceptable because it is a discoverable record of the most
-recent [[python -c]] source, in the project the run belongs to, and
-because it stays one file that later runs update in place.
-Failing to write it must not stop the student's program, but it must
-not pass unnoticed either, so the exception we swallow goes to the
+What the claim has to say has narrowed along with the file's lifetime.
+It is no longer a naming policy that must outlive the process to keep
+consecutive runs pointed at one file: the name is given back at the end
+of every run, so the next run finds it free by itself.
+What [[.learnlog/c-invocation]] records now is a single fact: that
+learnlog has written a file and has not removed it yet.
+The claim is created before the write and destroyed together with the
+file, so a claim found at the start of a run can only mean that the
+previous run died between those two moments---a [[SIGKILL]], a power
+cut, a pulled plug---and that the file it names, if it is still there,
+is learnlog's own leftover rather than something the student owns.
+Reusing that name is therefore both safe and self-healing: the next
+[[python -c]] run overwrites the leftover and then releases it, so a
+killed run costs one stale file until that happens instead of a
+growing pile of near-identical ones.
+Runs that are not [[python -c]] runs deliberately leave the leftover
+alone; a claim proves that learnlog wrote the file at some point, not
+that the bytes on disk are still the ones it wrote, and that is too
+thin a warrant for deleting a file in a run that had no business
+writing one.
+
+Recording the claim beside the repository rather than inside the
+source file is unchanged, and so is the reason: the bytes of that file
+are the program that ran, and a code state that quietly gained a
+marker comment learnlog wrote is no longer a record of the student's
+code.
+
+The helper hands the path it claimed back to its caller, because
+releasing has to remove precisely the file this run wrote and not the
+one the student may own beside it.
+It hands the path back even when the write failed, since a
+half-written file is still learnlog's to clean up.
+Failing to write must not stop the student's program, but it must not
+pass unnoticed either, so the exception we swallow goes to the
 diagnostics path (\cref{sec:diagnostics}) like every other one.
 
 <<functions>>=
 def _persist_c_invocation(repo, script, args):
-    """Persist ``python -c`` source as a worktree file."""
+    """Persist ``python -c`` source as a worktree file.
+
+    Returns the path claimed for this run, or ``None`` when there
+    was nothing to write or no free name to write it under.
+    """
     if script != "<python -c>" or not args:
-        return
+        return None
+    target = None
     try:
         target = _claim_c_invocation_path(repo)
         if target is not None:
             target.write_text(args[0])
     except Exception as error:
         _report_swallowed_failure("persist -c source", error)
+    return target
 @
 
 Claiming is a two-step lookup, and the order between the steps is what
-keeps the name stable.
+makes the leftover case work.
 An existing claim wins outright, even when the file it names has since
-been deleted: re-creating the name learnlog used last time turns
-consecutive [[python -c]] runs into a one-file diff instead of a
-growing pile of near-identical files.
-Only when no claim exists do we go looking for a free name.
+been deleted: adopting that name is how the run following a killed one
+takes ownership of the leftover instead of stepping around it and
+claiming a second name beside it.
+Only when no claim exists---the ordinary case, since a run that
+finishes gives its name back---do we go looking for a free one.
 
 <<functions>>=
 def _claim_c_invocation_path(repo):
@@ -1099,8 +1164,8 @@ if claimed and "/" not in claimed:
 @
 
 The alternatives are numbered and tried in a fixed order, so a project
-whose preferred name is taken still ends up with one stable file rather
-than a new one per run.
+whose preferred name belongs to the student still gets a name of its
+own, and gets the same one on every run.
 The search is bounded because a directory in which a hundred of these
 names are occupied is not one attempt away from success; there we
 decline to write anything, which costs that run its synthetic code
@@ -1121,6 +1186,37 @@ return None
 C_INVOCATION_NAME = "python_c_invocation.py"
 C_INVOCATION_CLAIM_NAME = "c-invocation"
 C_INVOCATION_MAX_NAMES = 100
+@
+
+Releasing is the mirror of claiming, and the order between its two
+steps carries the invariant the leftover story rests on: the file goes
+first and the claim second.
+A failure in the middle then leaves a claim without a file, never a
+file without a claim.
+The first costs nothing---the next run reuses a name whose file
+happens to be missing, which is what every ordinary run does
+anyway---while the second would strand the file for good: with no
+claim to identify it, no later run could tell it apart from something
+the student wrote, and learnlog would have to leave it alone forever.
+
+Deleting is as much a thing that must not break the program as writing
+was.
+A work tree that has turned read-only, or a file the student removed
+while their own program was running, must not surface as a traceback
+in the middle of their output, so this failure takes the same
+diagnostics path as the write.
+
+<<functions>>=
+def _release_c_invocation(repo, target):
+    """Remove the ``-c`` source file written for this run."""
+    if target is None:
+        return
+    try:
+        target.unlink(missing_ok=True)
+        claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
+        claim.unlink(missing_ok=True)
+    except Exception as error:
+        _report_swallowed_failure("release -c source", error)
 @
 
 Let's verify the property the anchoring exists for: the file follows
@@ -1157,16 +1253,29 @@ def test_does_not_clobber_a_file_it_did_not_write(workdir):
     ).read_text() == "print(1)"
 @
 
-The claim is what stops that fallback from happening again on every
-later run.
-Two runs in the same project must share one file, even though each run
-builds its own [[LearnlogRepo]]:
+Releasing has to undo both halves of the write, so that what the next
+run finds is a work tree with nothing of learnlog's in it and a name
+that is free again:
 
 <<test functions>>=
-def test_reuses_the_claimed_name_across_runs(workdir):
-    """A later run updates the claimed file instead of adding one."""
-    _persist_c_invocation(
-        LearnlogRepo(workdir), "<python -c>", ["print(1)"]
+def test_release_removes_the_file_and_the_claim(workdir):
+    """Nothing learnlog wrote survives the release."""
+    repo = LearnlogRepo(workdir)
+    target = _persist_c_invocation(
+        repo, "<python -c>", ["print(1)"]
+    )
+    _release_c_invocation(repo, target)
+    assert not target.exists()
+    assert not (
+        repo.git_dir / C_INVOCATION_CLAIM_NAME
+    ).exists()
+
+def test_released_name_is_claimed_again_next_run(workdir):
+    """A run after a released one gets the same name back."""
+    repo = LearnlogRepo(workdir)
+    _release_c_invocation(
+        repo,
+        _persist_c_invocation(repo, "<python -c>", ["print(1)"]),
     )
     _persist_c_invocation(
         LearnlogRepo(workdir), "<python -c>", ["print(2)"]
@@ -1175,6 +1284,48 @@ def test_reuses_the_claimed_name_across_runs(workdir):
         workdir / "python_c_invocation.py"
     ).read_text() == "print(2)"
     assert not (workdir / "python_c_invocation-1.py").exists()
+@
+
+A run that is killed never reaches its release, and the file it wrote
+outlives it.
+The claim it also left behind is what tells the next [[python -c]] run
+that the file is learnlog's own, so that run adopts it instead of
+adding a second one beside it---and hands both back when it is done:
+
+<<test functions>>=
+def test_adopts_the_leftover_of_a_killed_run(workdir):
+    """An unreleased file is reused, not stepped around."""
+    _persist_c_invocation(
+        LearnlogRepo(workdir), "<python -c>", ["print(1)"]
+    )
+    repo = LearnlogRepo(workdir)
+    target = _persist_c_invocation(
+        repo, "<python -c>", ["print(2)"]
+    )
+    assert target == workdir / "python_c_invocation.py"
+    assert target.read_text() == "print(2)"
+    assert not (workdir / "python_c_invocation-1.py").exists()
+    _release_c_invocation(repo, target)
+    assert not target.exists()
+@
+
+The two release steps are ordered so that the claim outlives the file
+it names, and we can see that by making the deletion fail.
+With a directory standing where the file should be, [[unlink]] raises,
+and the claim has to still be there afterwards---otherwise no later
+run could tell that leftover apart from the student's own work:
+
+<<test functions>>=
+def test_keeps_the_claim_when_the_file_cannot_be_removed(workdir):
+    """A failed deletion leaves the claim that identifies it."""
+    repo = LearnlogRepo(workdir)
+    claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
+    claim.write_text(C_INVOCATION_NAME + "\n")
+    target = workdir / C_INVOCATION_NAME
+    target.mkdir()
+    _release_c_invocation(repo, target)
+    assert target.is_dir()
+    assert claim.exists()
 @
 
 Finally, the point of writing the file at all: it has to be inside the
@@ -1193,6 +1344,53 @@ def test_c_source_joins_the_run_code_state(workdir):
     assert "python_c_invocation.py" in listed.split()
     stored = repo.git("show", "HEAD:python_c_invocation.py").stdout
     assert stored == "print(1)"
+@
+
+Once that commit exists the file has done its work, and the run can be
+read out of Git while the work tree carries no trace of it.
+What Git is left holding is a deletion that nothing has committed yet,
+and [[learnlog git status]] says so:
+
+<<test functions>>=
+def test_released_source_stays_readable_from_the_commit(workdir):
+    """The commit keeps the source the work tree gives up."""
+    repo = LearnlogRepo(workdir)
+    target = _persist_c_invocation(
+        repo, "<python -c>", ["print(1)"]
+    )
+    repo.begin_run(
+        "<python -c>", ["print(1)"],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    _release_c_invocation(repo, target)
+    assert not target.exists()
+    stored = repo.git("show", "HEAD:python_c_invocation.py").stdout
+    assert stored == "print(1)"
+    pending = repo.git("status", "--porcelain").stdout
+    assert "D python_c_invocation.py" in pending
+@
+
+The deletion does not stay on disk either: the next run stages it, so
+an ordinary script run that follows a [[python -c]] run has a code
+state with nothing synthetic in it.
+
+<<test functions>>=
+def test_later_runs_do_not_carry_the_c_source(workdir):
+    """A later run's code state is the student's project again."""
+    repo = LearnlogRepo(workdir)
+    target = _persist_c_invocation(
+        repo, "<python -c>", ["print(1)"]
+    )
+    repo.begin_run(
+        "<python -c>", ["print(1)"],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    _release_c_invocation(repo, target)
+    LearnlogRepo(workdir).begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 1),
+    )
+    listed = repo.git("ls-tree", "--name-only", "HEAD").stdout
+    assert "python_c_invocation.py" not in listed.split()
 @
 
 [[InputCapture]] handles piped stdin because [[input()]] eventually
@@ -1682,14 +1880,33 @@ The repository is built first and handed to the helper for the same
 reason: the directory Git commits from is then, by construction, the
 directory the file is written to.
 
+Giving the file back belongs on the other side of [[begin_run]], as
+early as it can be and no earlier.
+Earlier than the commit, and the source would miss the very tree it
+was written for.
+Later than initialisation---in [[on_exit]], say---and the file would
+be on disk for the whole of the student's program: a program that
+lists its own directory would see a module nobody wrote, and a program
+killed with [[SIGKILL]] would leave the file behind even though its
+header commit already holds the source.
+The two calls therefore bracket the one step that needs the file.
+That is also why the release lives here rather than inside
+[[begin_run]]: [[LearnlogRepo]] stays a generic Git wrapper that knows
+nothing about [[python -c]], exactly as the writing helper does.
+
 <<create repository and begin run>>=
 repo = LearnlogRepo(workdir)
 <<persist -c source>>
 repo.begin_run(main_script, main_args, start_time)
+<<release -c source>>
 @
 
 <<persist -c source>>=
-_persist_c_invocation(repo, main_script, main_args)
+c_invocation_path = _persist_c_invocation(repo, main_script, main_args)
+@
+
+<<release -c source>>=
+_release_c_invocation(repo, c_invocation_path)
 @
 
 <<install I/O wrappers>>=
@@ -1871,7 +2088,27 @@ class TestInitialize:
         assert result.stdout.strip() == str(project_root)
         assert (project_root / ".learnlog").is_dir()
         assert not (subdir / ".learnlog").exists()
+@
 
+The [[python -c]] cases that follow all have to look for the source in
+the same place, and it is no longer the work tree: the run hands its
+file back once the header commit has taken it, so the commit is what
+the assertions read.
+
+<<test helpers>>=
+def committed_c_source(workdir, name=C_INVOCATION_NAME):
+    """Return the ``-c`` source recorded in the newest commit."""
+    result = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "show", f"HEAD:{name}"],
+        cwd=str(workdir),
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+@
+
+<<test functions>>=
     @pytest.mark.parametrize(
         ("argv", "expected_script", "expected_args"),
         [
@@ -1910,17 +2147,8 @@ class TestInitialize:
         assert f"Script: {expected_script}" in msg
         assert f"Arguments: {expected_args}" in msg
         if expected_script == "<python -c>":
-            source_file = workdir / "python_c_invocation.py"
-            assert source_file.read_text() == "print(1)"
-            ls_result = subprocess.run(
-                ["git", "--git-dir=.learnlog",
-                 "--work-tree=.", "ls-files",
-                 "python_c_invocation.py"],
-                cwd=str(workdir),
-                capture_output=True, text=True,
-            )
-            assert ls_result.returncode == 0
-            assert ls_result.stdout.strip() == "python_c_invocation.py"
+            assert not (workdir / C_INVOCATION_NAME).exists()
+            assert committed_c_source(workdir) == "print(1)"
 
     def test_persists_multiline_python_c_source(
         self, workdir, test_env,
@@ -1934,9 +2162,7 @@ class TestInitialize:
             orig_argv=[sys.executable, "-c", source],
         )
         assert result.returncode == 0
-        assert (
-            workdir / "python_c_invocation.py"
-        ).read_text() == source
+        assert committed_c_source(workdir) == source
 
     def test_recovers_python_c_source_from_orig_argv(
         self, workdir, test_env,
@@ -1959,9 +2185,7 @@ class TestInitialize:
         msg = git_result.stdout
         assert "Script: <python -c>" in msg
         assert f"Arguments: {source}" in msg
-        assert (
-            workdir / "python_c_invocation.py"
-        ).read_text() == source
+        assert committed_c_source(workdir) == source
 
     def test_python_c_preserves_extras_after_source(
         self, workdir, test_env,
@@ -1986,9 +2210,7 @@ class TestInitialize:
         msg = git_result.stdout
         assert "Script: <python -c>" in msg
         assert f"Arguments: {source} alpha beta" in msg
-        assert (
-            workdir / "python_c_invocation.py"
-        ).read_text() == source
+        assert committed_c_source(workdir) == source
 @
 
 The last hazard is one no test above can see, because every run so far
@@ -2023,7 +2245,141 @@ project that logged it.
         )
         assert committed.returncode == 0
         assert committed.stdout == source
+@
 
+The unit tests above drive the two helpers by hand.
+What they cannot show is that a real interpreter start goes through
+both of them, so the property that matters most---the student's
+directory comes out of a [[python -c]] run exactly as it went in---has
+to be checked against an actual run:
+
+<<test functions>>=
+    def test_python_c_leaves_the_worktree_as_it_found_it(
+        self, workdir, test_env,
+    ):
+        """A -c run adds nothing to the directory it logs."""
+        source = 'print("temporary")'
+        before = sorted(
+            path.name for path in workdir.iterdir()
+            if path.name != ".learnlog"
+        )
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", source],
+        )
+        assert result.returncode == 0
+        after = sorted(
+            path.name for path in workdir.iterdir()
+            if path.name != ".learnlog"
+        )
+        assert after == before
+        assert committed_c_source(workdir) == source
+@
+
+The file learnlog gives back is its own and only its own.
+A student who already owns that name keeps their file, and the source
+of the run is recorded under the name learnlog fell back to---which it
+then hands back as well:
+
+<<test functions>>=
+    def test_python_c_spares_a_file_the_student_owns(
+        self, workdir, test_env,
+    ):
+        """A student's own file survives, contents and all."""
+        theirs = workdir / C_INVOCATION_NAME
+        theirs.write_text("# the student's own module\n")
+        source = 'print("temporary")'
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", source],
+        )
+        assert result.returncode == 0
+        assert theirs.read_text() == "# the student's own module\n"
+        assert not (
+            workdir / "python_c_invocation-1.py"
+        ).exists()
+        assert committed_c_source(
+            workdir, "python_c_invocation-1.py"
+        ) == source
+@
+
+The reason for handing the file back at all is what the \emph{next}
+run records.
+An ordinary script run that follows a [[python -c]] run has nothing to
+do with it, and its code state must say so:
+
+<<test functions>>=
+    def test_later_run_records_no_synthetic_file(
+        self, workdir, test_env,
+    ):
+        """A plain run after a -c run snapshots only real code."""
+        run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", 'print("temporary")'],
+        )
+        script = workdir / "hello.py"
+        script.write_text("import learnlog\nprint('hello')\n")
+        result = subprocess.run(
+            [sys.executable, "-S", str(script)],
+            cwd=str(workdir), env=test_env,
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        listed = subprocess.run(
+            ["git", "--git-dir=.learnlog", "--work-tree=.",
+             "ls-tree", "--name-only", "HEAD"],
+            cwd=str(workdir),
+            capture_output=True, text=True, timeout=30,
+        )
+        assert listed.returncode == 0
+        assert C_INVOCATION_NAME not in listed.stdout.split()
+@
+
+Finally the case the claim exists for.
+A run killed before it could release leaves the file and its claim
+behind; we stage exactly that state by hand, because a [[SIGKILL]] at
+the right microsecond is not something a test can aim for.
+The next [[python -c]] run has to adopt the leftover rather than write
+a second file beside it, and the directory has to be clean again
+afterwards:
+
+<<test functions>>=
+    def test_adopts_and_clears_a_leftover_from_a_killed_run(
+        self, workdir, test_env,
+    ):
+        """The run after a killed one cleans up after it."""
+        repo = LearnlogRepo(workdir)
+        leftover = workdir / C_INVOCATION_NAME
+        leftover.write_text('print("killed run")')
+        claim = repo.git_dir / C_INVOCATION_CLAIM_NAME
+        claim.write_text(C_INVOCATION_NAME + "\n")
+        source = 'print("next run")'
+        result = run_explicit_import(
+            "import learnlog",
+            cwd=workdir,
+            env=test_env,
+            argv=["-c"],
+            orig_argv=[sys.executable, "-c", source],
+        )
+        assert result.returncode == 0
+        assert not leftover.exists()
+        assert not (
+            workdir / "python_c_invocation-1.py"
+        ).exists()
+        assert not claim.exists()
+        assert committed_c_source(workdir) == source
+@
+
+<<test functions>>=
     def test_input_calls_are_logged_once_for_piped_stdin(
         self, workdir, test_env,
     ):
@@ -4160,6 +4516,35 @@ def _venv_binary(venv_dir, name):
     return cli.find_in_venv(venv_dir, name)
 
 
+def _committed_c_source(project):
+    """Return the ``-c`` source recorded in the learnlog repo.
+
+    The file lives in the work tree only long enough to be
+    committed, and later runs commit its deletion, so the oldest
+    commit that touched the path is the one still holding it.
+    """
+    revisions = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "rev-list", "--all", "--", "python_c_invocation.py"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout.split()
+    assert revisions, "no commit ever carried the -c source"
+    result = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "show", f"{revisions[-1]}:python_c_invocation.py"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return result.stdout
+
+
 def _git_history(project):
     """Return the full commit bodies in the learnlog repo."""
     result = subprocess.run(
@@ -4451,7 +4836,8 @@ def test_autostart_captures_common_invocations(tmp_path):
     assert "Script: pip" in history
     assert "Script: quick.py" in history
     assert "stdin: hello from tty\n" in history
-    assert (project / "python_c_invocation.py").read_text() == "print(1)"
+    assert not (project / "python_c_invocation.py").exists()
+    assert _committed_c_source(project) == "print(1)"
 @
 
 The last naming-sensitive cases are console-style wrappers whose
