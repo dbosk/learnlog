@@ -62,7 +62,7 @@ Five modules, all defined as `.nw` literate source in `src/learnlog/`:
 | `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the venv's project root (marker file + `sys.prefix`) for `initialize()`, and imports `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs. Must never import `learnlog` at module scope: `import learnlog._autostart` already runs `__init__.py`, so the activation veto (`LEARNLOG_SKIP_AUTOSTART`, `learnlog init`) lives in `initialize()`, not here |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
 | `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; append-only two-commit protocol (header commit with the code state before the run, trailer commit with the results after, linked by `Run-Id`), `flock` + per-run `GIT_INDEX_FILE` around each commit and around repository creation (`init_repo` is idempotent and race-safe); `git()` raises `GitError` on failure and `report_error()` records swallowed failures |
-| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), and `analyse` |
+| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`; refuses `$HOME`-or-above unless `--force`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), `doctor` (reports/repairs the interpreter's autostart wiring; dead wiring exits 1), and `analyse` |
 
 Tutorial sources in `src/learnlog/tutorials/`:
 - `getting-started.nw` — first-run setup, activation, running code, and batch playback
@@ -82,7 +82,9 @@ Tutorial sources in `src/learnlog/tutorials/`:
   autostart-wired interpreter (marker file present, `site.py` enabled) whose
   project no longer resolves logs *nothing* rather than guessing; so does a
   run whose only candidate root is `$HOME`. Both raise `UnanchoredRun`, which
-  `initialize()`'s handler turns into a `LEARNLOG_DEBUG` diagnostic
+  `initialize()`'s handler turns into a `LEARNLOG_DEBUG` diagnostic;
+  `learnlog doctor` makes that silent state visible and `--repair`
+  re-wires it. An empty marker file reads as no marker
 - `tests/Makefile` exports `LEARNLOG_SKIP_AUTOSTART=1` so the suite never logs
   its own pytest process; `test_env`/`_autostart_env` strip it for the
   subprocess tests that must be logged
