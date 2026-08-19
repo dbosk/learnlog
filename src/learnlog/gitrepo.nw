@@ -1166,6 +1166,7 @@ RUN_INDEX_PREFIX = "index-"
 
 
 \section{Beginning a run}
+\label{sec:beginning-a-run}
 
 At the start of each program execution, [[begin_run]] snapshots the work
 tree and commits it together with the run header.
@@ -1695,12 +1696,173 @@ another run committed in between, reverting to the header's tree would
 undo that run's snapshot.
 
 <<commit the trailer without touching the tree>>=
-with self.run_index(f"{run_id}-end"):
-    self.git("read-tree", "HEAD")
+with self.run_index(f"{run_id}-end") as index_path:
+    <<seed the private index from the shared one>>
+    self.git(
+        "read-tree", "--reset", "HEAD", timeout=GIT_TREE_TIMEOUT,
+    )
     self.git(
         "commit", "--allow-empty", "--file=-", input=message,
         timeout=GIT_TREE_TIMEOUT,
     )
+@
+
+Reading the tree is not what costs anything here; committing it is.
+Every commit begins by refreshing the index, and an index that
+[[read-tree]] has just written into an empty file carries no [[stat]]
+data at all---each entry's size and timestamps are zeros.
+Zeros tell Git nothing about whether the file on disk still matches, so
+it falls back on the answer that is always right and re-hashes the
+whole work tree.
+That is a second full read of the project, on top of the one
+[[begin_run]] paid for, and it buys a commit that records no code
+change whatsoever.
+Measured on a project of five hundred files of 64\,KiB, the trailer
+took a median 105\,ms against the header's 8\,ms: the half of the run
+that records nothing was the expensive half, by more than a factor of
+ten.
+
+So we seed the private index from the shared one exactly as
+\cref{sec:beginning-a-run} does---same chunk, same [[copy2]], same
+reason---and the entries arrive carrying the [[stat]] data Git recorded
+when it last hashed those files.
+Seeding alone does not survive a plain [[read-tree]] though: that form
+replaces the index outright, and the entries it puts there come from
+the tree with their [[stat]] fields zeroed, which is where we started.
+The [[strace]] counts confirm it---identical to not seeding at all.
+
+What preserves the cache is the single-tree \emph{merge} form.
+For a path whose blob in the index already matches the tree's, Git
+keeps the index's entry, [[stat]] data included, and the refresh
+becomes one [[lstat]] per file instead of one full read of it.
+On the same project the trailer falls to 9\,ms---what the header
+costs, which is what a commit that reads nothing new ought to
+cost---and the [[openat]] calls of the commit itself drop from 623 to
+108.
+The saving is the project's bytes, so it shrinks with them: the same
+five hundred files at 4\,KiB take the trailer from 16\,ms to 8\,ms.
+
+Seeding means the trailer no longer starts from a blank slate, and the
+index it starts from can disagree with [[HEAD]]: a student can stage
+files by hand through [[learnlog git add]], and a concurrent run
+publishes its own index between our two commits.
+The merge is what makes that harmless.
+Merging against a \emph{single} tree resolves every disagreement the
+same way---the tree wins.
+Paths the index has and the tree does not are dropped, paths the tree
+has and the index does not are added, and paths both have take the
+tree's blob; only the [[stat]] data is borrowed from the index, and
+only where the blobs already agree.
+What comes out is [[HEAD]]'s tree, entry for entry.
+
+Edits made to the work tree during the run cannot leak in either,
+because [[git commit]] commits the index, not the work tree.
+The refresh that opens an edited file does so to answer a question
+about [[stat]] data, and its only power is to write [[stat]] data back
+for entries whose content still matches; an entry whose content has
+changed is left exactly as the merge wrote it.
+Staging is something only [[git add]] and [[git commit -a]] do, and we
+run neither.
+
+We ask for [[--reset]] rather than [[-m]] because the two differ in one
+case, and it is the one we cannot afford.
+An index with unmerged entries---what a conflicted [[learnlog pull]]
+leaves behind---makes [[-m]] refuse with \enquote{you need to resolve
+your current index first}, and since [[git]] raises, a refusal here
+would cost the student the trailer, which is the loss the whole
+two-commit protocol exists to prevent
+(\cref{sec:two-commit-protocol}).
+[[--reset]] discards those entries instead, which is precisely what a
+command whose job is to reproduce [[HEAD]] should do with them.
+Both forms keep the [[stat]] cache.
+
+The index is discarded when the [[with]] block ends, and unlike
+[[begin_run]] we do not publish it as the shared one.
+The shared index is the student's staging area; the trailer only
+borrows it, and handing back a copy with their staged files stripped
+out would make [[learnlog git status]] lie about work they had done.
+
+Committing [[HEAD]]'s tree directly with [[git commit-tree]] would
+avoid the index and its refresh altogether---285 syscalls against
+828---but it also avoids everything [[git commit]] does around the
+tree: finding the identity, honouring the repository's configuration,
+writing the reflog, moving the branch.
+Reimplementing a commit to save one [[lstat]] per file is a poor trade
+when the file count is a student project's.
+
+Finally, [[read-tree]] joins the tree-sized commands on
+[[GIT_TREE_TIMEOUT]].
+It walks the whole tree, so a large project could have spent longer in
+it than the message-sized budget allows, and the penalty for that
+budget is not a slow run but the lost trailer again.
+
+Two tests hold the seeded index to the promises above.
+The first drifts everything that can drift while a run is in
+flight---an artefact appears, the source is edited beneath it, a file
+is staged by hand---and asks for the trailer's tree to still be
+[[HEAD]]'s, entry for entry.
+The second conflicts the shared index the way an interrupted
+[[learnlog pull]] would and asks for a trailer anyway; it is the test
+that fails if [[--reset]] is ever tidied into [[-m]].
+
+<<test functions>>=
+def test_finalize_records_head_tree_not_the_index(workdir):
+    """The trailer's tree is HEAD's, whatever the index holds."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    head_tree = repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip()
+    (workdir / "a.out").write_text("build artefact\n")
+    (workdir / "hello.py").write_text('print("edited")\n')
+    (workdir / "staged.txt").write_text("staged by hand\n")
+    repo.git("add", "staged.txt")
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    assert repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip() == head_tree
+    assert repo.git("show", "HEAD:hello.py").stdout \
+        == 'print("hello")\n'
+
+def test_finalize_survives_an_unmerged_index(workdir):
+    """A conflicted index must not cost the run its trailer."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    head_tree = repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip()
+    ours = repo.git(
+        "hash-object", "-w", "--stdin", input="ours\n",
+    ).stdout.strip()
+    theirs = repo.git(
+        "hash-object", "-w", "--stdin", input="theirs\n",
+    ).stdout.strip()
+    repo.git(
+        "update-index", "--index-info",
+        input=f"100644 {ours} 2\tconflict.txt\n"
+              f"100644 {theirs} 3\tconflict.txt\n",
+    )
+    assert repo.git("ls-files", "-u").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert msg.startswith("Run-End: hello.py")
+    assert repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip() == head_tree
 @
 
 Let's verify that finalisation records the results and leaves the
