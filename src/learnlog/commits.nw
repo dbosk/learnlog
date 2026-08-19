@@ -1639,7 +1639,8 @@ the output in place, reusing [[parse_show_sections]] to locate the
 boundaries.
 
 Two different rewrites need this: merging a run's trailer back into its
-header (\cref{sec:run-join}) and dropping learnlog's own runs.
+header (\cref{sec:run-join}) and dropping learnlog's internal runs
+(review runs stay---\cref{sec:filter-learnlog}).
 Taking the rewrite as a parameter keeps the fiddly
 un-indent/re-indent surgery in one place instead of two.
 
