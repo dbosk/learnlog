@@ -19,8 +19,8 @@ to import the CLI module.
 """Functions for querying learnlog commit data.
 
 Provides commit listing, summary parsing, detail
-retrieval, filtering of learnlog's own run blocks,
-and tag resolution.
+retrieval, filtering of learnlog's internal run blocks,
+view-trace parsing, and tag resolution.
 """
 
 <<commits imports>>
@@ -45,21 +45,38 @@ We need [[datetime]] for timestamp parsing and [[LearnlogRepo]]
 for type annotations in docstrings---the functions accept a repo
 instance but do not construct one.
 
+The recorder owns the commit format, so the field names and the
+trailer keyword come from \cref{gitrepo} rather than being spelled
+out a second time here.
+
 <<commits imports>>=
 from __future__ import annotations
 
 import datetime
 
-from learnlog.gitrepo import LearnlogRepo
+from learnlog.gitrepo import (
+    EXCEPTION_SECTION_MARKER,
+    LearnlogRepo,
+    REVIEW_SUBCOMMANDS,
+    RUN_ID_FIELD,
+    TRAILER_PREFIX,
+    VIEWED_FIELD,
+)
 @
 
 
 \section{Block separator}
 \label{sec:block-sep}
 
-Multiple runs without code changes are appended to the same
-commit message, separated by a line of three dashes surrounded
-by blank lines (see \cref{gitrepo}).
+A commit message can hold several run blocks separated by a line
+of three dashes surrounded by blank lines.
+Current learnlog versions write one run per commit, but this
+layout is still what a reader meets: repositories recorded by
+older versions grouped consecutive runs of unchanged code into
+one message, ProgSnap2 reconstruction rebuilds a commit from
+however many runs it has (\cref{progsnap2}), and joining a run's
+trailer back onto its header (\cref{sec:run-join}) produces
+exactly that block again.
 This separator is safe to split on because the section markers
 within a run block ([[--- I/O ---]], [[--- exception ---]])
 always have additional text after the dashes.
@@ -69,6 +86,598 @@ the commit functions and the ProgSnap2 exporter need it.
 
 <<commits constants>>=
 BLOCK_SEP = "\n\n---\n\n"
+@
+
+
+\section{Joining a run's two commits}
+\label{sec:run-join}
+
+A run is recorded as a header commit and a later trailer commit
+that names it by run id (\cref{sec:two-commit-protocol}).
+That split exists to make \emph{writing} safe under interleaving;
+nobody reading a log wants to see it.
+Every reader below therefore works with \emph{records}: a header
+commit whose message has its trailer merged back in, which is
+byte-for-byte the run block that a finalised run used to be.
+Trailer commits themselves are dropped from the listings---they
+carry no code state and no new command, only the results of a run
+that is already in the list.
+
+Joining takes three steps: recognising the two commits of a run,
+indexing the log by run id, and merging a trailer into the header
+block that asks for it.
+
+\subsection{Recognising the two commits of a run}
+
+A trailer commit is identified by its subject keyword, and its
+body starts with the run id it completes.
+Everything after that line is the trailer text as
+[[format_run_trailer]] produced it, so recovering it is a matter
+of dropping the two lines that the commit added.
+
+<<commits functions>>=
+def parse_trailer_message(message):
+    """Split a trailer commit message.
+
+    Returns ``(run_id, trailer_text)``, or ``None`` when
+    ``message`` is not a trailer commit.
+    """
+    if not message or not message.startswith(TRAILER_PREFIX):
+        return None
+
+    lines = message.split("\n")
+    for index, line in enumerate(lines):
+        if line.startswith(RUN_ID_FIELD):
+            run_id = line[len(RUN_ID_FIELD):].strip()
+            trailer = "\n".join(
+                lines[index + 1:]
+            ).strip("\n")
+            return run_id, trailer
+    return None
+@
+
+<<commits test functions>>=
+def test_parse_trailer_message():
+    from learnlog.commits import parse_trailer_message
+    message = (
+        "Run-End: hello.py (none)\n"
+        "\n"
+        "Run-Id: abc123\n"
+        "End-Time: 2026-01-01T10:00:05\n"
+        "Exit-Code: 0\n"
+    )
+    run_id, trailer = parse_trailer_message(message)
+    assert run_id == "abc123"
+    assert trailer.startswith("End-Time:")
+    assert "Run-Id" not in trailer
+
+def test_parse_trailer_message_rejects_header():
+    from learnlog.commits import parse_trailer_message
+    assert parse_trailer_message(
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+    ) is None
+    assert parse_trailer_message("") is None
+@
+
+The header side of the pairing is the same field read from the
+other end: a run block carries its own id on a line of its own,
+and that is the line a trailer commit points back to.
+We give it a name here, next to the trailer it pairs with, because
+both the indexing below and the merging further down ask the same
+question of a block---which run is this?---and neither should have
+to know how the recorder spells the field.
+
+<<commits functions>>=
+def run_block_id(block):
+    """Return the run id recorded in ``block``, or ``None``."""
+    for line in block.split("\n"):
+        if line.startswith(RUN_ID_FIELD):
+            return line[len(RUN_ID_FIELD):].strip()
+    return None
+@
+
+\subsection{Indexing the log by run id}
+\label{sec:run-index}
+
+A reader needs the trailer of a run before it can show that run,
+and it cannot know which commit holds it without looking.
+Reading every message once is therefore both simplest and
+cheapest: one [[git log]] call for the whole map, instead of one
+call per commit to hunt for its partner.
+As in [[get_commits]], an empty history makes [[git log]] exit
+non-zero; that is no trailers rather than an error, so the call opts
+out of [[check]] (\cref{gitrepo}).
+The walk starts from the recording branch rather than from
+[[HEAD]], for the reason \cref{sec:run-visibility} spells out for
+[[get_commits]]: the two must read the same history, or a run
+could be listed whose trailer this map does not hold.
+
+The same pass answers the opposite question for free.
+Refs land on trailer commits (\cref{sec:trailer-refs}), and
+resolving such a ref means going from a trailer commit \emph{back}
+to the header that carries its run's record---the same pairing by
+run id, read in the other direction.
+Every message needed for it is already in hand here, so we come
+away with two maps: run id to trailer text, and trailer commit to
+the header commit of the same run.
+
+<<commits functions>>=
+def scan_run_commits(repo):
+    """Index the log by run id in a single pass.
+
+    Returns ``(trailers, records)``.  ``trailers`` maps a run id
+    to the trailer text recorded for it; ``records`` maps the hash
+    of a trailer commit to the header commit that carries the same
+    run's record.  Commits that belong to no run are ignored.
+    """
+    result = repo.git(
+        "log", "-z", "--format=%H%n%B",
+        repo.recording_branch(), check=False,
+    )
+    if result.returncode != 0:
+        return {}, {}
+
+    trailers = {}
+    headers = {}
+    trailer_runs = {}
+    for commit_hash, message in iter_log_commits(result.stdout):
+        parsed = parse_trailer_message(message)
+        if parsed is None:
+            <<note which commit holds each header block>>
+            continue
+        run_id, trailer = parsed
+        trailers[run_id] = trailer
+        trailer_runs[commit_hash] = run_id
+    <<pair each trailer commit with its header commit>>
+    return trailers, records
+@
+
+A header commit usually holds one run block, but not always: older
+repositories grouped consecutive runs of unchanged code into one
+message, and so does ProgSnap2 reconstruction
+(\cref{sec:block-sep}).
+Splitting first means each of those runs is indexed on the commit
+that really carries it, rather than only the first one being
+found.
+
+<<note which commit holds each header block>>=
+for block in message.split(BLOCK_SEP):
+    run_id = run_block_id(block)
+    if run_id:
+        headers[run_id] = commit_hash
+@
+
+The two halves are joined at the end rather than as they are met,
+because [[git log]] hands us the trailer commit first: it is the
+younger of the pair, and its header is still several messages
+ahead in the walk.
+A trailer whose header never turns up is left out of the map, so
+that the caller can tell \enquote{this run's header is over there}
+from \enquote{this trailer names a run this history does not
+have}, and fall back accordingly.
+
+<<pair each trailer commit with its header commit>>=
+records = {
+    commit_hash: headers[run_id]
+    for commit_hash, run_id in trailer_runs.items()
+    if run_id in headers
+}
+@
+
+Each map has a caller that wants only that half, and asking for
+one should not make the other one's name appear at the call site.
+The two accessors below are what the rest of the program uses;
+[[scan_run_commits]] is the shared walk behind them.
+
+<<commits functions>>=
+def get_run_trailers(repo):
+    """Map run ids to the trailer text recorded for them."""
+    trailers, _ = scan_run_commits(repo)
+    return trailers
+<<commits functions>>=
+def get_record_commits(repo):
+    """Map trailer commits to the header commit of their run."""
+    _, records = scan_run_commits(repo)
+    return records
+@
+
+Asking Git for NUL-separated records ([[-z]]) is what makes the
+messages separable at all: they contain blank lines, dashes, and
+whole captured terminal sessions, so no textual delimiter is
+safe.
+A NUL is safe only because Git never puts one in a commit
+message---but captured program output can contain one, and a
+future writer might let it through, so we do not trust the
+separator alone.
+Each record starts with the commit hash on its own line, and a
+fragment that does not is a piece of the previous message that a
+stray NUL split off; we glue it back rather than reporting half a
+run.
+That leading line is worth keeping rather than dropping: it is the
+only place the walk learns \emph{which} commit a message came
+from, and the index above is built out of exactly those pairs.
+
+<<commits functions>>=
+def iter_log_commits(output):
+    """Yield ``(hash, message)`` pairs from ``git log``.
+
+    Reads the output of ``git log -z --format=%H%n%B``.
+    """
+    records = []
+    for fragment in output.split("\0"):
+        if not fragment:
+            continue
+        if records and not _starts_with_commit_hash(fragment):
+            records[-1] += "\0" + fragment
+        else:
+            records.append(fragment)
+
+    for record in records:
+        commit_hash, _, message = record.partition("\n")
+        yield commit_hash.strip(), message.rstrip("\n")
+@
+
+<<commits functions>>=
+def _starts_with_commit_hash(fragment):
+    """True if ``fragment`` begins with a hash on its own line."""
+    line = fragment.partition("\n")[0]
+    return len(line) in COMMIT_HASH_LENGTHS and all(
+        character in "0123456789abcdef"
+        for character in line
+    )
+<<commits constants>>=
+COMMIT_HASH_LENGTHS = (40, 64)
+@
+
+Both hash lengths are listed because a repository can use SHA-1 or
+SHA-256 object names, and which one a student's Git picks is
+configuration we do not control.
+
+Let's verify that a NUL inside a commit message does not split a
+record in two:
+
+<<commits test functions>>=
+def test_iter_log_commits_survives_embedded_nul():
+    from learnlog.commits import iter_log_commits
+    output = (
+        "a" * 40 + "\nRun: hello.py\nstdout: be\0fore\n\0"
+        + "b" * 40 + "\nRun: other.py\n\0"
+    )
+    commits = list(iter_log_commits(output))
+    assert len(commits) == 2
+    assert commits[0][0] == "a" * 40
+    assert "stdout: be\0fore" in commits[0][1]
+    assert commits[1] == ("b" * 40, "Run: other.py")
+@
+
+\subsection{Merging a trailer into its block}
+
+Merging appends the trailer to the block whose run id it names.
+A block that already ends in a trailer is left alone: messages
+from older repositories and from ProgSnap2 reconstruction are
+complete in themselves, and appending to them would duplicate the
+results.
+
+<<commits functions>>=
+def merge_run_trailers(message, trailers):
+    """Attach recorded trailers to the run blocks in ``message``.
+
+    ``trailers`` is the map from :func:`get_run_trailers`.
+    Blocks with no recorded trailer---an interrupted run, or an
+    already complete block---are returned unchanged.
+    """
+    if not message or not trailers:
+        return message
+
+    blocks = []
+    for block in message.split(BLOCK_SEP):
+        trailer = trailers.get(run_block_id(block))
+        if trailer and END_TIME_FIELD not in block:
+            block = block.rstrip("\n") + "\n" + trailer
+        blocks.append(block)
+    return BLOCK_SEP.join(blocks)
+<<commits constants>>=
+END_TIME_FIELD = "End-Time:"
+@
+
+<<commits test functions>>=
+def test_merge_run_trailers_completes_block():
+    from learnlog.commits import merge_run_trailers
+    header = (
+        "Run: hello.py (none)\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "Run-Id: abc123"
+    )
+    trailers = {
+        "abc123": "End-Time: 2026-01-01T10:00:05\nExit-Code: 0",
+    }
+    merged = merge_run_trailers(header, trailers)
+    assert merged.startswith(header)
+    assert "Exit-Code: 0" in merged
+
+def test_merge_run_trailers_leaves_unfinished_run():
+    """A run killed before finalising keeps its bare header."""
+    from learnlog.commits import merge_run_trailers
+    header = (
+        "Run: hello.py (none)\n\nRun-Id: killed"
+    )
+    assert merge_run_trailers(header, {"other": "x"}) == header
+
+def test_merge_run_trailers_does_not_duplicate():
+    """An already complete block is left alone."""
+    from learnlog.commits import merge_run_trailers
+    block = (
+        "Run: hello.py (none)\n\nRun-Id: abc123\n"
+        "End-Time: 2026-01-01T10:00:05\nExit-Code: 0"
+    )
+    trailers = {"abc123": "End-Time: 2026-01-01T10:00:05"}
+    assert merge_run_trailers(block, trailers) == block
+@
+
+\subsection{Refs that land on a trailer commit}
+\label{sec:trailer-refs}
+
+Tags and other refs are created by whatever is at HEAD when the
+user asks, and HEAD is a trailer commit for as long as no new run
+has started.
+A tag created just after a run finished therefore points at a
+commit that no listing contains.
+Since a trailer commit exists only to complete one run, we treat
+such a ref as naming that run, and answer with that run's header
+commit.
+
+Which run that is has to be read off the run id, the way every
+other join in this chapter reads it (\cref{sec:run-index}).
+The commit \emph{before} the trailer is not the pairing but a
+coincidence of it, and it holds only while no two runs are in
+flight at once---which is the very situation the two-commit
+protocol was written to survive (\cref{sec:two-commit-protocol}).
+Let a logged program start another logged program and the inner
+run finishes first, so the log reads
+$H_\text{outer}$, $H_\text{inner}$, $T_\text{inner}$,
+$T_\text{outer}$.
+The commit before $T_\text{outer}$ is then $T_\text{inner}$, a
+trailer commit that no listing contains, so a tag on the newest
+commit resolves to something no caller can find and is lost to
+every view.
+Finish them the other way round---the log reads
+$H_a$, $H_b$, $T_a$, $T_b$---and the commit before $T_a$ is
+$H_b$: a real header, of the wrong run.
+The student tags the run of [[a.py]] and playback shows them
+[[b.py]].
+
+The parent walk stays on as the fallback for a trailer commit the
+index cannot place: one recorded without a run id, or one whose
+header this history does not contain, as in a log assembled from
+part of a bundle.
+For those the topology is the only guess left, and it is the
+guess that was correct back when a log could not hold overlapping
+runs in the first place.
+
+The hash reaching this function is whatever a ref or a caller
+supplied, so the subject probe can fail, and its failing is not an
+error here.
+Git refuses a hash the object database no longer has, and a ref may
+name an object it will not walk as a commit at all; the probe then
+exits non-zero and [[git()]] would raise [[GitError]]
+(\cref{sec:diagnostics}).
+That failure is itself the answer to the question being asked: a hash
+Git cannot read as a commit is certainly not a trailer commit.
+So the probe opts out of [[check]] and such a hash resolves to
+itself---the same answer the [[rev-parse]] probe below already gives
+when it cannot step back to a parent.
+
+Reporting \enquote{not a commit} to the caller instead, as [[None]] or
+as an exception, has no shape that suits the callers.
+Both of them are read paths that have to degrade rather than abort:
+[[get_tag_map]] (\cref{sec:tag-resolution}), whose own [[git tag -l]]
+already falls back to an empty map, and [[play --from]]
+(\cref{sec:play}), which turns a hash it cannot find in the commit
+list into a message naming the ref the user typed.
+Handing them back the hash unchanged leads each of them to the answer
+it already has for a hash that names no run, whereas a second return
+shape would give both of them a new failure mode to handle for
+nothing gained.
+
+The index is a parameter rather than something this function always
+reads for itself, because [[get_tag_map]] resolves one hash per tag
+and would otherwise walk the whole log once per tag to rebuild the
+same map.
+It builds the map once and hands it over; a caller with a single
+hash to resolve, such as [[play --from]], omits the argument and
+pays for the one walk it needs.
+
+<<commits functions>>=
+def resolve_record_commit(repo, commit_hash, records=None):
+    """Return the commit that carries ``commit_hash``'s record.
+
+    Trailer commits resolve to the header commit of the run they
+    complete; every other hash resolves to itself, including one
+    that Git will not read as a commit.  ``records`` is the map
+    from :func:`get_record_commits`, read from ``repo`` when the
+    caller supplies none.
+    """
+    probe = repo.git(
+        "log", "-1", "--format=%s", commit_hash, check=False,
+    )
+    if probe.returncode != 0:
+        return commit_hash
+    if not probe.stdout.strip().startswith(TRAILER_PREFIX):
+        return commit_hash
+
+    if records is None:
+        records = get_record_commits(repo)
+    if commit_hash in records:
+        return records[commit_hash]
+    <<step back to the trailer's parent commit>>
+@
+
+<<step back to the trailer's parent commit>>=
+parent = repo.git(
+    "rev-parse", f"{commit_hash}^", check=False,
+)
+if parent.returncode != 0:
+    return commit_hash
+return parent.stdout.strip()
+@
+
+<<commits test functions>>=
+def test_resolve_record_commit_maps_trailer_to_header(workdir):
+    from learnlog.commits import resolve_record_commit
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    header = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    trailer = repo.git("rev-parse", "HEAD").stdout.strip()
+    assert resolve_record_commit(repo, trailer) == header
+    assert resolve_record_commit(repo, header) == header
+@
+
+The all-zero hash stands in for every object the probe cannot read:
+it is well formed, so it reaches Git rather than being rejected on
+the way, and no repository has it.
+Answering with the hash rather than raising is what the callers above
+depend on.
+
+<<commits test functions>>=
+def test_resolve_record_commit_tolerates_unreadable_hash(workdir):
+    """A hash Git cannot read as a commit resolves to itself."""
+    from learnlog.commits import resolve_record_commit
+    repo = LearnlogRepo(workdir)
+    absent = "0" * 40
+    assert resolve_record_commit(repo, absent) == absent
+@
+
+The two overlaps get a test each, because they fail differently
+and only one of the two failures announces itself.
+Both build the history from two [[LearnlogRepo]] instances, which
+is how an interleaved pair of processes writes it
+(\cref{sec:two-commit-protocol}): each instance carries its own
+run id, so the commits land in the order the calls are made.
+
+An inner run finishing first leaves a trailer commit immediately
+before the outer run's trailer, so a tag on the newest commit used
+to resolve to the inner run's trailer---a commit no listing has.
+The assertion checks both halves of what the callers need---the
+run the tag names, and that the answer is a commit [[get_commits]]
+lists, since that list is what [[play --from]] looks the answer up
+in and what it fails on with \enquote{not in the commit list}.
+
+<<commits test functions>>=
+def test_resolve_record_commit_lifo_overlap(workdir):
+    """A tag on the newest trailer names the run it completes."""
+    from learnlog.commits import (
+        get_commits,
+        resolve_record_commit,
+    )
+    outer = LearnlogRepo(workdir)
+    inner = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    outer.begin_run("outer.py", [], t0)
+    outer_header = outer.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip()
+    inner.begin_run("inner.py", [], t0)
+    inner.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=1),
+        exit_code=0,
+    )
+    outer.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=2),
+        exit_code=0,
+    )
+    newest = outer.git("rev-parse", "HEAD").stdout.strip()
+
+    resolved = resolve_record_commit(outer, newest)
+
+    assert resolved == outer_header
+    assert resolved in [c["hash"] for c in get_commits(outer)]
+@
+
+Finishing in the order the runs started puts a \emph{header}
+immediately before a trailer instead, so the topological answer is
+a commit every listing contains---and it belongs to the wrong run.
+Nothing reports an error in this case: the student tags one run
+and playback shows them another.
+The scripts are named apart so the assertion can say which run was
+found rather than only which hash.
+
+<<commits test functions>>=
+def test_resolve_record_commit_fifo_overlap(workdir):
+    """The first trailer names its own run, not the next one."""
+    from learnlog.commits import resolve_record_commit
+    first = LearnlogRepo(workdir)
+    second = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    first.begin_run("a.py", [], t0)
+    first_header = first.git("rev-parse", "HEAD").stdout.strip()
+    second.begin_run("b.py", [], t0)
+    first.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=1),
+        exit_code=0,
+    )
+    first_trailer = first.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip()
+    second.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=2),
+        exit_code=0,
+    )
+
+    resolved = resolve_record_commit(first, first_trailer)
+
+    assert resolved == first_header
+    message = first.git(
+        "log", "-1", "--format=%B", resolved,
+    ).stdout
+    assert "Script: a.py" in message
+@
+
+The fallback needs a trailer commit the index cannot place, and
+[[finalize_run]] never writes one, so the test writes it with
+plumbing: [[commit-tree]] hangs a message on a chosen parent
+without touching the index or the current branch, and the parent
+link and the message are all this function reads.
+
+<<commits test functions>>=
+def test_resolve_record_commit_without_run_id(workdir):
+    """A trailer with no run id falls back to its parent."""
+    from learnlog.commits import resolve_record_commit
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    header = repo.git("rev-parse", "HEAD").stdout.strip()
+    tree = repo.git(
+        "rev-parse", "HEAD^{tree}",
+    ).stdout.strip()
+    legacy = repo.git(
+        "commit-tree", tree, "-p", header, "-F", "-",
+        input=(
+            "Run-End: hello.py (none)\n"
+            "\n"
+            "End-Time: 2026-01-01T10:00:01\n"
+            "Exit-Code: 0\n"
+        ),
+    ).stdout.strip()
+
+    assert resolve_record_commit(repo, legacy) == header
 @
 
 
@@ -176,23 +785,162 @@ def test_format_elapsed_human_readable():
 
 \subsection{Recognising learnlog's own commits}
 
-Playback already filters [[Run: learnlog ...]] blocks out of the detailed
-display.
-The elapsed indicator should follow the same story: internal tool invocations
-must not become the \enquote{previous run} that a teacher interprets as a
-student retry.
+A [[Run: learnlog ...]] block can mean two quite different things to
+whoever reads the log.
+[[learnlog play]] and [[learnlog list]] are the student stepping back
+through their own history, and the recorder logs exactly those two
+subcommands because that reflection is itself evidence of learning
+(\cref{learnlog}); every view therefore shows them by default.
+Everything else learnlog leaves behind is plumbing: the [[pip]] install
+that [[learnlog init]] performs, and---in repositories written before
+the recorder narrowed to review runs---records of the remaining
+subcommands, which used to log themselves as well.
+That kind is noise in every view, so it is what [[--all]] now reveals.
+
+Three predicates therefore share one text-matching core, and each view
+picks the one that matches its question.
+[[is_learnlog_command]] asks \enquote{is this learnlog at all}, which
+is what the elapsed indicator needs; [[is_review_command]] picks out
+the reflection runs; [[is_internal_command]] is the remainder, and is
+the one the display filters use.
+
+All three read the command line rather than the commit, so the same
+test serves a commit subject (\cref{sec:filter-learnlog}) and a parsed
+run block (\cref{progsnap2}).
+
+Installing learnlog counts as learnlog activity too.
+[[learnlog init]] pip-installs the package into the project venv, and
+that [[pip]] run is captured like any other; it is setup, not
+development, so it is hidden by the same flag.
+We match only [[pip]] commands that mention learnlog, so a student
+installing their own dependencies still sees those runs.
+
+<<commits functions>>=
+def is_learnlog_command(command):
+    """Return true if ``command`` is learnlog's own activity.
+
+    Covers ``learnlog`` itself and the ``pip`` invocation that
+    installs it during ``learnlog init``.
+    """
+    parts = command.split()
+    if not parts:
+        return False
+    if parts[0] == "learnlog":
+        return True
+    return parts[0] in INSTALLER_COMMANDS and any(
+        "learnlog" in argument for argument in parts[1:]
+    )
+<<commits constants>>=
+INSTALLER_COMMANDS = ("pip", "pip3")
+@
+
+A commit records learnlog activity when either half of a run record
+does: the header names the command, and the trailer repeats it, so
+whichever commit we are looking at answers the question.
 
 <<commits functions>>=
 def is_learnlog_commit(commit):
     """Return true if ``commit`` records a learnlog CLI run."""
-    return commit.get("subject", "").startswith("Run: learnlog")
+    subject = commit.get("subject", "")
+    for prefix in (RUN_SUBJECT_PREFIX, TRAILER_PREFIX):
+        if subject.startswith(prefix):
+            return is_learnlog_command(
+                subject[len(prefix):]
+            )
+    return False
+<<commits constants>>=
+RUN_SUBJECT_PREFIX = "Run: "
 @
 
 <<commits test functions>>=
 def test_is_learnlog_commit():
     from learnlog.commits import is_learnlog_commit
     assert is_learnlog_commit({"subject": "Run: learnlog play"})
+    assert is_learnlog_commit(
+        {"subject": "Run-End: learnlog play"}
+    )
+    assert is_learnlog_commit(
+        {"subject": "Run: pip install learnlog"}
+    )
     assert not is_learnlog_commit({"subject": "Run: hello.py"})
+    assert not is_learnlog_commit(
+        {"subject": "Run: pip install requests"}
+    )
+    assert not is_learnlog_commit(
+        {"subject": "learnlog: initial commit"}
+    )
+@
+
+A review run is recognised by its subcommand, which makes the list of
+review subcommands a piece of vocabulary that the recorder and this
+reader must agree on: the recorder consults it to decide whether to
+log an invocation at all (\cref{learnlog}), and disagreement would
+mean runs that are recorded and then hidden, or filtered and never
+written.
+So [[REVIEW_SUBCOMMANDS]] is not defined here: it comes from
+\cref{gitrepo} through the import above, exactly like
+[[RUN_ID_FIELD]] and [[TRAILER_PREFIX]]---one definition that both
+halves read is what makes disagreement impossible rather than merely
+unlikely (\cref{sec:review-subcommands}).
+
+Only the first two tokens decide.
+Anything after them is options and arguments ([[learnlog list --all]]
+is still a review run), and a bare [[learnlog]] with no subcommand is
+not one---the recorder does not log it either.
+
+<<commits functions>>=
+def is_review_command(command):
+    """Return true if ``command`` is a learnlog review run.
+
+    Review runs are ``learnlog play`` and ``learnlog list``:
+    the subcommands with which a student looks back at their
+    own history.
+    """
+    parts = command.split()
+    return (
+        len(parts) > 1
+        and parts[0] == "learnlog"
+        and parts[1] in REVIEW_SUBCOMMANDS
+    )
+@
+
+The internal test is the difference between the two: learnlog's own
+activity minus the part of it that belongs to the student.
+Writing it as a difference rather than as a second list of subcommands
+means a subcommand can never be both, and that a repository recorded by
+an older version---which logged subcommands this list has never heard
+of---still classifies every one of them as plumbing.
+
+<<commits functions>>=
+def is_internal_command(command):
+    """Return true if ``command`` is learnlog's own plumbing.
+
+    Learnlog activity that is not a review run: the ``pip``
+    install performed by ``learnlog init``, and records of
+    other subcommands left by versions that logged them.
+    """
+    return (
+        is_learnlog_command(command)
+        and not is_review_command(command)
+    )
+@
+
+<<commits test functions>>=
+def test_is_review_command():
+    from learnlog.commits import (
+        is_internal_command,
+        is_review_command,
+    )
+    assert is_review_command("learnlog play")
+    assert is_review_command("learnlog list --all")
+    assert not is_review_command("learnlog")
+    assert not is_review_command("learnlog export out.bundle")
+    assert not is_review_command("pip install learnlog")
+    assert not is_review_command("play.py list")
+    assert not is_internal_command("learnlog play")
+    assert is_internal_command("learnlog export out.bundle")
+    assert is_internal_command("pip install learnlog")
+    assert not is_internal_command("hello.py")
 @
 
 
@@ -204,6 +952,20 @@ We look backwards for the previous commit that actually \emph{records a
 student run}---its subject begins [[Run:]] but is not one of learnlog's own
 [[Run: learnlog ...]] invocations---and subtract its date from the current
 commit's date.
+
+Review runs are skipped here deliberately, even though every other view
+now shows them: this number is meant to be read as thinking time between
+attempts at the code, and time spent paging through the log is not an
+attempt.
+The reference point is therefore chosen with [[is_learnlog_commit]], the
+widest of the three predicates, rather than with the narrower internal
+test that the displays filter by.
+
+Since every run now has a header commit of its own
+(\cref{sec:two-commit-protocol}), that date is the run's own start
+time.  It used to be the date of whichever run first created the commit
+that later runs were amended into, which made every gap after the first
+one wrong.
 
 Requiring a [[Run:]] subject is what excludes the [[learnlog: initial
 commit]].
@@ -237,7 +999,7 @@ def elapsed_since_previous_run(commits, index):
     for previous_index in range(index - 1, -1, -1):
         previous_commit = commits[previous_index]
         subject = previous_commit.get("subject", "")
-        if not subject.startswith("Run: ") or \
+        if not subject.startswith(RUN_SUBJECT_PREFIX) or \
                 is_learnlog_commit(previous_commit):
             continue
         previous = _parse_iso(previous_commit.get("date"))
@@ -317,15 +1079,43 @@ We list commits in chronological order (oldest first) because
 that matches the natural playback direction: the student starts
 writing code and we watch their progress forward in time.
 
+A repository with no commits at all---a freshly initialised one, or a
+bundle that turned out to be empty---makes [[git log]] exit non-zero.
+That is an empty history rather than a broken one, so this call opts out
+of [[check]] and reports it as an empty list.
+
+\label{sec:run-visibility}
+The listing walks the recording branch by name rather than
+[[HEAD]], because the two are no longer the same thing.
+Runs are committed to the branch wherever [[HEAD]] happens to
+point (\cref{sec:recording-branch}); a student who detaches
+[[HEAD]] with [[learnlog git checkout]] to look at an older
+version keeps recording runs, and a reader that walked [[HEAD]]
+would silently stop showing them---the newest runs would be the
+missing ones, with nothing to say so.
+Asking [[recording_branch]] makes the reader and the recorder
+agree on which history the log is, whatever the student does with
+[[HEAD]].
+
+Trailer commits are left out here, which is what makes every
+caller---listing, playback, and export---see one entry per run
+without knowing about the two-commit protocol.
+Dropping them loses nothing: a trailer carries no code state and
+no new command, and its contents reach the reader through
+[[merge_run_trailers]] instead.
+
 <<commits functions>>=
 def get_commits(repo):
     """Return a list of commits in chronological order.
 
     Each entry is a dict with ``hash``, ``subject``, and
-    ``date`` keys.
+    ``date`` keys.  An empty history yields an empty list.
+    Trailer commits are excluded: they complete the record of a
+    run that is already in the list.
     """
     result = repo.git(
-        "log", "--format=%H\t%s\t%aI", "--reverse"
+        "log", "--format=%H\t%s\t%aI", "--reverse",
+        repo.recording_branch(), check=False,
     )
     if result.returncode != 0:
         return []
@@ -334,13 +1124,78 @@ def get_commits(repo):
         if not line:
             continue
         parts = line.split("\t", 2)
-        if len(parts) == 3:
+        if len(parts) == 3 and \
+                not parts[1].startswith(TRAILER_PREFIX):
             commits.append({
                 "hash": parts[0],
                 "subject": parts[1],
                 "date": parts[2],
             })
     return commits
+@
+
+Let's verify that a finalised run appears once, not twice:
+
+<<commits test functions>>=
+def test_get_commits_excludes_trailer_commits(workdir):
+    from learnlog.commits import get_commits
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hi\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    subjects = [c["subject"] for c in get_commits(repo)]
+    assert subjects == [
+        "learnlog: initial commit",
+        "Run: hello.py (none)",
+    ]
+@
+
+A run recorded while [[HEAD]] is detached must show up like any
+other, complete with its trailer: this is the reader's half of the
+detached-head story, whose recorder's half
+\cref{sec:awkward-state} tests.
+The run id check goes through [[get_run_trailers]] so both walks
+of this section are held to the branch, not just the listing:
+
+<<commits test functions>>=
+def test_readers_follow_the_recording_branch(workdir):
+    from learnlog.commits import get_commits, get_run_trailers
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    old = repo.git("rev-parse", "HEAD~2").stdout.strip()
+    repo.git("checkout", "--detach", old)
+
+    detached = LearnlogRepo(workdir)
+    detached.begin_run(
+        "later.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    detached.finalize_run(
+        io_log="stdout: still visible\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 11, 0, 1),
+        exit_code=0,
+    )
+
+    subjects = [c["subject"] for c in get_commits(repo)]
+    assert "Run: later.py (none)" in subjects
+    trailers = get_run_trailers(repo)
+    assert any(
+        "still visible" in text for text in trailers.values()
+    )
 @
 
 <<commits test functions>>=
@@ -574,78 +1429,312 @@ def reorder_commit_detail(detail):
 @
 
 
-\section{Filtering learnlog's own runs}
+\section{Filtering learnlog's internal runs}
 \label{sec:filter-learnlog}
 
-When the [[learnlog]] CLI is invoked (\eg [[learnlog play]]), the
-package's [[__init__.py]] logs the invocation as a run block---just
-like any student program.
-These self-referential entries clutter the playback with tool usage
-that is not part of the student's development.
+Two kinds of block in a log are not the student running their own
+program, and they deserve opposite treatment.
+A review run is one of them, and it stays: that a student went back
+through their history the evening before the deadline is part of the
+story a reader came for.
+The other kind is plumbing---the [[pip]] install that
+[[learnlog init]] performs, and whatever an older version recorded of
+the subcommands that no longer log themselves.
+Plumbing is noise in every view, so it is hidden unless the user asks
+for it with [[--all]].
 
-Since multiple runs without code changes are appended to the same
-commit (separated by [[BLOCK_SEP]], see \cref{gitrepo}), a single
-commit can contain both student runs and learnlog runs.
-We therefore filter at the run-block level within each commit message,
-not at the commit level.
+Filtering happens at the run-block level within each commit message
+rather than at the commit level, because a message can carry several
+blocks (\cref{sec:block-sep}) and a mixed message must keep its student
+runs.
 
 <<commits functions>>=
-def filter_learnlog_runs(message):
-    """Remove learnlog CLI run blocks from a commit message.
+def filter_internal_runs(message):
+    """Remove learnlog's internal run blocks from a message.
 
     Splits on the ``---`` block separator and removes blocks
-    whose header starts with ``Run: learnlog``.
-    Returns the filtered message, which may be empty if all
-    blocks were learnlog runs.
+    whose header records learnlog's own plumbing.  Review runs
+    (``learnlog play`` and ``learnlog list``) are kept, as are
+    the student's own programs.  Returns the filtered message,
+    which may be empty if every block was internal.
     """
     blocks = message.split(BLOCK_SEP)
     filtered = [
-        b for b in blocks
-        if not b.lstrip().startswith("Run: learnlog")
+        b for b in blocks if not _is_internal_block(b)
     ]
     return BLOCK_SEP.join(filtered)
 @
 
-Let's verify that filtering works for mixed, student-only, and
-learnlog-only commit messages:
+A block's first line is its [[Run:]] header, which carries the same
+command string as the commit subject---so the block-level and the
+commit-level tests ask [[is_internal_command]] the same question about
+the same text.
+
+<<commits functions>>=
+def _is_internal_block(block):
+    """True if ``block`` records learnlog's own plumbing."""
+    first_line = block.lstrip().split("\n", 1)[0]
+    if not first_line.startswith(RUN_SUBJECT_PREFIX):
+        return False
+    return is_internal_command(
+        first_line[len(RUN_SUBJECT_PREFIX):]
+    )
+@
+
+The exporter (\cref{progsnap2}) asks the same questions about a run it
+has already parsed into fields, where the command is split in two.
+Rebuilding the command line from those fields is the only part that
+differs from the block-level and commit-level tests, so it is the only
+part written once and shared by all three run-level predicates:
+
+<<commits functions>>=
+def _run_command(run):
+    """Rebuild the command line of a parsed run block."""
+    script = run.get("script") or ""
+    arguments = run.get("arguments") or ""
+    return f"{script} {arguments}"
+@
+
+<<commits functions>>=
+def is_learnlog_run(run):
+    """True if a parsed run block records learnlog's activity."""
+    return is_learnlog_command(_run_command(run))
+@
+
+<<commits functions>>=
+def is_review_run(run):
+    """True if a parsed run block records a review run."""
+    return is_review_command(_run_command(run))
+@
+
+<<commits functions>>=
+def is_internal_run(run):
+    """True if a parsed run block records learnlog plumbing."""
+    return is_internal_command(_run_command(run))
+@
+
+A parsed block with no command at all---a fragment, or a block the
+parser could make nothing of---is nobody's activity, so every one of
+the three answers false rather than guessing:
 
 <<commits test functions>>=
-def test_filter_learnlog_runs_removes_block():
-    from learnlog.commits import filter_learnlog_runs
+def test_is_learnlog_run_parsed_block():
+    from learnlog.commits import is_learnlog_run
+    assert is_learnlog_run(
+        {"script": "learnlog", "arguments": "play"}
+    )
+    assert is_learnlog_run(
+        {"script": "pip", "arguments": "install learnlog"}
+    )
+    assert not is_learnlog_run(
+        {"script": "hello.py", "arguments": "(none)"}
+    )
+    assert not is_learnlog_run(
+        {"script": None, "arguments": None}
+    )
+
+def test_is_internal_run():
+    from learnlog.commits import (
+        is_internal_run,
+        is_review_run,
+    )
+    assert is_internal_run(
+        {"script": "pip", "arguments": "install learnlog"}
+    )
+    assert is_internal_run(
+        {"script": "learnlog", "arguments": "export out.bundle"}
+    )
+    assert not is_internal_run(
+        {"script": "learnlog", "arguments": "play"}
+    )
+    assert not is_internal_run(
+        {"script": "hello.py", "arguments": "(none)"}
+    )
+    assert not is_internal_run(
+        {"script": None, "arguments": None}
+    )
+    assert is_review_run(
+        {"script": "learnlog", "arguments": "list --all"}
+    )
+    assert not is_review_run(
+        {"script": "learnlog", "arguments": "export out.bundle"}
+    )
+@
+
+Let's verify that filtering keeps the student's runs and the review
+runs while dropping the plumbing between them:
+
+<<commits test functions>>=
+def test_filter_internal_runs_removes_block():
+    from learnlog.commits import filter_internal_runs
     msg = (
         "Run: hello.py (none)\n\nScript: hello.py\n"
         "\n\n---\n\n"
         "Run: learnlog play\n\nScript: learnlog\n"
+        "\n\n---\n\n"
+        "Run: pip install learnlog\n\nScript: pip\n"
     )
-    result = filter_learnlog_runs(msg)
+    result = filter_internal_runs(msg)
     assert "hello.py" in result
-    assert "learnlog" not in result
+    assert "Run: learnlog play" in result
+    assert "install learnlog" not in result
 
-def test_filter_learnlog_runs_preserves_student():
-    from learnlog.commits import filter_learnlog_runs
+def test_filter_internal_runs_preserves_student():
+    from learnlog.commits import filter_internal_runs
     msg = "Run: hello.py (none)\n\nScript: hello.py\n"
-    assert filter_learnlog_runs(msg) == msg
+    assert filter_internal_runs(msg) == msg
 
-def test_filter_learnlog_runs_all_learnlog():
-    from learnlog.commits import filter_learnlog_runs
+def test_filter_internal_runs_all_internal():
+    from learnlog.commits import filter_internal_runs
     msg = (
-        "Run: learnlog play\n\nScript: learnlog\n"
+        "Run: pip install learnlog\n\nScript: pip\n"
         "\n\n---\n\n"
         "Run: learnlog export\n\nScript: learnlog\n"
     )
-    result = filter_learnlog_runs(msg)
+    result = filter_internal_runs(msg)
     assert result.strip() == ""
 
-def test_filter_learnlog_runs_preserves_io_separator():
+def test_filter_internal_runs_preserves_io_separator():
     """The --- I/O --- marker within a block is not a separator."""
-    from learnlog.commits import filter_learnlog_runs
+    from learnlog.commits import filter_internal_runs
     msg = (
         "Run: hello.py (none)\n\nScript: hello.py\n"
         "\n--- I/O ---\nstdout: hello\n"
         "\n--- exception ---\nNone"
     )
-    result = filter_learnlog_runs(msg)
+    result = filter_internal_runs(msg)
     assert "stdout: hello" in result
+@
+
+
+\section{The view trace of a review run}
+\label{sec:view-trace}
+
+A review run records more than the fact that it happened: its trailer
+carries one line per commit the student actually looked at
+(\cref{gitrepo}), in the order they looked at them.
+
+\begin{quote}
+  [[Viewed: <commit hash> <ISO-8601 time> <action>]]
+\end{quote}
+
+Revisits appear again rather than being collapsed, because moving back
+to a commit already seen is exactly the kind of comparison a reader of
+the log wants to know happened.
+
+Three bare tokens after the keyword is what makes this section cheap to
+read back: hashes, timestamps and action words can contain neither a
+space nor a newline, so splitting on whitespace is unambiguous and none
+of the quoting that captured I/O needs applies here.
+
+Parsing is forgiving.
+A trailer written by a later version may carry actions or fields this
+reader has never heard of, and a line truncated by a crash mid-write is
+better dropped than turned into an exception in the middle of somebody's
+listing---so a line that does not yield exactly three fields is skipped
+rather than reported.
+
+<<commits functions>>=
+def parse_view_trace(block_text):
+    """Return the view trace recorded in a run block.
+
+    Reads the ``Viewed:`` lines of a review run's trailer and
+    returns them in the order recorded, as
+    ``(commit_hash, time, action)`` tuples.  A block without
+    such lines---every ordinary program run---yields an empty
+    list, and malformed lines are skipped.
+    """
+    views = []
+    for line in block_text.split("\n"):
+        if not line.startswith(VIEWED_FIELD):
+            continue
+        fields = line[len(VIEWED_FIELD):].split()
+        if len(fields) == VIEWED_FIELD_COUNT:
+            views.append(tuple(fields))
+    return views
+<<commits constants>>=
+VIEWED_FIELD_COUNT = 3
+@
+
+The field name itself, [[VIEWED_FIELD]], is the writer's
+(\cref{sec:finalising-a-run}) and arrives through the import above:
+reader and writer sharing one spelling is what lets the parser trust
+[[startswith]] here.
+
+Let's verify that a whole navigation sequence---including the revisit
+that makes it interesting---survives the trip through the trailer:
+
+<<commits test functions>>=
+def test_parse_view_trace_reads_viewed_lines():
+    from learnlog.commits import parse_view_trace
+    first, second = "a" * 40, "b" * 40
+    block = (
+        "Run: learnlog play\n"
+        "\n"
+        "Script: learnlog\n"
+        "Arguments: play\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "Run-Id: abc123\n"
+        "End-Time: 2026-01-01T10:00:20\n"
+        "Exit-Code: 0\n"
+        f"Viewed: {first} 2026-01-01T10:00:01 open\n"
+        f"Viewed: {second} 2026-01-01T10:00:05 next\n"
+        f"Viewed: {first} 2026-01-01T10:00:09 prev\n"
+        "\n--- I/O ---\n(no I/O)\n"
+        "\n--- exception ---\nNone"
+    )
+    assert parse_view_trace(block) == [
+        (first, "2026-01-01T10:00:01", "open"),
+        (second, "2026-01-01T10:00:05", "next"),
+        (first, "2026-01-01T10:00:09", "prev"),
+    ]
+
+def test_parse_view_trace_without_lines():
+    """An ordinary program run has no view trace."""
+    from learnlog.commits import parse_view_trace
+    assert parse_view_trace(
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "End-Time: 2026-01-01T10:00:05\nExit-Code: 0\n"
+    ) == []
+
+def test_parse_view_trace_skips_malformed():
+    """A truncated line is dropped, not reported."""
+    from learnlog.commits import parse_view_trace
+    assert parse_view_trace(
+        "Viewed: deadbeef\n"
+        "Viewed: deadbeef 2026-01-01T10:00:00 open\n"
+    ) == [("deadbeef", "2026-01-01T10:00:00", "open")]
+@
+
+The trace lives in the trailer commit, so it only reaches a reader if
+joining the two halves of a run (\cref{sec:run-join}) carries it
+across.
+It does, because merging appends the trailer text whole rather than
+field by field---which is precisely why that design is worth pinning
+down with a test:
+
+<<commits test functions>>=
+def test_merge_run_trailers_carries_view_trace():
+    """A review run's Viewed: lines survive the join."""
+    from learnlog.commits import (
+        merge_run_trailers,
+        parse_view_trace,
+    )
+    viewed = "c" * 40
+    header = (
+        "Run: learnlog play\n\nScript: learnlog\n"
+        "Arguments: play\nRun-Id: abc123"
+    )
+    trailers = {
+        "abc123": (
+            "End-Time: 2026-01-01T10:00:20\nExit-Code: 0\n"
+            f"Viewed: {viewed} 2026-01-01T10:00:01 open"
+        ),
+    }
+    merged = merge_run_trailers(header, trailers)
+    assert parse_view_trace(merged) == [
+        (viewed, "2026-01-01T10:00:01", "open"),
+    ]
 @
 
 
@@ -681,8 +1770,8 @@ without further changes.
 
 A block without an [[Exit-Code:]] line is classified as
 \emph{unknown} rather than \emph{failure}.  This happens when
-learnlog is killed (SIGKILL, power loss) before it can amend the
-commit with the trailer; the run may well have been proceeding
+learnlog is killed (SIGKILL, power loss) before it can commit the
+trailer; the run may well have been proceeding
 fine when the interruption occurred, so reporting it as a failure
 would be misleading.  Leaving such blocks out of both filters is
 the safer default---the teacher or student can still see them
@@ -704,7 +1793,7 @@ def classify_run_block(block_text):
     for line in block_text.split("\n"):
         if line.startswith("Exit-Code:"):
             exit_code = line.split(":", 1)[1].strip()
-        elif line.strip() == "--- exception ---":
+        elif line.strip() == EXCEPTION_SECTION_MARKER:
             in_exception = True
         elif in_exception:
             exception_lines.append(line)
@@ -774,7 +1863,7 @@ def test_classify_run_block_exception_with_zero_exit():
 
 A block with only a header---no trailer, no exit code---is
 unknown.  This corresponds to a run that was interrupted before
-[[finalize_run]] could amend the commit:
+[[finalize_run]] could commit its trailer:
 
 <<commits test functions>>=
 def test_classify_run_block_no_exit_code():
@@ -858,42 +1947,47 @@ We could fetch the raw commit message separately
 ([[git log --format=%B]]), but that would require an extra subprocess
 call per commit.
 Instead, we extract the message directly from the [[git show]]
-output---it is indented with four spaces---filter it, and reconstruct
+output---it is indented with four spaces---rewrite it, and reconstruct
 the output in place, reusing [[parse_show_sections]] to locate the
 boundaries.
 
-<<commits functions>>=
-def filter_show_output(show_output):
-    """Filter learnlog runs from ``git show`` output.
+Two different rewrites need this: merging a run's trailer back into its
+header (\cref{sec:run-join}) and dropping learnlog's internal runs
+(review runs stay---\cref{sec:filter-learnlog}).
+Taking the rewrite as a parameter keeps the fiddly
+un-indent/re-indent surgery in one place instead of two.
 
-    Extracts the indented commit message, strips the four-space
-    indentation, filters learnlog run blocks, re-indents, and
-    reconstructs the full output.  Returns ``None`` if all run
-    blocks were filtered out.
+<<commits functions>>=
+def rewrite_show_message(show_output, rewrite):
+    """Apply ``rewrite`` to the message inside ``git show`` output.
+
+    ``rewrite`` maps the un-indented commit message to a new one.
+    Returns the reconstructed output, or ``None`` when the
+    rewritten message is empty.
     """
     lines = show_output.split("\n")
     header_end, diff_start = parse_show_sections(lines)
 
-    <<extract and filter raw message>>
+    <<extract and rewrite raw message>>
     <<reconstruct show output>>
 @
 
-<<extract and filter raw message>>=
+<<extract and rewrite raw message>>=
 end = diff_start if diff_start is not None else len(lines)
 msg_lines = lines[header_end + 1:end]
 raw_msg = "\n".join(
     line[4:] if line.startswith("    ") else line
     for line in msg_lines
 )
-filtered_msg = filter_learnlog_runs(raw_msg)
+new_msg = rewrite(raw_msg)
 
-if not filtered_msg.strip():
+if not new_msg.strip():
     return None
 @
 
 <<reconstruct show output>>=
 reindented = []
-for line in filtered_msg.split("\n"):
+for line in new_msg.split("\n"):
     if line:
         reindented.append("    " + line)
     else:
@@ -904,35 +1998,94 @@ diff = lines[end:] if diff_start is not None else []
 return "\n".join(header + reindented + diff)
 @
 
+<<commits functions>>=
+def filter_show_output(show_output):
+    """Filter learnlog's internal runs from ``git show``.
+
+    Returns ``None`` if all run blocks were filtered out.
+    """
+    return rewrite_show_message(
+        show_output, filter_internal_runs,
+    )
+@
+
 
 \section{Retrieving commit detail}
 
-Filtering is enabled by default because learnlog runs are never part
-of the student's development story---a teacher reviewing the log
-should not have to remember a flag to get a clean view.
-The [[filter_learnlog]] parameter lets the [[--all]] flag disable it
+Filtering is enabled by default because learnlog's plumbing is never
+part of the student's story---a teacher reviewing the log should not
+have to remember a flag to get a clean view.
+The [[filter_internal]] parameter lets the [[--all]] flag disable it
 for debugging or completeness.
+Review runs come through either way: they are the student's activity,
+not learnlog's, and hiding them behind a flag would hide the very
+reflection the recorder logs them for.
+
+The trailer map is a parameter rather than something we fetch here
+because callers show many commits in a row: fetching it per commit
+would read the whole log once per displayed run.
+Callers that have no map---tests, and anyone who only wants the commit
+as it was recorded---see the header alone, with no end time or captured
+I/O.
 
 <<commits functions>>=
 def get_commit_detail(repo, commit_hash,
-                      filter_learnlog=True):
+                      filter_internal=True,
+                      trailers=None):
     """Return ``git show`` output for a single commit,
     reordered so the diff appears before the message.
 
-    When ``filter_learnlog`` is ``True`` (the default),
-    learnlog's own run blocks are stripped from the commit
-    message.  Returns ``None`` if all runs in the commit
-    were learnlog runs.
+    ``trailers`` is the map from :func:`get_run_trailers`; when
+    given, each run's results are merged into its header block.
+    When ``filter_internal`` is ``True`` (the default),
+    learnlog's internal run blocks are stripped from the commit
+    message; review runs are kept.  Returns ``None`` if every
+    run in the commit was internal.
     """
     result = repo.git("show", commit_hash)
     detail = result.stdout
 
-    if filter_learnlog:
+    if trailers:
+        detail = rewrite_show_message(
+            detail,
+            lambda message: merge_run_trailers(
+                message, trailers,
+            ),
+        )
+    if filter_internal and detail is not None:
         detail = filter_show_output(detail)
-        if detail is None:
-            return None
+    if detail is None:
+        return None
 
     return reorder_commit_detail(detail)
+@
+
+Let's verify that a run's results show up in its header commit once
+the trailer map is supplied:
+
+<<commits test functions>>=
+def test_get_commit_detail_merges_trailer(workdir):
+    from learnlog.commits import (
+        get_commits, get_commit_detail, get_run_trailers,
+    )
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    detail = get_commit_detail(
+        repo, commits[-1]["hash"],
+        trailers=get_run_trailers(repo),
+    )
+    assert "Run: hello.py" in detail
+    assert "Exit-Code: 0" in detail
+    assert "stdout: hello" in detail
 @
 
 <<commits test functions>>=
@@ -997,31 +2150,112 @@ than checking each commit individually, because the number
 of tags is small (typically one per lab session) and a
 single subprocess call is cheaper than one per commit.
 
+Each tagged hash goes through [[resolve_record_commit]]
+(\cref{sec:trailer-refs}) so that a tag created right after a
+run finished---and therefore sitting on that run's trailer
+commit---still lands on the run it marks rather than on a
+commit the callers cannot find.
+Resolving reads the run index (\cref{sec:run-index}), so we
+read it once here and hand the same map to every tag; letting
+each resolution fetch its own would walk the whole log once
+per tag for one identical answer.
+
+\subsection{A tag does not always name a commit directly}
+
+A lightweight tag is a ref whose object \emph{is} the
+commit, but [[git tag -a]] creates an intermediate
+\emph{tag object} that carries the tagger, the date and a
+message, and that object in turn names the commit.
+Both kinds reach a learnlog repository: [[learnlog git]]
+passes [[tag -a]] straight through, and so does a plain
+[[git tag -a]] in a clone---which is what a teacher
+marking a submission point reaches for.
+
+The field [[%(objectname)]] reports the object the ref
+points at, without dereferencing.
+For an annotated tag that is the tag object's hash, and a
+tag object's hash equals no commit in the log, so the
+lookups below never matched and every annotated tag
+vanished from [[list]], [[play]] and the ProgSnap2 export.
+The peeled field [[%(*objectname)]] is the hash Git
+arrives at after following the tag object, and it is
+\emph{empty} for a ref that needs no following.
+
+Neither field alone therefore covers both kinds, and
+[[%(if)]] is Git's own way of choosing between them: it
+emits the peeled hash when there is one and the direct
+hash otherwise.
+Reading both fields and choosing in Python would work
+equally well, but doing it in the format string keeps
+the difference between the two kinds of tag inside Git,
+rather than making the loop below reason about it.
+
+\subsection{A tag need not name a commit at all}
+
+Peeling says which object a ref arrives at; it does not
+promise that object is a commit.
+A tag can name any object in the database:
+[[git tag notes $(git hash-object -w notes.txt)]] tags a
+blob, [[git tag base HEAD^{tree}]] tags a tree, and both
+are ordinary Git that the [[learnlog git]] passthrough
+forwards untouched.
+
+Such a hash belongs to no run, and a key that is not a
+commit hash is worse for this map than no key at all:
+every caller looks the map up by the hash of a commit it
+is displaying, so the entry can never be found, and it
+sits in the map claiming otherwise.
+We therefore ask Git for the object's type in the same
+call---[[%(objecttype)]] and, for what a tag object peels
+to, [[%(*objecttype)]]---and keep only commits.
+Asking here rather than leaving the odd hashes to
+[[resolve_record_commit]] costs no extra process and
+keeps the two questions apart: that function decides what
+a hash \emph{means}, while which hashes are worth asking
+about is this map's own business.
+
+Each line now carries three fields, and only the last of
+them can contain a space, because Git forbids spaces in
+ref names---so splitting twice from the left recovers all
+three.
+
 <<commits functions>>=
 def get_tag_map(repo):
     """Map commit hashes to tag names.
 
     Returns a dict where keys are full commit hashes
     and values are lists of tag names pointing at that
-    commit.
+    commit.  Annotated tags are reported on the commit
+    their tag object names, and tags on a trailer commit
+    are reported on the run's header commit instead.
+    Tags whose object is not a commit are left out.
     """
     result = repo.git(
         "tag", "-l",
-        "--format=%(objectname) %(refname:short)",
+        "--format=%(if)%(*objectname)%(then)"
+        "%(*objectname) %(*objecttype)%(else)"
+        "%(objectname) %(objecttype)%(end)"
+        " %(refname:short)",
+        check=False,
     )
     if result.returncode != 0:
         return {}
+    records = get_record_commits(repo)
     tag_map = {}
     for line in result.stdout.strip().split("\n"):
-        if not line:
+        parts = line.split(" ", 2)
+        if len(parts) != 3:
             continue
-        parts = line.split(" ", 1)
-        if len(parts) == 2:
-            commit_hash, tag_name = parts
-            tag_map.setdefault(
-                commit_hash, []
-            ).append(tag_name)
+        commit_hash, object_type, tag_name = parts
+        if object_type != COMMIT_OBJECT_TYPE:
+            continue
+        tag_map.setdefault(
+            resolve_record_commit(repo, commit_hash, records),
+            [],
+        ).append(tag_name)
     return tag_map
+<<commits constants>>=
+COMMIT_OBJECT_TYPE = "commit"
 @
 
 Let's verify that the tag map correctly associates commits
@@ -1055,4 +2289,127 @@ def test_get_tag_map_no_tags(workdir):
     repo = LearnlogRepo(workdir)
     tag_map = get_tag_map(repo)
     assert tag_map == {}
+@
+
+Those tags are all lightweight, so they exercise only the
+[[%(objectname)]] half of the format string.
+A test for the other half has to be careful about which
+commit it tags, because [[resolve_record_commit]] hides
+the bug on exactly the commit one would reach for first.
+It asks Git for the tagged object's subject and for its
+first parent, and both of those requests peel a tag object
+on their way to a commit---so a tag object naming a
+\emph{trailer} commit still comes back as that run's
+header commit, by accident rather than by design.
+Everywhere else, including the header commit itself, the
+tag object's hash is what [[resolve_record_commit]]
+returns unchanged, and the tag is lost.
+
+So we tag a header commit by name, put one tag of each
+kind on it, and assert both names against that one hash.
+Dropping either half of the format string then fails the
+test, and the assertion states the invariant the two kinds
+share: how a tag was created must not change which commit
+it lands on.
+
+<<commits test functions>>=
+def test_get_tag_map_annotated_tag(workdir):
+    """Annotated and lightweight tags land alike."""
+    from learnlog.commits import get_tag_map
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    header = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("tag", "lab1", header)
+    repo.git(
+        "tag", "-a", "-m", "handed in", "submitted", header,
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    names = get_tag_map(repo)[header]
+    assert "lab1" in names
+    assert "submitted" in names
+@
+
+The odd tags get the same treatment, from the other side:
+we put a blob tag and a tree tag next to a good one and
+require the good one to survive them.
+The assertion has to look through the whole map rather
+than at one commit's entry, because the failure being
+pinned is not a wrong name under the right hash but an
+entry filed under a hash no caller will ever look up.
+
+<<commits test functions>>=
+def test_get_tag_map_skips_non_commit_tags(workdir):
+    """Tags on a blob or a tree stay out of the map."""
+    from learnlog.commits import get_tag_map
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    header = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("tag", "lab1", header)
+    blob = repo.git(
+        "hash-object", "-w", "hello.py",
+    ).stdout.strip()
+    repo.git("tag", "notes", blob)
+    tree = repo.git(
+        "rev-parse", "HEAD^{tree}",
+    ).stdout.strip()
+    repo.git("tag", "base", tree)
+
+    tag_map = get_tag_map(repo)
+
+    assert tag_map[header] == ["lab1"]
+    tagged = [name for names in tag_map.values() for name in names]
+    assert tagged == ["lab1"]
+@
+
+The map is looked up by the hash of a commit the caller is
+already showing---an event's code state in the ProgSnap2 export
+(\cref{progsnap2}), a listed commit in the viewer---so an entry
+filed under anything else is a tag that no caller will ever see.
+Overlapping runs used to produce exactly that, since
+[[learnlog tag]] marks HEAD and HEAD after an inner run finished
+first is the outer run's trailer commit.
+Asserting on the whole map rather than on one entry is what
+distinguishes the tag landing on its run from it merely landing
+somewhere.
+
+<<commits test functions>>=
+def test_get_tag_map_overlapping_runs(workdir):
+    """A tag on the newest trailer lands on its own run."""
+    from learnlog.commits import get_tag_map
+    outer = LearnlogRepo(workdir)
+    inner = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    outer.begin_run("outer.py", [], t0)
+    outer_header = outer.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip()
+    inner.begin_run("inner.py", [], t0)
+    inner.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=1),
+        exit_code=0,
+    )
+    outer.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t0 + datetime.timedelta(seconds=2),
+        exit_code=0,
+    )
+    outer.git("tag", "lab1")
+
+    tag_map = get_tag_map(outer)
+
+    assert list(tag_map) == [outer_header]
+    assert tag_map[outer_header] == ["lab1"]
 @

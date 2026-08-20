@@ -9,7 +9,13 @@ The [[.learnlog/]] directory contains only Git internals.
 
 We use [[subprocess]] rather than GitPython to keep the package
 dependency-free: Git is already installed on every lab machine, and our
-operations are simple (init, add, commit, amend).
+operations are simple (init, add, commit).
+
+The log is \emph{append-only}: we never rewrite a commit once it
+exists.
+\Cref{sec:two-commit-protocol} explains why that rules out the
+[[git commit --amend]] that earlier versions used, and how a run gets
+recorded instead.
 
 \section{Code overview}
 
@@ -22,10 +28,19 @@ work tree.
 """
 
 import subprocess
+import sys
 import os
 import pathlib
 import datetime
+import contextlib
+import re
+import shlex
+import shutil
+import uuid
 
+<<optional locking support>>
+
+<<constants>>
 <<classes>>
 <<functions>>
 @
@@ -34,9 +49,11 @@ import datetime
 """Tests for the Git repository management module."""
 import tempfile
 import os
+import sys
 import pathlib
 import subprocess
 import datetime
+import time
 import pytest
 from learnlog.gitrepo import *
 
@@ -78,10 +95,16 @@ def workdir(tmp_path, monkeypatch):
 \section{The [[LearnlogRepo]] class}
 
 The class needs four operations: running Git commands, initialising the
-repository, beginning a run (committing or amending), and finalising a
-run (amending with results).
+repository, beginning a run (committing the code state and the run
+header), and finalising a run (committing the results).
 We introduce the class shell here and fill in each method in its own
 section below.
+
+One run spans both of the last two operations, so the instance also
+carries the identity of the run currently in progress: the run id that
+links its two commits together, and the command it records.
+[[finalize_run]] needs both, and an instance handles exactly one run
+because each captured process creates its own [[LearnlogRepo]].
 
 <<classes>>=
 class LearnlogRepo:
@@ -94,16 +117,202 @@ class LearnlogRepo:
 
     def __init__(self, workdir):
         self.workdir = pathlib.Path(workdir)
-        self.git_dir = self.workdir / ".learnlog"
-        self.env = {
-            **os.environ,
-            "GIT_DIR": str(self.git_dir),
-            "GIT_WORK_TREE": str(self.workdir),
-        }
-        if not self.git_dir.exists():
-            self.init_repo()
+        self.git_dir = self.workdir / GIT_DIR_NAME
+        self.env = git_environment(
+            self.git_dir, self.workdir,
+        )
+        self.run_id = None
+        self.run_script = None
+        self.run_args = []
+        self.init_repo()
 
     <<repo methods>>
+@
+
+The constructor used to call [[init_repo]] only when [[.learnlog/]] was
+missing.
+Deciding from the directory alone is what a concurrent first run breaks
+(\cref{sec:init-repo}): the directory appears the instant one process
+starts initialising, so a second process constructed in that window
+would conclude that a repository was ready and run its first
+[[git add]] against one that was not there yet.
+[[init_repo]] is idempotent and answers that question properly, so the
+constructor simply always asks it.
+
+The directory name appears in three places that must agree: the path we
+hand to Git, the exclude pattern that keeps the log out of its own
+history (\cref{sec:init-repo}), and the diagnostics file we write inside
+it (\cref{sec:diagnostics}).
+A constant makes that agreement checkable instead of a coincidence of
+three string literals.
+
+<<constants>>=
+GIT_DIR_NAME = ".learnlog"
+@
+
+
+\section{The environment Git runs in}
+\label{sec:git-environment}
+
+Every Git command learnlog runs is told which repository to work on
+through the environment rather than through arguments, so building
+that environment is a decision of its own.
+It used to be built by copying the process environment and overriding
+[[GIT_DIR]] and [[GIT_WORK_TREE]] in it.
+Overriding two variables answers the two questions those variables
+ask, and leaves every other [[GIT_]] variable the parent process
+exported pointing wherever it pointed.
+
+That is not a hypothetical parent.
+Git exports [[GIT_INDEX_FILE]] to the hooks it runs, so a project
+whose [[pre-commit]] hook happens to run a logged program hands
+learnlog's [[git add .]] the path of the \emph{student's own}
+repository's index---and learnlog then stages the whole working
+directory into it, replacing whatever the student had deliberately
+staged.
+The variables that name an object store
+([[GIT_OBJECT_DIRECTORY]], [[GIT_ALTERNATE_OBJECT_DIRECTORIES]],
+[[GIT_QUARANTINE_PATH]]) are the same class one level down: learnlog's
+commits would be written into somebody else's store and vanish when it
+is discarded.
+So are [[GIT_AUTHOR_NAME]] and its relatives, which would attribute a
+run record to whatever commit was being made when the hook fired, and
+[[GIT_CONFIG]], which redirects the writes of [[git config]]---the
+command that configures the repository below---into a file we were
+never asked to touch.
+
+The list of variables that must not survive is therefore open-ended,
+and an override list can only ever name the ones we thought of.
+Inverting it closes the question: strip every [[GIT_]] variable, then
+add back the few that cannot decide what Git writes or where it goes.
+
+Three groups earn a place on that list.
+The transport variables---[[GIT_SSH]], [[GIT_SSH_COMMAND]],
+[[GIT_SSH_VARIANT]], [[GIT_ASKPASS]], [[GIT_TERMINAL_PROMPT]]---say
+how the student reaches a remote, which is exactly what [[push]] and
+[[pull]] need and exactly what a student is likely to have set in a
+shell profile rather than in a config file; they run through this
+environment (\cref{sec:push}), and stripping them would break the
+sharing commands for everyone who configures Git that way.
+The config-file selectors [[GIT_CONFIG_GLOBAL]], [[GIT_CONFIG_SYSTEM]]
+and [[GIT_CONFIG_NOSYSTEM]] say which files hold the student's
+configuration, and learnlog's identity and signing policy is built on
+reading it (\cref{sec:ensure-configured}): dropping them would make
+learnlog commit under its fallback identity for everyone whose Git is
+configured through those variables---containers, sandboxes, CI.
+[[GIT_TRACE]] and its variants only ask Git to narrate what it is
+doing, which is what somebody debugging learnlog's Git calls needs and
+which changes no outcome, so a prefix test lets all of them through
+without enumerating a moving target.
+
+<<functions>>=
+def git_environment(git_dir, workdir):
+    """Return the environment learnlog runs Git commands in.
+
+    Copies the process environment without any ``GIT_*`` variable
+    that could redirect what Git writes, keeps the few that only
+    describe how to reach a remote or which config files to read,
+    and points Git at the learnlog repository.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(GIT_VAR_PREFIX)
+        or key in INHERITED_GIT_VARS
+        or key.startswith(GIT_TRACE_PREFIX)
+    }
+    env["GIT_DIR"] = str(git_dir)
+    env["GIT_WORK_TREE"] = str(workdir)
+    return env
+<<constants>>=
+GIT_VAR_PREFIX = "GIT_"
+GIT_TRACE_PREFIX = "GIT_TRACE"
+INHERITED_GIT_VARS = frozenset({
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_ASKPASS",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+})
+@
+
+The environment is built once per [[LearnlogRepo]] and then handed to
+every command, which is what lets [[run_index]] below say \enquote{this
+index, for this run} by writing one key into it.
+That only works because the key is not there to begin with: with the
+parent's [[GIT_INDEX_FILE]] stripped, the variable is set in exactly
+one place in this module, and one [[grep]] confirms it.
+
+Let's verify that the variables that could redirect a write are gone
+while the ones that describe the student's setup survive:
+
+<<test functions>>=
+def test_git_environment_drops_a_redirecting_variable(
+        workdir, monkeypatch):
+    """An inherited index or object store is not ours to use."""
+    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/somebody-elses")
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", "/tmp/quarantine")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Hook")
+    monkeypatch.setenv("GIT_CONFIG", "/tmp/their-config")
+    repo = LearnlogRepo(workdir)
+    assert "GIT_INDEX_FILE" not in repo.env
+    assert "GIT_OBJECT_DIRECTORY" not in repo.env
+    assert "GIT_AUTHOR_NAME" not in repo.env
+    assert "GIT_CONFIG" not in repo.env
+    assert repo.env["GIT_DIR"] == str(workdir / ".learnlog")
+
+def test_git_environment_keeps_the_student_setup(
+        workdir, monkeypatch):
+    """Transport and configuration variables must survive."""
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i mykey")
+    monkeypatch.setenv("GIT_TRACE_PACKET", "1")
+    repo = LearnlogRepo(workdir)
+    assert repo.env["GIT_SSH_COMMAND"] == "ssh -i mykey"
+    assert repo.env["GIT_TRACE_PACKET"] == "1"
+@
+
+The variable this began with deserves the whole story rather than a
+dictionary lookup, because what it costs is somebody else's work.
+We build the situation the hook does: a student's repository with one
+file staged out of two, and [[GIT_INDEX_FILE]] naming its index the
+way Git names it for a hook.
+A logged run then happens inside that environment, and what must
+still be staged afterwards is the one file the student chose.
+
+<<test functions>>=
+def test_run_leaves_an_inherited_index_alone(
+        workdir, monkeypatch):
+    """A hook's staging survives a run that happens inside it."""
+    subprocess.run(
+        ["git", "init", "--quiet", str(workdir)],
+        check=True, capture_output=True,
+    )
+    (workdir / "staged.txt").write_text("staged\n")
+    (workdir / "unstaged.txt").write_text("unstaged\n")
+    subprocess.run(
+        ["git", "add", "staged.txt"],
+        cwd=str(workdir), check=True, capture_output=True,
+    )
+    monkeypatch.setenv(
+        "GIT_INDEX_FILE", str(workdir / ".git" / "index"),
+    )
+
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", [], now)
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=now, exit_code=0,
+    )
+
+    staged = subprocess.run(
+        ["git", "ls-files", "--cached"],
+        cwd=str(workdir), capture_output=True, text=True,
+    )
+    assert staged.stdout.split() == ["staged.txt"]
 @
 
 
@@ -113,118 +322,926 @@ Every Git command needs the same environment variables and working
 directory.
 The [[git]] method wraps this boilerplate and returns the
 [[CompletedProcess]] object for callers that need to inspect the result.
-We set a 10-second timeout to prevent hangs from blocking the student's
-program.
+
+Beyond that boilerplate, three decisions in this one method determine
+whether a run is recorded at all: what happens when Git fails, how long
+we are willing to wait for it, and how the commit message reaches Git.
+Each of them has cost us runs, so we take them in turn before assembling
+the method.
+A fourth decision---whether Git's output comes back as text or as
+bytes---costs no runs, but it decides who can use the wrapper at all,
+and a caller who cannot use it opts out of the other three as well.
+
+\subsection{Failure is an exception, not a return code}
+
+The wrapper used to hand every [[CompletedProcess]] back unexamined,
+which made \enquote{Git refused} indistinguishable from \enquote{Git
+succeeded} unless the caller remembered to look.
+Almost none did.
+Since the calls that matter most---[[add]], [[commit]]---are the ones
+whose result nobody inspected, a failing Git simply erased the run:
+[[.learnlog/index.lock]] held by a concurrent run, a scrubbed [[PATH]]
+under [[env -i]], a full disk.
+Nothing was written and nothing was said.
+
+Raising is the right default because the failure modes are not local to
+one call site: whoever ends up handling the exception can report it
+(\cref{sec:diagnostics}), whereas an ignored return code cannot be
+recovered further up.
+Callers that genuinely want the return code---[[git diff]] with
+[[--cached --quiet]], where the exit status \emph{is} the answer to
+\enquote{did anything change?}---opt out with [[check=False]] and get
+the old behaviour.
+
+The opt-out covers only the exit status.
+A missing [[git]] binary or an expired timeout still raises even under
+[[check=False]], because there is no exit status to interpret in those
+cases: treating them as \enquote{Git said no} would let
+[[check=False]] callers read [[returncode]] off a process that never
+ran.
+
+<<classes>>=
+class GitError(RuntimeError):
+    """A Git command run by learnlog failed.
+
+    Carries the command, its exit code (``None`` when Git could not
+    be run at all) and whatever Git wrote to standard error, so the
+    diagnostics path can report something actionable.
+    """
+
+    def __init__(self, args, returncode, stderr):
+        self.command = ("git",) + tuple(args)
+        self.returncode = returncode
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        self.stderr = (stderr or "").strip()
+        <<build the [[GitError]] message>>
+        super().__init__(message)
+@
+
+Standard error arrives as [[str]] from an ordinary call and as [[bytes]]
+from one that asked for a byte stream (\cref{sec:git-bytes}), so the
+constructor decodes it.
+A diagnostic is text whatever the command it describes was reading: it
+ends up in an exception message, on a terminal, and in the errors log
+(\cref{sec:diagnostics}).
+Decoding with [[errors="replace"]] rather than strictly is what keeps a
+failure reportable even when Git's complaint is not valid UTF-8---a
+locale mismatch or a mangled file name in the message must not turn a
+Git failure into a [[UnicodeDecodeError]] from the error path itself.
+
+We name the attribute [[command]] rather than [[args]] because
+[[BaseException.args]] already means something else---the constructor
+arguments---and [[super().__init__]] would overwrite ours.
+
+The rendered command is truncated.
+Arguments are supposed to be short now that message text goes on
+standard input, but this string is appended to a file on disk
+(\cref{sec:diagnostics}), and a diagnostics channel that can be made to
+write a megabyte per failure is a new problem rather than a fix for the
+old one.
+The head of the command is what identifies it, so that is what we keep.
+
+<<constants>>=
+MAX_REPORTED_COMMAND_CHARS = 200
+<<build the [[GitError]] message>>=
+status = (
+    "could not be run"
+    if returncode is None
+    else f"exited with status {returncode}"
+)
+detail = f": {self.stderr}" if self.stderr else ""
+command = " ".join(self.command)
+if len(command) > MAX_REPORTED_COMMAND_CHARS:
+    command = command[:MAX_REPORTED_COMMAND_CHARS] + "..."
+message = f"{command} {status}{detail}"
+@
+
+\subsection{How long we are willing to wait}
+
+The original 10-second timeout was chosen to bound how long learnlog
+may stall a student's program.
+It also, unintentionally, bounded how much work Git was allowed to do:
+[[git add .]] and [[git commit]] hash the entire work tree, so a
+project with a data directory, a build tree, or a virtual environment
+that the exclude patterns do not cover can exceed ten seconds on the
+first run---and the penalty for exceeding it was not a slow run but a
+lost one.
+
+So we separate the two concerns the single timeout was conflating.
+Commands that read a ref or a single commit finish in milliseconds; a
+minute for them means Git is stuck, not busy.
+Commands that walk the whole tree get a budget large enough that only a
+genuinely wedged Git (a hung credential helper, an unresponsive network
+filesystem) hits it.
+Losing a run is worse than delaying one, so both budgets err on the
+generous side.
+
+<<constants>>=
+GIT_TIMEOUT = 60
+GIT_TREE_TIMEOUT = 600
+@
+
+\subsection{Message text travels on standard input}
+\label{sec:commit-message-stdin}
+
+Linux caps the length of a \emph{single} [[argv]] string at
+[[MAX_ARG_STRLEN]], 128\,KiB---a per-string limit, separate from the
+much larger limit on the total size of the argument vector, and one
+that [[ulimit]] cannot raise.
+A commit message is exactly the kind of argument that grows without
+bound: the trailer carries the program's whole captured I/O, up to
+[[MAX_IOLOG_BYTES]] (\cref{sec:iolog-cap}), which is an order of
+magnitude past the cap.
+Passing it as [[git commit -m <message>]] therefore made
+[[subprocess]] fail with [[OSError: Argument list too long]] before Git
+was even started, and a program printing more than about 128\,KB lost
+its entire trailer---exit code, I/O and exception alike.
+
+Standard input has no such limit, so [[git commit --file=-]] takes the
+message the same way an editor session would, and [[-m]] and
+[[--file=-]] agree on everything except the length cap: with neither
+an editor nor an explicit [[--cleanup]], porcelain applies the
+[[whitespace]] cleanup mode to both.
+That cleanup is itself a lossy filter---it strips trailing spaces and
+collapses blank-line runs---which is one of the reasons run commits
+moved to [[commit-tree]] (\cref{sec:recording-branch}), where the
+message is stored verbatim; the reconstruction side commits the same
+way (\cref{progsnap2}) so the fidelity survives a round trip.
+
+The rule this leaves us with is simple enough to apply without thinking
+about lengths at each call site: \emph{message content never travels in
+[[argv]]}.
+Every commit in this program passes its message through [[input]].
+
+\subsection{Text or bytes}
+\label{sec:git-bytes}
+
+Decoding Git's output as text is right for nearly every call we make:
+refs, hashes, log output and status are text by construction, and
+callers want [[str]].
+It is wrong for exactly the calls that hand us a file.
+[[git archive]] emits a tar stream, and a tar stream that has been
+through a UTF-8 decoder is no longer a tar stream---at best it raises,
+at worst it silently becomes replacement characters.
+
+Because the wrapper could not express that, the one caller that needed
+it---the ProgSnap2 exporter's code-state extraction
+(\cref{sec:extract-code-state})---called [[subprocess.run]] itself, and
+in doing so opted out of everything decided above: it repeated the
+environment and working directory by hand, ran without a timeout, and
+turned a failing [[git archive]] into an empty code state instead of an
+error.
+That is the general shape of the problem, and the reason the mode
+belongs in the wrapper rather than in the caller: a wrapper a caller
+cannot use is a wrapper that caller works around, and the workaround
+loses \emph{all} the guarantees, not the one it needed to escape.
+
+So the mode becomes a parameter, [[text]], with the same name and
+default as [[subprocess.run]]'s.
+A sibling [[git_bytes()]] method was the alternative; it would have had
+to repeat the failure handling, the timeouts and the standard-input
+plumbing, and that repetition is what would drift the next time one of
+those three decisions changes.
+A parameter cannot drift: there is still one code path, and the mode
+only chooses what type comes back out of it.
+
+\subsection{The wrapper}
 
 <<repo methods>>=
-def git(self, *args):
+def git(self, *args, check=True, timeout=GIT_TIMEOUT,
+        input=None, text=True):
     """Run a Git command with the learnlog environment.
 
-    Returns the ``CompletedProcess`` object.  Raises no exception
-    on non-zero exit codes---callers check ``returncode`` themselves.
+    Returns the ``CompletedProcess``.  Raises ``GitError`` when Git
+    cannot be run at all (missing binary, timeout) and, unless
+    ``check`` is false, when Git exits non-zero.  Text passed as
+    ``input`` reaches Git on standard input; commit messages travel
+    that way to escape the operating system's argument-size limit.
+    With ``text`` false, standard output and standard error come back
+    as bytes, for commands whose output is a file rather than a
+    message.
     """
-    return subprocess.run(
+    <<run Git, turning process failures into [[GitError]]>>
+    if check and result.returncode != 0:
+        raise GitError(args, result.returncode, result.stderr)
+    return result
+@
+
+[[subprocess]] reports \enquote{Git could not be run} in two unrelated
+exception hierarchies---[[OSError]] for a missing binary or an
+oversized argument list, [[SubprocessError]] for a timeout---so we
+catch both and re-raise them as the one type callers have to know
+about.
+
+<<run Git, turning process failures into [[GitError]]>>=
+try:
+    result = subprocess.run(
         ["git"] + list(args),
         cwd=str(self.workdir),
         env=self.env,
         capture_output=True,
-        text=True,
-        timeout=10,
+        text=text,
+        timeout=timeout,
+        input=input,
     )
+except (OSError, subprocess.SubprocessError) as error:
+    raise GitError(args, None, str(error)) from error
 @
 
-Let's verify the helper runs Git commands in the right context:
+Let's verify the helper runs Git commands in the right context, and
+that each of the four decisions above holds:
 
 <<test functions>>=
 def test_git_runs_command(workdir):
     repo = LearnlogRepo(workdir)
     result = repo.git("status")
     assert result.returncode == 0
+
+def test_git_raises_on_failure(workdir):
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError):
+        repo.git("rev-parse", "--verify", "no/such/ref")
+
+def test_git_error_reports_command_and_stderr(workdir):
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError) as caught:
+        repo.git("cat-file", "-p", "0" * 40)
+    assert caught.value.returncode != 0
+    assert "cat-file" in str(caught.value)
+    assert caught.value.stderr
+
+def test_git_error_truncates_long_command(workdir):
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError) as caught:
+        repo.git("cat-file", "-p", "q" * 5_000)
+    head = str(caught.value).split(" exited with")[0]
+    assert len(head) == MAX_REPORTED_COMMAND_CHARS + 3
+
+def test_git_check_false_returns_failed_result(workdir):
+    repo = LearnlogRepo(workdir)
+    result = repo.git(
+        "rev-parse", "--verify", "no/such/ref", check=False
+    )
+    assert result.returncode != 0
+
+def test_git_missing_binary_raises_even_unchecked(workdir):
+    """A scrubbed PATH is not a return code to ignore."""
+    repo = LearnlogRepo(workdir)
+    repo.env["PATH"] = str(workdir / "empty")
+    with pytest.raises(GitError) as caught:
+        repo.git("status", check=False)
+    assert caught.value.returncode is None
+
+def test_git_input_reaches_git(workdir):
+    repo = LearnlogRepo(workdir)
+    result = repo.git(
+        "hash-object", "-w", "-t", "blob", "--stdin",
+        input="payload\n",
+    )
+    blob = result.stdout.strip()
+    assert repo.git("cat-file", "-p", blob).stdout \
+        == "payload\n"
+
+def test_git_bytes_mode_returns_undecodable_output(workdir):
+    """Content Git hands back need not be text at all."""
+    repo = LearnlogRepo(workdir)
+    content = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
+    (workdir / "logo.png").write_bytes(content)
+    blob = repo.git(
+        "hash-object", "-w", "logo.png"
+    ).stdout.strip()
+    result = repo.git("cat-file", "-p", blob, text=False)
+    assert result.stdout == content
+
+def test_git_bytes_mode_reports_failures_as_text(workdir):
+    """A byte-mode failure is still a readable diagnostic."""
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(GitError) as caught:
+        repo.git("cat-file", "-p", "0" * 40, text=False)
+    assert caught.value.returncode != 0
+    assert isinstance(caught.value.stderr, str)
+    assert caught.value.stderr
+    assert "b'" not in str(caught.value)
+@
+
+
+\section{Reporting failures where a human can find them}
+\label{sec:diagnostics}
+
+Raising [[GitError]] only moves the problem: the callers in
+[[__init__.py]] must keep swallowing everything, because transparency
+means a student's program may not crash, and may not acquire extra
+output, just because learnlog had a bad day.
+What transparency does \emph{not} require is that the failure leave no
+trace at all.
+Today a dropped run and a clean run look identical from every angle---to
+the student, to the teacher reading the log, and to us reading a bug
+report---and that is what makes these failures so expensive to diagnose.
+
+So the exception handlers keep swallowing, and [[report_error]] gives
+the evidence somewhere to land.
+Two channels, because two different people need it at two different
+times.
+[[.learnlog/errors.log]] is written unconditionally and read later: it
+is the record that explains a gap in a student's history weeks after the
+fact, and it costs the running program one append.
+[[LEARNLOG_DEBUG]] additionally mirrors each entry to standard error,
+for whoever is debugging learnlog \emph{now} and should not have to know
+that the file exists.
+
+<<constants>>=
+ERRORS_LOG_NAME = "errors.log"
+DEBUG_ENV_VAR = "LEARNLOG_DEBUG"
+<<functions>>=
+def report_error(context, error, workdir=None):
+    """Record a learnlog failure without disturbing the program.
+
+    Appends a timestamped entry to ``.learnlog/errors.log`` under
+    ``workdir`` (the current directory by default) and, when
+    ``LEARNLOG_DEBUG`` is set in the environment, mirrors it to the
+    real standard error.  Never raises.
+    """
+    timestamp = datetime.datetime.now().isoformat()
+    entry = (
+        f"{timestamp} {context}: "
+        f"{type(error).__name__}: {error}"
+    )
+    <<mirror the entry to stderr when debugging>>
+    <<append the entry to the errors log>>
+@
+
+The mirror writes to [[sys.__stderr__]], not [[sys.stderr]]: by the time
+anything can fail, learnlog has usually replaced [[sys.stderr]] with its
+own capturing wrapper, and a diagnostic sent through that wrapper would
+be recorded in the commit as though the student's program had printed
+it.
+[[sys.__stderr__]] is [[None]] in interpreters started without a console
+(pythonw, some embedded hosts), so we fall back to whatever
+[[sys.stderr]] currently is.
+
+<<mirror the entry to stderr when debugging>>=
+if os.environ.get(DEBUG_ENV_VAR):
+    stream = sys.__stderr__ or sys.stderr
+    try:
+        print(f"learnlog: {entry}", file=stream)
+    except Exception:
+        pass
+@
+
+We append only to a [[.learnlog/]] that already exists.
+The alternative---creating it---would mean that a learnlog failure in a
+directory that is not a learnlog project silently starts one, which is
+precisely the surprise the diagnostics are supposed to prevent.
+
+Writing the log \emph{inside} the Git directory is what keeps it out of
+the history it describes: [[.learnlog]] is the first exclude pattern
+(\cref{sec:init-repo}), so [[git add .]] never stages anything under it.
+Git's built-in protection does not apply here---that rule is hard-coded
+for a directory literally named [[.git]]---which is why the exclude
+pattern and this path are derived from the same constant.
+
+Finally, every failure inside [[report_error]] is itself swallowed---
+including the path handling, not just the write.
+This is the one place where that matters more than it looks: the only
+callers are [[except]] blocks whose whole purpose is to stop an
+exception from reaching the student's program, so an exception escaping
+from here would do precisely the damage those handlers exist to
+prevent.
+A read-only checkout, a full disk, or a nonsensical [[workdir]] must not
+turn a reported failure into an unreported crash.
+
+<<append the entry to the errors log>>=
+try:
+    git_dir = (
+        pathlib.Path(workdir or os.getcwd()) / GIT_DIR_NAME
+    )
+    if not git_dir.is_dir():
+        return
+    with open(
+        git_dir / ERRORS_LOG_NAME, "a", encoding="utf-8"
+    ) as log:
+        log.write(entry + "\n")
+except Exception:
+    pass
+@
+
+Let's verify both channels, and the exclusion that keeps the log out of
+the history:
+
+<<test functions>>=
+def test_report_error_appends_to_log(workdir):
+    repo = LearnlogRepo(workdir)
+    report_error("begin_run", ValueError("boom"), workdir)
+    log = (workdir / ".learnlog" / "errors.log").read_text()
+    assert "begin_run" in log
+    assert "ValueError: boom" in log
+
+def test_report_error_without_repo_is_silent(tmp_path):
+    report_error("begin_run", ValueError("boom"), tmp_path)
+    assert not (tmp_path / ".learnlog").exists()
+
+def test_report_error_never_raises(tmp_path):
+    """An unusable target must not become a second failure."""
+    report_error("begin_run", ValueError("boom"), "\0bad")
+
+def test_report_error_debug_writes_stderr(
+    workdir, monkeypatch, capsys
+):
+    LearnlogRepo(workdir)
+    monkeypatch.setenv("LEARNLOG_DEBUG", "1")
+    monkeypatch.setattr(sys, "__stderr__", sys.stderr)
+    report_error("on_exit", ValueError("boom"), workdir)
+    assert "ValueError: boom" in capsys.readouterr().err
+
+def test_report_error_quiet_without_debug(
+    workdir, monkeypatch, capsys
+):
+    LearnlogRepo(workdir)
+    monkeypatch.delenv("LEARNLOG_DEBUG", raising=False)
+    monkeypatch.setattr(sys, "__stderr__", sys.stderr)
+    report_error("on_exit", ValueError("boom"), workdir)
+    assert capsys.readouterr().err == ""
+
+def test_errors_log_is_never_staged(workdir):
+    repo = LearnlogRepo(workdir)
+    report_error("begin_run", ValueError("boom"), workdir)
+    repo.git("add", ".")
+    assert "errors.log" not in repo.git("ls-files").stdout
 @
 
 
 \section{Repository initialisation}
+\label{sec:init-repo}
 
 On the very first run, we need to create the Git repository, configure
 a committer identity, set up exclusion patterns, and make an initial
 commit of all source files.
 
-The learnlog repository inherits the student's global Git identity and
-GPG signing configuration.
-If a student has not configured Git at all, commits would fail---so we
-set a fallback identity only when no global one exists.
-This means commits are signed with the student's own key when available,
-which is the right thing for a log of \emph{their} work.
+That first run need not be alone.
+Two terminals open in the same project, a parallel [[make]], or a
+logged program that starts another logged program all reach this method
+within milliseconds of each other in a directory that has no
+[[.learnlog/]] yet, and each of them finds no repository to use.
+Running [[git init]] twice in \emph{sequence} is harmless---it is
+deliberately re-runnable---but running it twice at once is not.
+Both processes copy Git's template hooks into the new directory, and
+the one that loses on any single file dies with \enquote{cannot copy
+\ldots{} File exists}, taking its run with it.
+Even where both survive, the initial commit does not: two commits made
+with no [[HEAD]] to build on are two \emph{root} commits on the same
+branch, and the branch update that lands second leaves the other root,
+together with every run recorded on top of it, reachable from nothing.
+
+The single-writer lock of \cref{sec:commit-lock} is the right mechanism
+and cannot be used as it stands, because the file it locks lives inside
+the very directory whose creation is being raced.
+Creating that directory ourselves is what makes it usable: [[mkdir]]
+with [[exist_ok]] is safe for any number of simultaneous callers, an
+empty [[.learnlog/]] is one [[git init]] is perfectly happy to
+initialise, and a lock file inside it is kept out of the log by the
+same exclude pattern that keeps the rest of the Git directory out.
+
+Under the lock, the question to ask is not whether the directory
+exists---it does, we just made it---but whether the repository already
+has a commit.
+The loser of the race blocks until the winner's initial commit is in,
+finds one, and returns without writing anything.
 
 <<repo methods>>=
 def init_repo(self):
-    """Initialise a new ``.learnlog/`` Git repository.
+    """Make sure the ``.learnlog/`` repository is ready to use.
 
-    Creates the repository, sets a fallback committer identity
-    (only if the student has none configured globally), sets up
-    exclusion patterns, and makes an initial commit of all files.
+    Creates the repository and makes an initial commit of all
+    files when there is none.  Configures it (committer identity,
+    signing, exclusion patterns) whether it created the
+    repository or found one, so a cloned log is configured too.
+
+    Creating is skipped when the repository already has a
+    commit, so that concurrent first runs share one initial
+    commit instead of making a root commit each.
     """
-    self.git("init")
-    <<set fallback identity if needed>>
+    if not self.has_commit():
+        self.git_dir.mkdir(parents=True, exist_ok=True)
+        with self.commit_lock():
+            <<create the repository unless another process got there first>>
+    self.ensure_configured()
+@
 
-    <<set up exclude patterns>>
+The check before the lock is the one that runs on every later
+construction, and it is there to keep the common case---an established
+repository---from queueing behind whatever else is committing.
+The check inside the lock is the one that is authoritative.
+
+<<create the repository unless another process got there first>>=
+if not self.has_commit():
+    self.git("init")
+    self.write_configuration()
     <<initial commit>>
 @
 
-We check whether Git can resolve a user name; if not, we provide a
-generic fallback.
-This handles lab machines where students have never run
-[[git config]].
-We also disable GPG signing---these machine-generated commits do not
-need cryptographic signatures, and students may not have a GPG key
-configured:
+Creation and configuration used to be the same step, and this method
+used to return as soon as it found a commit---which meant that a
+repository learnlog did not create was never configured at all.
+Every clone is such a repository (\cref{sec:clone}), and what it is
+missing is not cosmetic: with no exclude file, the first run in the
+clone stages the log repository into its own history, and with no
+[[commit.gpgsign]] of its own, a student whose global configuration
+turns signing on gets a [[GitError]] from every commit learnlog
+attempts.
+Neither had a repair path, because [[init]] took the same early
+return.
 
-<<set fallback identity if needed>>=
-name_check = self.git("config", "user.name")
-if name_check.returncode != 0:
-    self.git("config", "user.name", "learnlog")
-    self.git("config", "user.email", "learnlog@localhost")
-self.git("config", "commit.gpgsign", "false")
+Splitting the two questions is what fixes the whole family: creation
+asks \enquote{does this repository have a commit?}, configuration asks
+\enquote{does this repository have the settings learnlog needs?}, and
+the second question has to be asked on every construction because its
+answer can go stale under a repository that is perfectly established---
+a clone that arrives without them, or a [[.learnlogignore]] the student
+writes after the first run.
+Creation calls [[write_configuration]] itself rather than leaving it
+to the [[ensure_configured]] that follows, because the exclude file has
+to be on disk \emph{before} the initial commit stages the tree---a
+first commit made without it is a log that starts by swallowing the
+student's virtual environment.
+
+\enquote{Has a commit} is the property that matters, rather than
+\enquote{has a Git directory}, because the directory appears at the
+very start of initialisation and the repository only becomes usable at
+the end of it.
+[[git rev-parse --verify]] answers it, and this is one of the places in
+this module where a non-zero exit is the answer rather than a problem:
+[[HEAD]] fails to resolve exactly while the branch is still unborn.
+The filesystem answers for free in the one case where it can---a
+directory that is not there cannot hold a commit---but every
+[[LearnlogRepo]] built on an existing log does pay for one
+[[rev-parse]].
+That is the price of the correctness above, and it is a small one next
+to what the same process is about to do: a run makes two commits, each
+of which walks the work tree.
+
+<<repo methods>>=
+def has_commit(self):
+    """Return whether the repository exists and has a commit."""
+    if not self.git_dir.is_dir():
+        return False
+    probe = self.git(
+        "rev-parse", "--verify", "--quiet", "HEAD",
+        check=False,
+    )
+    return probe.returncode == 0
+@
+
+Where [[fcntl]] is missing the lock is a no-op
+(\cref{sec:commit-lock}), and check-then-initialise is racy again.
+That is the same trade as for the commit lock itself: a platform
+without [[flock]] gets the protocol without the serialisation, rather
+than no learnlog at all.
+
+\subsection{Keeping the repository configured}
+\label{sec:ensure-configured}
+
+A configured learnlog repository is one where three things hold: Git
+can resolve a committer identity, [[commit.gpgsign]] is off, and
+[[info/exclude]] lists the patterns that keep the log out of its own
+history.
+[[ensure_configured]] establishes all three, and it has to be safe to
+call on every construction, because that is when the answers can have
+changed since the last one.
+
+It asks before it writes, and takes the lock only when the answer is
+no.
+Taking it unconditionally would put every program start in the queue
+behind whatever commit is in progress, which is the cost
+\cref{sec:commit-lock} refuses to pay for a lock that only means
+\enquote{learnlog is writing}.
+The questions are read-only, and the writes they lead to are the same
+writes any other process would make from the same answers, so a lost
+race costs a second write of identical content and never a wrong one.
+
+<<repo methods>>=
+def ensure_configured(self):
+    """Bring the repository's configuration up to date.
+
+    Does nothing when the settings and exclude patterns learnlog
+    needs are already in place, so it is cheap to call on every
+    construction and repairs whatever it finds missing.
+    """
+    if self.is_configured():
+        return
+    with self.commit_lock():
+        self.write_configuration()
+@
+
+Asking costs two [[git config]] probes on top of the [[rev-parse]] of
+[[has_commit]], which is the honest price of not trusting a marker.
+A marker saying \enquote{this repository was configured once} is in
+effect what the old early return believed, and a clone or a
+[[.learnlogignore]] written after the first run is exactly the case
+where that belief is wrong.
+The probes are also the cheapest Git commands there are---they read
+config files and touch no objects.
+Measured on a one-file project, asking costs about 7\,ms against the
+40\,ms the run it precedes spends on its two commits, and that ratio
+only improves on a project with something in it, because the commits
+grow with the tree and the probes do not.
+
+The exclude file is checked first because it is answered by a file
+read rather than by a process, and because it is the setting most
+likely to be stale: it changes whenever the student edits
+[[.learnlogignore]].
+
+<<repo methods>>=
+def is_configured(self):
+    """Return whether our settings are already in place."""
+    try:
+        current = (self.git_dir / EXCLUDE_PATH).read_text()
+    except OSError:
+        return False
+    if current != self.exclude_content():
+        return False
+    identity = self.git(
+        "config", "user.name", check=False,
+    )
+    if identity.returncode != 0:
+        return False
+    signing = self.git(
+        "config", "--bool", "commit.gpgsign", check=False,
+    )
+    return signing.stdout.strip() == "false"
+@
+
+Both probes are among the places in this module where a non-zero exit
+is the answer rather than a problem, so both run with [[check=False]]:
+[[git config user.name]] exits~1 precisely when no scope defines the
+setting.
+Neither asks where the answer came from.
+An identity the student configured globally is the right one for a log
+of \emph{their} work, so learnlog only supplies a fallback when Git can
+resolve none---which is the lab machine where nobody ever ran
+[[git config]].
+Signing is the mirror image: whatever the student's global
+configuration says, these machine-generated commits must not need a
+key, so learnlog writes the local [[false]] that overrides it.
+Reading the effective value rather than the local one is what makes
+the write happen once instead of on every run.
+
+<<repo methods>>=
+def write_configuration(self):
+    """Write the Git settings and exclude patterns we need."""
+    identity = self.git("config", "user.name", check=False)
+    if identity.returncode != 0:
+        self.git(
+            "config", "user.name", FALLBACK_USER_NAME,
+        )
+        self.git(
+            "config", "user.email", FALLBACK_USER_EMAIL,
+        )
+    self.git("config", "commit.gpgsign", "false")
+    <<swap the exclude file into place>>
+<<constants>>=
+FALLBACK_USER_NAME = "learnlog"
+FALLBACK_USER_EMAIL = "learnlog@localhost"
 @
 
 The exclude file ([[.learnlog/info/exclude]]) keeps infrastructure
-files out of the log.
-We exclude [[.learnlog]] itself (to prevent recursion),
-[[__pycache__]], virtual environments, and compiled bytecode.
-If the student has a [[.learnlogignore]] file, we append its
-patterns too---this is the only configuration hook, and it is empty by
+files out of the log: [[.learnlog]] itself, [[__pycache__]] and
+compiled bytecode, virtual environments, and the files
+[[learnlog export]] writes.
+If the student has a [[.learnlogignore]] file, its patterns are
+appended---this is the only configuration hook, and it is empty by
 default.
 
-<<set up exclude patterns>>=
-exclude_dir = self.git_dir / "info"
-exclude_dir.mkdir(parents=True, exist_ok=True)
-exclude_file = exclude_dir / "exclude"
-patterns = [
-    ".learnlog",
+The first pattern carries more weight than it looks: it is the only
+thing standing between the Git directory and its own history.
+Git ignores a directory named [[.git]] by rule, but [[.learnlog]] is an
+ordinary directory to [[git add]], so anything we write inside it---the
+diagnostics log of \cref{sec:diagnostics}, a lock file, a session
+transcript---is excluded by this line and by nothing else.
+Naming it from [[GIT_DIR_NAME]] keeps the pattern and the path
+inseparable.
+
+The export patterns are there for a mistake that compounds.
+[[learnlog export]] writes its bundle into the directory it is run
+from, which is normally the work tree (\cref{sec:export}), so without
+these two lines the next run commits the bundle---and the run after
+that exports a bundle containing the previous bundle.
+Each cycle roughly doubles what the log carries, from a file the log
+already contains in full.
+
+The two export extensions are named here rather than imported from the
+modules that write them---[[cli]] and [[progsnap2]] both import this
+one, so the dependency only goes this way---and a test in [[cli]],
+which knows both default names, asserts that they still agree with
+these suffixes (\cref{sec:staged-export}).
+
+<<constants>>=
+BUNDLE_SUFFIX = ".learnlog"
+PROGSNAP2_SUFFIX = ".progsnap2"
+EXCLUDE_PATH = "info/exclude"
+EXCLUDE_PATTERNS = (
+    GIT_DIR_NAME,
     "__pycache__",
     "*.pyc",
     ".venv",
     "venv",
     "env",
-]
-ignore_file = self.workdir / ".learnlogignore"
-if ignore_file.exists():
-    patterns.extend(
-        ignore_file.read_text().splitlines()
-    )
-exclude_file.write_text(
-    "\n".join(patterns) + "\n"
+    "*" + BUNDLE_SUFFIX,
+    "*" + PROGSNAP2_SUFFIX,
 )
+LEARNLOGIGNORE_NAME = ".learnlogignore"
 @
 
-<<initial commit>>=
-self.git("add", ".")
-self.git(
-    "commit",
-    "--allow-empty",
-    "-m",
-    "learnlog: initial commit",
+Deriving the file's whole content from the patterns, rather than
+appending to whatever is there, is what makes the write idempotent:
+running it twice leaves the same file, and comparing the two answers
+the question [[is_configured]] asks.
+It also means a [[.learnlogignore]] the student edits at any point
+takes effect on the next run instead of being frozen into the file the
+first run wrote.
+
+<<repo methods>>=
+def exclude_content(self):
+    """Return the text the exclude file should hold."""
+    patterns = list(EXCLUDE_PATTERNS)
+    try:
+        extra = (
+            self.workdir / LEARNLOGIGNORE_NAME
+        ).read_text()
+    except FileNotFoundError:
+        extra = ""
+    patterns.extend(extra.splitlines())
+    return "\n".join(patterns) + "\n"
+@
+
+The new content is written beside the exclude file and moved onto it,
+because [[git add .]] reads this file and not every reader is one we
+serialise: [[learnlog git]] hands the student Git itself
+(\cref{sec:git}), and a half-written exclude file is a file that
+excludes nothing.
+[[os.replace]] within one directory is atomic, so a reader sees either
+the old list or the new one.
+
+<<swap the exclude file into place>>=
+exclude_file = self.git_dir / EXCLUDE_PATH
+exclude_file.parent.mkdir(parents=True, exist_ok=True)
+staged = exclude_file.with_name(
+    exclude_file.name + STAGED_SUFFIX
 )
+staged.write_text(self.exclude_content())
+os.replace(staged, exclude_file)
+<<constants>>=
+STAGED_SUFFIX = ".new"
+@
+
+The repository this all exists for is one learnlog did not create, so
+the tests need one.
+A clone is what a student or a teacher actually has
+(\cref{sec:clone}), and it is reproduced here the way the command
+produces it: clone the log, then move the Git directory into an
+otherwise untouched project directory.
+
+<<test functions>>=
+def clone_learnlog(source, target):
+    """Reproduce what ``learnlog clone`` leaves in ``target``."""
+    staging = target.parent / f"{target.name}-staging"
+    subprocess.run(
+        [
+            "git", "clone", "--quiet",
+            str(source / ".learnlog"), str(staging),
+        ],
+        check=True, capture_output=True,
+    )
+    target.mkdir(parents=True, exist_ok=True)
+    (staging / ".git").rename(target / ".learnlog")
+    return target
+@
+
+The first thing such a repository is missing is the exclude file, and
+what that costs is measured in the log itself: with nothing excluding
+it, the very first run stages the Git directory into its own history.
+
+<<test functions>>=
+def test_a_cloned_repository_gets_the_exclude_file(workdir):
+    """Configuration reaches a repository we did not create."""
+    LearnlogRepo(workdir)
+    target = clone_learnlog(workdir, workdir / "clone")
+    (target / "hello.py").write_text('print("hi")\n')
+
+    repo = LearnlogRepo(target)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    tracked = repo.git("ls-files").stdout
+    assert "hello.py" in tracked
+    assert ".learnlog/" not in tracked
+@
+
+The second is the signing setting, and its cost is the whole log: a
+student whose global configuration turns signing on cannot commit at
+all in a repository that does not turn it off locally.
+We build exactly that student with a global config of our own, and
+point it at a signing program that always fails, so the test asks
+whether signing was attempted rather than whether this machine happens
+to hold a usable key.
+
+<<test functions>>=
+SIGNING_GLOBAL_CONFIG = """
+[user]
+    name = Global
+    email = global@example.com
+[commit]
+    gpgsign = true
+[gpg]
+    program = false
+"""
+
+def test_a_cloned_repository_can_commit_when_signing_is_on(
+        workdir, monkeypatch):
+    """A global gpgsign must not stop a cloned log."""
+    LearnlogRepo(workdir)
+    target = clone_learnlog(workdir, workdir / "clone")
+    config = workdir / "global-gitconfig"
+    config.write_text(SIGNING_GLOBAL_CONFIG)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+    repo = LearnlogRepo(target)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert "Run-Id" in repo.git("log", "--format=%B").stdout
+@
+
+The third case needs no clone at all: it is the student who writes a
+[[.learnlogignore]] after the first run, which the old code froze out
+of the exclude file forever.
+
+<<test functions>>=
+def test_learnlogignore_applies_after_the_first_run(workdir):
+    """An ignore file written later still takes effect."""
+    LearnlogRepo(workdir)
+    (workdir / ".learnlogignore").write_text("*.csv\n")
+    (workdir / "big.csv").write_text("a,b,c\n")
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert "big.csv" not in repo.git("ls-files").stdout
+@
+
+The exported bundle is excluded by the same file, and it is worth its
+own test because it is the one pattern whose absence grows the log
+without bound---the bundle the next run commits contains the log that
+committed the bundle before it.
+
+<<test functions>>=
+def test_exports_stay_out_of_the_log(workdir):
+    """An exported bundle is not part of the code state."""
+    (workdir / "learnlog.learnlog").write_bytes(b"bundle")
+    (workdir / "learnlog.progsnap2").write_bytes(b"zip")
+    repo = LearnlogRepo(workdir)
+    tracked = repo.git("ls-files").stdout
+    assert "learnlog.learnlog" not in tracked
+    assert "learnlog.progsnap2" not in tracked
+@
+
+The initial commit stages everything the student already has, which
+makes it the largest single staging operation learnlog ever performs---a
+term's worth of files on the first run in an existing directory.
+Both halves therefore take the tree budget rather than the default one
+(\cref{sec:commit-message-stdin}).
+
+This message is a constant and would fit in [[argv]], but it still goes
+in on standard input.
+The rule \enquote{no message content in [[argv]]} is only useful if it
+holds without exception: an occurrence of [[-m]] then means a bug, and
+one [[grep]] settles it.
+
+The staging happens in a private index, the same way a run's does.
+Named indexes are how learnlog keeps concurrent snapshots apart, but
+here the point is the other one \cref{sec:git-environment} makes: the
+index Git writes must be one this module chose, and saying so in every
+place that stages leaves no path where the answer comes from
+somewhere else.
+There is nothing to seed it from---this is the first index this
+repository has---so it is built from scratch and then published as the
+shared one, which is what leaves the stat cache warm for the first run.
+
+<<initial commit>>=
+shared_index = self.git_dir / SHARED_INDEX_NAME
+with self.run_index(INITIAL_INDEX_NAME) as index_path:
+    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    self.git(
+        "commit",
+        "--allow-empty",
+        "--file=-",
+        input="learnlog: initial commit",
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    <<publish the private index as the shared one>>
+<<constants>>=
+INITIAL_INDEX_NAME = "init"
 @
 
 Let's verify that initialisation creates a working repository with
@@ -268,69 +1285,1377 @@ def test_init_is_idempotent(workdir):
     assert result.stdout.strip().count("\n") == 0
 @
 
+The constructor's change has a test of its own, and it does not need
+concurrency at all.
+An initialising process leaves [[.learnlog/]] in a state no newcomer
+can distinguish from a bare directory, and the shortest way to produce
+that state on purpose is to make the bare directory.
+A [[LearnlogRepo]] built on it must come out with a working
+repository---which also means a first run killed halfway through
+initialisation is repaired by the next one instead of poisoning the
+project.
+
+<<test functions>>=
+def test_init_completes_a_bare_git_dir(workdir):
+    """A directory with no repository in it still gets one."""
+    (workdir / ".learnlog").mkdir()
+    repo = LearnlogRepo(workdir)
+    log = repo.git("log", "--oneline").stdout
+    assert "initial commit" in log
+    assert "hello.py" in repo.git("ls-files").stdout
+@
+
+Every remaining property above holds within a single process, and the
+one this section exists for does not: it needs several processes
+reaching an empty directory together.
+Separate processes rather than threads, because the lock they contend
+on is a kernel object shared between processes, and because that is the
+situation the students are in.
+
+Each of them runs the same short program.
+It has to be started with [[python -S]], an explicit [[PYTHONPATH]] and
+[[LEARNLOG_SKIP_AUTOSTART]], for a reason specific to this test: if
+[[import learnlog]] logged its own run, the repository would be created
+during the import, before the test had a chance to line the processes
+up, and the race under test would never happen.
+
+<<test functions>>=
+CONCURRENT_INIT_SOURCE = """\
+import datetime
+import pathlib
+import sys
+import time
+
+from learnlog.gitrepo import LearnlogRepo
+
+workdir, script, deadline = sys.argv[1], sys.argv[2], sys.argv[3]
+time.sleep(max(0.0, float(deadline) - time.time()))
+
+repo = LearnlogRepo(pathlib.Path(workdir))
+repo.begin_run(script, [], datetime.datetime(2026, 1, 1, 10, 0))
+print(repo.run_id)
+repo.finalize_run(
+    io_log="",
+    exception_info=None,
+    end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+    exit_code=0,
+)
+"""
+@
+
+Lining them up is the whole difficulty.
+Interpreter startup takes far longer, and varies far more, than the
+window between \enquote{no repository here} and \enquote{initial commit
+written}, so processes merely launched in a loop would arrive one after
+another and the test would pass on the broken code.
+Each child therefore sleeps until a wall-clock instant the parent
+picked in advance, which costs one fixed delay and puts every child at
+[[LearnlogRepo]] within a scheduling quantum of the others.
+A machine too slow to reach the deadline in time only makes the test
+less concurrent, never wrong.
+
+<<test functions>>=
+CONCURRENT_INIT_PROCESSES = 4
+CONCURRENT_INIT_BARRIER_SECONDS = 0.5
+@
+
+Two things are then true of a correctly initialised log, and each of
+them fails on its own kind of damage.
+There is exactly one root commit reachable from [[HEAD]], which a
+second initial commit breaks.
+And every run contributes its id twice, once from its header commit and
+once from its trailer, which breaks when a branch update lands on top
+of a root that another process had already replaced---the commits
+survive as objects, but nothing reaches them any more.
+
+<<test functions>>=
+def test_concurrent_init_keeps_one_root_and_every_run(
+        workdir):
+    """Simultaneous first runs share one initial commit."""
+    env = os.environ.copy()
+    checkout = pathlib.Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = str(checkout / "src")
+    env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    env.pop("LEARNLOG_PROJECT_ROOT", None)
+    deadline = time.time() + CONCURRENT_INIT_BARRIER_SECONDS
+
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable, "-S", "-c",
+                CONCURRENT_INIT_SOURCE,
+                str(workdir), f"run{n}.py", str(deadline),
+            ],
+            cwd=str(workdir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for n in range(CONCURRENT_INIT_PROCESSES)
+    ]
+    run_ids = []
+    for process in processes:
+        out, err = process.communicate(timeout=60)
+        assert process.returncode == 0, err
+        run_ids.append(out.strip())
+    assert len(set(run_ids)) == CONCURRENT_INIT_PROCESSES
+
+    repo = LearnlogRepo(workdir)
+    roots = repo.git(
+        "rev-list", "--max-parents=0", "HEAD",
+    ).stdout.split()
+    assert len(roots) == 1
+    log = repo.git("log", "--format=%B").stdout
+    for run_id in run_ids:
+        assert log.count(f"Run-Id: {run_id}") == 2
+@
+
+
+\section{One run, two commits}
+\label{sec:two-commit-protocol}
+
+A run produces information at two different moments: what the student
+was about to run---the command, its arguments, and the code as it
+looked right then---and how it went---the end time, the exit code, the
+captured I/O, and any exception.
+Writing the first half down \emph{before} the program starts is what
+makes the log crash-resilient: a program killed by [[SIGKILL]] never
+reaches our exit handler, but its header is already committed.
+
+Earlier versions completed such a record with [[git commit --amend]].
+That is only correct while learnlog is the sole writer and nobody has
+seen the commit yet, and neither assumption holds:
+
+\begin{description}
+\item[Overlapping runs] [[--amend]] rewrites whatever sits at
+  \emph{HEAD}, not the commit this run created.  A program that starts
+  another logged program, a run left in the background, or a
+  [[learnlog]] command overlapping a student run all end with a
+  different commit at HEAD, so the results are appended to a stranger's
+  run block: one run looks like it crashed, the other reports someone
+  else's output.
+\item[Published history] Amending replaces a commit that
+  [[learnlog push]] may already have sent and [[learnlog tag]] may
+  already point at.  The next push is rejected as non-fast-forward, and
+  the tag is left behind on an abandoned commit.
+\item[Timestamps] An amend keeps the original author date, so runs
+  folded into one commit all share the first run's timestamp, and the
+  interval between runs (\cref{commits}) is wrong for every run but
+  that one.
+\end{description}
+
+So we never rewrite anything.
+[[begin_run]] writes a \emph{header commit} carrying a fresh run id,
+and [[finalize_run]] writes a separate \emph{trailer commit} that
+repeats that run id and carries the results.
+Each process only ever \emph{adds} a commit, and it names the run it is
+talking about instead of trusting HEAD, which is what makes the
+protocol safe under any interleaving.
+
+Folding consecutive runs of unchanged code into one commit goes away
+with the amend that implemented it: every run now gets its own header
+commit, even when it records no change at all.
+Empty commits cost a few dozen bytes---the tree is shared---and in
+exchange a run's record no longer depends on what the previous run
+wrote.
+
+The price is that [[learnlog git log]] shows two commits per run.
+Every learnlog reader---[[list]], [[play]], and the ProgSnap2
+exporter---joins the pair back into a single record by run id
+(\cref{commits}), so the two-commit structure is visible only to
+someone inspecting the Git history directly.
+
+
+\subsection{Which code state belongs to a run}
+
+The header commit also decides \emph{when} the code is snapshotted, and
+that is a second thing the old protocol got wrong: it staged the work
+tree at the end of the run, so a program that wrote [[a.out]] committed
+that binary into its own run.
+
+The code state that explains a run is the code that was executed, not
+what the execution produced.
+We therefore snapshot at the start and leave the tree alone afterwards.
+Files written during the run are not lost: the next run's snapshot
+picks them up, where they appear as a change that happened between the
+two runs---which is exactly what they are.
+If the student never runs anything again, those files never enter the
+log, and a build artefact is no loss.
+
+
+\subsection{Run identity}
+
+A run id has to be unique within one repository, and it is minted by
+processes that cannot see each other---the whole point is that they do
+not coordinate---so a counter is not an option.
+A random UUID is: 122 random bits make a collision far less likely than
+a disk error.
+
+<<functions>>=
+def new_run_id():
+    """Return a fresh run identifier.
+
+    The id links a run's header commit to its trailer commit.
+    """
+    return uuid.uuid4().hex
+@
+
+
+\subsection{Serialising commits}
+\label{sec:commit-lock}
+
+Two learnlog processes can reach [[begin_run]] at the same instant.
+Git guards its own data structures with lock files, but a losing
+command \emph{fails} ([[index.lock]] already exists) rather than
+waiting, and a dropped run is data loss.
+We would rather wait a few milliseconds, so we take an exclusive
+[[flock]] on a file in [[.learnlog/]] around each commit.
+
+The lock covers one commit operation and nothing more.
+A lock held from [[begin_run]] to [[finalize_run]] would make two
+terminals take turns \emph{running programs} instead of taking turns
+\emph{committing}---a student's program would block on another
+student's program, which breaks transparency far worse than the race it
+prevents.
+
+Repository creation takes this same lock (\cref{sec:init-repo}),
+because the initial commit is a commit that must happen exactly once
+too.
+The lock therefore means \enquote{learnlog is writing to this
+repository}, not \enquote{a run is being committed}, and that is why
+its file has to live somewhere creation can be relied on to have made:
+inside [[.learnlog/]], which [[init_repo]] creates before it takes the
+lock.
+
+[[fcntl]] does not exist on Windows.
+Rather than fail there, we degrade to no locking: the protocol is still
+append-only, and the remaining window is the one Git itself guards.
+
+<<optional locking support>>=
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+@
+
+<<repo methods>>=
+@contextlib.contextmanager
+def commit_lock(self):
+    """Hold an exclusive lock while writing one commit.
+
+    Yields the locked handle, or ``None`` where no lock could be
+    taken and the commit therefore proceeds unserialised.
+    """
+    handle = self._acquire_lock()
+    try:
+        yield handle
+    finally:
+        if handle is not None:
+            handle.close()
+@
+
+The handle comes back out of the context manager because one caller has
+to know whether the exclusion it is standing on is real
+(\cref{sec:reclaim-run-indexes}).
+For every other caller the answer changes nothing---a commit is made
+either way---but an operation that is only safe while nobody else is
+committing cannot treat \enquote{locked} and \enquote{could not lock}
+as the same situation, and [[None]] is how this method says which one
+happened.
+
+Closing the file releases the lock, which also means the kernel releases
+it if the process dies mid-commit---no stale lock can wedge the next
+run.
+Failing to acquire the lock is not worth aborting a run over, so every
+error path here returns [[None]] and the commit proceeds unserialised.
+
+Which file, though?
+[[flock]] locks the open file---the inode---and the path is only how we
+found it.
+The two mean the same thing for exactly as long as nobody replaces the
+file behind the name.
+Delete [[learnlog.lock]] while a run holds it and the name is free
+again: the next process opens the path, creates a new file there, and
+takes an exclusive lock on \emph{that} one.
+Two processes now hold the lock, on two different files, and the kernel
+is right about both.
+
+Nobody deletes that file on purpose, but plenty of housekeeping does.
+A run killed between [[git add]] and its commit leaves behind the
+[[.lock]] file Git was writing its private index through, and the
+standard advice for a stray [[.lock]] in a Git repository is to delete
+it; a student who follows that advice with a wildcard takes
+[[learnlog.lock]] along with it.
+
+The process that suffers is not the one holding the lock---it holds a
+lock on a file, and it finishes its commit---but the one that was
+\emph{waiting} inside [[flock]] while the file was replaced.
+It went to sleep on the old file and wakes up holding a lock nobody
+will ever contend for, because everybody else now opens the new one.
+So once [[flock]] returns we ask whether the file we locked is still
+the file the lock path names, and when it is not we drop it and start
+over.
+Starting over opens the path again---by then the new file---and waits
+for whoever holds that one, which is the serialisation we asked for in
+the first place.
+
+The attempts are bounded because what they wait on is somebody else's
+behaviour: something recreating the file in a loop would otherwise keep
+us here for as long as it runs, and a student's program would wait for
+it.
+Running out of attempts is answered like any other failure to
+acquire---[[None]], and the commit proceeds unserialised.
+
+<<repo methods>>=
+def _acquire_lock(self):
+    """Return a locked file handle, or ``None`` if unavailable."""
+    if fcntl is None:
+        return None
+    lock_path = self.git_dir / LOCK_FILE_NAME
+    for _ in range(LOCK_ATTEMPTS):
+        try:
+            handle = open(lock_path, "w")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            return None
+        if _is_same_file(handle, lock_path):
+            return handle
+        handle.close()
+    return None
+<<constants>>=
+LOCK_FILE_NAME = "learnlog.lock"
+LOCK_ATTEMPTS = 8
+@
+
+Inode and device number are what \enquote{the same file} means to the
+kernel, and they are the terms [[flock]] is itself defined in.
+Comparing paths would answer a question we already know the answer to,
+and comparing contents would answer none---the file is empty either
+way.
+A [[stat]] that fails means there is no file at the path at all just
+now, which is a mismatch like any other.
+
+<<functions>>=
+def _is_same_file(handle, path):
+    """Say whether ``handle`` is open on the file now at ``path``."""
+    try:
+        held = os.fstat(handle.fileno())
+        named = os.stat(path)
+    except OSError:
+        return False
+    return (held.st_ino, held.st_dev) == (named.st_ino, named.st_dev)
+@
+
+Let us replace the file underneath an acquisition and check that what
+comes back is a lock on the file the next process would open---and that
+the next process therefore cannot have it.
+Driving [[_acquire_lock]] directly, with a stand-in for [[flock]] that
+swaps the file just before it locks, turns the race into a sequence
+instead of a coincidence.
+The tests skip where [[fcntl]] does, for the same reason the module
+degrades there.
+
+<<test functions>>=
+fcntl = pytest.importorskip("fcntl")
+
+def test_lock_survives_a_recreated_lock_file(workdir, monkeypatch):
+    """A lock file swapped mid-acquisition still excludes rivals."""
+    repo = LearnlogRepo(workdir)
+    lock_path = repo.git_dir / LOCK_FILE_NAME
+    real_flock = fcntl.flock
+    swapped = []
+
+    def swap_the_file_then_lock(fd, operation):
+        if not swapped:
+            swapped.append(True)
+            lock_path.unlink(missing_ok=True)
+            lock_path.write_text("")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", swap_the_file_then_lock)
+    handle = repo._acquire_lock()
+    monkeypatch.undo()
+    assert handle is not None
+    assert os.fstat(handle.fileno()).st_ino == lock_path.stat().st_ino
+    with open(lock_path) as rival:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(rival.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    handle.close()
+@
+
+And when the file never stops moving, the loop has to give up rather
+than hold a student's program hostage to whatever keeps moving it:
+
+<<test functions>>=
+def test_lock_gives_up_on_a_file_that_keeps_moving(workdir, monkeypatch):
+    """An endlessly recreated lock file ends in no lock, not a hang."""
+    repo = LearnlogRepo(workdir)
+    lock_path = repo.git_dir / LOCK_FILE_NAME
+    real_flock = fcntl.flock
+
+    def swap_the_file_then_lock(fd, operation):
+        lock_path.unlink(missing_ok=True)
+        lock_path.write_text("")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", swap_the_file_then_lock)
+    assert repo._acquire_lock() is None
+@
+
+
+\subsection{A private index per run}
+\label{sec:private-index}
+
+Staging with [[git add .]] writes the repository's shared index.
+Two concurrent runs sharing that file do not merely collide on
+[[index.lock]]: the loser may also snapshot the winner's staged state,
+so one run's commit would carry another run's tree.
+Pointing [[GIT_INDEX_FILE]] at a per-run file makes each snapshot
+private, and Git then has nothing left to contend on.
+
+We set the variable on the environment dict that [[git]] passes to every
+command rather than threading a parameter through it, so the wrapper
+stays a plain Git runner.
+A [[LearnlogRepo]] instance serves a single run, so no two commits share
+this dict.
+
+Two files come off again when the commit is done, and it is the second
+one that makes this more than tidiness.
+Git writes an index the way it writes everything it must not corrupt:
+it creates the index's own name with [[.lock]] appended, builds the new
+index in that file, and renames it into place.
+A private index therefore has a private lock file beside it for as long
+as Git is writing it, and a run killed in that window---the window a
+[[git add .]] over a large project holds open the longest---leaves the
+pair behind.
+
+An index left behind on its own would be harmless: the name carries the
+run id, so nothing ever reuses it, and Git ignores every file in its
+directory that it did not ask for.
+Its [[.lock]] is not harmless, and what makes it dangerous is not what
+it does but what it looks like.
+A stray [[.lock]] file is the one piece of Git housekeeping every
+student eventually meets, and what they are told to do with it is
+delete it; done with a wildcard over the directory it takes
+[[learnlog.lock]] along with it, which is precisely the accident
+\cref{sec:commit-lock} goes to some trouble to survive.
+Surviving the trap is worth having, but leaving the bait out is not.
+
+<<repo methods>>=
+@contextlib.contextmanager
+def run_index(self, name):
+    """Point Git at a private index file named after the run."""
+    index_path = self.git_dir / f"{RUN_INDEX_PREFIX}{name}"
+    self.env["GIT_INDEX_FILE"] = str(index_path)
+    try:
+        yield index_path
+    finally:
+        self.env.pop("GIT_INDEX_FILE", None)
+        <<remove the private index and its lock file>>
+<<constants>>=
+RUN_INDEX_PREFIX = "index-"
+@
+
+The suffix is Git's rather than ours, and naming it once is what keeps
+the shared [[index.lock]] that the publish below takes and the private
+locks Git makes here from becoming two independent spellings of the
+same protocol.
+
+<<functions>>=
+def git_lock_path(path):
+    """Return the lock file Git writes ``path`` through."""
+    return path.with_name(path.name + GIT_LOCK_SUFFIX)
+<<constants>>=
+GIT_LOCK_SUFFIX = ".lock"
+@
+
+Removing the two is best effort in the same sense as everything else on
+this path: a run may not fail because its cleanup did.
+Best effort has never meant silent, though, so what we decline to raise
+we still write down (\cref{sec:diagnostics})---a [[.learnlog/]] that
+keeps filling up with private indexes is a symptom worth being able to
+read about afterwards.
+
+<<remove the private index and its lock file>>=
+for leftover in (index_path, git_lock_path(index_path)):
+    try:
+        leftover.unlink(missing_ok=True)
+    except OSError as error:
+        report_error(
+            "remove run index", error, self.workdir,
+        )
+@
+
+Let us kill a run inside the block---an exception is as far as a test
+can go, and it exercises the same [[finally]]---and check that neither
+file outlives it:
+
+<<test functions>>=
+def test_run_index_cleanup_removes_the_lock_file_too(workdir):
+    """A run that dies inside the block leaves neither file."""
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(RuntimeError):
+        with repo.run_index("deadbeef-begin") as index_path:
+            index_path.write_text("")
+            git_lock_path(index_path).write_text("")
+            raise RuntimeError("killed mid-add")
+    assert not index_path.exists()
+    assert not git_lock_path(index_path).exists()
+@
+
+
+\section{Where a run's commits land}
+\label{sec:recording-branch}
+
+Both commits of \cref{sec:two-commit-protocol} were made with
+[[git commit]], and that single choice handed Git two decisions this
+module has to make for itself.
+
+\subsection{A half-finished merge is not ours to finish}
+\label{sec:unfinished-operations}
+
+Learnlog is not the only writer of the log repository.
+The student drives it directly through [[learnlog git]] (\cref{cli}),
+and does so most often when moving between machines: pull, and---when
+both machines recorded runs---merge.
+A merge that stops on a conflict leaves the repository half-finished:
+[[MERGE_HEAD]] names the other side, the index holds every conflicted
+path in two or three versions at once, and Git waits for the student
+to conclude or abandon the operation.
+
+[[git commit]] is the command that concludes it.
+That is documented behaviour and students depend on it; it is simply
+not what a recorder that happens to fire in that window wants.
+Such a run committed the work tree---conflict markers and all---as a
+two-parent merge commit, cleared [[MERGE_HEAD]], and left the student
+holding a merge Git now considered finished with a resolution nobody
+had chosen.
+Cherry-pick, revert and rebase park their state in the same place and
+came apart in the same way; the cherry-pick even lent the run header
+the author date of the commit being picked, so the record was
+timestamped wrong as well.
+
+What fixes this is the mechanism rather than a check.
+[[git commit-tree]] builds a commit from a tree and the parents we
+name, so there is no rule by which it could adopt [[MERGE_HEAD]] as a
+second parent, and it cleans nothing up afterwards.
+The student's half-finished operation survives the run exactly as they
+left it.
+
+A rebase is the honest limit of this, because it is the operation that
+rewrites the branch rather than adding to it: commits a run makes
+while one is in progress land on the branch as it stands, and the
+rebase then replaces that branch with its own result.
+The run record is lost and the student's rebase is not, which is the
+right way round---a recorder that survived by interfering is the
+failure this section is about.
+
+\subsection{A run belongs to the branch, not to [[HEAD]]}
+
+Git's other decision is where the commit goes: [[git commit]] moves
+whatever [[HEAD]] points at.
+That is right for a person and wrong for us, because [[HEAD]] is
+another thing the student can move.
+[[learnlog git checkout HEAD~4]] is a natural way to look at what a
+program used to be, and it detaches [[HEAD]].
+Runs recorded afterwards piled onto that detached head: the branch
+never moved, so nothing that reads the branch saw them; and since
+[[learnlog push]] sends [[refs/heads/*]], it pushed none of them.
+The only thing keeping them alive was the reflog.
+
+[[git commit-tree]] moves no ref at all.
+We move one ourselves, by name, with [[git update-ref]], and the name
+is the branch the log is recorded on rather than wherever [[HEAD]]
+happens to be pointing.
+Re-attaching [[HEAD]] would have been the other way to make the branch
+move again, and we deliberately do not: the student asked to stand at
+an older commit, and a recorder that undoes an explicit checkout is
+interfering with the very work it exists to observe.
+A run made from a detached head is recorded on the branch, [[HEAD]]
+stays where the student put it, and the two facts are independent.
+
+\subsection{Which branch that is}
+
+Ordinarily it is the branch [[HEAD]] points at, and
+[[git symbolic-ref]] names it in full.
+Asking per commit rather than remembering the answer is what lets a
+student who works on a branch of their own have their runs recorded
+there, which is what making a branch asks for.
+
+When [[HEAD]] is detached there is no such answer, so we ask the refs
+instead: among the repository's branches, the one committed to most
+recently is the one the log has been growing on, because a log grows
+one run at a time and nothing else commits here.
+Learnlog never makes a second branch---[[init]] and [[clone]] leave
+exactly one, whatever it is called---so the sort only has to choose
+between branches the student made.
+A repository with no branch left at all is past guessing; there we
+fall back to [[HEAD]] and record the run where the old code did.
+
+This is also why the branch is discovered rather than assumed: a
+[[.learnlog]] made by [[git init]] and one made by [[git clone]] from
+a classmate's remote need not agree on what the branch is called, and
+neither has to match this machine's [[init.defaultBranch]].
+
+<<repo methods>>=
+def recording_branch(self):
+    """Return the full ref of the branch runs are recorded on.
+
+    That is the branch ``HEAD`` points at or, when ``HEAD`` is
+    detached, the branch carrying the log's most recent commit.
+    """
+    head = self.git(
+        "symbolic-ref", "--quiet", "HEAD", check=False,
+    )
+    if head.returncode == 0 and head.stdout.strip():
+        return head.stdout.strip()
+    <<name the branch the log grew on>>
+@
+
+Both probes run with [[check=False]], and they are the successors of
+the ones \cref{sec:init-repo} counts: a detached [[HEAD]] is not a
+failure of [[symbolic-ref]] but the answer we came for, and a
+repository with no branches is likewise information rather than
+trouble.
+
+<<name the branch the log grew on>>=
+listing = self.git(
+    "for-each-ref", "--count=1", "--sort=-committerdate",
+    "--format=%(refname)", "refs/heads/", check=False,
+)
+return listing.stdout.strip() or "HEAD"
+@
+
+\subsection{Adding one commit to a branch}
+\label{sec:commit-on-branch}
+
+Three commands replace the one: a [[rev-parse]] reads the tip the new
+commit will build on, [[commit-tree]] writes the commit object, and
+[[update-ref]] moves the branch to it.
+
+Naming the parent turns the append-only protocol of
+\cref{sec:two-commit-protocol} from something inherited into something
+stated---and, more usefully, into something checkable.
+[[git update-ref]] takes the value the ref is expected to still have
+and refuses to move it otherwise.
+Every learnlog commit holds the lock of \cref{sec:commit-lock}, so the
+only writer that guard can catch is the student's own Git: a
+[[learnlog git commit]] or [[learnlog git pull]] landing between our
+two commands.
+Losing a run to that would be the wrong answer, so we read the tip
+again and rebuild the commit on top of whatever they wrote.
+
+<<repo methods>>=
+def commit_on_branch(self, branch, tree, message):
+    """Add a commit holding ``tree`` to the end of ``branch``.
+
+    ``tree`` may be any tree-ish; it is resolved afresh on each
+    attempt, so a caller may name it relative to the branch.
+    ``message`` becomes the commit message verbatim.  Returns the
+    new commit's hash.
+    """
+    if not message.endswith("\n"):
+        message += "\n"
+    for _ in range(BRANCH_UPDATE_ATTEMPTS):
+        <<build one commit and try to move [[branch]] to it>>
+    raise GitError(update, moved.returncode, moved.stderr)
+<<constants>>=
+BRANCH_UPDATE_ATTEMPTS = 3
+@
+
+Re-resolving [[tree]] on every attempt is what makes the retry safe
+for a caller that names a tree relative to the branch: the trailer of
+\cref{sec:finalising-a-run} wants \emph{the tree at the end of the
+log}, and after a lost race that is a different tree than it was.
+A caller passing a concrete hash gets the same hash each time, so the
+two kinds of caller need no second method.
+
+An attempt that exhausts the retries raises rather than returning
+quietly, because the caller is a run that has just been recorded
+half-way; \cref{sec:diagnostics} is where that ends up.
+
+<<build one commit and try to move [[branch]] to it>>=
+parent = self.branch_tip(branch)
+commit = self.git(
+    "commit-tree", tree, *(("-p", parent) if parent else ()),
+    input=message,
+).stdout.strip()
+update = (
+    "update-ref", "-m", RUN_REFLOG_MESSAGE,
+    branch, commit, parent or "",
+)
+moved = self.git(*update, check=False)
+if moved.returncode == 0:
+    return commit
+<<constants>>=
+RUN_REFLOG_MESSAGE = "learnlog: record run"
+@
+
+The empty string is how [[update-ref]] is told that the ref must not
+exist yet, so the same call covers the first commit on a branch and
+every one after it.
+Neither command needs the tree budget of
+\cref{sec:commit-message-stdin}: [[commit-tree]] writes one object and
+[[update-ref]] writes one ref, and neither walks the work tree however
+large the project is.
+
+The reflog message is a constant.
+It carries no message text, which keeps it clear of the argument-size
+limit that put commit messages on standard input, and the commit it
+describes says which half of which run it is anyway.
+
+<<repo methods>>=
+def branch_tip(self, branch):
+    """Return the commit ``branch`` points at, or ``None``."""
+    probe = self.git(
+        "rev-parse", "--verify", "--quiet", branch, check=False,
+    )
+    return probe.stdout.strip() or None
+@
+
+\subsection{What [[git commit]] did that we now do not}
+
+[[commit-tree]] is plumbing, so it is worth being explicit about what
+stops happening around the commit.
+Identity is not among it: the same [[user.name]] and [[user.email]]
+apply, so a run is still authored by the student
+(\cref{sec:init-repo}).
+Signing is: [[commit.gpgsign]] is a porcelain setting and plumbing
+never consults it.
+Initialisation switches signing off in any case, so nothing changes in
+practice---but it changes from a setting that could be switched back
+into a property of the mechanism.
+
+Message cleanup goes too.
+[[git commit]] strips trailing whitespace, collapses runs of blank
+lines and drops leading and trailing ones; the trailer sends the
+program's captured output through that filter, so a program printing
+two blank lines had one recorded.
+Verbatim is what a log of program output ought to be, which makes this
+the second thing the change improves by accident---the first being the
+cherry-picked author date above.
+The one thing we add is a closing newline when the message lacks one,
+because a commit object without it makes [[git log]] run the following
+line into the message.
+
+Finally, the reflog: [[update-ref]] writes one, so the safety net that
+kept the lost commits of the detached-head case findable is still
+there for the commits that now do not need it.
+
 
 \section{Beginning a run}
+\label{sec:beginning-a-run}
 
-At the start of each program execution, [[begin_run]] stages all files
-and creates (or amends) a commit with the run header.
+At the start of each program execution, [[begin_run]] snapshots the work
+tree and commits it together with the run header.
 
-The key decision is what to do when no files have changed since the last
-run.
-If the student runs the same program twice without editing anything,
-we do not want a new empty commit---that would clutter the log with
-duplicate snapshots.
-Instead, we amend the previous commit to append a new run block.
-This groups consecutive runs of identical code into a single commit,
-which is what you want when reviewing the log.
-
-When files \emph{have} changed, we create a fresh commit.
-The diff in that commit shows exactly what the student modified between
-runs.
+Whether the code changed is no longer part of that: every run gets its
+own header commit (\cref{sec:two-commit-protocol}), so the
+[[git diff --cached --quiet]] probe that this section used to describe
+as one of the places in this module where a non-zero exit is data
+rather than trouble went away with the commit folding it served.
+The probes that fill its place are the ref lookups of
+\cref{sec:recording-branch}.
 
 <<repo methods>>=
 def begin_run(self, script, args, start_time):
     """Record the start of a program run.
 
-    Stages all files.  If there are changes, creates a new commit
-    with the run header.  If no files changed, amends the previous
-    commit to append a new run block.
+    Snapshots the current code state and commits it with the run
+    header, which carries the run id that :meth:`finalize_run`
+    will refer back to.
 
-    Returns the run header string (needed by :meth:`finalize_run`).
+    Returns the run header string.
     """
-    header = format_run_header(script, args, start_time)
+    self.run_id = new_run_id()
+    self.run_script = script
+    self.run_args = list(args)
+    header = format_run_header(
+        script, args, start_time, self.run_id,
+    )
 
-    self.git("add", ".")
-    diff = self.git("diff", "--cached", "--quiet")
-    has_changes = diff.returncode != 0
-
-    if has_changes:
-        self.git("commit", "-m", header)
-    else:
-        <<amend previous commit with new run block>>
+    with self.commit_lock() as lock:
+        <<commit the code state with the run header>>
 
     return header
 @
 
-To amend, we read the existing commit message, add a separator, and
-append the new run header.
-On the very first run (the initial commit), this produces a commit
-message with both the initial-commit line and the run header.
+The commit is always made, including for the common case where the
+student re-runs unchanged code: [[commit-tree]] has no notion of an
+empty commit to refuse, so the [[--allow-empty]] that used to say so
+has nothing left to say.
+The tree is the work tree as it looks now, which is the state the
+program is about to execute, and [[git write-tree]] turns the staged
+index into the object [[commit_on_branch]] needs
+(\cref{sec:commit-on-branch}).
 
-<<amend previous commit with new run block>>=
-existing = self.git(
-    "log", "-1", "--format=%B"
-).stdout.rstrip("\n")
-combined = existing + "\n\n---\n\n" + header
+<<commit the code state with the run header>>=
+branch = self.recording_branch()
+self.reclaim_run_indexes(lock)
+with self.run_index(f"{self.run_id}-begin") as index_path:
+    <<seed the private index from the shared one>>
+    unfinished = self.unfinished_operation()
+    if unfinished:
+        <<clear the half-finished operation from the private index>>
+    self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    tree = self.git(
+        "write-tree", timeout=GIT_TREE_TIMEOUT,
+    ).stdout.strip()
+    self.commit_on_branch(branch, tree, header)
+    if not unfinished:
+        <<publish the private index as the shared one>>
+@
+
+\subsection{Indexes a killed run left behind}
+\label{sec:reclaim-run-indexes}
+
+The [[finally]] of \cref{sec:private-index} covers a run that dies of
+something Python can see.
+It covers nothing of a run that is killed outright: [[SIGKILL]] is not
+deliverable, the interpreter never reaches another line, and the index
+and its lock stay on disk with nobody left to remove them.
+That is the case a student actually meets---a program stopped from the
+window manager, a terminal closed, a container torn down---so some
+later run has to do it instead.
+
+Sweeps like this one live or die on how they decide which files are
+finished with, and the usual instruments are guesses.
+An age threshold has to name a duration that nothing legitimate
+exceeds, and there is none to name here: a seeded index carries the
+modification time of the index it was copied from
+(\cref{sec:stat-cache}), so its age says nothing at all about the run
+holding it.
+A naming convention proves only who created a file, never whether they
+are done with it.
+
+There is a fact available instead of a guess.
+A private index exists only inside a [[run_index]] block; both blocks
+in this module---the initial commit (\cref{sec:init-repo}) and the
+header commit above---run inside a [[commit_lock]]
+(\cref{sec:commit-lock}); and the kernel drops that lock however its
+holder dies, killed or not.
+A process that holds the commit lock is therefore looking at a
+directory in which no [[run_index]] block is live anywhere, so every
+file the prefix matches is a leftover.
+Nothing has to be timed, and nothing has to be assumed about how the
+owner died.
+
+That is a constraint on future call sites as much as an observation
+about the present ones.
+A [[run_index]] opened outside the commit lock would be a private index
+this sweep is entitled to delete while Git is writing it, and the
+damage would not be a lost run but a wrong one: [[git write-tree]] over
+an index that has gone missing writes the empty tree, and the header
+commit would record a project with no files in it.
+
+Which is why the sweep is handed the lock rather than told to take one.
+[[_acquire_lock]] answers \enquote{no lock} the same way it answers
+every other failure---with [[None]]---so a method that took its own
+could not tell holding the lock from having given up on it, and giving
+up is precisely when it must not sweep.
+Requiring the handle makes the precondition something the caller has to
+produce.
+Where [[fcntl]] is missing it is [[None]] always, and that platform
+keeps its leftovers rather than gambling with them, which is the trade
+every other user of this lock makes.
+
+One case is left over: a run that could not take the lock and made an
+index anyway.
+It is already committing unserialised (\cref{sec:commit-lock}), and it
+now also runs without the cover that holding the lock is what conveys.
+What answers it is how narrow the case is.
+[[_acquire_lock]] comes back empty-handed only where the filesystem
+refuses the lock outright---in which case nothing here sweeps either---
+or where something is recreating [[learnlog.lock]] faster than
+[[LOCK_ATTEMPTS]] tries can catch it, and that is not a repository in
+which any of the guarantees hanging off this lock still hold.
+
+<<repo methods>>=
+def reclaim_run_indexes(self, lock):
+    """Remove private index files that killed runs left behind.
+
+    Does nothing unless ``lock`` is a held commit lock: without
+    one, a file found here may belong to a run that is writing
+    it right now.
+    """
+    if lock is None:
+        return
+    for leftover in sorted(
+        self.git_dir.glob(f"{RUN_INDEX_PREFIX}*")
+    ):
+        try:
+            leftover.unlink(missing_ok=True)
+        except OSError as error:
+            report_error(
+                "reclaim run index", error, self.workdir,
+            )
+@
+
+One glob finds both halves of a pair, because Git appends its suffix to
+the index's own name and the prefix is still at the front of the
+result.
+The shared index and its lock are [[index]] and [[index.lock]], and the
+prefix matches neither---the hyphen that made the private names
+readable is what keeps them out of reach here.
+A file that disappears between the listing and the unlink is not a
+failure but a run's own [[finally]] having got there first, which is
+why it is asked for with [[missing_ok]] rather than reported.
+Anything else is reported and the sweep goes on, so one file that
+cannot be removed does not keep the others.
+
+The call sits at the top of the header commit, inside the lock and
+before this run makes an index of its own, which is what lets
+\enquote{every file the prefix matches} be read without an exception
+for ours.
+
+Let us leave behind what a killed run leaves behind---an index and the
+lock Git was writing it through---and check that the next run clears
+both:
+
+<<test functions>>=
+def test_a_run_reclaims_what_a_killed_run_left(workdir):
+    """A run sweeps the index files an earlier kill left."""
+    repo = LearnlogRepo(workdir)
+    orphan = repo.git_dir / f"{RUN_INDEX_PREFIX}deadbeef-begin"
+    orphan.write_text("")
+    git_lock_path(orphan).write_text("")
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    assert not orphan.exists()
+    assert not git_lock_path(orphan).exists()
+@
+
+Without the lock the same files are none of our business, and the sweep
+has to leave them exactly as it found them:
+
+<<test functions>>=
+def test_reclaim_without_the_lock_touches_nothing(workdir):
+    """No lock means no way to tell a leftover from a live run."""
+    repo = LearnlogRepo(workdir)
+    live = repo.git_dir / f"{RUN_INDEX_PREFIX}live-begin"
+    live.write_text("")
+    git_lock_path(live).write_text("")
+    repo.reclaim_run_indexes(None)
+    assert live.exists()
+    assert git_lock_path(live).exists()
+@
+
+The property the whole argument rests on needs a second process, since
+the lock it turns on is a kernel object shared between processes and
+not between threads of one.
+The roles are split across the two: here we are the run in progress,
+holding the commit lock with a private index of our own on disk, and
+there is a second run started into exactly that situation.
+A whole run rather than a bare call to the sweep, because where the
+call sits is half of what is under test---a sweep moved outside the
+lock, or one that stopped asking for it, would still pass a test that
+called it correctly by hand.
+
+The child announces itself once its imports are done, which keeps
+interpreter startup---by far the most variable thing in this test---out
+of the window we measure.
+After that a run that swept without the lock would need milliseconds to
+take the pair.
+So two things are asked at once: that the child is still running a
+second later, and that both files are still there.
+Then the lock comes off, and the same child is expected to finish and
+to have taken both files with it.
+
+<<test functions>>=
+RECLAIM_SWEEP_SOURCE = """\
+import datetime
+import pathlib
+import sys
+
+from learnlog.gitrepo import LearnlogRepo
+
+print("ready", flush=True)
+repo = LearnlogRepo(pathlib.Path(sys.argv[1]))
+repo.begin_run(
+    "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+)
+"""
+RECLAIM_BLOCKED_SECONDS = 1.0
+@
+
+<<test functions>>=
+def test_a_live_runs_index_survives_the_reclaim(workdir):
+    """The sweep waits for the lock a run in progress holds."""
+    repo = LearnlogRepo(workdir)
+    live = repo.git_dir / f"{RUN_INDEX_PREFIX}live-begin"
+    live.write_text("")
+    git_lock_path(live).write_text("")
+    env = os.environ.copy()
+    checkout = pathlib.Path(__file__).resolve().parents[2]
+    env["PYTHONPATH"] = str(checkout / "src")
+    env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    env.pop("LEARNLOG_PROJECT_ROOT", None)
+
+    with repo.commit_lock() as lock:
+        assert lock is not None
+        sweeper = subprocess.Popen(
+            [
+                sys.executable, "-S", "-c",
+                RECLAIM_SWEEP_SOURCE, str(workdir),
+            ],
+            cwd=str(workdir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert sweeper.stdout.readline() == "ready\n"
+        with pytest.raises(subprocess.TimeoutExpired):
+            sweeper.wait(timeout=RECLAIM_BLOCKED_SECONDS)
+        assert live.exists()
+        assert git_lock_path(live).exists()
+
+    _, err = sweeper.communicate(timeout=60)
+    assert sweeper.returncode == 0, err
+    assert not live.exists()
+    assert not git_lock_path(live).exists()
+@
+
+\subsection{Keeping the stat cache warm}
+\label{sec:stat-cache}
+
+An index is also a stat cache: Git re-hashes a file only when its
+[[stat]] data differs from what the index recorded.
+Starting each run from an empty index would therefore re-read the whole
+project on every run, so we seed the private index with a copy of the
+shared one, and move it back afterwards.
+Moving it back keeps the cache warm for the next run and keeps
+[[learnlog git status]] honest---an index left behind at repository
+initialisation would report every later commit as unstaged work.
+
+The copy has to carry the index's own modification time with it, and
+that is not tidiness: it is what keeps the cache from lying.
+Git compares file times at whole-second resolution, so an edit that
+lands in the same second as the one the index recorded, and happens not
+to change the file's size, is invisible to that comparison.
+What saves Git is the \emph{racily clean} rule: an entry whose recorded
+time is not older than the index's own modification time may have been
+written after the index was, so Git re-reads the file instead of
+trusting its [[stat]] data.
+Since Git writes the index only after it has stat'ed the file, that
+rule covers precisely the window the second-resolution comparison is
+blind to.
+
+Copying with a plain [[copyfile]] stamps the new index with the present
+moment.
+Once that moment falls in a later second than the entry's recorded
+time---which it does as soon as a second boundary passes between the
+run that wrote the cache and the run that reads it---the rule no longer
+fires, and the second-resolution comparison is left to answer alone.
+A student who edits a file and re-runs it within one second, which is
+the ordinary edit--run rhythm this tool exists to record, then gets a
+header commit holding the code from \emph{before} the edit.
+This is measured, not feared: in a loop that ran, edited by the same
+number of bytes, and ran again, [[copyfile]] recorded the stale version
+five times in four hundred sequences, and preserving the timestamp
+recorded it none in twelve hundred.
+[[shutil.copy2]] copies the modification time along with the contents,
+which makes the private index behave like the shared one it stands in
+for---all the rule ever assumed.
+
+Seeding remains best-effort, but \enquote{best effort} has to mean
+\emph{no cache} rather than \emph{a bad one}.
+A copy that fails part-way leaves a truncated file Git cannot read at
+all, and one whose timestamp did not survive is the silent-wrong-data
+case above.
+So a failed seeding removes what it made, and [[git add .]] rebuilds
+the cache from nothing: that costs one re-read of the project and
+nothing else.
+
+<<seed the private index from the shared one>>=
+shared_index = self.git_dir / SHARED_INDEX_NAME
+try:
+    shutil.copy2(shared_index, index_path)
+except OSError:
+    index_path.unlink(missing_ok=True)
+@
+
+Moving the index back is a write to [[.learnlog/index]], and that file
+comes with a protocol we were ignoring.
+Every Git command that writes the index first creates
+[[.learnlog/index.lock]] with [[O_EXCL]], builds the new index there,
+and renames it into place; the [[O_EXCL]] is what makes a second writer
+fail loudly instead of interleaving.
+A bare [[os.replace]] takes part in none of it.
+Run alongside a [[learnlog git add]] the student typed, both writers
+prepare a whole index out of what they read, and whichever [[rename]]
+lands second is the one that survives---the other's work is gone, with
+nothing anywhere to say so.
+
+So we take the lock Git would have taken.
+Creating [[index.lock]] with [[O_CREAT]] and [[O_EXCL]] \emph{is} the
+protocol: holding it is what makes a concurrent Git command fail rather
+than interleave, and failing to create it is how a concurrent Git
+command tells us it is already writing the index.
+Readers take no lock at all, and need none: we still install the file
+with a single [[rename]], so a reader sees the old index or the new
+one, never a half-written one.
+
+A lock we cannot get means we skip the publish, and that is a choice
+rather than a resignation---but only when \enquote{cannot get} means
+what we think it means.
+[[O_EXCL]] refuses for exactly one reason we planned for, and
+[[FileExistsError]] is that reason spelled out: somebody else is
+writing the index.
+Every other way [[open]] can fail here---a read-only [[.learnlog/]], a
+full disk, a directory that has been pulled out from under us---is a
+failure this module is not entitled to read as a busy neighbour, and
+catching them together made all of them look like one.
+Separating them costs one [[except]] clause and buys the difference
+between a design decision and a defect (\cref{sec:diagnostics}).
+The same holds below for the [[rename]] and for taking the lock file
+off again: neither has a benign reading at all, so neither may pass
+without a line in the log.
+The skip itself stays silent, because a diagnostic for the case we
+designed for would only teach whoever reads the log to ignore the file.
+
+
+What we are publishing is a stat cache and nothing more---the header
+commit is already made, out of the private index, and stands whatever
+happens here.
+Losing the cache costs the next run one [[git add .]] that re-reads the
+project, which is what the first run does anyway.
+Waiting for the lock would trade that cost for making a student's
+program wait on the student's own Git command, and
+\cref{sec:commit-lock} has already said what we think of that trade.
+
+The lock file has to come off again in every case, because left behind
+it is not our problem but the student's: the next [[git add]] in that
+repository fails with \enquote{Unable to create index.lock}, and a
+repository that refuses to stage anything is exactly the damage this
+tool must never do.
+Hence the [[finally]]---and hence that only the process whose
+[[O_EXCL]] succeeded removes it.
+Removing a lock we found rather than made would hand the index to two
+writers at once, which is the one thing the lock is there to prevent.
+
+<<publish the private index as the shared one>>=
+shared_lock = self.git_dir / SHARED_INDEX_LOCK_NAME
+try:
+    lock_fd = os.open(shared_lock, INDEX_LOCK_FLAGS, 0o666)
+except FileExistsError:
+    pass
+except OSError as error:
+    report_error("take index lock", error, self.workdir)
+else:
+    <<move the index into place and drop the lock>>
+<<constants>>=
+SHARED_INDEX_NAME = "index"
+SHARED_INDEX_LOCK_NAME = SHARED_INDEX_NAME + GIT_LOCK_SUFFIX
+INDEX_LOCK_FLAGS = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+@
+
+<<move the index into place and drop the lock>>=
+try:
+    os.replace(index_path, shared_index)
+except OSError as error:
+    report_error("publish run index", error, self.workdir)
+finally:
+    os.close(lock_fd)
+    try:
+        shared_lock.unlink()
+    except OSError as error:
+        report_error(
+            "release index lock", error, self.workdir,
+        )
+@
+
+Let us hold [[index.lock]] the way a Git command would, and check that
+the run is recorded all the same and the student's index is left as it
+was:
+
+<<test functions>>=
+def test_publish_skipped_while_the_index_lock_is_held(workdir):
+    """A locked index is left alone; the run is recorded anyway."""
+    repo = LearnlogRepo(workdir)
+    shared = repo.git_dir / SHARED_INDEX_NAME
+    lock = repo.git_dir / SHARED_INDEX_LOCK_NAME
+    before = shared.read_bytes()
+    lock.write_text("")
+    (workdir / "extra.py").write_text("x = 1\n")
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert f"Run-Id: {repo.run_id}" in msg
+    assert shared.read_bytes() == before
+    assert lock.exists()
+@
+
+With nobody holding the lock the publish goes through, and---just as
+important---leaves no lock file behind for the student's next
+[[git add]] to trip over.
+Staging a file at the end of the test is how we ask about both at once:
+it fails if what we published is not an index Git will read, and it
+fails if a lock of ours is still in the way.
+
+<<test functions>>=
+def test_publish_replaces_the_index_and_leaves_no_lock(workdir):
+    """A publish that runs unopposed also cleans up after itself."""
+    repo = LearnlogRepo(workdir)
+    shared = repo.git_dir / SHARED_INDEX_NAME
+    before = shared.read_bytes()
+    (workdir / "extra.py").write_text("x = 1\n")
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    assert shared.read_bytes() != before
+    assert not (repo.git_dir / SHARED_INDEX_LOCK_NAME).exists()
+    repo.git("add", "extra.py")
+@
+
+The two outcomes have to be distinguishable from outside, and the only
+place they can be told apart is the log.
+A [[rename]] that fails is the one failure here with no benign reading,
+so a run that hits it stays a recorded run---the header commit was made
+before any of this---and says so where somebody can find it later:
+
+<<test functions>>=
+def test_a_failed_publish_is_recorded_in_the_errors_log(
+        workdir, monkeypatch
+):
+    """A rename that fails is a defect, not a design decision."""
+    repo = LearnlogRepo(workdir)
+
+    def refuse(*args, **kwargs):
+        raise OSError("no room on device")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    monkeypatch.undo()
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert f"Run-Id: {repo.run_id}" in msg
+    log = (repo.git_dir / ERRORS_LOG_NAME).read_text()
+    assert "publish run index" in log
+    assert "no room on device" in log
+@
+
+Whereas the skip we designed for writes nothing at all.
+Asking for the log file to be absent rather than merely unchanged is
+the stronger question: a log that exists is a log somebody will read,
+and the first entry in it should never be one that means everything is
+fine.
+
+<<test functions>>=
+def test_the_skipped_publish_says_nothing(workdir):
+    """The lock-held skip is expected, so it stays silent."""
+    repo = LearnlogRepo(workdir)
+    (repo.git_dir / SHARED_INDEX_LOCK_NAME).write_text("")
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    assert not (repo.git_dir / ERRORS_LOG_NAME).exists()
+@
+
+
+\subsection{Snapshotting around a half-finished operation}
+
+Seeding brings more than the stat cache across when the student is in
+the middle of a merge (\cref{sec:unfinished-operations}).
+The index a conflicted merge leaves behind holds each conflicted path
+in several versions with no decision between them, and
+[[git write-tree]]---which is how the staged index becomes the tree we
+commit---refuses to write anything at all while that is so.
+
+[[git add .]] would resolve most of it on the way past: staging a file
+replaces its unmerged entries with the one version now in the work
+tree.
+Depending on that is the wrong bet twice over.
+It makes the header commit contingent on [[git add]] reaching every
+conflicted path, and a path it does not reach costs the run its
+header; and it leaves the base of the snapshot to be decided by
+accident.
+
+[[read-tree --reset]] settles both.
+It is the form that discards unmerged entries instead of failing on
+them, and what it reads in is the recording branch's tree, so the
+snapshot demonstrably starts from the last thing the log recorded and
+[[git add .]] then brings it up to the work tree exactly as it does on
+any other run.
+
+The other half is what must \emph{not} happen.
+Publishing this index as the shared one would hand the student back an
+index in which Git considers their conflict resolved---the same damage
+as the merge commit of \cref{sec:unfinished-operations}, done to the
+index instead of to the history.
+So during a half-finished operation the copy stays private and is
+thrown away with the rest, at the price of one cold cache on the next
+run, and the merge the student is in the middle of---[[MERGE_HEAD]],
+the message, the unmerged index, the work tree---is left as they left
+it.
+
+The work tree we do read, and we record what is there: conflict
+markers included.
+That is the code the program ran, and
+\cref{sec:two-commit-protocol}'s answer to which code state belongs to
+a run has no exception for code the student is unhappy with.
+Recording the pre-merge state instead would be the misleading
+option---it would show a run failing on a syntax error in a file that,
+as recorded, contains no syntax error.
+
+<<clear the half-finished operation from the private index>>=
 self.git(
-    "commit", "--amend", "--allow-empty",
-    "-m", combined,
+    "read-tree", "--reset", branch, timeout=GIT_TREE_TIMEOUT,
+)
+report_error(
+    "begin_run",
+    UnfinishedOperation(
+        f"{unfinished} in {self.git_dir}: recorded the run "
+        f"without touching it"
+    ),
+    self.workdir,
 )
 @
 
-Let's verify both the new-commit and amend paths:
+The diagnostic is the transparency half of the decision: a run that
+quietly behaves differently is worse than one that says so, and
+[[.learnlog/errors.log]] is where learnlog says the things it must not
+say on the student's terminal (\cref{sec:diagnostics}).
+That channel renders the exception's type name, which is what a class
+of our own buys here: a line naming an unfinished operation rather
+than a line naming [[RuntimeError]].
+It is never raised.
+
+<<classes>>=
+class UnfinishedOperation(RuntimeError):
+    """A Git operation was left in progress in the log repository.
+
+    Reported, never raised: a run records itself around a merge,
+    cherry-pick, revert or rebase rather than disturbing it.
+    """
+@
+
+Git parks that state in files whose names are part of its
+interface---[[git status]] reads the same ones to tell the student
+what is in progress---so asking the filesystem answers the question
+without a subprocess at all.
+
+<<repo methods>>=
+def unfinished_operation(self):
+    """Return the name of a Git operation left in progress.
+
+    ``None`` when the repository is not in the middle of a merge,
+    cherry-pick, revert or rebase.
+    """
+    for name in UNFINISHED_OPERATION_FILES:
+        if (self.git_dir / name).exists():
+            return name
+    return None
+<<constants>>=
+UNFINISHED_OPERATION_FILES = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+)
+@
+
+Let's verify that each run gets its own commit, that the header
+carries the run id and the arguments, and that the snapshot is the code
+as it was when the run started:
 
 <<test functions>>=
-def test_begin_run_new_commit_on_file_change(workdir):
+def test_begin_run_commits_on_file_change(workdir):
     repo = LearnlogRepo(workdir)
     (workdir / "hello.py").write_text('print("changed")\n')
     now = datetime.datetime.now()
@@ -339,25 +2664,30 @@ def test_begin_run_new_commit_on_file_change(workdir):
     lines = result.stdout.strip().split("\n")
     assert len(lines) == 2  # initial + run
 
-def test_begin_run_amends_on_no_change(workdir):
+def test_begin_run_commits_without_file_change(workdir):
+    """Unchanged code still gets its own header commit."""
     repo = LearnlogRepo(workdir)
     now = datetime.datetime.now()
     repo.begin_run("hello.py", [], now)
     result = repo.git("log", "--oneline")
     lines = result.stdout.strip().split("\n")
-    assert len(lines) == 1  # amended initial
+    assert len(lines) == 2  # initial + run
 
-def test_begin_run_two_runs_no_change_single_commit(workdir):
+def test_begin_run_two_runs_two_commits(workdir):
+    """Two runs of identical code are two separate records."""
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t1)
+    first = repo.git("rev-parse", "HEAD").stdout.strip()
     repo.begin_run("hello.py", ["--verbose"], t2)
     result = repo.git("log", "--oneline")
     lines = result.stdout.strip().split("\n")
-    assert len(lines) == 1
-    msg = repo.git("log", "-1", "--format=%B").stdout
-    assert "---" in msg  # separator between runs
+    assert len(lines) == 3
+    parent = repo.git(
+        "rev-parse", "HEAD^"
+    ).stdout.strip()
+    assert parent == first  # first record untouched
 
 def test_begin_run_header_includes_args(workdir):
     repo = LearnlogRepo(workdir)
@@ -366,6 +2696,13 @@ def test_begin_run_header_includes_args(workdir):
     msg = repo.git("log", "-1", "--format=%B").stdout
     assert "arg1 arg2" in msg
 
+def test_begin_run_header_includes_run_id(workdir):
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime.now()
+    repo.begin_run("hello.py", [], now)
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert f"Run-Id: {repo.run_id}" in msg
+
 def test_begin_run_new_commit_after_edit(workdir):
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
@@ -373,9 +2710,65 @@ def test_begin_run_new_commit_after_edit(workdir):
     (workdir / "hello.py").write_text('print("v2")\n')
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t2)
-    result = repo.git("log", "--oneline")
-    lines = result.stdout.strip().split("\n")
-    assert len(lines) == 2
+    result = repo.git("show", "HEAD:hello.py")
+    assert result.stdout == 'print("v2")\n'
+@
+
+A stat cache that lies is silent, so the seeding above gets a test that
+reproduces the lie on purpose.
+Three things have to line up for it: the two versions must be the same
+size, the edit must land in the same second as the version the index
+recorded, and the run that reads the cache must start after that second
+has passed---otherwise the racily clean rule fires and the bug hides.
+Waiting for a second boundary twice arranges all three.
+The first wait gives the write--run--edit sequence a whole fresh second
+to fit inside, and the second wait moves the run that reads the cache
+out of that second.
+
+<<test functions>>=
+def _wait_for_the_next_second():
+    """Block until the clock crosses into the next second."""
+    deadline = int(time.time()) + 1
+    while time.time() < deadline:
+        time.sleep(0.005)
+
+def test_begin_run_stages_edit_within_one_second(workdir):
+    """A same-size edit inside one time granule is still staged."""
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    _wait_for_the_next_second()
+    script.write_text('print("v1")\n')
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    script.write_text('print("v2")\n')
+    _wait_for_the_next_second()
+    repo.begin_run("hello.py", [], datetime.datetime.now())
+    assert repo.git("show", "HEAD:hello.py").stdout \
+        == 'print("v2")\n'
+@
+
+Files written \emph{during} a run belong to the next run's snapshot,
+not to the run that produced them---this is the build-artefact case
+from \cref{sec:two-commit-protocol}:
+
+<<test functions>>=
+def test_run_output_files_stay_out_of_the_run(workdir):
+    """A file written during the run is not in its code state."""
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "a.out").write_text("binary\n")
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    files = repo.git("ls-tree", "-r", "--name-only", "HEAD")
+    assert "a.out" not in files.stdout
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    files = repo.git("ls-tree", "-r", "--name-only", "HEAD")
+    assert "a.out" in files.stdout
 @
 
 
@@ -385,21 +2778,222 @@ The run header is a plain-text block with key--value fields.
 We keep it simple---no YAML, no JSON---so it is easy to read in
 [[git log]] output.
 
+The [[Run-Id:]] field is what a reader matches against the trailer
+commit.
+It is optional because reconstructed histories (\cref{progsnap2}) build
+complete blocks that need no partner commit to look for.
+
+
+\subsection{Which invocations get a header at all}
+\label{sec:review-subcommands}
+
+Before a header can be formatted there has to be a run, and learnlog's
+own command line is the one caller for which that is a judgement call
+rather than a fact.
+Most of what [[learnlog]] does for a student is housekeeping---wiring a
+venv, cloning a repository, pushing, tagging, exporting---and
+housekeeping is not learning data.
+Two subcommands are different in kind: [[learnlog play]] and
+[[learnlog list]] are the student \emph{reading their own history},
+and that act of reflection is behaviour worth recording.
+So those two are logged as ordinary runs and every other subcommand
+leaves no trace at all, not even a repository
+(\cref{sec:veto}).
+
+Naming the two here, rather than in the CLI that implements them, is
+what keeps the dependencies pointing the right way.
+The list has two consumers and the CLI is neither: the recorder in
+[[learnlog/__init__.py]] reads it before deciding to start a run, and
+the readers of \cref{commits} read it to tell reflection apart from
+learnlog's other activity in a log.
+Both already import this module for the rest of the run-record
+vocabulary---[[RUN_ID_FIELD]], [[TRAILER_PREFIX]]---and both are
+imported \emph{by} [[learnlog.cli]] rather than the other way round.
+
+<<constants>>=
+REVIEW_SUBCOMMANDS = ("play", "list")
+@
+
+
+\subsection{Arguments that fit on one line}
+\label{sec:run-arguments}
+
+A line-oriented format asks two things of a value: that it stay on its
+line, and that it come back out the way it went in.
+Joining the argument list with spaces gives neither.
+
+Two different lists write the same field: one argument reading
+[[alpha beta]] and two arguments reading [[alpha]] and [[beta]] both
+come out as [[Arguments: alpha beta]], and no reader can tell them
+apart afterwards.
+For a [[python -c]] run the field stops meaning anything at all,
+because there the first argument is the program \emph{source} and the
+student's real arguments follow it.
+
+A source may also contain newlines, and then the field is not merely
+ambiguous, it is no longer a field.
+Measured on the format as it was, a run whose source read
+[[import sys]] on one line and [[print("hi")]] on the next gave a
+commit subject ending at [[Run: <python -c> import sys]], an
+[[Arguments:]] value reading [[import sys]], and a remainder that the
+parser (\cref{progsnap2}) scanned as though it were more header
+lines---so a source containing a line [[Exit-Code: 99]] was read back
+as this run's exit code.
+
+The shell answered this question long ago, and the project already
+uses its answer where [[activate]] prints paths into shell code
+(\cref{sec:emit-activation}): [[shlex.quote]] turns any string into one
+word, and [[shlex.split]] turns the words back into the original list.
+Ordinary arguments need no quoting and come through untouched, so
+[[Run: hello.py alpha beta]] still reads like the command line the
+student typed---which is the whole reason the header is plain text.
+
 <<functions>>=
-def format_run_header(script, args, start_time):
+def format_run_arguments(args):
+    """Format an argument list as one header field value.
+
+    Each argument becomes a single shell word, so the list can be
+    recovered exactly by ``parse_run_arguments``.  An empty list is
+    written as the ``(none)`` marker.
+    """
+    if not args:
+        return NO_ARGUMENTS
+    return " ".join(
+        shlex.quote(_escape_argument(str(arg))) for arg in args
+    )
+<<constants>>=
+NO_ARGUMENTS = "(none)"
+@
+
+What quoting does not do is remove newlines: a quoted string simply
+spans lines.
+So before quoting we replace the two characters that end a line with a
+backslash and a letter, and the backslash itself first, since the
+substitution gives it a meaning it did not have before.
+Backslash, newline, and carriage return are the entire table: no other
+character can break a line, and the one character that could break the
+escaping---a NUL---cannot reach us, because the operating system hands
+over [[argv]] entries as NUL-terminated strings and a NUL inside one is
+therefore not representable.
+
+Deriving the reverse table from the forward one is what keeps the two
+in step: an escape added to one is understood by the other without a
+second edit.
+
+<<functions>>=
+def _escape_argument(text):
+    """Return ``text`` with line-ending characters escaped."""
+    for character, code in ARGUMENT_ESCAPES:
+        text = text.replace(character, "\\" + code)
+    return text
+<<constants>>=
+ARGUMENT_ESCAPES = (
+    ("\\", "\\"),
+    ("\n", "n"),
+    ("\r", "r"),
+)
+ARGUMENT_UNESCAPES = {
+    code: character for character, code in ARGUMENT_ESCAPES
+}
+@
+
+Reading is the same two steps in reverse.
+Both are forgiving, because a header is data we may meet again in a log
+written by an older version of this tool or edited by hand: an
+unbalanced quote falls back to splitting on whitespace, and a backslash
+that escapes nothing we know stays a backslash.
+Neither can raise, and the worst either can do is return the words a
+naive split would have returned anyway.
+
+<<functions>>=
+def parse_run_arguments(value):
+    """Return the argument list recorded in an ``Arguments:`` field.
+
+    Inverts ``format_run_arguments``.  A value not quoted that way
+    is split on whitespace instead.
+    """
+    value = value.strip()
+    if not value or value == NO_ARGUMENTS:
+        return []
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        words = value.split()
+    return [_unescape_argument(word) for word in words]
+
+def _unescape_argument(text):
+    """Return ``text`` with the argument escapes resolved."""
+    return ESCAPED_CHARACTER.sub(
+        lambda match: ARGUMENT_UNESCAPES.get(
+            match.group(1), match.group(0)
+        ),
+        text,
+    )
+<<constants>>=
+ESCAPED_CHARACTER = re.compile(r"\\(.)")
+@
+
+Let's verify that the common case is left alone and that the awkward
+one survives:
+
+<<test functions>>=
+def test_format_run_arguments_leaves_plain_words_alone():
+    """An ordinary command line still reads like one."""
+    assert format_run_arguments(["alpha", "beta"]) \
+        == "alpha beta"
+    assert format_run_arguments([]) == "(none)"
+
+def test_run_arguments_round_trip_plain_words():
+    args = ["--verbose", "input.txt"]
+    assert parse_run_arguments(
+        format_run_arguments(args)
+    ) == args
+
+def test_run_arguments_round_trip_source_and_extras():
+    """A -c source with spaces and newlines comes back whole."""
+    args = ['import sys\nprint("hi there")', "alpha", "beta"]
+    value = format_run_arguments(args)
+    assert "\n" not in value
+    assert parse_run_arguments(value) == args
+
+def test_run_arguments_round_trip_backslashes_and_returns():
+    args = ["c:\\path\\n", "a\r\nb", "", "one two"]
+    value = format_run_arguments(args)
+    assert "\n" not in value and "\r" not in value
+    assert parse_run_arguments(value) == args
+
+def test_parse_run_arguments_tolerates_unquotable_text():
+    """An old or hand-edited value degrades to a plain split."""
+    assert parse_run_arguments("alpha 'beta") == ["alpha", "'beta"]
+    assert parse_run_arguments("(none)") == []
+    assert parse_run_arguments("") == []
+@
+
+
+\subsection{The header block}
+
+<<functions>>=
+def format_run_header(script, args, start_time,
+                      run_id=None):
     """Format a run header block.
 
     The header records which script was run, its arguments, and
-    the start time.
+    the start time.  When ``run_id`` is given, it is recorded as
+    the ``Run-Id`` field that links this run to its trailer.
     """
-    args_str = " ".join(args) if args else "(none)"
-    return (
-        f"Run: {script} {args_str}\n"
-        f"\n"
-        f"Script: {script}\n"
-        f"Arguments: {args_str}\n"
-        f"Start-Time: {start_time.isoformat()}"
-    )
+    args_str = format_run_arguments(args)
+    lines = [
+        f"Run: {script} {args_str}",
+        "",
+        f"Script: {script}",
+        f"Arguments: {args_str}",
+        f"Start-Time: {start_time.isoformat()}",
+    ]
+    if run_id:
+        lines.append(f"{RUN_ID_FIELD} {run_id}")
+    return "\n".join(lines)
+<<constants>>=
+RUN_ID_FIELD = "Run-Id:"
 @
 
 Let's verify the format:
@@ -412,55 +3006,255 @@ def test_format_run_header_basic():
     assert "Script: hello.py" in header
     assert "Arguments: arg1" in header
     assert "Start-Time: 2026-03-20T14:30:00" in header
+    assert "Run-Id:" not in header
 
 def test_format_run_header_no_args():
     t = datetime.datetime(2026, 3, 20, 14, 30)
     header = format_run_header("hello.py", [], t)
     assert "Arguments: (none)" in header
+
+def test_format_run_header_with_run_id():
+    t = datetime.datetime(2026, 3, 20, 14, 30)
+    header = format_run_header("hello.py", [], t, "abc123")
+    assert "Run-Id: abc123" in header
+
+def test_format_run_header_keeps_every_field_on_one_line():
+    """A -c source cannot forge header lines of its own."""
+    t = datetime.datetime(2026, 3, 20, 14, 30)
+    source = 'import sys\nExit-Code: 99\nprint("hi")'
+    header = format_run_header(
+        "<python -c>", [source, "alpha"], t, "abc123",
+    )
+    fields = dict(
+        line.split(":", 1) for line in header.split("\n")
+        if ":" in line and not line.startswith("Run:")
+    )
+    assert "Exit-Code" not in fields
+    assert parse_run_arguments(fields["Arguments"]) == [
+        source, "alpha",
+    ]
+    subject = header.split("\n", 1)[0]
+    assert subject.startswith("Run: <python -c> ")
 @
 
 
 \section{Finalising a run}
+\label{sec:finalising-a-run}
 
-After the program finishes (or crashes), [[finalize_run]] amends the
-current commit to append the I/O log, exception information, end time,
-and exit code.
-This completes the run block that [[begin_run]] started.
+After the program finishes (or crashes), [[finalize_run]] commits the
+I/O log, exception information, end time, and exit code as a new
+commit that names the run it completes.
 
 If the program was killed by SIGKILL, the [[atexit]] handler never
 fires and [[finalize_run]] is never called.
-The commit still exists with the run header from [[begin_run]], so we
-know a run was attempted---the missing [[End-Time]] field signals
-an abnormal termination.
+The header commit from [[begin_run]] still stands, so we know a run was
+attempted---the missing [[End-Time]] field signals an abnormal
+termination, exactly as before.
+
+A trailer written without a preceding [[begin_run]] has no header to
+point at.
+We still commit it, under a fresh id, rather than throwing the results
+away: no reader will show it, but the data is in the repository if
+someone goes looking.
+
+That signal is only trustworthy if the \emph{other} ways of losing a
+trailer are gone, which is what makes this method the one that most
+needed \cref{sec:commit-message-stdin}: it is where the captured I/O
+enters the message, so it was the method that failed on
+[[MAX_ARG_STRLEN]], and it failed by producing exactly the record a
+[[SIGKILL]] leaves behind.
+
+A review run (\cref{sec:review-subcommands}) brings one extra kind of
+result with it, which is why the method takes a [[view_trace]].
+Its I/O is not worth keeping---the output of [[learnlog play]] is the
+log read back, and copying it into the log would nest the history
+inside itself---so what a review run has to say is instead \emph{which
+commits the student looked at, and how they moved between them}.
+The parameter is optional because every other caller has nothing to
+put in it, and an ordinary program run then writes exactly the trailer
+it wrote before.
 
 <<repo methods>>=
 def finalize_run(self, io_log, exception_info,
-                 end_time, exit_code):
-    """Complete the current run block with results.
+                 end_time, exit_code, view_trace=None):
+    """Complete the current run with a trailer commit.
 
-    Amends the current commit to append I/O log, exception
-    information, end time, and exit code.
+    Commits the I/O log, exception information, end time, and
+    exit code under the run id from :meth:`begin_run`.  Nothing
+    already in the repository is modified, and the commit records
+    no code change.
+
+    ``view_trace`` is an optional sequence of
+    ``(time, commit, action)`` triples naming the commits a
+    review run displayed.
     """
-    existing = self.git(
-        "log", "-1", "--format=%B"
-    ).stdout.rstrip("\n")
+    run_id = self.run_id or new_run_id()
+    self.run_id = None
 
     trailer = format_run_trailer(
-        io_log, exception_info, end_time, exit_code
+        io_log, exception_info, end_time, exit_code, view_trace,
     )
-    combined = existing + "\n" + trailer
+    message = format_trailer_commit(
+        self.run_script, self.run_args, run_id, trailer,
+    )
 
-    self.git("add", ".")
-    self.git(
-        "commit", "--amend", "--allow-empty",
-        "-m", combined,
-    )
+    with self.commit_lock():
+        <<commit the trailer without touching the tree>>
 @
 
-Let's verify that finalisation completes the run block:
+The trailer records results, not code, so the tree it needs is one the
+log already has: the tree at the end of the recording branch.
+Naming it is all there is to it, because [[commit-tree]] takes any
+tree-ish and [[refs/heads/...^{tree}]] is one.
+
+<<commit the trailer without touching the tree>>=
+branch = self.recording_branch()
+self.commit_on_branch(branch, f"{branch}^{{tree}}", message)
+@
+
+We name the \emph{branch's} tree rather than this run's header's, and
+the difference is a concurrent run.
+Two programs can be in flight at once
+(\cref{sec:two-commit-protocol}), and if the other one's header
+committed while ours ran, the branch has moved on; a trailer built
+from our own header's tree would put that run's snapshot back the way
+it was before---a code change, a revert, recorded by the commit that
+is supposed to record none.
+Naming the branch means the trailer copies whatever stands at the end
+of the log at the moment it lands, and names it again if the ref moved
+between reading the tip and moving it
+(\cref{sec:commit-on-branch}).
+
+That this is now one line is worth dwelling on, because it used to be
+the expensive half of a run.
+[[git commit]] commits an index, so a trailer that had to record no
+change had to first build an index holding [[HEAD]]'s tree---and then
+pay for the refresh with which every commit begins.
+An index written from a tree carries no [[stat]] data at all, each
+entry's size and timestamps zero, and zeros tell Git nothing about
+whether the file on disk still matches, so it re-hashed the whole work
+tree: a second full read of the project, to record nothing.
+Measured on five hundred files of 64\,KiB, that trailer took a median
+105\,ms against the header's 8\,ms.
+Seeding the private index from the shared one and reading the tree in
+with the single-tree \emph{merge} form of [[read-tree]]---which keeps
+the index's [[stat]] data for every path whose blob already matches
+the tree's---brought it back to 9\,ms and the commit's [[openat]]
+calls from 623 to 108.
+
+Naming the tree removes the question instead of answering it.
+There is no index to seed, no refresh to keep cheap, and no work that
+grows with the project: the trailer is one object write and one ref
+update whatever the student's directory contains.
+The [[read-tree --reset]] that this section used to argue for lives on
+in [[begin_run]], where an index is genuinely needed
+(\cref{sec:beginning-a-run}), and for the second of the two reasons it
+was chosen here---it is the form that discards unmerged entries rather
+than failing on them.
+
+The student's staging area is now neither read nor written by a
+trailer.
+That was the reason the trailer's private index was never published:
+handing back a copy with the student's hand-staged files stripped out
+would have made [[learnlog git status]] lie about work they had done.
+Not having an index at all is the same promise, kept by construction.
+
+Edits made to the work tree during the run cannot leak in either, and
+that too is now true by construction rather than by argument: the tree
+we commit is one that is already in the log, and nothing between the
+two commits of a run so much as looks at the work tree.
+
+That property started as an accuracy requirement---a finished run must
+not be credited with code it never executed---but the review runs of
+\cref{sec:review-subcommands} now lean on it for their meaning.
+A [[learnlog play]] session is long, and it is exactly the time when a
+student sits with their history in one window and their editor in the
+other.
+Because the header stages the work tree at the moment playback starts
+and the trailer stages nothing at all, an edit made while reading is
+left uncommitted, and the next commit to pick it up is the header of
+the next program run.
+That is the reading we want: the edit shows up as \enquote{what they
+changed after reviewing} rather than as part of the review itself.
+Were the trailer ever to stage the work tree, that diff would be
+absorbed into the review session and the connection to the run it
+belongs to would be lost.
+
+Two tests hold the trailer to the promises above.
+The first drifts everything that can drift while a run is in
+flight---an artefact appears, the source is edited beneath it, a file
+is staged by hand---and asks for the trailer's tree to still be
+[[HEAD]]'s, entry for entry.
+The second conflicts the shared index the way an interrupted
+[[learnlog pull]] would and asks for a trailer anyway; it caught the
+older mechanism refusing on an unmerged index, and it now guards the
+promise that a trailer never consults one.
 
 <<test functions>>=
-def test_finalize_appends_io_and_exit(workdir):
+def test_finalize_records_head_tree_not_the_index(workdir):
+    """The trailer's tree is HEAD's, whatever the index holds."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    head_tree = repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip()
+    (workdir / "a.out").write_text("build artefact\n")
+    (workdir / "hello.py").write_text('print("edited")\n')
+    (workdir / "staged.txt").write_text("staged by hand\n")
+    repo.git("add", "staged.txt")
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    assert repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip() == head_tree
+    assert repo.git("show", "HEAD:hello.py").stdout \
+        == 'print("hello")\n'
+
+def test_finalize_survives_an_unmerged_index(workdir):
+    """A conflicted index must not cost the run its trailer."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    head_tree = repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip()
+    ours = repo.git(
+        "hash-object", "-w", "--stdin", input="ours\n",
+    ).stdout.strip()
+    theirs = repo.git(
+        "hash-object", "-w", "--stdin", input="theirs\n",
+    ).stdout.strip()
+    repo.git(
+        "update-index", "--index-info",
+        input=f"100644 {ours} 2\tconflict.txt\n"
+              f"100644 {theirs} 3\tconflict.txt\n",
+    )
+    assert repo.git("ls-files", "-u").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert msg.startswith("Run-End: hello.py")
+    assert repo.git(
+        "rev-parse", "HEAD^{tree}"
+    ).stdout.strip() == head_tree
+@
+
+Let's verify that finalisation records the results and leaves the
+header commit alone:
+
+<<test functions>>=
+def test_finalize_records_io_and_exit(workdir):
     repo = LearnlogRepo(workdir)
     now = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], now)
@@ -476,6 +3270,27 @@ def test_finalize_appends_io_and_exit(workdir):
     assert "Exit-Code: 0" in msg
     assert "stdout: hello" in msg
     assert "--- exception ---\nNone" in msg
+
+def test_finalize_keeps_header_commit(workdir):
+    """The trailer is a new commit; the header is untouched."""
+    repo = LearnlogRepo(workdir)
+    now = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], now)
+    header_hash = repo.git(
+        "rev-parse", "HEAD"
+    ).stdout.strip()
+    run_id = repo.run_id
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+    parent = repo.git("rev-parse", "HEAD^").stdout.strip()
+    assert parent == header_hash
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert msg.startswith("Run-End: hello.py")
+    assert f"Run-Id: {run_id}" in msg
 
 def test_finalize_records_exception(workdir):
     repo = LearnlogRepo(workdir)
@@ -508,34 +3323,595 @@ def test_finalize_no_io(workdir):
     assert "(no I/O)" in msg
 @
 
+A review run's whole record is the trace, so it has to survive the
+trip through the commit message intact---order included, since the
+order is what makes it a navigation rather than a set of commits:
+
+<<test functions>>=
+def test_finalize_run_records_view_trace(workdir):
+    """A review run's trailer carries its navigation, in order."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "learnlog", ["play"], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    trace = [
+        (datetime.datetime(2026, 1, 1, 10, 0, 1), "aaa", "open"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 2), "bbb", "next"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 3), "aaa", "prev"),
+    ]
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 4),
+        exit_code=0,
+        view_trace=trace,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert [
+        line for line in msg.split("\n")
+        if line.startswith("Viewed:")
+    ] == [
+        "Viewed: aaa 2026-01-01T10:00:01 open",
+        "Viewed: bbb 2026-01-01T10:00:02 next",
+        "Viewed: aaa 2026-01-01T10:00:03 prev",
+    ]
+    assert "(no I/O)" in msg
+@
+
+The two tests below pin the halves of the review semantics that live
+in this module rather than in the recorder.
+
+The first is the header side: playback begins by snapshotting the work
+tree, so whatever the student changed since their last run is part of
+the state they sat down to review.  Without that, a review of code
+edited an hour ago would be recorded against an hour-old snapshot.
+
+<<test functions>>=
+def test_review_header_snapshots_state_at_start(workdir):
+    """The review run's header holds the code as it is now."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("edited")\n')
+    repo.begin_run(
+        "learnlog", ["play"],
+        datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    assert repo.git(
+        "show", "HEAD:hello.py",
+    ).stdout == 'print("edited")\n'
+@
+
+The second is the trailer side, and it is the property
+\cref{sec:finalising-a-run} argued for: an edit made while a run is in
+flight belongs to the \emph{next} run, not to the one still finishing.
+[[test_finalize_records_head_tree_not_the_index]] above already shows
+such an edit staying out of the trailer's tree; what this test adds is
+the other half, that the edit is not merely dropped but handed on.
+
+<<test functions>>=
+def test_edits_during_a_run_belong_to_the_next_run(workdir):
+    """An edit made mid-run lands in the following run's header."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "learnlog", ["play"],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "hello.py").write_text('print("while reviewing")\n')
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 30),
+        exit_code=0,
+    )
+    assert repo.git(
+        "show", "HEAD:hello.py",
+    ).stdout == 'print("hello")\n'
+
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 1),
+    )
+    assert repo.git(
+        "show", "HEAD:hello.py",
+    ).stdout == 'print("while reviewing")\n'
+    assert repo.git(
+        "log", "-1", "--format=%s",
+    ).stdout.strip() == "Run: hello.py (none)"
+@
+
+The interleaving from \cref{sec:two-commit-protocol} is the case the
+old protocol corrupted: a logged program starts another logged program,
+so the inner run finalises first.
+Each run must still get its own results.
+
+<<test functions>>=
+def test_overlapping_runs_keep_their_own_results(workdir):
+    """An inner run finalising first must not steal the trailer."""
+    parent = LearnlogRepo(workdir)
+    child = LearnlogRepo(workdir)
+    t0 = datetime.datetime(2026, 1, 1, 10, 0)
+
+    parent.begin_run("parent.py", [], t0)
+    parent_id = parent.run_id
+    child.begin_run("child.py", [], t0)
+    child_id = child.run_id
+    child.finalize_run(
+        io_log="stdout: CHILD\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    parent.finalize_run(
+        io_log="stdout: PARENT\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 2),
+        exit_code=3,
+    )
+
+    child_trailer = _trailer_for(parent, child_id)
+    parent_trailer = _trailer_for(parent, parent_id)
+    assert "stdout: CHILD" in child_trailer
+    assert "Exit-Code: 0" in child_trailer
+    assert "stdout: PARENT" in parent_trailer
+    assert "Exit-Code: 3" in parent_trailer
+@
+
+The helper looks for the trailer commit that names a given run id,
+which is the same join the readers in \cref{commits} perform---spelled
+out here so this test verifies the recorded data rather than the code
+that reads it back:
+
+<<test functions>>=
+def _trailer_for(repo, run_id):
+    """Return the trailer commit message naming ``run_id``."""
+    hashes = repo.git("log", "--format=%H").stdout.split()
+    for commit_hash in hashes:
+        message = repo.git(
+            "log", "-1", "--format=%B", commit_hash,
+        ).stdout
+        if message.startswith("Run-End:") and \
+                run_id in message:
+            return message
+    return ""
+@
+
+The regression test for the argument-size limit uses 300\,KB of I/O:
+comfortably past the 128\,KiB cap, and comfortably under
+[[MAX_IOLOG_BYTES]], so it is a size a real program can reach.
+The second run afterwards checks that a loud run does not disturb the
+records around it; both records are read from the whole log, since
+each run is a header and a trailer commit
+(\cref{sec:two-commit-protocol}):
+
+<<test functions>>=
+LARGE_IO_BYTES = 300_000
+
+def test_finalize_survives_io_beyond_argv_limit(workdir):
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    io_log = "x" * LARGE_IO_BYTES + "\nstdout: TAIL\n"
+    repo.finalize_run(
+        io_log=io_log,
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=7,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert "End-Time: 2026-01-01T10:00:05" in msg
+    assert "Exit-Code: 7" in msg
+    assert "stdout: TAIL" in msg
+    assert msg.count("x") >= LARGE_IO_BYTES
+
+def test_run_after_large_run_keeps_both(workdir):
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    repo.finalize_run(
+        io_log="x" * LARGE_IO_BYTES,
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+    repo.begin_run(
+        "hello.py", ["again"],
+        datetime.datetime(2026, 1, 1, 10, 1),
+    )
+    repo.finalize_run(
+        io_log="stdout: second\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 1, 1),
+        exit_code=0,
+    )
+    msg = repo.git("log", "--format=%B").stdout
+    assert msg.count("x") >= LARGE_IO_BYTES
+    assert "Arguments: again" in msg
+    assert "stdout: second" in msg
+@
+
+
+\section{Runs against a repository in an awkward state}
+\label{sec:awkward-state}
+
+The two states of \cref{sec:recording-branch} are ones the student
+puts the repository into on purpose, and both used to change what a
+run meant.
+Since a run only sees them by accident---it starts when a program
+starts, not when the repository is ready---the tests here set the
+repository up the way the student would and then run a program
+through it.
+
+The first state is a conflicted merge.
+Building one takes a commit that is not on the branch, which is what
+[[learnlog pull]] fetches from another machine; the helper makes one
+with the same plumbing \cref{sec:commit-on-branch} uses, so no second
+work tree is needed.
+
+<<test functions>>=
+def _conflicted_merge(repo, workdir):
+    """Leave the repository mid-merge, as a conflicted pull does.
+
+    Returns the commit the merge is trying to bring in.
+    """
+    base = repo.git("rev-parse", "HEAD").stdout.strip()
+    (workdir / "hello.py").write_text('print("ours")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 9, 0),
+    )
+    blob = repo.git(
+        "hash-object", "-w", "--stdin",
+        input='print("theirs")\n',
+    ).stdout.strip()
+    tree = repo.git(
+        "mktree", input=f"100644 blob {blob}\thello.py\n",
+    ).stdout.strip()
+    theirs = repo.git(
+        "commit-tree", tree, "-p", base, input="theirs\n",
+    ).stdout.strip()
+    repo.git("update-ref", "refs/heads/other", theirs)
+    merged = repo.git("merge", "--no-edit", "other", check=False)
+    assert merged.returncode != 0
+    return theirs
+@
+
+A run recorded in that window must leave every part of the merge where
+it found it, and its own two commits must have one parent each---a
+second parent is what \enquote{learnlog resolved the conflict} looks
+like in the history.
+The code state it records is the work tree as it stands, conflict
+markers and all, for the reason \cref{sec:beginning-a-run} gives, and
+the diagnostic says so where a student can find it.
+
+<<test functions>>=
+def test_run_during_a_conflicted_merge_adds_one_parent(workdir):
+    """A run must not conclude the student's merge for them."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    theirs = _conflicted_merge(repo, workdir)
+
+    running = LearnlogRepo(workdir)
+    running.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    running.finalize_run(
+        io_log="stderr: SyntaxError\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=1,
+    )
+
+    trailer_parents = repo.git(
+        "log", "-1", "--format=%P", branch,
+    ).stdout.split()
+    header_parents = repo.git(
+        "log", "-1", "--format=%P", f"{branch}~1",
+    ).stdout.split()
+    assert len(trailer_parents) == 1
+    assert len(header_parents) == 1
+
+    assert (workdir / ".learnlog" / "MERGE_HEAD").exists()
+    assert repo.git(
+        "rev-parse", "MERGE_HEAD",
+    ).stdout.strip() == theirs
+    assert repo.git("ls-files", "-u").stdout.strip()
+    assert "<<<<<<<" in (workdir / "hello.py").read_text()
+    assert "<<<<<<<" in repo.git(
+        "show", f"{branch}~1:hello.py",
+    ).stdout
+    errors = (
+        workdir / ".learnlog" / "errors.log"
+    ).read_text()
+    assert "UnfinishedOperation" in errors
+    assert "MERGE_HEAD" in errors
+@
+
+Those are the parts; the whole is whether the student can still
+finish.
+Concluding the merge is [[git commit]] with the conflict resolved, and
+what comes out has to be a real merge commit: two parents, the second
+being the commit that was being merged and the first the run that
+happened in the meantime.
+
+<<test functions>>=
+def test_the_students_merge_can_still_be_concluded(workdir):
+    """The half-finished merge survives a run and completes."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    theirs = _conflicted_merge(repo, workdir)
+
+    running = LearnlogRepo(workdir)
+    running.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    running.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=1,
+    )
+    trailer = repo.git("rev-parse", branch).stdout.strip()
+
+    (workdir / "hello.py").write_text('print("resolved")\n')
+    repo.git("add", "hello.py")
+    repo.git("commit", "--file=-", input="merged\n")
+
+    parents = repo.git(
+        "log", "-1", "--format=%P", branch,
+    ).stdout.split()
+    assert parents == [trailer, theirs]
+    assert not (workdir / ".learnlog" / "MERGE_HEAD").exists()
+@
+
+The second state is a detached [[HEAD]], which is what
+[[learnlog git checkout]] leaves behind when a student goes to look at
+an older version of their code.
+The run afterwards has to reach the branch: [[git log --branches]] is
+the set of commits [[learnlog push]] would send, so asking for the
+run's records there is asking whether the run was pushable.
+And [[HEAD]] has to still be where the student left it, because the
+run is not entitled to undo their checkout.
+
+<<test functions>>=
+def test_runs_land_on_the_branch_from_a_detached_head(workdir):
+    """A detached HEAD must not take the run's commits with it."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    (workdir / "hello.py").write_text('print("v1")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    old = repo.git("rev-parse", "HEAD~2").stdout.strip()
+    repo.git("checkout", "--detach", old)
+    before = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+
+    detached = LearnlogRepo(workdir)
+    detached.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    run_id = detached.run_id
+    detached.finalize_run(
+        io_log="stdout: detached\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 11, 0, 1),
+        exit_code=0,
+    )
+
+    after = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+    assert after == before + 2
+    pushable = repo.git(
+        "log", "--branches", "--format=%B",
+    ).stdout
+    assert "stdout: detached" in pushable
+    assert pushable.count(f"Run-Id: {run_id}") == 2
+    assert repo.git("rev-parse", "HEAD").stdout.strip() == old
+    assert repo.git(
+        "symbolic-ref", "--quiet", "HEAD", check=False,
+    ).returncode != 0
+@
+
+Finding the branch from a detached [[HEAD]] is the part of that with
+no obvious answer, so it gets its own test: the branch a run picks
+while detached is the one it would have picked attached.
+A renamed branch checks the other half of \cref{sec:recording-branch}
+---that nothing here knows what the branch is called, which is what a
+clone from a classmate's remote requires.
+
+<<test functions>>=
+def test_recording_branch_survives_a_detached_head(workdir):
+    """Detaching HEAD does not change which branch records runs."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    commit = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("checkout", "--detach", commit)
+    assert repo.recording_branch() == branch
+
+def test_runs_follow_a_renamed_branch(workdir):
+    """The recording branch is whatever the repository calls it."""
+    repo = LearnlogRepo(workdir)
+    repo.git("branch", "-m", "trunk")
+    assert repo.recording_branch() == "refs/heads/trunk"
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: renamed\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    msg = repo.git(
+        "log", "-1", "--format=%B", "refs/heads/trunk",
+    ).stdout
+    assert "stdout: renamed" in msg
+@
+
+Finally, the message the student's program produced now reaches the
+commit unaltered (\cref{sec:recording-branch}), which is worth one
+test of its own: blank lines and trailing spaces are data in a
+transcript, and the porcelain that used to write these commits removed
+both.
+
+<<test functions>>=
+def test_trailer_keeps_the_io_log_verbatim(workdir):
+    """Blank lines and trailing spaces survive into the commit."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    io_log = "stdout: one   \n\n\n\nstdout: two\n"
+    repo.finalize_run(
+        io_log=io_log,
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    msg = repo.git("log", "-1", "--format=%B").stdout
+    assert io_log in msg
+@
+
 
 \section{Formatting the run trailer}
+\label{sec:io-section}
 
-The trailer is appended by [[finalize_run]] and contains the end time,
-exit code, I/O log, and exception information.
+The trailer contains the end time, exit code, I/O log, and exception
+information.
+Its text is unchanged from when it was appended to the header inside
+one commit message: a reader that joins the two commits produces
+exactly the block format that older repositories already contain
+(\cref{commits}), so nothing downstream had to learn a second layout.
+
+The view trace of a review run joins that text as [[Viewed:]] lines
+directly below [[Exit-Code:]].
+Putting them among the fields rather than in a section of their own
+is what makes them free: every reader of this format either recognises
+a [[Key: value]] line or ignores it, so a log written by this version
+stays readable to the parsers that predate it, and the [[--- I/O ---]]
+and [[--- exception ---]] markers keep the positions those parsers
+search for.
+A run with nothing to report writes no lines at all, which is why the
+ordinary program run's trailer is byte-for-byte what it always was.
+
+Everything downstream reads the log from between these two markers,
+not from the argument the recorder passed in: the exporter parses the
+section (\cref{sec:parse-run-block}), and the importer writes a new
+one.
+So this function does not merely print the log, it \emph{defines} the
+form the log is kept in, and every reader has to be able to reproduce
+that form exactly---which it can only do if there is one form to
+reproduce.
+
+Two rules give it one.
+The log's trailing newlines come off, because the section is a
+sequence of lines and the newline that ends its last line is written
+by the join, not by the log; leaving the log's own would make the
+section end with a blank line that is also the separator before
+[[--- exception ---]], and nothing could later tell the two apart.
+And a log that this leaves empty---one that was newlines and nothing
+else---is written as [[(no I/O)]] rather than as an empty section, so
+\enquote{nothing was captured} has a single spelling.
+The second rule is what the first one costs: without it the
+placeholder and the empty section mean the same thing in different
+bytes, and a reader that has to choose one of them when it writes the
+section back---which the ProgSnap2 importer does---returns a trailer
+that differs from the one it was given, in a run that captured
+nothing.
+
+Naming the markers as constants serves the same end.
+It lets the parser be written as this function's inverse rather than
+as a second description of the same layout
+(\cref{sec:parse-run-block}), so the two can disagree only if someone
+changes the constant---and then they change together.
 
 <<functions>>=
 def format_run_trailer(io_log, exception_info,
-                       end_time, exit_code):
+                       end_time, exit_code, view_trace=None):
     """Format the trailer appended by :func:`finalize_run`.
 
     Contains the end time, exit code, I/O log, and exception
-    information.
+    information.  ``view_trace``, when given, is a sequence of
+    ``(time, commit, action)`` triples written out as ``Viewed:``
+    lines.
+
+    The I/O section holds the log verbatim apart from its trailing
+    newlines; a log with nothing left after those is written as the
+    ``(no I/O)`` placeholder.
     """
     parts = [
         f"End-Time: {end_time.isoformat()}",
         f"Exit-Code: {exit_code}",
-        "",
-        "--- I/O ---",
-        io_log.rstrip("\n") if io_log else "(no I/O)",
-        "",
-        "--- exception ---",
     ]
+    parts.extend(
+        format_viewed_line(*entry) for entry in view_trace or ()
+    )
+    parts.extend([
+        "",
+        IO_SECTION_MARKER,
+        (io_log or "").rstrip("\n") or NO_IO_PLACEHOLDER,
+        "",
+        EXCEPTION_SECTION_MARKER,
+    ])
     if exception_info:
         parts.append(exception_info)
     else:
         parts.append("None")
     return "\n".join(parts)
+<<constants>>=
+IO_SECTION_MARKER = "--- I/O ---"
+EXCEPTION_SECTION_MARKER = "--- exception ---"
+NO_IO_PLACEHOLDER = "(no I/O)"
+@
+
+Each line answers three questions in the order a reader asks them:
+\emph{what} was on screen, \emph{when}, and \emph{how} the student got
+there.
+The commit therefore comes first even though the recorder
+(\cref{sec:review-runs}) timestamps the event first, and the argument
+order here follows the recorder so a stored triple can be splatted
+straight in.
+
+All three values are bare tokens---a hexadecimal hash, an ISO-8601
+timestamp, a single lower-case word---so the quoting apparatus of
+\cref{sec:run-arguments} has nothing to do here.
+That is a property of what a trace is rather than luck: the hashes come
+from Git, and the actions come from a fixed vocabulary the viewer
+chooses from, so neither can carry a newline in from outside.
+Recording the full hash rather than an abbreviation costs a few
+characters and buys an unambiguous join against the log later, when the
+history may have grown past the length at which the abbreviation was
+unique.
+
+<<functions>>=
+def format_viewed_line(viewed_at, commit_hash, action):
+    """Format one ``Viewed:`` line of a review run's trailer.
+
+    Arguments come in the order ``learnlog.record_view`` stores
+    them; the line itself leads with the commit that was shown.
+    """
+    return (
+        f"{VIEWED_FIELD} {commit_hash} "
+        f"{viewed_at.isoformat()} {action}"
+    )
+<<constants>>=
+VIEWED_FIELD = "Viewed:"
 @
 
 Let's verify the format:
@@ -560,19 +3936,139 @@ def test_format_run_trailer_with_exception():
     assert "ValueError: oops" in trailer
 @
 
+The rule that keeps the section round-trippable is worth stating as a
+test of its own, because it is invisible in any log that captured
+something: a log of newlines and an absent log are the same run to a
+reader, so they must be the same bytes to a writer.
+
+<<test functions>>=
+def test_format_run_trailer_writes_no_io_once():
+    """A log left empty by the rstrip is the empty log."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    assert format_run_trailer("\n\n", None, end, 0) == \
+        format_run_trailer("", None, end, 0)
+    assert NO_IO_PLACEHOLDER in format_run_trailer(
+        "\n\n", None, end, 0,
+    )
+@
+
+The view trace has two things to prove, and the second is the one that
+protects every existing log: the lines must arrive in the order they
+were recorded---a revisit is data, so identical hashes may repeat---and
+a run that saw nothing must add nothing.
+
+<<test functions>>=
+def test_format_run_trailer_records_the_view_trace():
+    """Viewed: lines follow Exit-Code in navigation order."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trace = [
+        (datetime.datetime(2026, 1, 1, 10, 0, 1), "aaa", "open"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 2), "bbb", "next"),
+        (datetime.datetime(2026, 1, 1, 10, 0, 3), "aaa", "prev"),
+    ]
+    trailer = format_run_trailer("", None, end, 0, trace)
+    viewed = [
+        line for line in trailer.split("\n")
+        if line.startswith("Viewed:")
+    ]
+    assert viewed == [
+        "Viewed: aaa 2026-01-01T10:00:01 open",
+        "Viewed: bbb 2026-01-01T10:00:02 next",
+        "Viewed: aaa 2026-01-01T10:00:03 prev",
+    ]
+    lines = trailer.split("\n")
+    assert lines.index("Exit-Code: 0") < lines.index(viewed[0])
+    assert lines.index(viewed[-1]) < lines.index("--- I/O ---")
+
+@pytest.mark.parametrize("trace", [None, []])
+def test_format_run_trailer_omits_an_empty_view_trace(trace):
+    """A run that viewed nothing writes the trailer it always did."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trailer = format_run_trailer("stdout: hi\n", None, end, 0, trace)
+    assert "Viewed:" not in trailer
+    assert trailer == format_run_trailer(
+        "stdout: hi\n", None, end, 0,
+    )
+@
+
+
+\subsection{The trailer commit message}
+
+The trailer commit needs a subject line of its own, because Git shows
+subjects everywhere ([[git log --oneline]], [[git shortlog]]) and
+\enquote{End-Time: \ldots} would read as noise.
+We reuse the header's shape with a [[Run-End:]] keyword, so a subject
+still says which command the commit is about, and a reader can tell the
+two kinds of commit apart by the keyword alone---the same test that
+decides which commits are learnlog's own (\cref{sec:filter-learnlog})
+can decide which are trailers.
+
+The run id comes first in the body so that the join key sits at a fixed
+place, and the trailer text follows verbatim: dropping the subject and
+the [[Run-Id:]] line is all a reader needs to do to recover it.
+
+The arguments go through \cref{sec:run-arguments} for the same reason
+they do in the header, and here it is the subject line itself that is
+at stake: a newline in an argument would make Git's idea of the subject
+end in the middle of the command.
+
+<<functions>>=
+def format_trailer_commit(script, args, run_id, trailer):
+    """Format the commit message for a run's trailer.
+
+    ``script`` and ``args`` repeat the command from the header so
+    the commit subject is meaningful on its own; ``run_id``
+    identifies the run this trailer completes.
+    """
+    args_str = format_run_arguments(args)
+    return "\n".join([
+        f"{TRAILER_PREFIX}{script or '(unknown)'} {args_str}",
+        "",
+        f"{RUN_ID_FIELD} {run_id}",
+        trailer,
+    ])
+<<constants>>=
+TRAILER_PREFIX = "Run-End: "
+@
+
+Let's verify that the message carries the join key and that its subject
+identifies the command:
+
+<<test functions>>=
+def test_format_trailer_commit():
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trailer = format_run_trailer("", None, end, 0)
+    message = format_trailer_commit(
+        "hello.py", ["arg1"], "abc123", trailer,
+    )
+    assert message.startswith("Run-End: hello.py arg1")
+    assert "Run-Id: abc123" in message
+    assert message.endswith(trailer)
+
+def test_format_trailer_commit_without_begin_run():
+    """A trailer with no recorded command still has a subject."""
+    end = datetime.datetime(2026, 1, 1, 10, 0, 5)
+    trailer = format_run_trailer("", None, end, 0)
+    message = format_trailer_commit(
+        None, [], "abc123", trailer,
+    )
+    assert message.startswith("Run-End: (unknown) (none)")
+@
+
 
 \section{Full lifecycle test}
 
-To verify the complete workflow, we simulate two runs: one where the
-student has not changed anything (amends), and one after an edit (new
-commit):
+To verify the complete workflow, we simulate two runs: one on unchanged
+code and one after an edit.
+Both produce a header and a trailer commit, and only the second changes
+the tree:
 
 <<test functions>>=
 def test_full_lifecycle(workdir):
     """Simulate two runs: one with changes, one without."""
     repo = LearnlogRepo(workdir)
 
-    # First run (amends initial commit since no change)
+    # First run, on the code as initially committed.
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
     repo.finalize_run(
@@ -585,7 +4081,7 @@ def test_full_lifecycle(workdir):
     # Edit file
     (workdir / "hello.py").write_text('print("v2")\n')
 
-    # Second run (new commit since file changed)
+    # Second run, on the edited code.
     t2 = datetime.datetime(2026, 1, 1, 10, 5)
     repo.begin_run("hello.py", [], t2)
     repo.finalize_run(
@@ -595,7 +4091,17 @@ def test_full_lifecycle(workdir):
         exit_code=0,
     )
 
-    result = repo.git("log", "--oneline")
-    lines = result.stdout.strip().split("\n")
-    assert len(lines) == 2  # initial+run1, run2
+    subjects = repo.git(
+        "log", "--reverse", "--format=%s"
+    ).stdout.strip().split("\n")
+    assert subjects == [
+        "learnlog: initial commit",
+        "Run: hello.py (none)",
+        "Run-End: hello.py (none)",
+        "Run: hello.py (none)",
+        "Run-End: hello.py (none)",
+    ]
+    assert repo.git(
+        "show", "HEAD:hello.py"
+    ).stdout == 'print("v2")\n'
 @

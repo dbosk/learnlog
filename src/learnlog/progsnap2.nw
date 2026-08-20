@@ -56,7 +56,7 @@ import datetime
 import io
 import zipfile
 import pytest
-from learnlog.gitrepo import LearnlogRepo
+from learnlog.gitrepo import GitError, LearnlogRepo
 
 <<progsnap2 test functions>>
 @
@@ -66,11 +66,28 @@ from learnlog.gitrepo import LearnlogRepo
 
 The export needs CSV writing, temporary directories for code state
 extraction, and zip file creation.
-We import [[get_commits]], [[filter_learnlog_runs]],
+We import [[get_commits]], [[filter_internal_runs]],
 [[BLOCK_SEP]], and [[get_tag_map]] from the commits module
 rather than reimplementing the commit-walking logic.
 The tag map lets us populate the [[X-Tag]] column in the
 event table.
+Reassembling a run from its two commits is likewise the commits
+module's job (\cref{sec:run-join}): [[get_run_trailers]] and
+[[merge_run_trailers]] hand us the same complete run block that a
+single-commit log would have contained, so everything below parses
+one format.
+Deciding what a run \emph{is} comes from there too: [[is_internal_run]]
+names the plumbing this export drops, and [[is_review_run]] the
+reflection it exports under an event type of its own
+(\cref{sec:review-events}).
+Importing both rather than testing the command string here is what
+keeps the dataset agreeing with what [[list]] and [[play]] show---the
+three views classify a run by asking the same function
+(\cref{sec:filter-learnlog}).
+Every Git invocation goes through [[LearnlogRepo.git]]
+(\cref{sec:git-bytes}), so nothing here imports [[subprocess]];
+[[sys]] is imported for the single message the restorer writes to
+standard error (\cref{sec:reconstruct}).
 
 <<progsnap2 imports>>=
 from __future__ import annotations
@@ -81,7 +98,7 @@ import difflib
 import io
 import pathlib
 import shutil
-import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -90,14 +107,26 @@ from learnlog.commits import (
     _parse_iso,
     format_elapsed,
     get_commits,
+    get_run_trailers,
     get_tag_map,
-    filter_learnlog_runs,
+    filter_internal_runs,
+    is_internal_run,
+    is_review_run,
+    merge_run_trailers,
+    parse_view_trace,
     BLOCK_SEP,
 )
 from learnlog.gitrepo import (
+    EXCEPTION_SECTION_MARKER,
+    GIT_DIR_NAME,
+    GIT_TREE_TIMEOUT,
+    GitError,
+    IO_SECTION_MARKER,
     LearnlogRepo,
+    NO_IO_PLACEHOLDER,
     format_run_header,
     format_run_trailer,
+    parse_run_arguments,
 )
 @
 
@@ -111,6 +140,7 @@ PROGSNAP2_VERSION = 8
 
 
 \section{Parsing individual run blocks}
+\label{sec:parse-run-block}
 
 The existing [[parse_run_summary]] (\cref{commits}) extracts
 just enough for the [[list]] command: command string, start time,
@@ -130,20 +160,29 @@ the raw text for I/O and exception sections.  Missing trailer
 fields are represented as [[None]]---this lets callers distinguish
 \enquote{program crashed} from \enquote{exit code was zero}.
 
+A review run's trailer carries a further section, the [[Viewed:]]
+lines naming the commits the student looked at.
+Reading it is [[parse_view_trace]]'s job (\cref{sec:view-trace}); we
+call it here so that every consumer of a parsed block sees the trace
+as just another field, and so that ordinary runs---which have no such
+lines---come back with an empty list rather than a missing key.
+
 <<progsnap2 functions>>=
 def parse_run_block(block_text):
     """Parse a single run block into a dict.
 
     Returns a dict with keys ``script``, ``arguments``,
     ``start_time``, ``end_time``, ``exit_code``,
-    ``io_log``, and ``exception_info``.
-    Missing trailer fields are ``None``.
+    ``io_log``, ``exception_info``, and ``viewed``.
+    Missing trailer fields are ``None``; ``viewed`` is the
+    view trace, empty for everything but a review run.
     """
     result = {
         "script": None, "arguments": None,
         "start_time": None, "end_time": None,
         "exit_code": None, "io_log": None,
         "exception_info": None,
+        "viewed": parse_view_trace(block_text),
     }
 
     <<parse key-value fields>>
@@ -179,30 +218,68 @@ for line in block_text.split("\n"):
         )
 @
 
-The I/O and exception sections use [[--- I/O ---]] and
-[[--- exception ---]] as delimiters.
-We extract the text between these markers, treating [[None]] and
-[[(no I/O)]] as empty values.
+The I/O and exception sections are delimited by the markers
+[[format_run_trailer]] writes (\cref{sec:io-section}), and the I/O
+section is read back by cutting exactly at them.
+The parser this replaced took the text between the markers and
+[[strip]]ped it, which is the natural thing to write and wrong for
+this format: a captured log is a transcript, so spaces at the start of
+its first line and at the end of its last are output the program
+produced, and an export that removed them showed an analysis different
+bytes than the student saw.
+
+Cutting exactly means naming both edges as the writer writes them.
+The log begins on the line after the [[--- I/O ---]] marker, so the
+opening delimiter carries the newline that ends the marker line.
+It ends one blank line above [[--- exception ---]], and that blank
+line belongs to the layout rather than to the log
+(\cref{sec:io-section}), so the closing cut drops exactly one
+newline---[[removesuffix]] rather than [[rstrip]], because a run of
+newlines at the end of the section would be output too, and only the
+last of them is the separator.
+
+Anchoring both delimiters between newlines is what keeps a run's own
+text from being mistaken for one: a program that prints
+[[--- exception ---]] has that line recorded as [[stdout: ]] plus the
+text, which the anchor does not match.
+An \emph{unprefixed} line could still say it (\cref{sec:io-notes}),
+and no anchor can settle that---the format has one way of spelling
+both---so we take the first closing marker, as this has always done.
 
 <<parse trailer fields>>=
-if "--- I/O ---" in block_text:
-    io_start = block_text.index("--- I/O ---")
-    io_text = block_text[io_start + len("--- I/O ---"):]
-    if "--- exception ---" in io_text:
-        exc_marker = io_text.index("--- exception ---")
-        io_content = io_text[:exc_marker].strip()
+io_start = block_text.find(IO_SECTION_OPEN)
+if io_start >= 0:
+    io_text = block_text[io_start + len(IO_SECTION_OPEN):]
+    exc_start = io_text.find(EXCEPTION_SECTION_OPEN)
+    if exc_start < 0:
+        io_content = io_text.rstrip("\n")
+    else:
+        io_content = io_text[:exc_start].removesuffix("\n")
         exc_content = io_text[
-            exc_marker + len("--- exception ---"):
+            exc_start + len(EXCEPTION_SECTION_OPEN):
         ].strip()
-        if io_content and io_content != "(no I/O)":
-            result["io_log"] = io_content
         if exc_content and exc_content != "None":
             result["exception_info"] = exc_content
-    else:
-        io_content = io_text.strip()
-        if io_content and io_content != "(no I/O)":
-            result["io_log"] = io_content
+    if io_content and io_content != NO_IO_PLACEHOLDER:
+        result["io_log"] = io_content
+<<progsnap2 constants>>=
+IO_SECTION_OPEN = f"\n{IO_SECTION_MARKER}\n"
+EXCEPTION_SECTION_OPEN = f"\n{EXCEPTION_SECTION_MARKER}\n"
 @
+
+The exception section keeps its [[strip]], and the asymmetry is in the
+format rather than in our attention: the I/O section has a marker
+below it to cut at, while the exception text runs to the end of the
+block and therefore ends in whatever the commit message ended
+in---Git's closing newline included.
+There is nothing there to preserve it against, so preserving it would
+be preserving punctuation the recorder never wrote.
+
+A block whose I/O section has no [[--- exception ---]] below it is not
+something [[format_run_trailer]] can produce; it is what a hand-made
+or truncated message looks like.
+We read the section to the end of the block and drop the trailing
+newlines, which is the same cut the writer would have made.
 
 Let's verify the parser handles complete blocks, header-only
 blocks (crash), and blocks with exceptions:
@@ -272,6 +349,72 @@ def test_parse_run_block_exception():
     assert result["exit_code"] == "1"
     assert result["io_log"] is None
     assert "SyntaxError" in result["exception_info"]
+@
+
+The parser's real contract is stronger than any of those blocks can
+say, and it is easiest to state by asking the writer for the block:
+whatever [[format_run_trailer]] puts in the section comes back out of
+it unchanged, spaces at both ends included.
+
+<<progsnap2 test functions>>=
+def test_parse_run_block_keeps_io_verbatim():
+    """The I/O section reads back exactly as it was written."""
+    from learnlog.gitrepo import format_run_trailer
+    from learnlog.progsnap2 import parse_run_block
+    io_log = (
+        "   [session start]   \n"
+        "stdout: padded   \n"
+        "stdout: \n"
+        "stdout: "
+    )
+    block = "\n".join([
+        "Run: menu.py (none)",
+        "",
+        "Script: menu.py",
+        "Arguments: (none)",
+        "Start-Time: 2026-01-01T10:00:00",
+        format_run_trailer(
+            io_log, None,
+            datetime.datetime(2026, 1, 1, 10, 0, 5), 0,
+        ),
+    ])
+    assert parse_run_block(block)["io_log"] == io_log
+@
+
+A review run's block reaches the exporter with its navigation intact,
+while an ordinary run reports an empty trace rather than nothing at
+all---so a consumer never has to test for the key's presence:
+
+<<progsnap2 test functions>>=
+def test_parse_run_block_exposes_viewed():
+    from learnlog.progsnap2 import parse_run_block
+    first, second = "a" * 40, "b" * 40
+    block = (
+        "Run: learnlog play\n"
+        "\n"
+        "Script: learnlog\n"
+        "Arguments: play\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "End-Time: 2026-01-01T10:00:20\n"
+        "Exit-Code: 0\n"
+        f"Viewed: {first} 2026-01-01T10:00:01 open\n"
+        f"Viewed: {second} 2026-01-01T10:00:05 next\n"
+        "\n--- I/O ---\n(no I/O)\n"
+        "\n--- exception ---\nNone"
+    )
+    result = parse_run_block(block)
+    assert result["viewed"] == [
+        (first, "2026-01-01T10:00:01", "open"),
+        (second, "2026-01-01T10:00:05", "next"),
+    ]
+
+def test_parse_run_block_without_views():
+    from learnlog.progsnap2 import parse_run_block
+    result = parse_run_block(
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "Start-Time: 2026-01-01T10:00:00"
+    )
+    assert result["viewed"] == []
 @
 
 
@@ -381,6 +524,18 @@ def test_classify_run_result_crash():
     assert classify_run_result(run) == ""
 @
 
+The two signals are deliberately independent.
+A program that ends with \mintinline{python}{sys.exit(3)} reports
+failure without raising anything, so there is no traceback to record
+(\cref{sec:exit-status}); the exit code alone has to carry the verdict:
+
+<<progsnap2 test functions>>=
+def test_classify_run_result_nonzero_exit_without_exception():
+    from learnlog.progsnap2 import classify_run_result
+    run = {"exit_code": "3", "exception_info": None}
+    assert classify_run_result(run) == "Error"
+@
+
 
 \section{Extracting exception type and message}
 
@@ -462,17 +617,106 @@ Each chunk is a tuple of [[(event_type, text)]]:
   ProgSnap2 does not distinguish them).
 \item[ [[X-Run.Input]] ] contains the text of a single
   [[stdin]] line.
+\item[ [[X-Run.Note]] ] contains the joined lines that name
+  no stream at all (\cref{sec:io-notes}).
 \end{description}
+
+\subsection{Lines that name no stream}
+\label{sec:io-notes}
+
+A log line normally begins with the stream it came from, but not every
+line does, and what happens to the ones that do not is a decision this
+side has to make rather than assume away.
+The chunker this replaced dropped them: a line matching none of the
+three prefixes fell through the branches and was never written to the
+dataset, so an export quietly reported a shorter transcript than the
+one the run recorded.
+
+The tempting answer is that this cannot happen---[[IOLog]] prefixes
+every line it writes (\cref{capture})---and it is wrong for exactly
+the line that matters most.
+When a run exceeds the log's size cap, the capture layer appends a
+bracketed [[learnlog: I/O log truncated at N bytes]] line of its own,
+with no prefix, and that is the one line in the log a reader must not
+lose: it is the log saying that it is incomplete.
+Rejecting unprefixed input at [[finalize_run]] would refuse learnlog's
+own marker, and prefixing it would attribute learnlog's words to the
+student's program.
+
+So we keep such a line as itself.
+It becomes a chunk of its own kind, [[X-Run.Note]], grouped like
+output because consecutive notes are as much one block as consecutive
+output lines are, and it comes back with no prefix added, which is
+what makes the round trip exact rather than merely lossless-looking.
+
+<<progsnap2 functions>>=
+def classify_io_line(line):
+    """Split one I/O log line into an event type and its text.
+
+    ``stdout:`` and ``stderr:`` lines are output, ``stdin:``
+    lines are input, and a line carrying none of those prefixes
+    is a note and keeps its text whole.
+    """
+    for prefix, event_type in IO_LINE_PREFIXES:
+        if line.startswith(prefix):
+            return event_type, line[len(prefix):]
+    return "X-Run.Note", line
+<<progsnap2 constants>>=
+IO_LINE_PREFIXES = (
+    ("stdout: ", "X-Run.Output"),
+    ("stderr: ", "X-Run.Output"),
+    ("stdin: ", "X-Run.Input"),
+)
+@
+
+Turning a dataset back into a log reads the same correspondence
+backwards (\cref{sec:rebuild-io-log}), and needs one thing more than
+the prefix: which column of the event holds the text.
+A second table says both, and saying them in one place is what keeps
+export and import inverses of each other rather than two hand-written
+descriptions of the same correspondence---the export side picks the
+column from it as well.
+
+[[X-Run.Note]] gets a column of its own rather than borrowing
+[[ProgramOutput]], because that column is the ProgSnap2 spec's and
+means \enquote{what the program printed}; a note is learnlog talking
+about the run, and filing it as program output would be the same kind
+of silent lie as dropping it.
+The [[X-]] namespace is where a format keeps what the spec has no word
+for.
+
+Note that this table is not the inverse of the one above: two prefixes
+map to output and only one comes back, which is the [[stderr]]
+distinction ProgSnap2 cannot express and learnlog therefore loses at
+export.
+That loss is in the spec's shape, not in this code, and it is the only
+one left in this direction.
+
+<<progsnap2 constants>>=
+IO_EVENT_COLUMNS = {
+    "X-Run.Output": ("ProgramOutput", "stdout: "),
+    "X-Run.Input": ("ProgramInput", "stdin: "),
+    "X-Run.Note": ("X-Note", ""),
+}
+@
+
+\subsection{Grouping the lines into chunks}
+
+With the line vocabulary named, the chunker is a grouping loop over
+it.
+An input line is its own chunk---a student's answer is one act, and
+merging two of them would invent a conversation that did not
+happen---while output and notes accumulate until the kind changes.
 
 <<progsnap2 functions>>=
 def chunk_io_log(io_log):
-    """Chunk an I/O log into output/input event pairs.
+    """Chunk an I/O log into output, input, and note events.
 
     Returns a list of ``(event_type, text)`` tuples where
-    ``event_type`` is ``"X-Run.Output"`` or
-    ``"X-Run.Input"``.  Consecutive output lines are
-    grouped into a single output chunk; each input line
-    becomes its own chunk.
+    ``event_type`` is ``"X-Run.Output"``, ``"X-Run.Input"``, or
+    ``"X-Run.Note"``.  Consecutive output lines are grouped into
+    a single output chunk, as are consecutive notes; each input
+    line becomes its own chunk.
 
     Returns an empty list if ``io_log`` is empty or None.
     """
@@ -480,36 +724,34 @@ def chunk_io_log(io_log):
         return []
 
     chunks = []
-    output_buf = []
+    buffered = []
+    buffered_type = None
 
     for line in io_log.split("\n"):
-        if line.startswith("stdin: "):
-            if output_buf:
-                chunks.append((
-                    "X-Run.Output",
-                    "\n".join(output_buf),
-                ))
-                output_buf = []
-            chunks.append((
-                "X-Run.Input",
-                line[len("stdin: "):],
-            ))
-        elif line.startswith("stdout: "):
-            output_buf.append(
-                line[len("stdout: "):]
-            )
-        elif line.startswith("stderr: "):
-            output_buf.append(
-                line[len("stderr: "):]
-            )
+        event_type, text = classify_io_line(line)
+        if event_type == "X-Run.Input":
+            <<flush the buffered lines>>
+            chunks.append((event_type, text))
+            continue
+        if event_type != buffered_type:
+            <<flush the buffered lines>>
+            buffered_type = event_type
+        buffered.append(text)
 
-    if output_buf:
-        chunks.append((
-            "X-Run.Output",
-            "\n".join(output_buf),
-        ))
+    <<flush the buffered lines>>
 
     return chunks
+@
+
+The flush asks whether the buffer is empty, not whether its text is,
+and that is what keeps a blank entry from vanishing: a program that
+printed an empty line leaves a buffer holding one empty string, and a
+list holding an empty string is not an empty list.
+
+<<flush the buffered lines>>=
+if buffered:
+    chunks.append((buffered_type, "\n".join(buffered)))
+    buffered = []
 @
 
 <<progsnap2 test functions>>=
@@ -578,6 +820,38 @@ def test_chunk_io_log_only_input():
     assert chunks == [("X-Run.Input", "yes")]
 @
 
+The lines that name no stream have two things to prove: that they
+reach the dataset at all, and that they arrive whole---prefix-shaped
+text at the start of such a line is text, not a prefix, and a line
+that merely resembles one is still a note.
+
+<<progsnap2 test functions>>=
+def test_chunk_io_log_keeps_unprefixed_lines():
+    """A line naming no stream becomes a note, kept whole."""
+    from learnlog.progsnap2 import chunk_io_log
+    log = (
+        "stdout: working\n"
+        "[learnlog: I/O log truncated at 10 bytes]\n"
+        "   stdout: not a prefix"
+    )
+    chunks = chunk_io_log(log)
+    assert chunks == [
+        ("X-Run.Output", "working"),
+        (
+            "X-Run.Note",
+            "[learnlog: I/O log truncated at 10 bytes]\n"
+            "   stdout: not a prefix",
+        ),
+    ]
+
+def test_chunk_io_log_keeps_blank_output_entries():
+    """Trailing blank entries are entries, not padding."""
+    from learnlog.progsnap2 import chunk_io_log
+    log = "stdout: hi\nstdout: \nstdout: "
+    chunks = chunk_io_log(log)
+    assert chunks == [("X-Run.Output", "hi\n\n")]
+@
+
 
 \section{Code state identification}
 
@@ -615,32 +889,52 @@ def get_code_state_id(repo, commit_hash, seen_trees):
 
 
 \section{Extracting code state files}
+\label{sec:extract-code-state}
 
 To populate [[CodeStates/]], we extract the file tree for each
 unique code state.
-We use [[git archive]] to produce a tar stream, which we unpack
-into the target directory.
-Unlike [[repo.git()]], which uses [[text=True]] and cannot
-handle binary data, we call [[subprocess.run]] directly with
-the repo's environment variables.
+[[git archive]] hands us the whole tree as a single tar stream, which
+we unpack into the target directory---one command per state, rather
+than a checkout per state that would disturb the work tree we are
+reading.
+
+A tar stream is bytes, and that used to be the reason this function
+bypassed [[repo.git()]] and called [[subprocess.run]] itself.
+The bypass cost more than the decoding it avoided.
+Without the wrapper's failure handling, a [[git archive]] that failed
+returned quietly, and the caller wrote an \emph{empty} directory into
+[[CodeStates/]].
+Nothing downstream can distinguish that from a genuinely empty working
+tree, so the export looked successful while the dataset claimed the
+student had deleted every file---and reading such a dataset back does
+exactly what it says: [[restore_code_state]]
+(\cref{sec:reconstruct}) treats a code state as the whole tree, so
+playback deletes the reconstructed work tree file by file.
+
+Now that the wrapper can return bytes (\cref{sec:git-bytes}),
+extraction is an ordinary [[repo.git()]] call and a failure raises
+[[GitError]] out of the export.
+Stopping is the right answer here even though a missing code state
+would only spoil part of the dataset: a dataset that lies about what
+the student wrote is worse than one that was never written, because
+only the one that was never written gets noticed.
+The timeout is the tree-sized one for the same reason [[git add .]]
+uses it---the command reads every file in the tree.
 
 <<progsnap2 functions>>=
 def extract_code_state(repo, commit_hash, state_dir):
     """Extract the file tree of a commit into a directory.
 
     Uses ``git archive`` to produce a tar stream and unpacks
-    it into ``state_dir``.
+    it into ``state_dir``.  Raises ``GitError`` if Git cannot
+    produce the archive, rather than leaving an empty state
+    behind.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "archive", "--format=tar", commit_hash],
-        env=repo.env,
-        cwd=str(repo.workdir),
-        capture_output=True,
+    result = repo.git(
+        "archive", "--format=tar", commit_hash,
+        text=False, timeout=GIT_TREE_TIMEOUT,
     )
-    if result.returncode != 0:
-        return
-
     with tarfile.open(
         fileobj=io.BytesIO(result.stdout)
     ) as tar:
@@ -649,6 +943,13 @@ def extract_code_state(repo, commit_hash, state_dir):
             filter="data",
         )
 @
+
+Unpacking needs no path check of its own.
+[[filter="data"]] is tarfile's strictest extraction policy: it refuses
+members whose names are absolute, escape the destination, or link
+outside it, which is precisely the guarantee the read-back path has to
+establish by hand (\cref{sec:reconstruct}) because there the names
+arrive from a zip index that no filter has vetted.
 
 <<progsnap2 test functions>>=
 def test_get_code_state_id_deduplicates(workdir):
@@ -706,6 +1007,21 @@ def test_extract_code_state(workdir):
     assert len(files) >= 1
 @
 
+A commit Git cannot read must not pass for a commit with no files.
+The empty directory is the dangerous outcome, so the test asserts both
+that the failure is raised and that no state was left behind for a
+caller to mistake for a snapshot:
+
+<<progsnap2 test functions>>=
+def test_extract_code_state_raises_on_git_failure(workdir):
+    from learnlog.progsnap2 import extract_code_state
+    repo = LearnlogRepo(workdir)
+    out = workdir / "state_out"
+    with pytest.raises(GitError):
+        extract_code_state(repo, "0" * 40, out)
+    assert list(out.iterdir()) == []
+@
+
 
 \section{Writing the ProgSnap2 dataset}
 
@@ -730,7 +1046,7 @@ lifetime of that temporary data.
 
 <<progsnap2 functions>>=
 def do_export_progsnap2(repo, output_path,
-                        filter_learnlog_flag=True):
+                        filter_internal_flag=True):
     """Export the learnlog repository as a ProgSnap2 zip.
 
     Creates a zip file at ``output_path`` containing
@@ -748,7 +1064,9 @@ We walk commits in chronological order, parsing each commit
 message into run blocks.
 For each commit we determine the code state and generate events:
 a [[File.Edit]] event when the tree hash changes from the
-previous commit, and a [[Run.Program]] event for each run block.
+previous commit, and one event per run block---[[Run.Program]] for
+the student's own programs, [[X-Review]] for the [[play]] and
+[[list]] invocations with which they looked back at them.
 
 The [[Order]] column provides a global sequence number across
 all events, scoped per subject (the [[EventOrderScope]] metadata
@@ -759,6 +1077,7 @@ suffices.
 <<collect events and code states>>=
 commits = get_commits(repo)
 tag_map = get_tag_map(repo)
+trailers = get_run_trailers(repo)
 seen_trees = {}
 events = []
 resource_files = []
@@ -773,7 +1092,7 @@ for commit in commits:
 
     <<get subject and code state for commit>>
     <<optionally emit File.Edit event>>
-    <<emit Run.Program events>>
+    <<emit run events>>
 @
 
 We extract the author name as [[SubjectID]], since each learnlog
@@ -834,32 +1153,53 @@ if current_tree != prev_tree:
 
 For each run block we emit a [[Run.Program]] event with the
 parsed metadata.
-When [[filter_learnlog_flag]] is set, we skip blocks whose
-script is [[learnlog]] (the same filtering logic as
-[[filter_learnlog_runs]], but at the parsed-block level
-rather than raw text).
+The message we parse is the commit's own message with the run's
+trailer merged back in, so a run that finished contributes its exit
+code, timing, and I/O to the same event as its header---the
+[[Run.Program]] event stays anchored to the commit that holds the
+code state the run executed.
+When [[filter_internal_flag]] is set, we skip blocks that record
+learnlog's internal activity (the same test as [[filter_internal_runs]],
+but at the parsed-block level rather than raw text).
 
-After emitting the [[Run.Program]] event, we generate
-chunked I/O events for that run's captured output and input.
+After emitting the run event, we generate its child events---the
+chunked I/O of a program run, or the view trace of a review run.
 The spec recommends [[ParentEventID]] to link child events
-to their parent (v8, \S4.3.6, lines~902--912), so each I/O
-event references its parent [[Run.Program]]'s [[EventID]].
+to their parent (v8, \S4.3.6, lines~902--912), so each child
+event references its parent run's [[EventID]].
 We save that ID in [[run_event_id]] before the order counter
-advances past the I/O events.
+advances past the children.
 
-<<emit Run.Program events>>=
+A review run is a run in every respect this table can see: it has a
+script, arguments, a start and an end, and it either finished or it
+did not.
+So it fills the same columns, and only the [[EventType]] differs.
+That difference is the point.
+The analysis in \cref{sec:group-pairs} reads the stream as an
+alternation of [[File.Edit]] and [[Run.Program]], and a student who
+edits, pages back through yesterday's failures, and then runs would---
+were the review a [[Run.Program]]---have the review credited with the
+edit and the real run recorded as a re-run of unchanged code.
+Marking it [[X-Review]] is the whole fix, because the pairing loop
+dispatches on [[EventType]] and has no branch for anything else: an
+event type it does not know passes through it untouched.
+An analysis tool that has never heard of [[X-Review]] behaves the same
+way, which is the property the [[X-]] prefix exists to promise.
+
+<<emit run events>>=
 body = repo.git(
     "log", "-1", "--format=%B", commit_hash,
 ).stdout.rstrip("\n")
+body = merge_run_trailers(body, trailers)
 
 runs = parse_commit_runs(body)
 for run in runs:
-    if filter_learnlog_flag \
-            and run["script"] == "learnlog":
+    if filter_internal_flag and is_internal_run(run):
         continue
 
     order += 1
     run_event_id = order
+    review = is_review_run(run)
     program_result = classify_run_result(run)
     exc_type, exc_msg = parse_exception_line(
         run["exception_info"]
@@ -868,7 +1208,7 @@ for run in runs:
     timestamp = run["start_time"] or commit["date"]
 
     events.append({
-        "EventType": "Run.Program",
+        "EventType": "X-Review" if review else "Run.Program",
         "EventID": order,
         "Order": order,
         "SubjectID": subject_id,
@@ -889,7 +1229,10 @@ for run in runs:
         "X-CommitHash": commit_hash,
     })
 
-    <<emit I/O events for run>>
+    if review:
+        <<emit X-Review.View events>>
+    else:
+        <<emit I/O events for run>>
 
 prev_tree = current_tree
 @
@@ -943,13 +1286,93 @@ for evt_type, text in io_chunks:
         "X-CommitHash": commit_hash,
     }
     resource_path = f"Resources/io_{order}.txt"
-    if evt_type == "X-Run.Output":
-        io_event["ProgramOutput"] = resource_path
-    else:
-        io_event["ProgramInput"] = resource_path
+    column, _ = IO_EVENT_COLUMNS[evt_type]
+    io_event[column] = resource_path
     resource_files.append((resource_path, text))
     events.append(io_event)
 @
+
+\subsection{What a review looked at}
+\label{sec:review-events}
+
+The [[X-Review]] event says that a student sat down with their log;
+the [[Viewed:]] lines of its trailer (\cref{sec:view-trace}) say what
+they actually put on screen and in what order.
+That sequence is the research signal---which failure they went back to,
+how far back, how many times---so it must survive into the dataset
+rather than being summarised into a count.
+A sequence does not fit in a cell, which is the same reason the
+captured I/O became child events: we emit one [[X-Review.View]] event
+per line of the trace, in trace order, each pointing at its
+[[X-Review]] parent exactly as an I/O chunk points at its run.
+
+Two columns carry what is new.
+[[X-ViewedCommit]] is the full commit hash the trace recorded, which is
+what makes the trace a \emph{join} rather than a note: it matches the
+[[X-CommitHash]] of the events generated from that commit, so a query
+can go straight from \enquote{the student looked here} to the run and
+the code state they were looking at.
+[[X-ViewAction]] is the word the viewer chose from its fixed
+vocabulary---[[open]], [[next]], [[prev]], [[jump-first]],
+[[jump-last]], [[batch]]---and it is what separates a deliberate jump
+to the beginning from paging past a commit on the way to somewhere
+else.
+
+The timestamps are the trace's own rather than the run's.
+The I/O children leave theirs empty because learnlog has no per-line
+timing to put there, but a view event has exactly that: the moment the
+commit appeared.
+Without it the trace would only record an order, and dwell time---how
+long a student stayed on a failure before moving on---is measured
+between consecutive views, not between runs.
+
+One caveat belongs to the hashes rather than to this code.
+When the review was [[learnlog play -f]] on a bundle or a dataset, the
+commits on screen were the temporary reconstruction's
+(\cref{sec:reconstruct}), so the recorded hashes join within that
+session and against the source named in [[X-Arguments]], not against
+the student's own log.
+
+<<emit X-Review.View events>>=
+for viewed_commit, viewed_at, action in run["viewed"]:
+    order += 1
+    events.append({
+        "EventType": "X-Review.View",
+        "EventID": order,
+        "Order": order,
+        "SubjectID": subject_id,
+        "CodeStateID": code_state_id,
+        "ParentEventID": run_event_id,
+        "ServerTimestamp": viewed_at,
+        "ClientTimestamp": viewed_at,
+        "ProgramResult": "",
+        "X-EndTime": "",
+        "X-ExitCode": "",
+        "X-Script": "",
+        "X-Arguments": "",
+        "X-ExceptionType": "",
+        "X-ExceptionMessage": "",
+        "ProgramOutput": "",
+        "ProgramInput": "",
+        "X-Tag": commit_tags,
+        "X-CommitHash": commit_hash,
+        "X-ViewedCommit": viewed_commit,
+        "X-ViewAction": action,
+    })
+@
+
+The branch also declines to export a review run's own captured output,
+which is a decision rather than an oversight.
+Normally there is none: the recorder installs no I/O wrappers for these
+invocations precisely because a batch playback \emph{prints the log},
+and capturing that would file a copy of the history inside the history
+(\cref{sec:review-runs}).
+A log written before that rule, or one where [[play]] output reached
+the trailer by some other route, would still carry one---and exporting
+it would put every earlier run's output into [[Resources/]] a second
+time, attached to an event that did not produce it.
+Keeping the I/O branch for program runs only is what keeps
+[[Resources/]] a record of what programs printed.
 
 \subsection{Writing the zip file}
 
@@ -990,8 +1413,27 @@ for commit in commits:
 for tree_hash, state_id in seen_trees.items():
     commit_hash = tree_to_commit[tree_hash]
     state_subdir = states_dir / str(state_id)
-    extract_code_state(repo, commit_hash, state_subdir)
+    try:
+        extract_code_state(repo, commit_hash, state_subdir)
+    except GitError as error:
+        raise SystemExit(
+            f"Failed to extract code state for "
+            f"{commit_hash}: {error}"
+        ) from error
 @
+
+The exporter is where a failed extraction turns from an exception into
+a sentence.
+[[extract_code_state]] raises [[GitError]] because that is what a
+library function owes its callers---the tests below distinguish it, and
+so could any future caller---but every path that reaches this chunk
+comes from a command a person typed, so it ends the same way
+[[do_export]] ends a failed bundle (\cref{sec:export}): one line naming
+what could not be read, and a non-zero exit status, rather than a
+traceback through a program the user did not write.
+The commit hash is in the message because a dataset is exported from a
+history the user still has: it is the one piece of information that
+makes the failure investigable with [[learnlog git]].
 
 The metadata CSV has two columns: [[Property]] and [[Value]].
 We declare version~8, consistent event ordering scoped per
@@ -1035,8 +1477,22 @@ zip file.
 The optional [[X-EndTime]] column preserves learnlog's run trailer end
 time without changing the meaning of [[ServerTimestamp]] and
 [[ClientTimestamp]].
+The [[X-ViewedCommit]] and [[X-ViewAction]] columns carry the view
+trace of a review run (\cref{sec:review-events}); only
+[[X-Review.View]] events fill them.
+The [[X-Note]] column references the resource file of an
+[[X-Run.Note]] event, the transcript lines that name no stream
+(\cref{sec:io-notes}), and is empty everywhere else.
 Older datasets remain valid because the reader keeps whatever columns
 the CSV provides.
+
+The column list is the union of what every event type needs, and the
+writer fills the gaps: [[csv.DictWriter]] substitutes its [[restval]],
+the empty string, for any column an event dict omits.
+That is what lets each event above list only the columns it actually
+has something to say about---a [[File.Edit]] carries no [[X-EndTime]],
+a [[Run.Program]] no [[X-ViewedCommit]]---without every new column
+having to be threaded back through every other event type.
 
 <<build main table csv string>>=
 main_columns = [
@@ -1050,8 +1506,11 @@ main_columns = [
     "X-ExceptionType", "X-ExceptionMessage",
     "ProgramOutput",
     "ProgramInput",
+    "X-Note",
     "X-Tag",
     "X-CommitHash",
+    "X-ViewedCommit",
+    "X-ViewAction",
 ]
 main_buf = io.StringIO()
 main_writer = csv.DictWriter(
@@ -1127,7 +1586,42 @@ def test_do_export_progsnap2_creates_zip(workdir):
             if n.startswith("Resources/")
         ]
         assert len(resources) >= 1
+@
 
+An export that cannot read one of its code states must fail as a
+message, not as a zip file missing a directory nobody looks in.
+We make the extraction fail and check that the exporter stops and says
+which commit it stopped on:
+
+<<progsnap2 test functions>>=
+def test_do_export_progsnap2_reports_failed_extraction(
+    workdir, monkeypatch,
+):
+    from learnlog import progsnap2
+    from learnlog.progsnap2 import do_export_progsnap2
+
+    def failing_extract(repo, commit_hash, state_dir):
+        raise GitError(
+            ("archive", commit_hash), 128,
+            "fatal: not a tree object",
+        )
+
+    monkeypatch.setattr(
+        progsnap2, "extract_code_state", failing_extract
+    )
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    output = workdir / "test.progsnap2"
+
+    with pytest.raises(SystemExit) as caught:
+        do_export_progsnap2(repo, output)
+
+    assert "not a tree object" in str(caught.value)
+    assert not output.exists()
+@
+
+<<progsnap2 test functions>>=
 def test_progsnap2_metadata_version(workdir):
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
@@ -1189,25 +1683,39 @@ def test_progsnap2_unfinished_run_has_empty_end_time(workdir):
     assert len(run_events) >= 1
     assert run_events[0]["X-EndTime"] == ""
 
-def test_progsnap2_filters_learnlog_runs(workdir):
+def test_progsnap2_filters_internal_runs(workdir):
+    """Plumbing is dropped; the student's review is exported.
+
+    The review lands under its own event type, so it is
+    neither hidden like the pip install nor counted as an
+    attempt at the program like ``hello.py``.
+    """
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("pip", ["install", "learnlog"], t1)
     output = workdir / "test.progsnap2"
     do_export_progsnap2(repo, output)
     with zipfile.ZipFile(str(output)) as zf:
         main = zf.read("MainTable.csv").decode("utf-8")
     reader = csv_mod.DictReader(io.StringIO(main))
     events = list(reader)
-    scripts = [
-        e["X-Script"] for e in events
-        if e["EventType"] == "Run.Program"
-    ]
-    assert "hello.py" in scripts
-    assert "learnlog" not in scripts
+
+    def commands_of(event_type):
+        return [
+            f"{e['X-Script']} {e['X-Arguments']}"
+            for e in events
+            if e["EventType"] == event_type
+        ]
+
+    program_runs = commands_of("Run.Program")
+    assert any(c.startswith("hello.py") for c in program_runs)
+    assert not any("learnlog" in c for c in program_runs)
+    assert not any("pip" in c for c in program_runs)
+    assert commands_of("X-Review") == ["learnlog play"]
 
 def test_progsnap2_file_edit_event(workdir):
     import csv as csv_mod
@@ -1391,6 +1899,144 @@ def test_progsnap2_no_io_events_when_empty(workdir):
     assert len(resources) == 0
 @
 
+A review run's children are of the other kind.
+The trace below deliberately contains a revisit---the student pages
+forward and then comes back to where they started.
+Collapsing repeated commits into one row is the tempting summary, and
+it would throw away the very thing a trace is for: that the student
+compared two states, twice, is the observation.
+
+<<progsnap2 test functions>>=
+def test_progsnap2_emits_view_events(workdir):
+    """Each Viewed: line becomes an ordered child event."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    first, second = "a" * 40, "b" * 40
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("learnlog", ["play"], t1)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 20),
+        exit_code=0,
+        view_trace=[
+            (datetime.datetime(2026, 1, 1, 10, 0, 1),
+             first, "open"),
+            (datetime.datetime(2026, 1, 1, 10, 0, 5),
+             second, "next"),
+            (datetime.datetime(2026, 1, 1, 10, 0, 9),
+             first, "prev"),
+        ],
+    )
+    output = workdir / "views.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+
+    review = [
+        e for e in events if e["EventType"] == "X-Review"
+    ]
+    assert len(review) == 1
+    views = [
+        e for e in events
+        if e["EventType"] == "X-Review.View"
+    ]
+    assert [
+        (v["X-ViewedCommit"], v["X-ViewAction"],
+         v["ServerTimestamp"])
+        for v in views
+    ] == [
+        (first, "open", "2026-01-01T10:00:01"),
+        (second, "next", "2026-01-01T10:00:05"),
+        (first, "prev", "2026-01-01T10:00:09"),
+    ]
+    assert all(
+        v["ParentEventID"] == review[0]["EventID"]
+        for v in views
+    )
+    orders = [int(v["Order"]) for v in views]
+    assert orders == sorted(orders)
+    assert min(orders) > int(review[0]["Order"])
+    assert all(
+        v["ClientTimestamp"] == v["ServerTimestamp"]
+        for v in views
+    )
+@
+
+The two columns are new, so the header must declare them---a
+[[DictWriter]] that has never heard of a key raises rather than
+guessing, and the events that do not fill them must still be
+writable:
+
+<<progsnap2 test functions>>=
+def test_progsnap2_view_columns_declared(workdir):
+    """The view columns exist, and other events leave them empty."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    output = workdir / "columns.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+    assert "X-ViewedCommit" in reader.fieldnames
+    assert "X-ViewAction" in reader.fieldnames
+    assert all(
+        e["X-ViewedCommit"] == "" and e["X-ViewAction"] == ""
+        for e in events
+    )
+@
+
+The I/O of a review run is deliberately not exported, so we hand the
+exporter one anyway---an old log, or a [[play]] whose output reached
+the trailer another way---and check that it neither becomes resource
+files nor attaches children to the review:
+
+<<progsnap2 test functions>>=
+def test_progsnap2_review_event_has_no_io_children(workdir):
+    """A review's captured output is not re-exported."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("learnlog", ["play", "-b"], t1)
+    repo.finalize_run(
+        io_log="stdout: Run: hello.py\nstdout: exit 0\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 3),
+        exit_code=0,
+    )
+    output = workdir / "review-io.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+        resources = [
+            n for n in zf.namelist()
+            if n.startswith("Resources/")
+        ]
+    reader = csv_mod.DictReader(io.StringIO(main))
+    events = list(reader)
+    review = [
+        e for e in events if e["EventType"] == "X-Review"
+    ]
+    assert len(review) == 1
+    assert not [
+        e for e in events
+        if e["EventType"].startswith("X-Run.")
+    ]
+    assert not [
+        e for e in events
+        if e["ParentEventID"] == review[0]["EventID"]
+    ]
+    assert resources == []
+@
+
 Tags attached to commits appear in the [[X-Tag]] column of
 the exported event table.
 We verify that a tagged commit carries the tag name and
@@ -1432,12 +2078,12 @@ def test_progsnap2_tag_column(workdir):
     assert len(untagged) >= 1
 
 def test_progsnap2_no_duplicate_edit_when_filtered(workdir):
-    """Filtered learnlog runs do not create duplicate edits."""
+    """Filtered internal runs do not create duplicate edits."""
     import csv as csv_mod
     from learnlog.progsnap2 import do_export_progsnap2
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
-    repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("pip", ["install", "learnlog"], t1)
     output = workdir / "filtered.progsnap2"
     do_export_progsnap2(repo, output)
     with zipfile.ZipFile(str(output)) as zf:
@@ -1471,7 +2117,8 @@ The reader returns a dict with four keys:
   dicts, preserving the CSV column names as keys.
 \item[ [[code_states]] ] A nested dict mapping each
   [[CodeStateID]] to a dict of
-  \{filename: file content\} pairs.
+  \{filename: file content\} pairs.  Content is [[str]] for
+  files that decode as UTF-8 and [[bytes]] for the rest.
 \item[ [[resources]] ] A dict mapping resource paths
   (e.g.\ [[Resources/io_3.txt]]) to their text content.
 \end{description}
@@ -1527,9 +2174,41 @@ events = list(reader)
 @
 
 Code states live under [[CodeStates/{id}/]] in the zip.
-We read each file's content as a string, grouping by state ID.
-Binary files are skipped---ProgSnap2 is designed for source
-code, and our code states contain only text files.
+A code state is a snapshot of the student's entire working tree, and a
+working tree is not necessarily text: a sprite for a game, a compiled
+[[a.out]], a [[.pyc]], or a PDF handed in with the code all end up
+there because [[extract_code_state]] archives whatever Git tracked.
+Reading every entry as UTF-8 therefore cannot work.
+Skipping the undecodable ones---what we used to do---is worse than it
+sounds: [[restore_code_state]] treats the code state as the
+\emph{whole} tree, so a file missing from the dict is a file
+\emph{deleted} from the reconstructed working tree, and playback of a
+student's own project silently loses their data files.
+
+We therefore keep the decoded [[str]] when the bytes are valid UTF-8
+and the raw [[bytes]] when they are not.
+The type then carries what we actually know about the file: text for
+everything the diff and \LaTeX{} machinery can work with, bytes for
+what only a byte-exact round trip can preserve.
+This is the same text-versus-binary distinction Git itself makes, and
+it keeps the common case---source code---unchanged for every consumer.
+
+<<progsnap2 functions>>=
+def decode_if_text(data):
+    """Return ``data`` decoded as UTF-8, or the raw bytes.
+
+    Bytes that are not valid UTF-8 are returned unchanged so that
+    binary files survive a round trip byte for byte.
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data
+@
+
+With the decoding decision isolated, the reader itself only has to
+split each archive entry into its state ID and its path inside that
+state:
 
 <<read code states from zip>>=
 code_states = {}
@@ -1543,23 +2222,29 @@ for name in zf.namelist():
     filename = parts[1]
     if state_id not in code_states:
         code_states[state_id] = {}
-    try:
-        code_states[state_id][filename] = (
-            zf.read(name).decode("utf-8")
-        )
-    except UnicodeDecodeError:
-        pass
+    code_states[state_id][filename] = decode_if_text(
+        zf.read(name)
+    )
 @
 
 Resource files (I/O text) live under [[Resources/]].
+Here the same fallback would be useless: a resource is a captured I/O
+log whose only destination is a reconstructed commit message, and
+there is nothing sensible to do with raw bytes on that path.
+Our own exporter writes these from [[str]], so they are always valid
+UTF-8, but a dataset produced by another tool---or by a future version
+that captures I/O at the file-descriptor level---may not be.
+Decoding with [[errors="replace"]] turns that into a few replacement
+characters in one line of output instead of a [[UnicodeDecodeError]]
+that makes the entire dataset unreadable.
 
 <<read resource files from zip>>=
 resources = {}
 for name in zf.namelist():
     if not name.startswith("Resources/"):
         continue
-    resources[name] = (
-        zf.read(name).decode("utf-8")
+    resources[name] = zf.read(name).decode(
+        "utf-8", errors="replace"
     )
 @
 
@@ -1614,8 +2299,69 @@ def test_read_progsnap2_from_buffer(workdir):
     assert "metadata" in dataset
 @
 
+A student project with a binary file in it is the case that used to
+lose data, so we check the whole path: a PNG-like blob with an
+embedded [[NUL]] and a lone \verb|0xff| byte (which no UTF-8 decoder
+accepts) must come back byte for byte, while the source file next to
+it still comes back as text.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_roundtrips_binary_file(workdir):
+    """Binary code-state files survive export and read-back."""
+    from learnlog.progsnap2 import (
+        do_export_progsnap2, read_progsnap2,
+    )
+    blob = b"\x89PNG\r\n\x1a\n\x00\xff\xferaw"
+    (workdir / "logo.png").write_bytes(blob)
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hi\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    output = workdir / "test.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    dataset = read_progsnap2(output)
+    states = dataset["code_states"]
+    state = states[max(states, key=int)]
+    assert state["logo.png"] == blob
+    assert isinstance(state["hello.py"], str)
+@
+
+Resources come from student I/O, and a dataset written by another tool
+may hold bytes that are not valid UTF-8.
+Reading must still succeed; we assemble a minimal dataset by hand so
+the test does not depend on our own exporter ever producing such a
+resource:
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_replaces_invalid_resource_bytes(
+    tmp_path,
+):
+    """Undecodable resource bytes do not abort the read."""
+    from learnlog.progsnap2 import read_progsnap2
+
+    output = tmp_path / "manual.progsnap2"
+    with zipfile.ZipFile(output, "w") as zf:
+        zf.writestr(
+            "DatasetMetadata.csv",
+            "Property,Value\nVersion,8\n",
+        )
+        zf.writestr("MainTable.csv", "EventID,Order\n")
+        zf.writestr("Resources/io_1.txt", b"ok\xffbad")
+
+    dataset = read_progsnap2(output)
+    assert dataset["resources"]["Resources/io_1.txt"] == \
+        "ok\ufffdbad"
+@
+
 
 \section{Reconstructing a temporary repository}
+\label{sec:reconstruct}
 
 The [[analyse]] command can work directly from the flat event
 stream, but [[play]] and [[list]] already rely on Git commit
@@ -1635,8 +2381,13 @@ tree too.
 
 Two details need explicit care.
 First, [[LearnlogRepo(tmpdir / "repo")]] auto-creates an
-initial commit; the first reconstructed commit therefore amends
-that commit instead of adding an extra synthetic one.
+initial commit, and a reconstruction has no use for it: a live log
+needs somewhere to stand before its first run, whereas a dataset
+already says where the history starts.
+Keeping the placeholder would show up as a run that never happened,
+so we take it down before replaying rather than paint over it
+afterwards---which is also what lets every group be written the same
+way (\cref{sec:reconstructed-commits}).
 Second, ProgSnap2's I/O model merges [[stderr]] into output and
 still cannot recover that distinction.
 We therefore rebuild the header faithfully, preserve end time when
@@ -1646,6 +2397,21 @@ exception, and merged I/O.
 The public entry point returns the reconstructed repository and
 the temporary directory that owns it.  The caller removes that
 directory after playback or listing finishes.
+
+Everything after [[mkdtemp]] therefore runs inside a guard, for the
+reasons spelled out where [[resolve_source]] does the same for
+bundles (\cref{sec:resolve-source}): the directory is ours
+until we hand it back by returning, and once it becomes ours nothing
+but this function knows its name.
+Reconstruction is the slowest thing learnlog does---one Git commit
+per recorded run, each restoring a full code snapshot---so it is
+also the operation a student is most likely to interrupt, and the
+one that leaves the largest thing behind when they do: not an empty
+directory but a complete repository.
+The guard starts at [[mkdtemp]] rather than at the replay loop
+because [[LearnlogRepo]] runs [[git init]] and two [[git config]]
+calls before the first run is replayed, and a directory abandoned
+during setup is just as lost as one abandoned mid-replay.
 
 <<progsnap2 functions>>=
 def read_progsnap2_as_repo(source):
@@ -1660,22 +2426,31 @@ def read_progsnap2_as_repo(source):
         raise SystemExit("No commits found in ProgSnap2 dataset.")
 
     tmpdir = tempfile.mkdtemp(prefix="learnlog-ps2-play-")
-    repo_path = pathlib.Path(tmpdir) / "repo"
-    repo_path.mkdir()
-    repo = LearnlogRepo(repo_path)
-    subject_id = commit_groups[0]["events"][0].get(
-        "SubjectID", "learnlog"
-    ) or "learnlog"
-
-    <<configure reconstructed repository identity>>
-
     try:
-        <<replay grouped commits into temporary repository>>
-    except Exception:
+        <<reconstruct the repository under [[tmpdir]]>>
+    except BaseException:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
+@
 
-    return repo, tmpdir
+The [[except Exception]] this replaces caught the reconstruction
+failures---a malformed dataset, a snapshot Git refused---and by
+construction could not catch [[KeyboardInterrupt]], which is how the
+leak was reported in the first place.
+
+<<reconstruct the repository under [[tmpdir]]>>=
+repo_path = pathlib.Path(tmpdir) / "repo"
+repo_path.mkdir()
+repo = LearnlogRepo(repo_path)
+subject_id = commit_groups[0]["events"][0].get(
+    "SubjectID", "learnlog"
+) or "learnlog"
+
+<<configure reconstructed repository identity>>
+<<start the branch over from the dataset>>
+<<replay grouped commits into temporary repository>>
+
+return repo, tmpdir
 @
 
 We preserve the student's identity in the temporary history so
@@ -1690,18 +2465,39 @@ repo.git(
 )
 @
 
-Each commit group restores the corresponding snapshot, rebuilds
-the commit message, and either amends the auto-created initial
-commit or creates a new one.  After the commit exists, we add
-any tags that were exported for that group.
+Taking the placeholder down is a deletion of the \emph{branch}, not
+of the commit it points at.
+The reconstruction is one pass in a directory it owns and deletes, so
+an unreferenced commit costs nothing; what the deletion buys is that
+the first group's commit becomes a root commit, and every group's
+commit is then written the same way.
+
+[[recording_branch]] names the branch rather than assuming it, for the
+reason it does everywhere else (\cref{sec:recording-branch}): the name
+[[LearnlogRepo]] just created is whatever [[init.defaultBranch]] says
+on the machine doing the import, and a reconstruction has no more
+right to guess it than a run does.
+We ask once and keep the answer in [[branch]], because the replay loop
+below needs the same name to commit onto; asking again per group would
+be asking a question whose answer we have just changed.
+
+<<start the branch over from the dataset>>=
+branch = repo.recording_branch()
+repo.git("update-ref", "-d", branch)
+@
+
+Each commit group restores the corresponding snapshot, stages it,
+rebuilds the commit message, and adds the commit to the branch.
+After the commit exists, we add any tags that were exported for that
+group.
 
 <<replay grouped commits into temporary repository>>=
-for index, group in enumerate(commit_groups):
+for group in commit_groups:
     restore_code_state(
         repo.workdir,
         dataset["code_states"].get(group["code_state_id"], {}),
     )
-    repo.git("add", ".")
+    <<stage the restored code state>>
 
     message = build_reconstructed_commit_message(
         group, dataset["resources"]
@@ -1711,22 +2507,109 @@ for index, group in enumerate(commit_groups):
     <<recreate tags for reconstructed commit>>
 @
 
-The first group replaces the placeholder initial commit that
-[[LearnlogRepo]] created during setup.  Later groups become
-ordinary commits.
+\subsection{Staging a code state the dataset is the authority on}
+\label{sec:reconstruction-staging}
+
+We are committing into a [[LearnlogRepo]], so it carries learnlog's
+exclude patterns like any other (\cref{sec:ensure-configured}), and
+two of them---[[*.learnlog]] and [[*.progsnap2]]---name the files
+[[learnlog export]] writes.
+Those patterns are a policy about what a \emph{new} run records: a
+bundle sitting in the work tree is the export the log already
+contains, and committing it doubles the log on every cycle.
+They say nothing about what an existing dataset reports, and on this
+side the dataset is the authority.
+Everything in a code state was, by construction, tracked in the log it
+came from---[[git archive]] exports a committed tree
+(\cref{sec:extract-code-state})---so a dataset exported before those
+patterns existed can legitimately carry a file with either suffix.
+Letting the exclude file drop it would make the reconstructed history
+disagree with the dataset it was rebuilt from, and disagree silently,
+because a file Git declines to add is not an error.
+Hence [[-f]]: the restore decides what is in the tree, and staging
+takes all of it.
+
+That leaves the one pattern which is not policy.
+[[.learnlog]] is the Git directory of the very repository we are
+committing into, and it sits inside the work tree, so it is an
+ordinary directory to [[git add]] and is kept out of its own history
+by that pattern and nothing else (\cref{sec:ensure-configured}).
+A bare [[git add -f .]] would stage [[HEAD]], the index, the object
+store and the lock file as project files.
+Naming it as an excluded pathspec is what makes [[-f]] override the
+policy patterns without touching the structural one.
+[[safe_snapshot_path]] already refuses to \emph{write} anything under
+that directory, so the pathspec is the second half of a rule the
+restore states first: nothing the dataset names can land there, and
+nothing learnlog itself put there can be staged out of it.
+
+<<stage the restored code state>>=
+repo.git(
+    "add", "-f", "--", ".", GIT_DIR_PATHSPEC,
+    timeout=GIT_TREE_TIMEOUT,
+)
+<<progsnap2 constants>>=
+GIT_DIR_PATHSPEC = f":(exclude){GIT_DIR_NAME}"
+@
+
+Building the pathspec from [[GIT_DIR_NAME]] rather than spelling
+[[.learnlog]] again is the same reasoning that names the exclude
+pattern from it: the directory and the one thing protecting it should
+not be able to disagree.
+
+\subsection{Writing the reconstructed commit}
+\label{sec:reconstructed-commits}
+
+A reconstructed message carries the same captured I/O as the message
+it was exported from, and it has to arrive in the new repository
+unchanged.
+That is a stronger requirement than it sounds, because [[git commit]]
+does not treat a message as data: its default cleanup strips trailing
+whitespace from every line and collapses runs of blank lines.
+A learnlog I/O log is made of exactly that---a program printing an
+empty line records the prefix [[stdout:]] followed by a space, and a
+program printing spaces records them---so a log the recorder wrote
+verbatim (\cref{sec:finalising-a-run}) came back tidied, and an
+analysis over a reconstructed repository saw different bytes than the
+student's program had produced.
+
+[[git commit --cleanup=verbatim]] switches the tidying off, and it is
+the smaller change: the loop already stages and commits in one step.
+We route through [[commit_on_branch]] (\cref{sec:commit-on-branch})
+instead, because verbatim is not a property this side should have to
+remember to ask for.
+The recorder's commits are already written by that method, and its
+contract---the message becomes the commit message verbatim, with a
+closing newline supplied when the caller left one off---is what
+defines the bytes a learnlog commit holds.
+Reconstruction wants those bytes, so it should call that code rather
+than reassemble the same guarantee here out of a porcelain flag plus a
+newline convention restated a second time; two statements of one rule
+is how the rule drifts.
+
+What it costs is one command.
+[[commit_on_branch]] takes a tree rather than a work tree, so
+[[git write-tree]] turns the index we have just staged into one, on
+the same tree-sized budget as the [[git add]] that filled it: what
+either command walks is the size of the student's project.
+What it saves is the special case: [[commit-tree]] appends to a branch
+that need not exist yet, so with the placeholder gone the first group
+is no longer an amend and the loop no longer asks which group it is
+on.
+[[--allow-empty]] goes with it, because plumbing has no opinion about
+a commit that changes nothing, and so does [[--reset-author]], because
+a commit built by [[commit-tree]] is authored by the configured
+identity to begin with.
+The message still travels on standard input, as it did before and for
+the reason it did (\cref{sec:commit-message-stdin}): a run loud enough
+to overflow [[argv]] on the way out is equally loud on the way back
+in, and [[commit-tree]] reads it from there too.
 
 <<write reconstructed commit>>=
-if index == 0:
-    repo.git(
-        "commit", "--amend", "--allow-empty",
-        "--reset-author",
-        "-m", message,
-    )
-else:
-    repo.git(
-        "commit", "--allow-empty",
-        "-m", message,
-    )
+tree = repo.git(
+    "write-tree", timeout=GIT_TREE_TIMEOUT,
+).stdout.strip()
+repo.commit_on_branch(branch, tree, message)
 @
 
 Tag recreation must happen after the commit is written because
@@ -1784,28 +2667,245 @@ def group_events_by_commit(events):
   new snapshot are removed.
 \item[Directories] We create parent directories on demand so
   nested files under [[CodeStates/]] restore cleanly.
+\item[Log repository] The reconstructed repository keeps its Git
+  directory at [[.learnlog]] \emph{inside} the working tree it is
+  rebuilding, so a snapshot must never touch that path.
+\item[File types] Content is written back with the same type it was
+  read as, so binary files round-trip unchanged.
+\item[Untrusted names] Every entry name is checked before it is
+  joined onto the working directory, because a name in a dataset is
+  not necessarily a name that stays inside one.
 \end{description}
+
+The [[.learnlog]] rule is the one that was previously only half
+applied.
+Skipping the directory while deleting but not while writing looks
+harmless, because learnlog's own exporter never puts [[.learnlog]]
+paths into a code state.
+It is not: a code state is student-controlled data, so a project that
+happens to contain a directory called [[.learnlog]]---or a dataset
+from another tool, or a hand-edited one---makes the write loop
+overwrite [[HEAD]], the index, or a ref of the very repository we are
+committing into, mid-replay.
+Expressing both passes through one predicate is what makes the guard
+symmetric by construction rather than by inspection.
+
+<<progsnap2 functions>>=
+def is_learnlog_path(name):
+    """Return whether ``name`` lies inside the ``.learnlog`` directory."""
+    parts = pathlib.PurePath(name).parts
+    return bool(parts) and parts[0] == ".learnlog"
+@
+
+[[.learnlog]] was only the nearest instance of a larger problem.
+A code-state entry is a \emph{name} that we join onto [[workdir]], and
+the names come from the zip index of a dataset learnlog did not
+necessarily write: a hand-edited file, an export from another tool, a
+classmate's dataset arriving by mail.
+Two shapes of name that [[pathlib]] accepts do not stay under
+[[workdir]] at all.
+A name like [[../id_rsa]] climbs out of the directory, and an absolute
+one discards it entirely---[[workdir / "/etc/passwd"]] \emph{is}
+[[/etc/passwd]], because joining an absolute path replaces the left
+operand instead of extending it.
+Playing back an untrusted dataset would then write attacker-chosen
+content wherever the student can write.
+
+The decision is one function, applied to every entry before anything
+is created, and it hands back the path to write rather than a yes or
+no: the join is the very thing being judged, so returning it is what
+stops the caller from computing it a second time and differently.
+It answers in two halves---a name half, which we can settle without
+touching the disk, and a filesystem half, which we cannot---and
+neither half subsumes the other.
+
+The name half rejects what cannot be a plain relative path: an empty
+name or [[.]], which select no file; a root or a drive, which make the
+join absolute; and any [[..]] component, which walks upwards.
+We read the name as a [[PureWindowsPath]] even on Unix.
+That is not portability decoration.
+[[PureWindowsPath]] treats both slashes as separators and recognises
+drive letters and UNC prefixes, so it sees [[C:/secrets]] and
+[[a\..\..\x]] as the paths whoever wrote them meant.
+A dataset is a file that travels between machines, and a check that
+only understands the conventions of the machine it happens to run on
+is a check an attacker satisfies by choosing the other platform's
+spelling.
+
+<<progsnap2 functions>>=
+def is_safe_relative_name(name):
+    """Return whether ``name`` is a plain relative path.
+
+    Rejects absolute names, drive and UNC prefixes, ``..``
+    components, and names that select no file at all.  The name is
+    read with Windows separator rules so that a dataset written on
+    either platform is judged the same way.
+    """
+    pure = pathlib.PureWindowsPath(name)
+    if pure.drive or pure.root:
+        return False
+    parts = pure.parts
+    return bool(parts) and ".." not in parts
+@
+
+The filesystem half answers the question a name cannot: where does the
+join actually land?
+A name can be relative, [[..]]-free and still escape through a
+symbolic link that already exists in the tree---with [[data]] pointing
+at [[/tmp]], the entry [[data/x]] lands in [[/tmp/x]].
+Resolving the join and requiring the result to stay under the resolved
+[[workdir]] settles that, because resolution is exactly what follows
+those links.
+We resolve [[workdir]] as well: comparing a resolved path against an
+unresolved root would report an escape for every project that lives
+under a symlinked home directory.
+Resolution can still refuse, on a symlink loop; refusing to write is
+then the answer we already wanted.
+
+<<progsnap2 functions>>=
+def safe_snapshot_path(workdir, name):
+    """Return where ``name`` may be restored, relative to ``workdir``.
+
+    Returns ``None`` when the entry must not be written: when it is
+    not a plain relative path, when it reaches into the ``.learnlog``
+    directory of the repository being rebuilt, or when the join
+    leaves ``workdir`` through a symbolic link.
+    """
+    if not is_safe_relative_name(name):
+        return None
+    parts = pathlib.PureWindowsPath(name).parts
+    relative = pathlib.Path(*parts)
+    if is_learnlog_path(relative):
+        return None
+    try:
+        target = (workdir / relative).resolve()
+        if not target.is_relative_to(workdir.resolve()):
+            return None
+    except OSError:
+        return None
+    return relative
+@
+
+Rebuilding the relative path from the parsed parts rather than using
+the name as given is what makes the [[.learnlog]] check and the join
+see the same path the name check saw: a Windows-style
+[[.learnlog\HEAD]] is one opaque file name to [[PurePath]] on Unix,
+and it must not slip past a guard that has already read it as two
+components.
+
+An unsafe entry is skipped, with a line on standard error naming it,
+and the rest of the state restores normally.
+Refusing the whole dataset is the other defensible answer, and for a
+tool that only ever read its own exports it would be the better one.
+This one reads foreign datasets on purpose---that is what
+[[learnlog play -f]] and [[learnlog analyse]] are for---and a
+researcher looking at someone else's data is better served by the
+files that were fine plus a visible complaint than by a command that
+refuses an entire dataset over one bad name.
+What we must not do is skip in silence: the same entry is an attack in
+one dataset and a bug in the exporter that produced another, and
+neither gets fixed by a tool that says nothing.
+
+The message goes to [[sys.stderr]], not to the [[sys.__stderr__]] that
+[[report_error]] uses (\cref{sec:diagnostics}).
+The difference is who is meant to read it.
+[[report_error]] reports learnlog failing behind a student's back and
+must stay out of the run it describes, whereas this is a command
+talking to the person who typed it, and it belongs in that command's
+output like every other message [[play]] and [[analyse]] print.
+
+<<progsnap2 functions>>=
+def warn_unsafe_snapshot_path(name):
+    """Report a code-state entry that was not restored."""
+    print(
+        f"learnlog: skipping unsafe code state path {name!r}",
+        file=sys.stderr,
+    )
+@
+
+Writing the snapshot has to preserve the distinction
+[[read_progsnap2]] recorded: [[str]] goes through [[write_text]] and
+[[bytes]] through [[write_bytes]].
+Forcing everything through [[write_text]] would raise on a binary file,
+and forcing everything through [[write_bytes]] would encode text with
+the platform's default rules instead of the UTF-8 we decoded from.
 
 <<progsnap2 functions>>=
 def restore_code_state(workdir, code_state):
     """Replace ``workdir`` contents with a full code snapshot."""
-    expected = {pathlib.Path(name) for name in code_state}
+    <<vet the snapshot entries>>
 
     for path in sorted(workdir.rglob("*"), reverse=True):
         rel = path.relative_to(workdir)
-        if rel.parts and rel.parts[0] == ".learnlog":
+        if is_learnlog_path(rel):
             continue
-        if path.is_dir():
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
             if any(rel in item.parents for item in expected):
                 continue
             path.rmdir()
         elif rel not in expected:
             path.unlink()
 
-    for name, content in code_state.items():
-        target = workdir / name
+    for relative, content in snapshot.items():
+        target = workdir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content)
+@
+
+The symbolic-link branch of the deletion pass exists because [[Path]]
+answers the question above it the wrong way for us.
+[[rglob]] yields links alongside real entries, and [[is_dir]] follows
+them, so a link pointing at a directory says yes---and [[rmdir]] then
+refuses that same link with [[NotADirectoryError]], because the link
+is not a directory, it only points at one.
+Removing a link is [[unlink]] whatever it points at, and that is also
+the only removal that leaves the far end alone: [[rmdir]] here would
+have been a request to delete somebody else's directory.
+
+We remove links without asking whether the snapshot claims the name.
+A code state records file contents, so restoring an entry means
+creating a file under that name, whereas a link left in place would
+make the write pass follow it and overwrite whatever is at the other
+end.
+That is the substitution [[safe_snapshot_path]] already refuses when
+it judges a name; arriving at it from the tree instead of from the
+name does not make it a different thing, and deleting the link first
+is what makes the two passes agree---the name is created, not
+followed.
+
+No caller reaches this today.
+[[restore_code_state]] rebuilds into a temporary tree that playback
+creates for it (\cref{sec:reconstruct}), and a code state carries file
+contents rather than links, so nothing puts a symbolic link in the
+tree being walked.
+The branch is here because the loop is written against the filesystem
+and not against that single caller: a restore over a directory that
+already existed, or a dataset that does carry a link, turns a missing
+predicate into an exception raised halfway through deleting, leaving a
+tree that is neither the old one nor the new one.
+A pass that empties a directory has to be one that finishes.
+
+Vetting happens before either pass, and both passes then work from its
+result.
+That ordering is what keeps the two halves consistent: a rejected entry
+is not written, and---because the deletion pass removes whatever the
+snapshot does not claim---it is also not treated as a file the
+reconstructed tree ought to contain.
+
+<<vet the snapshot entries>>=
+snapshot = {}
+for name, content in code_state.items():
+    relative = safe_snapshot_path(workdir, name)
+    if relative is None:
+        warn_unsafe_snapshot_path(name)
+        continue
+    snapshot[relative] = content
+expected = set(snapshot)
 @
 
 Rebuilding the commit message mirrors the original structure as
@@ -1820,6 +2920,27 @@ Datasets exported by current learnlog versions also carry
 Older datasets remain readable because a missing [[X-EndTime]] simply
 means the rebuilt block omits the [[End-Time:]] line.
 
+The message is rebuilt from the events that \emph{are} runs, and there
+are two kinds: the student's programs and their reviews.
+Both become the same kind of block---a review run is written to the log
+by the same [[begin_run]] and [[finalize_run]] as any other
+(\cref{sec:review-runs}), so reconstructing it is not a second code
+path but the same one applied to a second event type.
+What differs is only which children the block draws on: a
+[[Run.Program]] has I/O chunks and no view trace, an [[X-Review]] the
+reverse.
+Asking for both and letting the empty one come back empty is what makes
+that possible: a branch on the event type would have to be right about
+which kind of child each type has, and a dataset that disagreed---a
+review carrying I/O from an older exporter, say---would lose whatever
+the branch did not expect to find.
+
+Selecting by an explicit tuple rather than by exclusion is what keeps
+the child events out of the block list.
+An [[X-Review.View]] event sits in the group's event list beside its
+parent, and a loop that skipped only [[X-Run.Output]] and
+[[X-Run.Input]] would try to build a run block out of it.
+
 <<progsnap2 functions>>=
 def build_reconstructed_commit_message(group, resources):
     """Build a learnlog-style commit message from one group."""
@@ -1830,19 +2951,26 @@ def build_reconstructed_commit_message(group, resources):
     )
 
     for event in events:
-        if event["EventType"] != "Run.Program":
+        if event["EventType"] not in RECONSTRUCTED_RUN_EVENTS:
             continue
         io_log = rebuild_io_log(
             group["events"], event["EventID"], resources
         )
+        view_trace = rebuild_view_trace(
+            group["events"], event["EventID"]
+        )
         blocks.append(
-            build_reconstructed_run_block(event, io_log)
+            build_reconstructed_run_block(
+                event, io_log, view_trace
+            )
         )
 
     if not blocks:
         return "learnlog: reconstructed commit"
 
     return BLOCK_SEP.join(blocks)
+<<progsnap2 constants>>=
+RECONSTRUCTED_RUN_EVENTS = ("Run.Program", "X-Review")
 @
 
 We reuse [[format_run_header]] so the first half of each block is
@@ -1853,12 +2981,35 @@ run apart from the already-lost [[stderr]] split.
 For older datasets without [[X-EndTime]], we fall back to the older
 behaviour and omit the [[End-Time:]] line.
 
+[[X-Arguments]] holds the field exactly as the header wrote it, so
+recovering the list is [[parse_run_arguments]] and nothing else
+(\cref{sec:run-arguments}).
+Splitting the column on whitespace instead---which is what this did
+before---turns one argument containing a space into two, and a
+[[python -c]] source into as many arguments as it has words, so the
+block we rebuild would not be the block we exported.
+
+A review run's [[Viewed:]] lines come back the same way its I/O would:
+handed to [[format_run_trailer]], which is the one place that knows
+where in the trailer they go (\cref{sec:finalising-a-run}).
+Reusing the writer rather than assembling the lines here is what makes
+the round trip exact instead of approximately right---a reconstructed
+trailer is byte-identical to the one the run wrote, and stays so if the
+layout ever changes.
+
+The fallback for datasets without [[X-EndTime]] therefore needs no view
+trace of its own.
+[[End-Time:]] and the [[Viewed:]] lines are written by the same
+[[finalize_run]] into the same trailer, so a dataset that lost the one
+never carried the other; anything that did would have to be a hand-made
+file, and the header we still emit for it is the honest reconstruction
+of what it records.
+
 <<progsnap2 functions>>=
-def build_reconstructed_run_block(event, io_log):
+def build_reconstructed_run_block(event, io_log, view_trace=None):
     """Rebuild one run block from a ProgSnap2 run event."""
     script = event.get("X-Script", "") or "(unknown)"
-    args_value = event.get("X-Arguments", "")
-    args = [] if args_value in ("", "(none)") else args_value.split()
+    args = parse_run_arguments(event.get("X-Arguments", ""))
     start_time = datetime.datetime.fromisoformat(
         event["ServerTimestamp"]
     )
@@ -1877,6 +3028,7 @@ def build_reconstructed_run_block(event, io_log):
             exception_info,
             end_time,
             int(exit_code) if exit_code else 0,
+            view_trace,
         )
         return f"{header}\n{trailer}"
 
@@ -1886,14 +3038,20 @@ def build_reconstructed_run_block(event, io_log):
     if io_log or exception_info:
         parts.extend([
             "",
-            "--- I/O ---",
-            io_log.rstrip("\n") if io_log else "(no I/O)",
+            IO_SECTION_MARKER,
+            (io_log or "").rstrip("\n") or NO_IO_PLACEHOLDER,
             "",
-            "--- exception ---",
+            EXCEPTION_SECTION_MARKER,
             exception_info or "None",
         ])
     return "\n".join(parts)
 @
+
+The fallback writes the section the way [[format_run_trailer]] does,
+down to the placeholder for a log that is nothing but newlines
+(\cref{sec:io-section}), because a block this function produces is
+read back by the same parser as any other and there is only one form
+for it to read.
 
 The exception text stored in ProgSnap2 is split into type and
 message columns.
@@ -1911,10 +3069,16 @@ def rebuild_exception_info(event):
     return exc_type or exc_msg or None
 @
 
+\subsection{Turning the events back into a log}
+\label{sec:rebuild-io-log}
+
 ProgSnap2 stores child I/O events separately from the parent run.
 We rebuild learnlog's textual I/O log by walking the matching
-child events in order and reattaching the original [[stdout:]]/
-[[stdin:]] prefixes.
+child events in order and putting each one's lines back under the
+prefix its kind is written with---which is the second reading of
+[[IO_EVENT_COLUMNS]] (\cref{sec:io-notes}), so the log comes back
+under the prefixes it went in with by construction rather than by two
+lists agreeing.
 The [[stderr]] distinction is already lost at export time, so all
 output is reconstructed as [[stdout:]].
 
@@ -1924,6 +3088,14 @@ which becomes a trailing newline in the resource text.
 Reconstruction therefore has to use [[split("\n")]] rather than
 [[splitlines()]]: the trailing empty element is not a stray artifact,
 but the representation of the student's actual blank line.
+
+For the same reason the joined log is returned as it is.
+An earlier version ended with [[rstrip("\n")]], which was harmless
+only as long as every line carried a prefix: prefixed lines cannot end
+in a newline, so the strip could never fire except on a note
+(\cref{sec:io-notes})---that is, except on data.
+Trimming the log is [[format_run_trailer]]'s decision to make
+(\cref{sec:io-section}), and it makes it either way.
 
 <<progsnap2 functions>>=
 def rebuild_io_log(events, parent_event_id, resources):
@@ -1937,19 +3109,64 @@ def rebuild_io_log(events, parent_event_id, resources):
         key=lambda event: int(event["Order"]),
     )
     for event in children:
-        if event["EventType"] == "X-Run.Output":
-            resource = event.get("ProgramOutput", "")
-            prefix = "stdout: "
-        elif event["EventType"] == "X-Run.Input":
-            resource = event.get("ProgramInput", "")
-            prefix = "stdin: "
-        else:
+        columns = IO_EVENT_COLUMNS.get(event["EventType"])
+        if columns is None:
             continue
-        text = resources.get(resource, "")
+        column, prefix = columns
+        text = resources.get(event.get(column, ""), "")
         lines.extend(
             f"{prefix}{line}" for line in text.split("\n")
         )
-    return "\n".join(lines).rstrip("\n")
+    return "\n".join(lines)
+@
+
+The unknown-type skip above is what makes the child kinds
+independent: a run's children are whatever events name it as parent,
+and the loop reads only the ones the table names.
+An [[X-Review.View]] among them is therefore not a case to handle but a
+case already handled, which is the same tolerance the pairing loop
+(\cref{sec:group-pairs}) relies on.
+
+The view trace comes back by the mirror-image walk.
+Where [[rebuild_io_log]] returns text, this returns the triples
+[[format_run_trailer]] expects---the timestamp first, because that is
+the order [[learnlog.record_view]] stores them in and the order the
+writer's parameters take (\cref{gitrepo}), even though the line itself
+leads with the commit.
+
+A view whose timestamp will not parse is dropped rather than
+substituted for, because the substitute would be a lie: an invented
+time in a trace read as a chronology is worse than a shorter trace, and
+the trace is the only thing in the dataset whose timestamps are read as
+the events they describe rather than as metadata about a run.
+
+<<progsnap2 functions>>=
+def rebuild_view_trace(events, parent_event_id):
+    """Rebuild a review run's view trace from its child events.
+
+    Returns ``(time, commit, action)`` triples in event order,
+    ready for :func:`learnlog.gitrepo.format_run_trailer`.
+    Views with an unreadable timestamp are skipped.
+    """
+    trace = []
+    children = sorted(
+        [
+            event for event in events
+            if event.get("ParentEventID") == parent_event_id
+            and event["EventType"] == "X-Review.View"
+        ],
+        key=lambda event: int(event["Order"]),
+    )
+    for event in children:
+        viewed_at = _parse_iso(event.get("ServerTimestamp"))
+        if viewed_at is None:
+            continue
+        trace.append((
+            viewed_at,
+            event.get("X-ViewedCommit", ""),
+            event.get("X-ViewAction", ""),
+        ))
+    return trace
 @
 
 Let's verify the helpers before testing the full CLI path.
@@ -1977,6 +3194,228 @@ def test_restore_code_state_replaces_full_snapshot(tmp_path):
     assert (tmp_path / "main.py").read_text() == \
         "print('main')\n"
     assert (tmp_path / ".learnlog").exists()
+@
+
+The write pass needs its own guard test, because the deletion pass
+above passes either way.
+We seed a plausible Git directory and then hand the restorer a
+snapshot that claims to contain it; the live [[HEAD]] must survive:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_never_writes_into_learnlog(
+    tmp_path,
+):
+    from learnlog.progsnap2 import restore_code_state
+
+    (tmp_path / ".learnlog").mkdir()
+    (tmp_path / ".learnlog" / "HEAD").write_text(
+        "ref: refs/heads/main\n"
+    )
+
+    restore_code_state(tmp_path, {
+        "main.py": "print('main')\n",
+        ".learnlog/HEAD": "ref: refs/heads/attacker\n",
+        ".learnlog/hooks/pre-commit": "#!/bin/sh\nrm -rf .\n",
+    })
+
+    assert (tmp_path / ".learnlog" / "HEAD").read_text() == \
+        "ref: refs/heads/main\n"
+    assert not (
+        tmp_path / ".learnlog" / "hooks"
+    ).exists()
+    assert (tmp_path / "main.py").exists()
+@
+
+Binary content must reach the working tree unchanged; writing it as
+text would either raise or re-encode it:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_writes_binary_content(tmp_path):
+    from learnlog.progsnap2 import restore_code_state
+
+    blob = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
+    restore_code_state(tmp_path, {
+        "assets/logo.png": blob,
+        "main.py": "print('main')\n",
+    })
+
+    assert (tmp_path / "assets" / "logo.png").read_bytes() \
+        == blob
+    assert (tmp_path / "main.py").read_text() == \
+        "print('main')\n"
+@
+
+The escaping names are what the guard exists for.
+We give the restorer a working directory with a sibling next to it and
+ask it to write over that sibling three ways---upwards, upwards via a
+subdirectory that does not exist, and sideways with a Windows drive
+letter.
+Nothing outside the working directory may appear or change, the
+legitimate entry must still restore, and each refusal must be audible:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_refuses_escaping_names(
+    tmp_path, capsys,
+):
+    from learnlog.progsnap2 import restore_code_state
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    restore_code_state(workdir, {
+        "../escaped.py": "print('escaped')\n",
+        "a/../../escaped.py": "print('escaped')\n",
+        "C:/escaped.py": "print('escaped')\n",
+        "pkg/main.py": "print('main')\n",
+    })
+
+    assert [p.name for p in tmp_path.iterdir()] == ["work"]
+    assert not (workdir / "C:").exists()
+    assert (workdir / "pkg" / "main.py").read_text() == \
+        "print('main')\n"
+    assert capsys.readouterr().err.count("escaped.py") == 3
+@
+
+An absolute name is the same attack without the [[..]], and it is the
+one [[pathlib]] makes easiest to write by accident: the join simply
+discards the working directory.
+Here the target is a real file that exists, so the test can assert the
+stronger property---that its contents are untouched:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_refuses_absolute_names(
+    tmp_path, capsys,
+):
+    from learnlog.progsnap2 import restore_code_state
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    victim = tmp_path / "victim.py"
+    victim.write_text("original\n")
+
+    restore_code_state(workdir, {
+        str(victim): "print('overwritten')\n",
+        "main.py": "print('main')\n",
+    })
+
+    assert victim.read_text() == "original\n"
+    assert (workdir / "main.py").exists()
+    assert str(victim) in capsys.readouterr().err
+@
+
+The deletion pass needs the same scrutiny from the other side, where
+the danger arrives as a link in the tree rather than as a name in the
+dataset.
+We hang two links in the working directory, one at a directory and one
+at a file, both pointing outside it, and claim neither in the
+snapshot.
+Restoring has to remove both links and run to the end, and everything
+they pointed at has to survive---which is precisely the difference
+between the [[unlink]] this branch performs and the [[rmdir]] it
+avoids:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_removes_symlinks_not_targets(tmp_path):
+    from learnlog.progsnap2 import restore_code_state
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("keep\n")
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "dirlink").symlink_to(
+        outside, target_is_directory=True,
+    )
+    (workdir / "filelink").symlink_to(outside / "secret.txt")
+
+    restore_code_state(workdir, {"main.py": "print('main')\n"})
+
+    assert not (workdir / "dirlink").is_symlink()
+    assert not (workdir / "filelink").is_symlink()
+    assert (workdir / "main.py").read_text() == "print('main')\n"
+    assert (outside / "secret.txt").read_text() == "keep\n"
+    assert sorted(p.name for p in outside.iterdir()) == \
+        ["secret.txt"]
+@
+
+A link whose name the snapshot \emph{does} claim is what the
+unconditional removal is for.
+The link has to point inside the working directory for the test to
+reach the write pass at all, since a name resolving outside is refused
+before then, so we aim it at a second file that the same snapshot also
+claims.
+Restoring both names must leave two files: if the link survived the
+deletion pass, [[main.py]] would still be a link and the content meant
+for it would have landed in [[real.py]]:
+
+<<progsnap2 test functions>>=
+def test_restore_code_state_replaces_a_claimed_symlink(tmp_path):
+    from learnlog.progsnap2 import restore_code_state
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "real.py").write_text("real\n")
+    (workdir / "main.py").symlink_to(workdir / "real.py")
+
+    restore_code_state(workdir, {
+        "main.py": "print('main')\n",
+        "real.py": "print('real')\n",
+    })
+
+    assert not (workdir / "main.py").is_symlink()
+    assert (workdir / "main.py").read_text() == "print('main')\n"
+    assert (workdir / "real.py").read_text() == "print('real')\n"
+@
+
+The name checks are worth testing directly too, because
+[[restore_code_state]] can only observe the ones that reach the
+filesystem:
+
+<<progsnap2 test functions>>=
+@pytest.mark.parametrize("name", [
+    "../escaped.py",
+    "a/../../escaped.py",
+    "/etc/passwd",
+    "C:/Windows/System32/drivers/etc/hosts",
+    "\\\\server\\share\\payload",
+    "",
+    ".",
+])
+def test_is_safe_relative_name_rejects(name):
+    from learnlog.progsnap2 import is_safe_relative_name
+    assert not is_safe_relative_name(name)
+
+@pytest.mark.parametrize("name", [
+    "main.py",
+    "pkg/main.py",
+    "pkg/sub/deep.py",
+    ".hidden",
+])
+def test_is_safe_relative_name_accepts(name):
+    from learnlog.progsnap2 import is_safe_relative_name
+    assert is_safe_relative_name(name)
+@
+
+The symbolic-link escape is the case only the filesystem half can
+catch: every component of [[data/x.py]] is an ordinary relative name,
+yet the join leaves the working directory:
+
+<<progsnap2 test functions>>=
+def test_safe_snapshot_path_refuses_symlink_escape(tmp_path):
+    from learnlog.progsnap2 import safe_snapshot_path
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workdir / "data").symlink_to(outside)
+
+    assert safe_snapshot_path(workdir, "main.py") is not None
+    assert safe_snapshot_path(workdir, "data/x.py") is None
+    assert safe_snapshot_path(
+        workdir, ".learnlog/HEAD"
+    ) is None
 @
 
 The next test checks that child I/O events rebuild a readable
@@ -2049,6 +3488,13 @@ reconstruct it, and verify that playback-oriented Git features
 still work: commit count, tags, commit messages, and deleted
 files.
 
+The first run's record is the \emph{second} commit: the initial
+snapshot stands on its own, since no run is folded into it any more
+(\cref{sec:two-commit-protocol}).
+The tag is worth watching too---it was created while HEAD was a
+trailer commit, so it only survives the round trip because
+[[get_tag_map]] reports it on the run's header commit.
+
 <<progsnap2 test functions>>=
 def test_read_progsnap2_as_repo_roundtrip(workdir):
     import shutil
@@ -2101,7 +3547,7 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
 
         first_message = reconstructed.git(
             "log", "-1", "--format=%B",
-            rebuilt_commits[0]["hash"],
+            rebuilt_commits[1]["hash"],
         )
         assert first_message.returncode == 0
         assert "Run: hello.py --name Alice" in \
@@ -2114,11 +3560,352 @@ def test_read_progsnap2_as_repo_roundtrip(workdir):
 
         status = reconstructed.git("show", "HEAD:main.py")
         assert status.returncode == 0
-        missing = reconstructed.git("show", "HEAD:hello.py")
+        missing = reconstructed.git(
+            "show", "HEAD:hello.py", check=False
+        )
         assert missing.returncode != 0
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+@
 
+That test reads the round trip field by field, which is how it
+survived a version of the import that changed the fields' contents.
+The stronger question is whether the run comes back as the same
+\emph{bytes}, so we ask it that way: the reconstructed message is
+compared against the original one whole.
+
+The two differ in exactly one line, and knowing which is the point of
+the comparison.
+[[Run-Id]] links a header commit to its trailer commit
+(\cref{sec:two-commit-protocol}); it is an artefact of how a live log
+is written, not something ProgSnap2 records, and a reconstructed run
+is one commit that needs no such link.
+Dropping that line and requiring the rest to match exactly is
+therefore the strongest statement the round trip can support.
+
+The log it makes that statement about is built to break every way the
+path has been observed to lose a byte, because a fidelity test is only
+as good as the ugliest transcript it carries.
+Its first line is padded with spaces on the left and its prompt padded
+on the right, which is where Git's default commit cleanup used to
+strike and where the export's [[strip]] struck after that; its blank
+entries come in runs, including at the very end, where the trailer's
+last newline and the resource encoding's meet
+(\cref{sec:io-section}); and a note sits in the middle of it, so the
+lines that name no stream (\cref{sec:io-notes}) are covered by the
+same equality rather than by a promise.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_keeps_the_message_verbatim(
+    workdir,
+):
+    """A round trip alters no byte of a recorded run block."""
+    import shutil
+    from learnlog.commits import (
+        get_commits,
+        get_run_trailers,
+        merge_run_trailers,
+    )
+    from learnlog.gitrepo import RUN_ID_FIELD
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "menu.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log=(
+            "   [session start]   \n"
+            "stdout: choose:   \n"
+            "stdout: \n"
+            "stdout: \n"
+            "stdout: done\n"
+            "stdout: \n"
+            "stdout: \n"
+        ),
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+
+    recorded = repo.git(
+        "log", "-1", "--format=%B",
+        get_commits(repo)[-1]["hash"],
+    ).stdout.rstrip("\n")
+    expected = "\n".join(
+        line
+        for line in merge_run_trailers(
+            recorded, get_run_trailers(repo),
+        ).split("\n")
+        if not line.startswith(RUN_ID_FIELD)
+    )
+
+    output = workdir / "verbatim.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        rebuilt = reconstructed.git(
+            "log", "-1", "--format=%B",
+            get_commits(reconstructed)[-1]["hash"],
+        ).stdout
+        assert rebuilt.rstrip("\n") == expected
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+That equality would also hold if the export dropped a note and the
+import invented an identical one, so the policy for lines that name no
+stream (\cref{sec:io-notes}) is pinned where it is decided: in the
+dataset.
+The line under test is the one that made keeping them the only
+honest choice---learnlog's truncation marker---and the assertion is
+that it arrives as a note event carrying its own text, not as
+program output and not as nothing.
+
+<<progsnap2 test functions>>=
+def test_export_progsnap2_keeps_unprefixed_lines(workdir):
+    """A line naming no stream is exported as a note event."""
+    import shutil
+    from learnlog.commits import get_commits
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    notice = "[learnlog: I/O log truncated at 10 bytes]"
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "noisy.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log=f"stdout: hello\n{notice}\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+
+    output = workdir / "notes.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    dataset = read_progsnap2(output)
+    notes = [
+        event for event in dataset["events"]
+        if event["EventType"] == "X-Run.Note"
+    ]
+    assert len(notes) == 1
+    assert notes[0]["ProgramOutput"] == ""
+    assert dataset["resources"][notes[0]["X-Note"]] == notice
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        rebuilt = reconstructed.git(
+            "log", "-1", "--format=%B",
+            get_commits(reconstructed)[-1]["hash"],
+        ).stdout
+        assert f"stdout: hello\n{notice}\n" in rebuilt
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+The other thing a round trip must not quietly change is which files
+the code state contained.
+A dataset old enough to predate learnlog's export patterns can carry
+a file named like one of learnlog's own exports---the student
+downloaded a classmate's dataset into the project directory, and the
+run that followed committed it---and importing such a dataset into a
+repository that now excludes those names used to drop the file
+without saying so.
+The test builds that history the only way the current recorder can:
+by staging the file explicitly, which is what an older learnlog did
+by default.
+
+Its second assertion is the other half of forcing the add.
+[[-f]] overrides every exclude pattern, and one of them is the
+repository's own Git directory (\cref{sec:reconstruction-staging}), so
+a reconstruction that forces without excluding it commits [[HEAD]] and
+the object store as project files.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_keeps_export_named_file(workdir):
+    """An export-named file in a code state survives import."""
+    import shutil
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    (workdir / "handout.progsnap2").write_text("classmate\n")
+    repo = LearnlogRepo(workdir)
+    repo.git("add", "-f", "handout.progsnap2")
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hi\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    assert "handout.progsnap2" in repo.git(
+        "ls-tree", "-r", "--name-only", "HEAD",
+    ).stdout
+
+    output = workdir / "old.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        tracked = reconstructed.git(
+            "ls-tree", "-r", "--name-only", "HEAD",
+        ).stdout.split("\n")
+        assert "handout.progsnap2" in tracked
+        assert not [
+            name for name in tracked
+            if name.startswith(".learnlog/")
+        ]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+Every test above receives the temporary directory and frees it
+itself, which is the successful path and says nothing about the
+failing one.
+For that we interrupt the replay at [[restore_code_state]]---the
+first thing the loop does per commit, so the repository exists and
+the reconstruction is genuinely under way---and then look at where
+[[mkdtemp]] would have put the directory.
+That location is ours for the duration of the test, so the
+assertion is about an otherwise empty directory rather than about a
+[[/tmp]] full of other people's files, and the test can tell
+\enquote{cleaned up} from \enquote{someone else cleaned up}.
+Raising [[KeyboardInterrupt]] rather than a plain [[Exception]] is
+the point of the test: the old handler caught the latter and would
+still pass, which is how the leak survived the tests it had.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_cleans_up_on_interrupt(
+    workdir, monkeypatch,
+):
+    """Ctrl-C mid-reconstruction leaves no temp repository."""
+    import tempfile
+    from learnlog import progsnap2
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    repo = LearnlogRepo(workdir)
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], moment)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=moment,
+        exit_code=0,
+    )
+    output = workdir / "interrupted.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    scratch = workdir.parent / "ps2-reconstruct-tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        progsnap2, "restore_code_state", interrupt
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        read_progsnap2_as_repo(output)
+
+    assert list(scratch.glob("learnlog-ps2-play-*")) == []
+@
+
+The reconstruction rebuilds a message from the exported I/O, so a run
+that was too loud for [[argv]] on the way out is equally too loud on the
+way back in.
+This round-trip keeps the same 300\,KB the exporter had to carry:
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_large_io(workdir):
+    import shutil
+    from learnlog.commits import get_commits
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    repo.finalize_run(
+        io_log="stdout: " + "z" * 300_000 + "\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+
+    output = workdir / "large.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        rebuilt = get_commits(reconstructed)
+        message = reconstructed.git(
+            "log", "-1", "--format=%B", rebuilt[-1]["hash"],
+        ).stdout
+        assert message.count("z") >= 300_000
+        assert "Exit-Code: 0" in message
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+Reconstruction is the path [[learnlog play -f dataset.progsnap2]]
+takes, so it is where a binary file in the student's project used to
+be lost.
+We check the bytes at the far end of the whole pipeline---export,
+read, restore, commit---rather than trusting the reader test alone,
+because each stage had its own opportunity to turn them into text.
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_as_repo_keeps_binary_file(workdir):
+    import shutil
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        read_progsnap2_as_repo,
+    )
+
+    blob = b"\x89PNG\r\n\x1a\n\x00\xff\xferaw"
+    (workdir / "logo.png").write_bytes(blob)
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hi\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    output = workdir / "binary.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        restored = reconstructed.workdir / "logo.png"
+        assert restored.read_bytes() == blob
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+<<progsnap2 test functions>>=
 def test_build_reconstructed_run_block_without_end_time():
     from learnlog.progsnap2 import build_reconstructed_run_block
 
@@ -2140,6 +3927,205 @@ def test_build_reconstructed_run_block_without_end_time():
     assert "Run: hello.py" in block
     assert "Exit-Code: 1" in block
     assert "End-Time:" not in block
+@
+
+A review run has to make the same journey.
+The test below follows one out through the export and back in through
+the reconstruction, and then reads the rebuilt repository the way
+[[list]] and [[play]] read it---through [[filter_internal_runs]] and
+[[parse_commit_runs]]---rather than by matching the message text.
+That is the property that matters: not that the [[Viewed:]] lines came
+back as characters, but that a reader arriving at the reconstructed log
+with no knowledge of ProgSnap2 finds a review run with its trace,
+indistinguishable from the one the student actually recorded.
+Listing the blocks the parser found, rather than searching them for a
+string, is also what catches the opposite failure: a child event turned
+into a block of its own would show up here as a third run nobody
+performed.
+
+<<progsnap2 test functions>>=
+def test_reconstruction_keeps_review_events(workdir):
+    """A review run and its view trace survive the round trip."""
+    import shutil
+    from learnlog.commits import (
+        filter_internal_runs, get_commits,
+    )
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        parse_commit_runs,
+        read_progsnap2_as_repo,
+    )
+    repo = LearnlogRepo(workdir)
+    seen = "d" * 40
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("learnlog", ["play"], t2)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 30),
+        exit_code=0,
+        view_trace=[
+            (datetime.datetime(2026, 1, 1, 10, 5, 2),
+             seen, "open"),
+            (datetime.datetime(2026, 1, 1, 10, 5, 8),
+             seen, "next"),
+        ],
+    )
+
+    output = workdir / "review.progsnap2"
+    do_export_progsnap2(repo, output)
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        blocks = []
+        for commit in get_commits(reconstructed):
+            message = reconstructed.git(
+                "log", "-1", "--format=%B", commit["hash"],
+            ).stdout
+            blocks.extend(parse_commit_runs(
+                filter_internal_runs(message)
+            ))
+        assert [block["script"] for block in blocks] == [
+            "hello.py", "learnlog",
+        ]
+        review = blocks[1]
+        assert review["arguments"] == "play"
+        assert review["viewed"] == [
+            (seen, "2026-01-01T10:05:02", "open"),
+            (seen, "2026-01-01T10:05:08", "next"),
+        ]
+        assert review["exit_code"] == "0"
+        assert review["end_time"] == "2026-01-01T10:05:30"
+        assert review["io_log"] is None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+The child events of the two kinds must also stay out of each other's
+way, which is a property of the two rebuilders rather than of the
+round trip, and is worth asking about directly.
+The I/O event below carries a timestamp, which learnlog's own exporter
+never gives one---that is the point.
+Both rebuilders select their children by event type, and a test whose
+I/O event had no timestamp would pass even if [[rebuild_view_trace]]
+selected by nothing at all, because the missing timestamp would filter
+it out by accident.
+A dataset from a tool that does record per-line timing would then turn
+every output chunk into a view of no commit.
+
+<<progsnap2 test functions>>=
+def test_rebuild_ignores_the_other_kind_of_child():
+    """I/O and view children do not leak into each other."""
+    from learnlog.progsnap2 import (
+        rebuild_io_log, rebuild_view_trace,
+    )
+    events = [
+        {
+            "EventType": "X-Run.Output", "EventID": "2",
+            "Order": "2", "ParentEventID": "1",
+            "ServerTimestamp": "2026-01-01T10:00:02",
+            "ProgramOutput": "Resources/io_2.txt",
+        },
+        {
+            "EventType": "X-Review.View", "EventID": "3",
+            "Order": "3", "ParentEventID": "1",
+            "ServerTimestamp": "2026-01-01T10:00:03",
+            "X-ViewedCommit": "e" * 40,
+            "X-ViewAction": "batch",
+        },
+        {
+            "EventType": "X-Review.View", "EventID": "4",
+            "Order": "4", "ParentEventID": "1",
+            "ServerTimestamp": "not a time",
+            "X-ViewedCommit": "f" * 40,
+            "X-ViewAction": "next",
+        },
+    ]
+    resources = {"Resources/io_2.txt": "hello"}
+
+    assert rebuild_io_log(events, "1", resources) == \
+        "stdout: hello"
+    assert rebuild_view_trace(events, "1") == [
+        (datetime.datetime(2026, 1, 1, 10, 0, 3),
+         "e" * 40, "batch"),
+    ]
+@
+
+The awkward case is the one the export exists for: a [[python -c]] run,
+whose first argument is a program source with spaces and newlines in
+it, followed by the arguments the student actually passed.
+Let's follow one all the way through---commit, export, read back---and
+check that the list that comes out is the list that went in, while a
+plain script run still reads like a command line in the column:
+
+<<progsnap2 test functions>>=
+def test_progsnap2_round_trips_python_c_arguments(workdir):
+    import csv as csv_mod
+    import shutil
+    from learnlog.gitrepo import parse_run_arguments
+    from learnlog.progsnap2 import (
+        do_export_progsnap2, read_progsnap2_as_repo,
+    )
+    source = 'import sys\nprint("hi there")'
+    args = [source, "alpha", "beta"]
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("<python -c>", args, t1)
+    repo.finalize_run(
+        io_log="stdout: hi there\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    output = workdir / "c.progsnap2"
+    do_export_progsnap2(repo, output)
+
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    runs = [
+        event for event in csv_mod.DictReader(io.StringIO(main))
+        if event["EventType"] == "Run.Program"
+    ]
+    assert len(runs) == 1
+    assert parse_run_arguments(runs[0]["X-Arguments"]) == args
+
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        message = reconstructed.git(
+            "log", "-1", "--format=%B"
+        ).stdout
+        recovered = [
+            line.split(":", 1)[1]
+            for line in message.split("\n")
+            if line.startswith("Arguments:")
+        ]
+        assert parse_run_arguments(recovered[0]) == args
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def test_progsnap2_plain_arguments_stay_readable(workdir):
+    """Ordinary arguments are not dressed up in quotes."""
+    import csv as csv_mod
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", ["alpha", "beta"], t1)
+    output = workdir / "plain.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    runs = [
+        event for event in csv_mod.DictReader(io.StringIO(main))
+        if event["EventType"] == "Run.Program"
+    ]
+    assert runs[0]["X-Arguments"] == "alpha beta"
 @
 
 
@@ -2210,11 +4196,27 @@ for sid in by_subject:
 For each subject we walk the sorted events.
 A [[File.Edit]] starts a new pair accumulator.
 A [[Run.Program]] completes the current pair.
-I/O events ([[X-Run.Output]], [[X-Run.Input]]) are attached
-to the most recent [[Run.Program]] via [[ParentEventID]].
+The child events of a run---output, input, and the notes that name no
+stream (\cref{sec:io-notes})---are attached to the most recent
+[[Run.Program]] via [[ParentEventID]].
+Asking [[IO_EVENT_COLUMNS]] which types those are keeps this loop
+correct for free when the vocabulary grows: a transcript line the
+exporter learns to keep is one the report learns to show.
 When a [[Run.Program]] appears without a preceding
 [[File.Edit]], we create a pair with [[edit=None]]---this
 happens when the student re-runs without editing.
+
+Every other event type falls through the chain of tests without
+touching [[current_edit]], and that silence is load-bearing rather
+than incidental: it is what places the review events
+(\cref{sec:review-events}) outside the edit--run cycle.
+A student who edits, pages back through the log, and then runs still
+produces one pair joining that edit to that run, because the
+[[X-Review]] and [[X-Review.View]] events between them match no branch
+here.
+Were they matched by the [[Run.Program]] branch instead, the review
+would consume the pending edit and the real run would be recorded as a
+re-run of code nobody had touched.
 
 <<walk events to form pairs>>=
 grouped = {}
@@ -2235,9 +4237,7 @@ for sid, subj_events in by_subject.items():
             current_tag = tag
         elif etype == "Run.Program":
             <<create pair from edit and run>>
-        elif etype in (
-            "X-Run.Output", "X-Run.Input"
-        ):
+        elif etype in IO_EVENT_COLUMNS:
             <<attach I/O to parent run>>
 
     <<flush final pending edit>>
@@ -3059,6 +5059,27 @@ def format_edit_latex(pair, prev_pair, code_states):
         <<format edit as unified diff>>
 @
 
+Now that code states keep binary files instead of dropping them
+(\cref{sec:read-progsnap2}), the formatter has to say something about
+a file it cannot typeset.
+Neither [[minted]] nor [[difflib]] can do anything useful with a PNG,
+so we report its presence and size and move on; silently omitting it
+would make the report claim the student's tree contained only the
+text files.
+The note ends with a newline so that joining the parts leaves a blank
+line after it; two binary files in a row would otherwise run together
+into a single \LaTeX{} paragraph.
+
+<<progsnap2 functions>>=
+def format_binary_file_latex(filename, content):
+    """Note a binary code-state file that cannot be shown."""
+    return (
+        "\\textbf{Binary file: "
+        f"\\texttt{{{_latex_escape(filename)}}}"
+        f"}} ({len(content)} bytes, content not shown)\n"
+    )
+@
+
 When there is no previous state, we show each file
 in its entirety.
 To keep the filename visible in the rendered document, we emit
@@ -3068,6 +5089,11 @@ an explicit label rather than a LaTeX comment.
 parts = []
 for filename in sorted(current.keys()):
     content = current[filename]
+    if isinstance(content, bytes):
+        parts.append(
+            format_binary_file_latex(filename, content)
+        )
+        continue
     parts.append(
         "\\textbf{File: "
         f"\\texttt{{{_latex_escape(filename)}}}"
@@ -3084,6 +5110,10 @@ For subsequent edits, we compute a unified diff per
 file.
 Files that did not change are skipped.
 New files show as additions; deleted files as removals.
+A file that is binary on either side gets the same note as above
+rather than a diff: comparing the two byte strings is enough to tell
+that it changed, which is all a diff of unprintable data could
+convey anyway.
 
 <<format edit as unified diff>>=
 all_files = sorted(
@@ -3095,6 +5125,12 @@ for filename in all_files:
     old = previous.get(filename, "")
     new = current.get(filename, "")
     if old == new:
+        continue
+    if isinstance(new, bytes) or isinstance(old, bytes):
+        changed = new if isinstance(new, bytes) else old
+        parts.append(
+            format_binary_file_latex(filename, changed)
+        )
         continue
     diff_lines = list(difflib.unified_diff(
         old.splitlines(keepends=True),
@@ -3194,6 +5230,10 @@ I/O events are stored as resource files in the zip.
 We read each resource and concatenate them, prefixing
 input lines with [[>~]] so the reader can distinguish
 what the student typed from what the program printed.
+Which column holds an event's resource is again the table's answer
+(\cref{sec:io-notes}), so a note reaches the report as the line it
+is---and a report of a run whose log was truncated says so, which is
+the whole reason those lines are kept.
 
 <<progsnap2 functions>>=
 def format_io_latex(io_events, resources):
@@ -3209,11 +5249,10 @@ def format_io_latex(io_events, resources):
     parts = []
     for event in io_events:
         etype = event["EventType"]
-        res_path = (
-            event.get("ProgramOutput", "")
-            or event.get("ProgramInput", "")
+        column, _ = IO_EVENT_COLUMNS.get(
+            etype, ("ProgramOutput", ""),
         )
-        text = resources.get(res_path, "")
+        text = resources.get(event.get(column, ""), "")
         if etype == "X-Run.Input":
             for line in text.split("\n"):
                 parts.append(f"> {line}")
@@ -3221,6 +5260,34 @@ def format_io_latex(io_events, resources):
             parts.append(text)
 
     return "\n".join(parts).rstrip()
+@
+
+Let's verify that the report shows a transcript line that names no
+stream, since a truncated log is exactly the run whose report must not
+look complete:
+
+<<progsnap2 test functions>>=
+def test_format_io_latex_shows_notes():
+    """A note reaches the report as the line it is."""
+    from learnlog.progsnap2 import format_io_latex
+    notice = "[learnlog: I/O log truncated at 5 bytes]"
+    io_events = [
+        {
+            "EventType": "X-Run.Output",
+            "ProgramOutput": "Resources/io_2.txt",
+        },
+        {
+            "EventType": "X-Run.Note",
+            "ProgramOutput": "",
+            "X-Note": "Resources/io_3.txt",
+        },
+    ]
+    resources = {
+        "Resources/io_2.txt": "hello",
+        "Resources/io_3.txt": notice,
+    }
+    assert format_io_latex(io_events, resources) == \
+        f"hello\n{notice}"
 @
 
 \subsection{\LaTeX{} escaping}
@@ -3662,7 +5729,118 @@ def test_generate_analysis_latex_title_override():
         in latex
     )
     assert "\\section{anon-1234}" not in latex
+@
 
+The claim that review events leave the analysis alone is easy to state
+and easy to get wrong, so we check it against the shape of the report
+rather than against its text.
+The repository below is the awkward arrangement: the student runs,
+edits, \emph{reviews}, and only then runs again---so a review sits
+exactly where it could steal the pending edit.
+Deleting the review events from the same stream must produce the same
+pairs, which is a stronger statement than \enquote{it did not crash}:
+the report is not merely still generated, it is the report the run
+would have produced.
+The command itself gets the last word, because the pieces can each be
+right while the path a user actually takes is not: the same repository
+goes through [[learnlog analyse]] end to end, and the report it prints
+has to have the same two runs in it.
+
+<<progsnap2 test functions>>=
+def test_analyse_ignores_review_events(workdir, monkeypatch):
+    """A review between an edit and a run changes no table."""
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        generate_analysis_latex,
+        group_edit_run_pairs,
+        read_progsnap2,
+    )
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0)
+    )
+    repo.finalize_run(
+        io_log="stdout: v1\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "learnlog", ["play"],
+        datetime.datetime(2026, 1, 1, 10, 2),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 2, 30),
+        exit_code=0,
+        view_trace=[(
+            datetime.datetime(2026, 1, 1, 10, 2, 5),
+            "a" * 40, "open",
+        )],
+    )
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5)
+    )
+    repo.finalize_run(
+        io_log="stdout: v2\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+
+    output = workdir / "analyse.progsnap2"
+    do_export_progsnap2(repo, output)
+    dataset = read_progsnap2(output)
+
+    def shape(grouped):
+        return {
+            sid: {
+                tag: [
+                    (
+                        pair["edit"] and pair["edit"]["EventID"],
+                        pair["run"] and pair["run"]["EventID"],
+                    )
+                    for pair in pairs
+                ]
+                for tag, pairs in tags.items()
+            }
+            for sid, tags in grouped.items()
+        }
+
+    grouped = group_edit_run_pairs(dataset["events"])
+    without_reviews = [
+        event for event in dataset["events"]
+        if not event["EventType"].startswith("X-Review")
+    ]
+    assert shape(grouped) == shape(
+        group_edit_run_pairs(without_reviews)
+    )
+
+    pairs = next(iter(grouped.values()))[""]
+    assert len(pairs) == 2
+    assert all(
+        pair["edit"] is not None and pair["run"] is not None
+        for pair in pairs
+    )
+    assert [
+        pair["run"]["X-Script"] for pair in pairs
+    ] == ["hello.py", "hello.py"]
+
+    latex = generate_analysis_latex(dataset, grouped)
+    assert latex.count("\\paragraph{Run ") == 2
+    assert "learnlog" not in latex
+
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["analyse"])
+    assert result.exit_code == 0
+    assert result.output.count("\\paragraph{Run ") == 2
+@
+
+<<progsnap2 test functions>>=
 def test_format_edit_latex_first_edit():
     """First edit shows full file content."""
     from learnlog.progsnap2 import format_edit_latex
@@ -3712,6 +5890,35 @@ def test_format_edit_latex_diff():
     assert "\\begin{minted}{diff}" in result
     assert "-" in result
     assert "+" in result
+
+def test_format_edit_latex_notes_binary_files():
+    """Binary code-state files are reported, not typeset."""
+    from learnlog.progsnap2 import format_edit_latex
+    prev_pair = {
+        "edit": {"EventID": "1"},
+        "run": None,
+        "io": [],
+        "code_state_id": "0",
+    }
+    pair = {
+        "edit": {"EventID": "2"},
+        "run": None,
+        "io": [],
+        "code_state_id": "1",
+    }
+    code_states = {
+        "0": {"logo.png": b"\x89PNG\x00\xff"},
+        "1": {"logo.png": b"\x89PNG\x00\xfe\xfd"},
+    }
+    first = format_edit_latex(pair, None, code_states)
+    assert "\\texttt{logo.png}" in first
+    assert "\\begin{minted}" not in first
+
+    diff = format_edit_latex(
+        pair, prev_pair, code_states,
+    )
+    assert "\\texttt{logo.png}" in diff
+    assert "\\begin{minted}" not in diff
 
 def test_format_run_latex_with_io():
     """Run with I/O shows script info and minted block."""

@@ -4,9 +4,11 @@
 The [[learnlog]] command lets students prepare projects for
 logging and lets both students and teachers manage and review
 the development logs that are produced.
-It provides fourteen subcommands: [[init]] prepares a project
+It provides fifteen subcommands: [[init]] prepares a project
 directory (creating [[.learnlog/]] and installing [[learnlog]]
-for the student's chosen language), [[activate]] and
+for the student's chosen language), [[doctor]] reports whether
+the running interpreter still records runs and can repair the
+wiring when it does not, [[activate]] and
 [[deactivate]] emit shell code for entering or leaving the
 project [[.venv/]], [[tutorial]] embeds guided walkthroughs
 for common learnlog workflows, [[list]] gives a compact
@@ -32,7 +34,9 @@ arguments with minimal boilerplate, and the modern
 """Command-line interface for learnlog.
 
 Provides the ``learnlog`` command with subcommands for setting
-up a project to record with learnlog (``init``), emitting
+up a project to record with learnlog (``init``), checking and
+repairing the autostart wiring of the running interpreter
+(``doctor``), emitting
 shell code to activate or deactivate the project ``.venv/``,
 running guided tutorials through pytorial (``tutorial``),
 running Git commands against the log, exporting the log as a
@@ -81,6 +85,18 @@ etc.) live in the [[commits]] module (\cref{commits}).
 The ProgSnap2 exporter lives in [[progsnap2]] (\cref{progsnap2}).
 The interactive viewer lives in [[viewer]] (\cref{viewer}).
 
+Four names are imported from inside learnlog rather than restated
+here, because the CLI has to apply exactly the rules the runtime
+applies.  [[_is_home_or_above]] is the bound that keeps
+repository discovery out of the home directory (\cref{learnlog});
+[[init]] and [[doctor]] apply it to the roots they are asked to
+\emph{create}, where discovery never gets a say
+(\cref{sec:setup-home-guard}).  The three names from
+[[learnlog._autostart]] are what an interpreter itself consults at
+startup to decide whether, and where, to log; [[doctor]] asks them
+the same questions and reports the answers
+(\cref{sec:autostart-diagnosis}).
+
 <<imports>>=
 from __future__ import annotations
 
@@ -100,12 +116,25 @@ from typing import Annotated
 import pytorial
 import typer
 
-from learnlog import find_learnlog_dir
-from learnlog.gitrepo import LearnlogRepo
+from learnlog import _is_home_or_above, find_learnlog_dir
+from learnlog._autostart import (
+    _DEFAULT_MARKER_PATH,
+    _is_autostart_wired,
+    _replace_file,
+    _resolve_project_root,
+)
+from learnlog.gitrepo import (
+    GIT_TREE_TIMEOUT,
+    LearnlogRepo,
+    git_environment,
+)
 from learnlog.commits import (
     get_commits,
+    get_run_trailers,
+    merge_run_trailers,
     parse_run_summary,
-    filter_learnlog_runs,
+    filter_internal_runs,
+    resolve_record_commit,
     commit_outcomes,
 )
 from learnlog.progsnap2 import (
@@ -181,6 +210,7 @@ def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
 
 
 \section{Resolving the source}
+\label{sec:resolve-source}
 
 The [[play]], [[list]], and [[analyse]] commands accept an
 optional source that can be a directory (containing
@@ -261,6 +291,42 @@ if verify.returncode != 0:
     )
 
 tmpdir = tempfile.mkdtemp(prefix="learnlog-play-")
+try:
+    <<clone the bundle into the temporary directory>>
+except BaseException:
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    raise
+@
+
+Ownership of that directory changes hands halfway through the branch,
+and the guard exists to make the handover total.
+Once we return, the directory is the caller's---the return value says
+so---and the caller frees it in its own [[finally]].
+Until then nobody else knows the name, so if we leave by any other
+route than [[return]], the directory becomes unreachable garbage in
+[[/tmp]] that no later run will recognise or collect.
+Cloning a bundle is slow enough for the student to change their mind
+about, and [[Ctrl-C]] is how they say so; the clone can also fail
+on a bundle Git could list but not resolve.
+
+\paragraph{Why the broad net.}
+
+[[except BaseException]] is normally a warning sign, and deserves the
+argument for why it is the right net here rather than the usual
+[[except Exception]].
+The three things it catches beyond [[except Exception]]---
+[[KeyboardInterrupt]], [[SystemExit]], [[GeneratorExit]]---are exactly
+the ones a program must not quietly absorb, which is what makes the
+broad net a bad habit in general.
+What disarms the objection is the bare [[raise]]: the handler decides
+nothing about the exception, it frees a resource on the way past and
+lets the exception continue to whoever it was for.
+Catching less would not be safer, only leakier.
+And catching less would miss the case that actually happens:
+[[Ctrl-C]] is the one exit from here a person takes deliberately, and
+it is precisely the one [[except Exception]] is defined not to see.
+
+<<clone the bundle into the temporary directory>>=
 tmppath = pathlib.Path(tmpdir)
 
 subprocess.run(
@@ -360,6 +426,53 @@ def test_resolve_source_progsnap2(workdir):
         shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
+The leak is only observable in the directory [[mkdtemp]] chose, so
+the test chooses it: pointing [[tempfile.tempdir]] at a directory of
+our own makes \enquote{nothing was left behind} a statement about
+one empty directory rather than about a [[/tmp]] shared with every
+other process on the machine.
+We interrupt the [[git clone]] specifically---the [[git bundle
+list-heads]] before it must still run, or the branch would fail
+before it ever created the directory whose fate we are testing.
+The [[pytest.raises]] is half the assertion: cleaning up is only
+correct if the interruption still gets through, and a handler that
+swallowed it would leave no temporary directory either.
+
+<<test functions>>=
+def test_resolve_source_bundle_cleans_up_on_interrupt(
+    workdir, monkeypatch,
+):
+    """Ctrl-C during unbundling leaves no temporary directory."""
+    import tempfile
+    from learnlog import cli
+
+    repo = LearnlogRepo(workdir)
+    bundle_path = workdir / "test.bundle"
+    repo.git(
+        "bundle", "create", str(bundle_path), "--all"
+    )
+
+    scratch = workdir.parent / "resolve-source-tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    real_run = subprocess.run
+
+    def interrupt_the_clone(cmd, *args, **kwargs):
+        if "clone" in cmd:
+            raise KeyboardInterrupt
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(
+        cli.subprocess, "run", interrupt_the_clone
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.resolve_source(str(bundle_path))
+
+    assert list(scratch.glob("learnlog-play-*")) == []
+@
+
 
 \section{The export command}
 \label{sec:export}
@@ -393,6 +506,11 @@ the whole log every time and let the student pick a lecture with
 DEFAULT_BUNDLE_NAME = "learnlog.learnlog"
 @
 
+Bundling writes out every object in the history, so it gets the
+tree-sized timeout rather than the default one, and it turns off
+[[check]] so that a failure reaches the user as the message below
+rather than as a [[GitError]] traceback.
+
 <<export functions>>=
 def do_export(repo, output):
     """Export the learnlog repository as a Git bundle.
@@ -401,7 +519,8 @@ def do_export(repo, output):
     commit history.
     """
     result = repo.git(
-        "bundle", "create", str(output), "--all"
+        "bundle", "create", str(output), "--all",
+        check=False, timeout=GIT_TREE_TIMEOUT,
     )
     if result.returncode != 0:
         raise SystemExit(
@@ -421,6 +540,115 @@ def test_do_export_creates_bundle(workdir):
         capture_output=True,
     )
     assert verify.returncode == 0
+@
+
+\subsection{Exports appear all at once}
+\label{sec:staged-export}
+
+Where the export lands is ordinarily the work tree, because that is
+where the student is standing when they run the command.
+That makes the file two things at once: an output, and part of the
+directory the \emph{next} run snapshots.
+The exclude patterns settle whether it is committed
+(\cref{sec:ensure-configured}); this settles what a reader can see
+while it is being written.
+
+A bundle of a term's log takes long enough to write that a run
+starting in the middle of it is not a thought experiment, and a run
+that snapshots a half-written file records a file that never existed.
+Writing beside the destination and renaming solves it the way it is
+always solved: [[os.replace]] within a directory is atomic, so the
+name either does not exist or names a finished export.
+
+The staging file takes the destination's extension rather than a
+neutral one, which is what puts it under the same exclude pattern as
+the result.
+A [[.tmp]] file would be excluded by nothing, so the very run this is
+protecting against would commit the half-written bundle under its
+temporary name instead.
+
+The two exporters differ only in what they write, so the staging is
+written once and takes the writer as an argument.
+
+<<export functions>>=
+def write_export_atomically(export, repo, output):
+    """Write an export through a file beside ``output``.
+
+    Calls ``export(repo, path)`` on a temporary file in the
+    destination's directory and moves it onto ``output``, so that
+    the destination never names a partial export.
+    """
+    try:
+        handle, name = tempfile.mkstemp(
+            dir=output.parent,
+            prefix=EXPORT_STAGING_PREFIX,
+            suffix=output.suffix,
+        )
+    except OSError as error:
+        raise SystemExit(f"Cannot write to {output}: {error}")
+    os.close(handle)
+    staged = pathlib.Path(name)
+    try:
+        export(repo, staged)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    os.replace(staged, output)
+<<constants>>=
+EXPORT_STAGING_PREFIX = ".learnlog-export-"
+@
+
+Cleaning up on [[BaseException]] rather than [[Exception]] is what
+covers the interruption this is about: a student who gives up on a
+slow export with [[Ctrl-C]] should be left with the export they had
+before, not with a staging file the next run has to be told to ignore.
+Re-raising keeps the interruption an interruption.
+
+Let's verify that the destination is written by a rename and not by
+the exporter itself:
+
+<<test functions>>=
+def test_export_goes_through_a_staging_file(
+    workdir, monkeypatch,
+):
+    """The destination appears complete or not at all."""
+    from learnlog.cli import app
+    from learnlog import cli
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    renames = []
+    real_replace = cli.os.replace
+
+    def record(source, destination):
+        renames.append((source, destination))
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(cli.os, "replace", record)
+    monkeypatch.chdir(workdir)
+    bundle = workdir / "out.learnlog"
+    result = CliRunner().invoke(
+        app, ["export", "-o", str(bundle)]
+    )
+    assert result.exit_code == 0
+    staged = [
+        source for source, destination in renames
+        if str(destination) == str(bundle)
+    ]
+    assert len(staged) == 1
+    assert str(staged[0]) != str(bundle)
+    assert pathlib.Path(staged[0]).suffix == ".learnlog"
+    assert bundle.exists()
+
+def test_export_names_match_the_excluded_patterns(workdir):
+    """The exclude patterns must cover what export writes."""
+    from learnlog.cli import (
+        DEFAULT_BUNDLE_NAME, DEFAULT_PROGSNAP2_NAME,
+    )
+    from learnlog.gitrepo import (
+        BUNDLE_SUFFIX, PROGSNAP2_SUFFIX,
+    )
+    assert DEFAULT_BUNDLE_NAME.endswith(BUNDLE_SUFFIX)
+    assert DEFAULT_PROGSNAP2_NAME.endswith(PROGSNAP2_SUFFIX)
 @
 
 
@@ -482,10 +710,130 @@ activated venv) still commit to the right
 (\cref{sec:setup-autostart-hook}).
 
 The helpers that support [[init]] are split across the
-following subsections by concern: choosing a language,
+following subsections by concern: bounding where a project
+may be created at all, choosing a language,
 finding the interpreter, locating [[pip]] and [[python]]
 once a venv exists, writing the autostart hook, and
 finally the pipeline that wires them together.
+
+
+\subsection{Refusing a home-directory project root}
+\label{sec:setup-home-guard}
+
+Repository \emph{discovery} is bounded: the upward walk in
+[[find_learnlog_dir]] stops before the home directory, so no
+misplaced script can make learnlog adopt [[$HOME]] by accident
+(\cref{learnlog}).  [[init]] is the other way a repository comes
+into existence, and it is the more dangerous one, because
+discovery never runs afterwards to correct it.  A student who
+types [[learnlog init python]] one directory too high---in
+[[$HOME]] itself---gets a [[.learnlog/]] there \emph{and} a
+marker file naming it, and the marker is authoritative: every
+later run of that venv reads it and stages the whole home
+directory, from [[.ssh/]] to the browser cache, into the log.
+Nothing in the run path can second-guess it, since the marker's
+whole purpose is to override the guess.
+
+So [[init]] applies discovery's own predicate to the root it is
+about to create.  Importing [[_is_home_or_above]] rather than
+restating the rule is what keeps the two entry points from
+drifting apart: whatever counts as \enquote{too high} for the
+walk counts as too high for [[init]] by construction.
+
+Only that one condition refuses.  A project directory that is
+also a Git checkout is the documented normal layout---the log
+repository is deliberately hidden in [[.learnlog/]] precisely so
+it can live alongside the student's own [[.git/]]---so the Git
+boundary that bounds the \emph{walk} has no business bounding
+[[init]].
+
+The refusal is nevertheless overridable.  \enquote{Never} would
+be a guess about the user's intent, and there are honest reasons
+to want a log rooted at a directory we would otherwise refuse: a
+teacher recording a demo in a scratch account, or an
+investigation into learnlog's own behaviour in that layout.  What
+the guard has to prevent is the \emph{accident}, and a flag the
+user has to type does that: [[--force]] costs one word when it is
+meant, and is never typed by the student who merely forgot to
+[[cd]].
+
+The caller supplies the way out as a hint, because it differs by
+command---[[init]] can offer [[--force]], while [[doctor]] can
+only send the user somewhere else (\cref{sec:doctor-command}).
+Keeping the \emph{reason} in one place and letting the next step
+vary is what makes the helper worth having at all.
+
+<<helper functions>>=
+def refuse_home_root(path, hint):
+    """Refuse ``path`` as a project root if it is $HOME or above.
+
+    Raises ``SystemExit`` with an explanation followed by
+    ``hint``, which should tell the caller how to proceed.
+    Returns ``None`` for any acceptable path.
+    """
+    if not _is_home_or_above(path):
+        return
+    raise SystemExit(
+        f"Refusing to make {path} a learnlog project root: it "
+        f"is your home directory or an ancestor of it, so every "
+        f"run would commit unrelated files into the log.  {hint}"
+    )
+@
+
+Let's verify the boundary from both sides.  The tests point
+[[HOME]] at a temporary directory so they neither depend on nor
+disturb the real one:
+
+<<test functions>>=
+def test_refuse_home_root_rejects_home(tmp_path, monkeypatch):
+    """The home directory itself is refused."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(SystemExit, match="home directory"):
+        refuse_home_root(home, "Pass --force.")
+
+def test_refuse_home_root_rejects_ancestor(tmp_path, monkeypatch):
+    """A directory above the home directory is refused too."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(SystemExit, match="ancestor"):
+        refuse_home_root(tmp_path, "Pass --force.")
+
+def test_refuse_home_root_includes_hint(tmp_path, monkeypatch):
+    """The caller's next step is part of the message."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(SystemExit, match="Pass --force."):
+        refuse_home_root(home, "Pass --force.")
+
+def test_refuse_home_root_allows_project_below_home(
+    tmp_path, monkeypatch,
+):
+    """An ordinary project directory under $HOME is allowed."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    project = home / "lab1"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert refuse_home_root(project, "Pass --force.") is None
+
+def test_refuse_home_root_allows_git_checkout(
+    tmp_path, monkeypatch,
+):
+    """A project that is also a Git checkout is not refused."""
+    from learnlog.cli import refuse_home_root
+    home = tmp_path / "home"
+    project = home / "lab1"
+    (project / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    assert refuse_home_root(project, "Pass --force.") is None
+@
 
 
 \subsection{Selecting a language}
@@ -990,10 +1338,17 @@ files are placed inside the venv's [[site-packages]]:
     from outside the project (say, [[python
     /tmp/scratch.py]] inside an activated venv) would have
     no way to find the matching [[.learnlog/]] by walking
-    up from its own directory.  [[_autostart]] reads this
-    file and exports it as [[LEARNLOG_PROJECT_ROOT]], which
-    [[initialize()]] consults before falling back to the
-    cwd search (\cref{learnlog}).
+    up from its own directory.  [[_autostart]] only
+    \emph{resolves} the recorded path; it is
+    [[initialize()]] that asks for it, exports the answer
+    as [[LEARNLOG_PROJECT_ROOT]]---scoped to this venv by a
+    companion [[LEARNLOG_ANCHOR_PREFIX]]---so that children
+    of the same session inherit the same anchor, and
+    consults it before falling back to the cwd search
+    (\cref{sec:initialize}).
+    The split keeps [[_autostart]] free of any import of
+    the package, which \cref{learnlog} explains is
+    load-bearing.
 \end{description}
 
 To find [[site-packages]] on both POSIX and Windows
@@ -1039,6 +1394,18 @@ initialised before the rename: if the legacy file is left in
 place, [[site.py]] still reaches it first and the editable
 install problem remains.
 
+Both writes go through [[_replace_file]] (\cref{learnlog}) rather than
+through [[write_text]], and the reason is that neither file is written
+in private.  [[init]] runs in a venv other interpreters may be
+starting in at that very moment, and a truncating write leaves the
+name empty until it is filled: a startup that samples the [[.pth]]
+then is simply not wired, and one that samples the marker sees an
+interpreter wired to nowhere, which logs the run into no repository at
+all.  Writing a sibling temporary file and renaming it over the name
+means the empty state never exists to be read.  Re-running [[init]] in
+an active venv is exactly when that matters, since that is when a
+student is most likely to have another Python running.
+
 The whole body runs inside a [[try/except OSError]]: an
 autostart hook that fails to install is a missed feature,
 not a broken install.  The student can still use
@@ -1064,8 +1431,9 @@ def write_autostart_files(venv_dir, project_root):
       from outside the project.
 
     Writes are idempotent (identical content is left
-    alone).  Filesystem errors are reported as warnings
-    but do not abort ``init``.
+    alone) and atomic, so an interpreter starting concurrently
+    never reads a half-installed file.  Filesystem errors are
+    reported as warnings but do not abort ``init``.
     """
     legacy_path = None
     files = [
@@ -1089,7 +1457,7 @@ def write_autostart_files(venv_dir, project_root):
             path = purelib / name
             if path.exists() and path.read_text() == content:
                 continue
-            path.write_text(content)
+            _replace_file(path, content)
     except OSError as exc:
         typer.echo(
             f"Warning: could not install autostart hook "
@@ -1102,9 +1470,16 @@ To verify, we monkeypatch [[venv_purelib]] to return a
 scratch directory under [[tmp_path]] so the test does not
 depend on a real venv, and then check: both files exist
 with the expected content; a second call with the same
-arguments is a no-op (file mtimes unchanged); and an
-[[OSError]] from [[venv_purelib]] surfaces as a stderr
-warning rather than a crash.
+arguments is a no-op (file mtimes unchanged); that a call
+which does change a file replaces it rather than emptying
+it first; and that an [[OSError]] from [[venv_purelib]]
+surfaces as a stderr warning rather than a crash.
+
+Watching the rename is how the last of those stays a test
+of the code instead of a test of the machine's timing.  At
+the moment the new marker is moved into place the name must
+still hold the old project's path in full---which cannot
+happen if anything truncated it on the way.
 
 <<test functions>>=
 def test_write_autostart_files_creates_both_files(
@@ -1164,6 +1539,35 @@ def test_write_autostart_files_is_idempotent(
     mtime_before = pth.stat().st_mtime_ns
     cli.write_autostart_files(tmp_path / ".venv", tmp_path)
     assert pth.stat().st_mtime_ns == mtime_before
+
+def test_write_autostart_files_never_empties_a_file(
+    tmp_path, monkeypatch,
+):
+    """Re-wiring replaces the marker instead of truncating it."""
+    from learnlog import cli
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    monkeypatch.setattr(
+        cli, "venv_purelib", lambda d: purelib,
+    )
+    old = tmp_path / "old-project"
+    new = tmp_path / "new-project"
+    cli.write_autostart_files(tmp_path / ".venv", old)
+
+    observed = []
+    real_replace = os.replace
+
+    def observing_replace(source, destination):
+        observed.append(pathlib.Path(destination).read_text())
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", observing_replace)
+    cli.write_autostart_files(tmp_path / ".venv", new)
+
+    assert observed == [str(old.resolve()) + "\n"]
+    assert (
+        purelib / "learnlog_project_root.txt"
+    ).read_text() == str(new.resolve()) + "\n"
 
 def test_write_autostart_files_warns_on_oserror(
     tmp_path, monkeypatch, capsys,
@@ -1507,9 +1911,276 @@ def test_init_python_invokes_write_autostart_files(
 @
 
 
+\section{Diagnosing the autostart wiring}
+\label{sec:autostart-diagnosis}
+
+Autostart is the one part of learnlog that is invisible while it
+works, which is precisely what makes it hard to notice when it
+stops.  A venv whose marker names a project the student has since
+deleted, renamed, or unmounted resolves to nothing, and the run
+path answers that by declining to log rather than by inventing a
+repository beside whatever the student happens to be working on
+(\cref{sec:autostart-wired}).  Declining is the right call---the
+alternative is an unbounded repository in the wrong place---but it
+is silent by construction: a student's program must behave
+identically with and without learnlog, so the refusal cannot print
+a word.  Weeks of runs can go missing from a dataset with nothing
+anywhere to say so.
+
+The CLI carries no such obligation.  Nothing a student runs
+depends on what [[learnlog doctor]] prints, so this is the one
+place that can afford to say out loud what the runtime decided in
+silence.
+
+Three states are worth telling apart, because each calls for a
+different response:
+\begin{description}
+\item[Not wired] No marker file sits next to this interpreter's
+    [[site-packages]].  Nothing is broken---the interpreter was
+    simply never prepared by [[learnlog init]], which is also the
+    normal state for a student who writes an explicit
+    \mintinline{python}{import learnlog} line.  The remedy, if one
+    is wanted at all, is [[init]].
+\item[Wired and anchored] The marker, or the [[sys.prefix]]
+    backup, resolves to a project that still holds a
+    [[.learnlog/]].  Runs are being recorded, and the report says
+    into which project---which doubles as the answer to
+    \enquote{why are my runs landing in the wrong log?}
+\item[Wired but dead] A marker exists, so this interpreter was
+    told which project it serves, yet neither the marker nor the
+    backup resolves.  This is the silent-data-loss state, and the
+    only one [[doctor]] can repair.
+\end{description}
+
+Notice what separates the first state from the third: both resolve
+to no project at all, and only the \emph{presence} of the marker
+file tells them apart.  That is the same distinction
+[[initialize()]] draws before refusing to log
+(\cref{sec:autostart-wired}), which is why [[doctor]] asks
+[[_is_autostart_wired]] instead of inspecting the [[.pth]] file
+itself: a diagnosis that used a different test from the runtime's
+would eventually disagree with it, and a diagnosis that disagrees
+with the thing it diagnoses is worse than none.
+
+<<constants>>=
+class AutostartState(enum.Enum):
+    """How the running interpreter is wired for autostart.
+
+    ``unwired`` means no marker file exists, ``anchored`` that
+    the wiring resolves to a project, and ``dead`` that a marker
+    exists but resolves to nothing -- the state in which runs go
+    unrecorded with no sign of it.
+    """
+
+    unwired = "unwired"
+    anchored = "anchored"
+    dead = "dead"
+@
+
+For the dead state, the single most useful fact is the path the
+marker actually holds: [[/home/alice/lab1]] tells a student who
+renamed a directory exactly what happened, whereas \enquote{the
+project could not be resolved} tells them nothing they can act
+on.  We show the raw recorded text rather than anything derived
+from it, because the discrepancy between what is recorded and what
+exists is the whole finding.  A marker that cannot be read at all
+is a different fault with the same consequence, so it reports
+itself in the same slot instead of raising: a diagnostic command
+that crashes on the very file it was asked to explain would leave
+the student worse off than the silence they came to ask about.
+That is also why the [[except]] clause is broad---the marker is
+arbitrary bytes on a disk we do not control, and a permission
+error and a half-written file are the same news here.
+
+<<helper functions>>=
+def marker_contents(marker_path):
+    """Return the marker file's text, or why it cannot be read."""
+    try:
+        return pathlib.Path(marker_path).read_text().strip()
+    except Exception as exc:
+        return f"<unreadable: {exc}>"
+@
+
+The report is a single function so that the command itself has
+nothing left to decide.  It takes the same two overrides as the
+resolver it calls, [[marker_path]] and [[sys_prefix]], and
+defaults both to the running interpreter's values.  Mirroring
+[[_resolve_project_root]]'s signature here is deliberate: the
+defaults keep the command a no-argument call, while the parameters
+let the tests drive every branch against a scratch directory
+instead of building a real venv.
+
+Resolving has one side effect worth naming.  When the marker is
+stale but the [[sys.prefix]] backup still finds the project,
+[[_resolve_project_root]] rewrites the marker (\cref{learnlog}).
+A moved project is therefore repaired by the mere act of asking,
+and---more to the point---the report describes what the next run
+will actually do rather than what the file happened to say a
+moment earlier.
+
+<<helper functions>>=
+def autostart_report(marker_path=None, sys_prefix=None):
+    """Describe how the running interpreter is wired to log.
+
+    Returns a ``(state, lines)`` pair, where ``state`` is an
+    ``AutostartState`` and ``lines`` are ready to print.  Both
+    arguments default to the running interpreter's own marker
+    path and ``sys.prefix``.
+    """
+    <<default the report inputs to this interpreter>>
+    <<report an interpreter nobody wired>>
+    <<report the project the wiring resolves to>>
+    <<report wiring that resolves to nothing>>
+@
+
+Every report opens with the interpreter it is about.  That line is
+not decoration: a student who installed learnlog with [[pipx]], or
+who forgot to activate the project venv, is asking about a
+different environment from the one their programs run in, and
+\enquote{not wired} only becomes intelligible next to the name of
+what was inspected.
+
+<<default the report inputs to this interpreter>>=
+if marker_path is None:
+    marker_path = _DEFAULT_MARKER_PATH
+if sys_prefix is None:
+    sys_prefix = sys.prefix
+marker_path = pathlib.Path(marker_path)
+lines = [f"Interpreter: {sys_prefix}"]
+@
+
+An unwired interpreter still gets a [[Marker]] line, naming the
+directory the marker would have lived in.  It is what turns a bare
+\enquote{not wired} into something checkable: the student who
+expected this environment to be wired can compare that directory
+against the venv they actually ran [[init]] in.
+
+<<report an interpreter nobody wired>>=
+if not _is_autostart_wired(marker_path=marker_path):
+    return AutostartState.unwired, lines + [
+        "Autostart:   not wired -- runs of this interpreter "
+        "are not recorded.",
+        f"Marker:      no {marker_path.name} in "
+        f"{marker_path.parent}",
+        "Run 'learnlog init python' in your project to wire "
+        "this environment.",
+    ]
+@
+
+Past that point the interpreter is wired, and the only remaining
+question is whether the wiring still lands anywhere.  We answer it
+with [[_resolve_project_root]] rather than by reading the marker
+ourselves, so that both of the runtime's sources count: an
+anchored report covers the project named by the marker \emph{and}
+the one recovered from [[sys.prefix]] when the marker has gone
+stale.  Reporting only the first would call a self-healing venv
+broken.
+
+<<report the project the wiring resolves to>>=
+project_root = _resolve_project_root(
+    marker_path=marker_path, sys_prefix=sys_prefix,
+)
+if project_root is not None:
+    return AutostartState.anchored, lines + [
+        "Autostart:   wired",
+        f"Project:     {project_root}",
+        f"Runs of this interpreter are recorded in "
+        f"{pathlib.Path(project_root) / '.learnlog'}.",
+    ]
+@
+
+What falls through is the state the command exists for: a marker
+is present, so somebody ran [[init]] for this interpreter, and
+neither source resolves, so nothing is being recorded.  Both facts
+are already established by the time we get here, which is why this
+last block asserts nothing and simply says what it knows.
+
+<<report wiring that resolves to nothing>>=
+return AutostartState.dead, lines + [
+    "Autostart:   wired, but the project it names is gone -- "
+    "runs are NOT being recorded.",
+    f"Marker:      {marker_path} names "
+    f"{marker_contents(marker_path)}",
+    "Run 'learnlog doctor --repair' from your project "
+    "directory to re-wire this interpreter.",
+]
+@
+
+Let's verify the classification.  A scratch directory stands in
+for [[site-packages]], and the presence and contents of the marker
+file inside it select the state, exactly as they would in a real
+venv:
+
+<<test functions>>=
+def test_autostart_report_unwired_without_marker(tmp_path):
+    """No marker file means nobody wired this interpreter."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    state, lines = autostart_report(
+        marker_path=purelib / "learnlog_project_root.txt",
+        sys_prefix=str(tmp_path / "nowhere" / ".venv"),
+    )
+    assert state is AutostartState.unwired
+
+def test_autostart_report_anchored_via_marker(tmp_path):
+    """A marker naming a live project reports that project."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(project) + "\n")
+    state, lines = autostart_report(
+        marker_path=marker,
+        sys_prefix=str(tmp_path / "nowhere" / ".venv"),
+    )
+    assert state is AutostartState.anchored
+    assert any(str(project) in line for line in lines)
+
+def test_autostart_report_anchored_via_backup(tmp_path):
+    """A stale marker is healed from the sys.prefix backup."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "moved-away") + "\n")
+    state, lines = autostart_report(
+        marker_path=marker,
+        sys_prefix=str(project / ".venv"),
+    )
+    assert state is AutostartState.anchored
+    assert marker.read_text().strip() == str(project)
+
+def test_autostart_report_dead_shows_marker_contents(tmp_path):
+    """A marker naming a vanished project is reported verbatim."""
+    from learnlog.cli import AutostartState, autostart_report
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    state, lines = autostart_report(
+        marker_path=marker,
+        sys_prefix=str(tmp_path / "nowhere" / ".venv"),
+    )
+    assert state is AutostartState.dead
+    assert any(
+        str(tmp_path / "deleted-lab") in line for line in lines
+    )
+
+def test_marker_contents_reports_unreadable_marker(tmp_path):
+    """An unreadable marker explains itself instead of raising."""
+    from learnlog.cli import marker_contents
+    assert "unreadable" in marker_contents(tmp_path / "gone.txt")
+@
+
+
 \section{Typer application}
 
-We define the Typer app at module level with fourteen
+We define the Typer app at module level with fifteen
 commands.
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
@@ -1599,7 +2270,52 @@ strengthening the learning signal.
 We lock the resulting mixed-mode pattern list in with regression tests
 against the generated tutorial resource.
 
+Those tests reach a step by its title rather than by its position.  A
+tutorial is a document, and a document grows a step in the middle
+sooner or later---adding the [[doctor]] step
+(\cref{tut:getting-started}) shifted every index after it---so an
+assertion keyed on position fails for an edit that is none of its
+business, and reports an integer rather than the thing that changed.
+Order still carries meaning, so one test spells the sequence out in
+full: that keeps the ordering covered while leaving exactly one place
+to update when the walkthrough gains a step.
+
 <<test functions>>=
+def getting_started_tutorial():
+    """Parse the shipped getting-started tutorial resource."""
+    from importlib import resources
+
+    from pytorial.catalog import parse_tutorial_text
+
+    tutorial_path = resources.files("learnlog") / "tutorials"
+    tutorial_path = tutorial_path / "getting-started.md"
+    return parse_tutorial_text(
+        tutorial_path.read_text(),
+        source_path=tutorial_path,
+    )
+
+def getting_started_step(title):
+    """Return the shipped getting-started step called ``title``."""
+    steps = {
+        step.title: step
+        for step in getting_started_tutorial().steps
+    }
+    assert title in steps, sorted(steps)
+    return steps[title]
+
+def test_getting_started_keeps_its_step_order():
+    """The walkthrough sets up, checks, writes, runs, inspects."""
+    assert [
+        step.title for step in getting_started_tutorial().steps
+    ] == [
+        "Create a fresh project",
+        "Activate the project environment",
+        "Confirm that runs are being recorded",
+        "Create a small program",
+        "Run the program",
+        "Inspect the recorded run",
+    ]
+
 def test_tutorial_list_lists_builtin_tutorials():
     """`learnlog tutorial list` includes our shipped tutorials."""
     from learnlog.cli import app
@@ -1621,21 +2337,9 @@ def test_tutorial_list_lists_builtin_tutorials():
     )
 
 def test_getting_started_uses_shell_step_for_file_creation():
-    """Step 3 stays in the shell with pre-activated project Python."""
-    from importlib import resources
+    """File creation stays in the shell, on the project Python."""
+    step = getting_started_step("Create a small program")
 
-    from pytorial.catalog import parse_tutorial_text
-
-    tutorial_path = resources.files("learnlog") / "tutorials"
-    tutorial_path = tutorial_path / "getting-started.md"
-    tutorial = parse_tutorial_text(
-        tutorial_path.read_text(),
-        source_path=tutorial_path,
-    )
-
-    step = tutorial.steps[2]
-
-    assert step.title == "Create a small program"
     assert step.kind is None
     assert step.edit_file is None
     assert step.required_patterns == ()
@@ -1649,21 +2353,9 @@ def test_getting_started_uses_shell_step_for_file_creation():
 
 def test_getting_started_reactivates_and_checks_playback():
     """Later shell steps pre-activate the venv and require playback."""
-    from importlib import resources
+    run_step = getting_started_step("Run the program")
+    play_step = getting_started_step("Inspect the recorded run")
 
-    from pytorial.catalog import parse_tutorial_text
-
-    tutorial_path = resources.files("learnlog") / "tutorials"
-    tutorial_path = tutorial_path / "getting-started.md"
-    tutorial = parse_tutorial_text(
-        tutorial_path.read_text(),
-        source_path=tutorial_path,
-    )
-
-    run_step = tutorial.steps[3]
-    play_step = tutorial.steps[4]
-
-    assert run_step.title == "Run the program"
     assert run_step.kind is None
     assert run_step.edit_file is None
     assert run_step.pre_command == 'eval "$(learnlog activate)"\n'
@@ -1678,7 +2370,6 @@ def test_getting_started_reactivates_and_checks_playback():
     assert "fresh shell" in run_step.instructions
     assert "re-activated the project environment" in run_step.instructions
 
-    assert play_step.title == "Inspect the recorded run"
     assert play_step.pre_command == 'eval "$(learnlog activate)"\n'
     assert tuple(
         (pattern.pattern, pattern.mode)
@@ -1692,6 +2383,59 @@ def test_getting_started_reactivates_and_checks_playback():
     assert play_step.check_command is None
     assert "Script: hello.py" in play_step.instructions
     assert "diff" in play_step.instructions
+@
+
+One step is keyed to learnlog's \emph{output} rather than to what the
+student types.  The [[doctor]] step (\cref{tut:getting-started}) is
+satisfied only by a transcript containing the anchored report's
+\enquote{Runs of this interpreter are recorded in} line
+(\cref{sec:autostart-diagnosis}), which is what makes it a check that
+this interpreter really records runs instead of a check that the
+student typed the command.  That buys a real verification at the price
+of a string shared between a tutorial and a report neither of which
+knows about the other: reword the report, and the shipped tutorial
+stops being passable---silently, and only for students.
+
+So we drive the two against each other.  We build the report for a
+wired interpreter, assemble the transcript the step would record, and
+let [[pytorial]]'s own matcher rule on it; the unwired report goes
+through the same matcher to confirm that the step gates on the wiring
+and not merely on the word [[doctor]] appearing somewhere.
+
+<<test functions>>=
+def test_doctor_step_matches_the_report_it_checks(tmp_path):
+    """The tutorial's doctor step gates on a wired report."""
+    from learnlog.cli import autostart_report
+    from pytorial.run import transcript_matches_patterns
+
+    def transcript(**resolver_args):
+        _, lines = autostart_report(**resolver_args)
+        return "$ learnlog doctor\n" + "\n".join(lines) + "\n"
+
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(project) + "\n")
+    step = getting_started_step(
+        "Confirm that runs are being recorded"
+    )
+
+    assert transcript_matches_patterns(
+        transcript(
+            marker_path=marker,
+            sys_prefix=str(project / ".venv"),
+        ),
+        step.required_patterns,
+    )
+    assert not transcript_matches_patterns(
+        transcript(
+            marker_path=tmp_path / "bare" / "marker.txt",
+            sys_prefix=str(tmp_path / "bare"),
+        ),
+        step.required_patterns,
+    )
 @
 
 
@@ -1710,7 +2454,14 @@ The optional [[-C]] / [[--dir]] flag mirrors the pattern
 used by [[set-remote]] and [[push]] and makes [[init]]
 scriptable from a parent directory.  The [[--python]]
 option is the [[init]]-specific escape hatch discussed in
-\cref{sec:setup-target-python}.
+\cref{sec:setup-target-python}, and [[--force]] the one
+that overrides the home-directory refusal
+(\cref{sec:setup-home-guard}).
+
+The guard runs before the [[LearnlogRepo]] constructor, not
+after: the constructor is what creates [[.learnlog/]], and a
+refusal that leaves the directory behind would have already done
+the damage it exists to prevent.
 
 <<typer commands>>=
 @app.command(name="init")
@@ -1742,6 +2493,16 @@ def init(
             ),
         ),
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help=(
+                "Set up the project even when the directory "
+                "is your home directory or above it."
+            ),
+        ),
+    ] = False,
 ):
     """Set up a project to record with learnlog."""
     workdir = (
@@ -1749,6 +2510,12 @@ def init(
         if directory
         else pathlib.Path.cwd()
     )
+    if not force:
+        refuse_home_root(
+            workdir,
+            "Change to your project directory, or pass "
+            "--force if you really mean this one.",
+        )
     LearnlogRepo(workdir)
     if language is Language.python:
         init_python(workdir, python)
@@ -1804,6 +2571,471 @@ expected [[.learnlog/]] directory.  We stub the Python pipeline rather
 than exercise it here because its behaviour is checked separately, which
 also keeps these tests independent of the network and the local Python
 toolchain.
+
+The home-directory guard needs the same treatment at the command
+level, since that is where [[--force]] lives.  These tests point
+[[HOME]] at a temporary directory and then check every outcome
+that matters: that the refusal fires from the current directory
+and through [[-C]] alike, that nothing is left behind by a
+refused run, that the message names the way out, that
+[[--force]] takes it, and---the one that would catch an
+over-eager guard---that an ordinary project below the home
+directory is unaffected.
+
+<<test functions>>=
+def test_init_refuses_home_directory(tmp_path, monkeypatch):
+    """`init` in $HOME refuses and creates nothing."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(home)
+    result = CliRunner().invoke(app, ["init", "python"])
+    assert result.exit_code != 0
+    assert not (home / ".learnlog").exists()
+
+def test_init_refusal_names_force(tmp_path, monkeypatch):
+    """The refusal tells the student how to override it."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(home)
+    result = CliRunner().invoke(app, ["init", "python"])
+    assert "--force" in result.output
+
+def test_init_refuses_directory_above_home(
+    tmp_path, monkeypatch,
+):
+    """A directory above $HOME is refused through -C too."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    result = CliRunner().invoke(
+        app, ["init", "python", "-C", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    assert not (tmp_path / ".learnlog").exists()
+
+def test_init_force_allows_home_directory(
+    tmp_path, monkeypatch,
+):
+    """`--force` creates the project in $HOME anyway."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(home)
+    result = CliRunner().invoke(
+        app, ["init", "python", "--force"],
+    )
+    assert result.exit_code == 0
+    assert (home / ".learnlog").is_dir()
+
+def test_init_allows_project_under_home(tmp_path, monkeypatch):
+    """An ordinary project below $HOME is untouched by the guard."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    home = tmp_path / "home"
+    project = home / "lab1"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli.init_python",
+        lambda workdir, python: None,
+    )
+    monkeypatch.chdir(project)
+    result = CliRunner().invoke(app, ["init", "python"])
+    assert result.exit_code == 0
+    assert (project / ".learnlog").is_dir()
+@
+
+
+\subsection{The [[doctor]] command}
+\label{sec:doctor-command}
+
+[[doctor]] prints the report of \cref{sec:autostart-diagnosis}
+and, given [[--repair]], acts on it.
+
+The exit status carries the finding too, so the report is usable
+from a script or a lab checklist: dead wiring exits non-zero,
+the other two states exit zero.  \enquote{Not wired} is
+deliberately not a failure---an interpreter nobody prepared is
+behaving exactly as intended---whereas dead wiring is the one
+state in which a student believes their runs are being recorded
+and they are not.
+
+<<typer commands>>=
+@app.command(name="doctor")
+def doctor(
+    repair: Annotated[
+        bool,
+        typer.Option(
+            "--repair",
+            help=(
+                "Re-wire this interpreter for the learnlog "
+                "project in the current directory."
+            ),
+        ),
+    ] = False,
+):
+    """Check whether this interpreter records runs."""
+    <<report the wiring and stop unless repairing>>
+    <<choose the project to re-wire for>>
+    <<refuse an interpreter we must not wire>>
+    <<re-wire and report the result>>
+@
+
+The report is printed first whether or not [[--repair]] was
+given, so that a repair run leaves behind a record of what it
+found as well as what it did.  Without [[--repair]] the finding
+\emph{is} the whole command, so it becomes the exit status and we
+stop.
+
+<<report the wiring and stop unless repairing>>=
+state, lines = autostart_report()
+for line in lines:
+    typer.echo(line)
+if not repair:
+    raise typer.Exit(
+        code=1 if state is AutostartState.dead else 0
+    )
+@
+
+Repair has to settle two questions---which project to wire to,
+and which interpreter to wire---and it refuses to guess at
+either.
+
+The project is whatever the ordinary upward search finds.  When
+there is none, the answer is [[init]] rather than a repository
+invented somewhere plausible: guessing a root from the current
+directory is precisely the behaviour that was removed from the
+run path for creating whole-home repositories, and re-introducing
+it inside a command called \enquote{repair} would be worse than
+leaving it where it was.
+
+That search is already bounded away from the home directory, so a
+student standing in [[$HOME]] is told \enquote{no project found}
+even when [[$HOME/.learnlog]] is sitting right there, forced into
+existence by an earlier [[init --force]]
+(\cref{sec:setup-home-guard}).  Saying that would be actively
+misleading, so the guard answers first and in its own words---and
+its hint is the only honest one available, since a project we
+refuse to search for is also one we refuse to wire.
+
+<<choose the project to re-wire for>>=
+workdir = find_learnlog_dir()
+if workdir is None:
+    cwd = pathlib.Path.cwd()
+    refuse_home_root(
+        cwd,
+        "Re-run 'learnlog init python --force' there if "
+        "that is really the project you want.",
+    )
+    raise SystemExit(
+        f"No .learnlog/ directory found from {cwd}.  Run "
+        f"'learnlog init python' in your project first."
+    )
+@
+
+The interpreter is this one---the process running
+[[doctor]]---because that is the process the report just
+described, and repairing a different environment would leave the
+finding standing.  Two ways of invoking [[doctor]] make
+\enquote{this one} the wrong answer, and both are refused rather
+than merely warned about, because the consequence is invisible
+from where the student stands.
+
+Outside a virtual environment there is no learnlog wiring of ours
+to repair and [[site-packages]] belongs to the system package
+manager; [[sys.prefix == sys.base_prefix]] is CPython's own test
+for that situation.  Inside a virtual environment that is not the
+project's own [[.venv/]]---the shape a [[pipx]] install produces,
+where [[doctor]] runs from learnlog's private environment---the
+marker would wire the tool rather than the student's programs.
+The log would then fill with [[learnlog play]] and [[learnlog list]]
+runs, the two the veto lets through (\cref{sec:veto}), and with
+nothing the student ever wrote: a record of reading a history that
+was never written.  A project that has a [[.venv/]] we are not running from is
+exactly that case, and the fix is to activate it first.
+
+The check is conditioned on the project actually having a
+[[.venv/]], because installing into an already-active environment
+elsewhere is a supported layout (\cref{sec:setup-pipeline}); when
+the project has no venv of its own there is nothing to be
+mismatched with.
+
+<<refuse an interpreter we must not wire>>=
+venv_dir = pathlib.Path(sys.prefix)
+if sys.prefix == sys.base_prefix:
+    raise SystemExit(
+        f"{venv_dir} is not a virtual environment, so there "
+        f"is no learnlog wiring here to repair.  Activate "
+        f"the project's .venv/ and try again."
+    )
+project_venv = workdir / ".venv"
+if (
+    project_venv.is_dir()
+    and venv_dir.resolve() != project_venv.resolve()
+):
+    raise SystemExit(
+        f"This command is running from {venv_dir}, not the "
+        f"project's {project_venv}.  Activate the project "
+        f"venv and run 'learnlog doctor --repair' again."
+    )
+@
+
+The repair itself is [[write_autostart_files]], the same helper
+[[init]] uses (\cref{sec:setup-autostart-hook}); a second way of
+writing the wiring would be a second thing to keep in step with
+the resolver.
+
+That helper turns filesystem failures into a warning instead of
+an abort, which is the right trade for [[init]]---a missing hook
+is a lost feature, not a broken project---but it does mean the
+call cannot tell us whether it worked.  So we ask the report
+again afterwards and let the second answer, rather than the
+write, decide both what the command claims and what it exits
+with.
+
+<<re-wire and report the result>>=
+write_autostart_files(venv_dir, workdir)
+typer.echo("")
+typer.echo(f"Re-wired this interpreter for {workdir}:")
+state, lines = autostart_report()
+for line in lines:
+    typer.echo(line)
+raise typer.Exit(
+    code=0 if state is AutostartState.anchored else 1
+)
+@
+
+Let's verify the three reports and the exit statuses that go with
+them.  Each test substitutes a scratch [[site-packages]] for the
+interpreter's own and moves [[sys.prefix]] somewhere harmless, so
+that the outcome depends only on the fixture and never on how the
+machine running the suite happens to be wired:
+
+<<test functions>>=
+def test_doctor_reports_unwired_interpreter(
+    tmp_path, monkeypatch,
+):
+    """Without a marker, doctor says so and succeeds."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH",
+        purelib / "learnlog_project_root.txt",
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "not wired" in result.output
+    assert "learnlog init python" in result.output
+
+def test_doctor_reports_anchored_project(tmp_path, monkeypatch):
+    """A live marker is reported with the project it names."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(project) + "\n")
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0
+    assert "wired" in result.output
+    assert str(project) in result.output
+
+def test_doctor_reports_dead_wiring(tmp_path, monkeypatch):
+    """Dead wiring names the stale path and exits non-zero."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert "NOT being recorded" in result.output
+    assert str(tmp_path / "deleted-lab") in result.output
+    assert "--repair" in result.output
+@
+
+The repair path is exercised through the same substitution the
+[[write_autostart_files]] tests use---a scratch directory
+standing in for the venv's [[site-packages]]
+(\cref{sec:setup-autostart-hook})---so the whole command runs for
+real without building a virtual environment.  What the test
+checks is what the student cares about: after the repair, the
+marker names the project they were standing in, and the [[.pth]]
+hook that reads it exists.
+
+<<test functions>>=
+def test_doctor_repair_rewires_dead_marker(
+    tmp_path, monkeypatch,
+):
+    """--repair points a dead marker at the current project."""
+    from learnlog import cli
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.setattr(cli, "venv_purelib", lambda d: purelib)
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code == 0
+    assert marker.read_text().strip() == str(project)
+    assert (purelib / "zzz-learnlog-autostart.pth").exists()
+    assert str(project) in result.output
+
+def test_doctor_repair_without_project_points_at_init(
+    tmp_path, monkeypatch,
+):
+    """Outside a project, repair refuses to guess a root."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.chdir(scratch)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "learnlog init python" in result.output
+    assert marker.read_text().strip() == str(
+        tmp_path / "deleted-lab"
+    )
+
+def test_doctor_repair_refuses_home_directory(
+    tmp_path, monkeypatch,
+):
+    """Repair honours the home-directory bound as init does."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    home = tmp_path / "home"
+    (home / ".learnlog").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / ".venv"))
+    monkeypatch.chdir(home)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "home directory" in result.output
+    assert marker.read_text().strip() == str(
+        tmp_path / "deleted-lab"
+    )
+
+def test_doctor_repair_refuses_foreign_venv(
+    tmp_path, monkeypatch,
+):
+    """A project with its own .venv/ must be repaired from it."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    (project / ".venv").mkdir()
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(
+        sys, "prefix", str(tmp_path / "elsewhere-venv"),
+    )
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "Activate the project venv" in result.output
+    assert marker.read_text().strip() == str(
+        tmp_path / "deleted-lab"
+    )
+
+def test_doctor_repair_refuses_outside_a_venv(
+    tmp_path, monkeypatch,
+):
+    """There is nothing of ours to repair in a system Python."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    purelib = tmp_path / "site-packages"
+    purelib.mkdir()
+    marker = purelib / "learnlog_project_root.txt"
+    marker.write_text(str(tmp_path / "deleted-lab") + "\n")
+    project = tmp_path / "lab1"
+    (project / ".learnlog").mkdir(parents=True)
+    monkeypatch.setattr(
+        "learnlog.cli._DEFAULT_MARKER_PATH", marker,
+    )
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.chdir(project)
+
+    result = CliRunner().invoke(app, ["doctor", "--repair"])
+
+    assert result.exit_code != 0
+    assert "not a virtual environment" in result.output
+@
 
 
 \subsection{The [[activate]] command}
@@ -2083,8 +3315,9 @@ def list_commits(
         typer.Option(
             "--all", "-a",
             help=(
-                "Include learnlog's own runs in the "
-                "output."
+                "Include learnlog's internal runs "
+                "(e.g. the pip install from "
+                "learnlog init)."
             ),
         ),
     ] = False,
@@ -2118,7 +3351,8 @@ def list_commits(
         if not commits:
             raise SystemExit("No commits found.")
 
-        filter_lr = not show_all
+        filter_internal = not show_all
+        trailers = get_run_trailers(repo)
         <<build wanted outcome set>>
         for commit in commits:
             <<get and summarise commit>>
@@ -2141,19 +3375,27 @@ if failure:
     wanted.add("failure")
 @
 
-For each commit we fetch the full message body, optionally
-filter out learnlog's own runs using [[filter_learnlog_runs]],
+For each commit we fetch the full message body, merge in the
+trailers of the runs it records (\cref{sec:run-join}), optionally
+filter out learnlog's internal runs using [[filter_internal_runs]],
 drop commits that do not match the outcome filter, and then
 extract the summary with [[parse_run_summary]].
 Commits whose runs are all filtered out (or that have no run
 blocks, like the initial commit) are silently skipped.
 
+Merging matters here beyond cosmetics: the outcome filters read the
+exit code, which lives in the trailer.
+Without the merge, [[--success]] and [[--failure]] would match
+nothing at all, since every commit would look like an interrupted
+run.
+
 <<get and summarise commit>>=
 body = repo.git(
     "log", "-1", "--format=%B", commit["hash"],
 ).stdout.rstrip("\n")
-if filter_lr:
-    body = filter_learnlog_runs(body)
+body = merge_run_trailers(body, trailers)
+if filter_internal:
+    body = filter_internal_runs(body)
 <<skip commits that do not match the outcome filter>>
 summary = parse_run_summary(body)
 if summary is None:
@@ -2213,8 +3455,8 @@ def test_list_command_via_from_option(workdir):
     assert result.exit_code == 0
     assert "hello.py arg1" in result.output
 
-def test_list_command_multiple_runs(workdir):
-    """Multiple runs in one commit show run count."""
+def test_list_command_lists_each_run(workdir):
+    """Each run is a line of its own."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -2227,10 +3469,41 @@ def test_list_command_multiple_runs(workdir):
         app, ["list", "--from", str(workdir)]
     )
     assert result.exit_code == 0
+    assert "2026-01-01 10:00 hello.py" in result.output
+    assert "2026-01-01 10:05 hello.py" in result.output
+
+def test_list_command_counts_runs_in_one_commit(workdir):
+    """A commit holding several runs shows the run count.
+
+    Logs recorded before the two-commit protocol grouped
+    consecutive runs of unchanged code into one commit, and
+    ProgSnap2 reconstruction still builds such commits.
+    """
+    from learnlog.cli import app
+    from learnlog.commits import BLOCK_SEP
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    block = (
+        "Run: hello.py (none)\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:0{minute}:00"
+    )
+    repo.git(
+        "commit", "--allow-empty", "-m",
+        block.format(minute=0) + BLOCK_SEP
+        + block.format(minute=5),
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
     assert "(2 runs)" in result.output
 
-def test_list_command_filters_learnlog(workdir):
-    """Learnlog runs are hidden by default."""
+def test_list_shows_review_runs(workdir):
+    """Review runs are listed without asking for --all."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -2243,28 +3516,44 @@ def test_list_command_filters_learnlog(workdir):
     )
     assert result.exit_code == 0
     assert "hello.py" in result.output
-    assert "learnlog" not in result.output
+    assert "learnlog play" in result.output
 
-def test_list_command_all_shows_learnlog(workdir):
-    """The --all flag counts learnlog runs too."""
+def test_list_command_all_shows_internal(workdir):
+    """The --all flag lists learnlog's internal runs too."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
-    repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("learnlog", ["export", "out.bundle"], t1)
     runner = CliRunner()
-    # Without --all, the learnlog run is filtered out.
+    # Without --all, the internal run is filtered out.
     filtered = runner.invoke(
         app, ["list", "--from", str(workdir)]
     )
-    assert "(2 runs)" not in filtered.output
-    # With --all, both runs are counted.
+    assert "learnlog export" not in filtered.output
+    # With --all, it is listed as its own record.
     unfiltered = runner.invoke(
         app, ["list", "--all", "--from", str(workdir)]
     )
     assert unfiltered.exit_code == 0
-    assert "(2 runs)" in unfiltered.output
+    assert "learnlog export" in unfiltered.output
+
+def test_list_command_hides_pip_install_of_learnlog(workdir):
+    """Installing learnlog is setup noise, not development."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("pip", ["install", "learnlog"], t1)
+    repo.begin_run("pip", ["install", "requests"], t1)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "install learnlog" not in result.output
+    assert "install requests" in result.output
 @
 
 Let's verify the outcome filters.  The first two tests use a
@@ -2379,28 +3668,35 @@ def test_list_both_flags_show_either(workdir):
     assert "bad.py" in result.output
 
 def test_list_mixed_commit_appears_in_both(workdir):
-    """A commit with both outcomes shows under each flag."""
+    """A commit with both outcomes shows under each flag.
+
+    One commit holds several runs in logs recorded before the
+    two-commit protocol and in ProgSnap2 reconstructions, so we
+    build such a commit directly here.
+    """
     from learnlog.cli import app
+    from learnlog.commits import BLOCK_SEP
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
-    t1 = datetime.datetime(2026, 1, 1, 10, 0)
-    end1 = datetime.datetime(2026, 1, 1, 10, 0, 1)
-    repo.begin_run("mixed.py", [], t1)
-    repo.finalize_run(
-        io_log="",
-        exception_info=None,
-        end_time=end1,
-        exit_code=0,
+    block = (
+        "Run: mixed.py (none)\n"
+        "\n"
+        "Script: mixed.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:0{minute}:00\n"
+        "End-Time: 2026-01-01T10:0{minute}:01\n"
+        "Exit-Code: {code}\n"
+        "\n"
+        "--- I/O ---\n"
+        "(no I/O)\n"
+        "\n"
+        "--- exception ---\n"
+        "None"
     )
-    # Same code re-run: amends the commit with a second block.
-    t2 = datetime.datetime(2026, 1, 1, 10, 5)
-    end2 = datetime.datetime(2026, 1, 1, 10, 5, 1)
-    repo.begin_run("mixed.py", [], t2)
-    repo.finalize_run(
-        io_log="",
-        exception_info=None,
-        end_time=end2,
-        exit_code=1,
+    repo.git(
+        "commit", "--allow-empty", "-m",
+        block.format(minute=0, code=0) + BLOCK_SEP
+        + block.format(minute=5, code=1),
     )
     runner = CliRunner()
     success_result = runner.invoke(
@@ -2463,17 +3759,27 @@ def export(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    if progsnap2:
-        if output == pathlib.Path(DEFAULT_BUNDLE_NAME):
-            output = pathlib.Path(
-                DEFAULT_PROGSNAP2_NAME
-            )
-        do_export_progsnap2(repo, output.resolve())
-    else:
-        do_export(repo, output.resolve())
+    if progsnap2 and output == pathlib.Path(
+        DEFAULT_BUNDLE_NAME
+    ):
+        output = pathlib.Path(DEFAULT_PROGSNAP2_NAME)
+
+    write_export_atomically(
+        do_export_progsnap2 if progsnap2 else do_export,
+        repo,
+        output.resolve(),
+    )
 
     typer.echo(f"Exported to {output}")
 @
+
+Both formats go out through [[write_export_atomically]]
+(\cref{sec:staged-export}) rather than only the bundle, because both
+land in the work tree and a half-written ProgSnap2 zip is no better a
+thing to commit than a half-written bundle.
+Choosing the writer before staging, rather than staging inside each
+writer, also keeps the rule where a reader can see it: everything this
+command writes appears at its destination in one step.
 
 <<test functions>>=
 def test_export_command(workdir, monkeypatch):
@@ -2523,6 +3829,32 @@ def test_export_progsnap2_custom_output(
     assert out.exists()
 @
 
+The export lands in the work tree, so the run after it decides whether
+the log now carries a copy of itself.
+This is the whole cycle in one test: export, then run, then ask what
+the run recorded.
+
+<<test functions>>=
+def test_exported_bundle_is_not_committed_by_the_next_run(
+    workdir, monkeypatch,
+):
+    """A run after an export must not commit the export."""
+    from learnlog.cli import app, DEFAULT_BUNDLE_NAME
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["export"])
+    assert result.exit_code == 0
+    assert (workdir / DEFAULT_BUNDLE_NAME).exists()
+
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert DEFAULT_BUNDLE_NAME not in \
+        repo.git("ls-files").stdout
+@
+
 
 \subsection{The [[set-remote]] command}
 \label{sec:set-remote}
@@ -2547,6 +3879,10 @@ If [[origin]] already exists we update its URL with
 [[git remote add]].
 We detect the current state by checking the exit code of
 [[git remote get-url]], which fails when the remote does not exist.
+That probe is a question, not a command, so it runs with
+[[check=False]]; the [[set-url]]/[[add]] that follows does too, because
+a bad URL should reach the user as the message below rather than as a
+traceback.
 
 <<typer commands>>=
 @app.command(name="set-remote")
@@ -2569,14 +3905,17 @@ def set_remote(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    check = repo.git("remote", "get-url", "origin")
-    if check.returncode == 0:
+    existing = repo.git(
+        "remote", "get-url", "origin", check=False
+    )
+    if existing.returncode == 0:
         result = repo.git(
-            "remote", "set-url", "origin", url
+            "remote", "set-url", "origin", url,
+            check=False,
         )
     else:
         result = repo.git(
-            "remote", "add", "origin", url
+            "remote", "add", "origin", url, check=False,
         )
 
     if result.returncode != 0:
@@ -2629,8 +3968,8 @@ def test_set_remote_updates_existing(workdir, monkeypatch):
 \subsection{The [[push]] command}
 \label{sec:push}
 
-The [[push]] command sends all branches to [[origin]] with tracking
-([[--all -u]]).
+The [[push]] command sends the log to [[origin]] with tracking
+([[-u]]).
 The expected workflow is that the remote repository starts empty, so
 a regular push suffices.
 For the less common case where the remote already contains commits
@@ -2639,12 +3978,57 @@ For the less common case where the remote already contains commits
 This is safe because [[.learnlog/]] is a single-writer recording
 artefact---there is no risk of overwriting someone else's work.
 
-Unlike [[repo.git()]], which captures output with a ten-second
-timeout, [[push]] uses [[subprocess.run]] with inherited standard
-I/O---the same approach as the [[git]] passthrough command
-(\cref{sec:git}).
-This lets the user see transfer progress and respond to credential
-prompts.
+\paragraph{What \enquote{the log} has to mean.}
+
+[[push]] and [[export]] (\cref{sec:export}) are two ways to hand the
+same log to the same teacher, so they have to hand over the same
+thing.
+They did not.
+[[export]] bundles [[--all]], which for [[git bundle]] means every
+ref---branches \emph{and} tags---while [[git push --all]] means
+[[refs/heads/*]] and nothing else.
+A student who marked their milestones with [[learnlog tag lab1]]
+(\cref{sec:tag}) and shared by pushing delivered a log in which no
+milestone existed, and had no way of noticing: the push reported
+success, because sending no tags is not an error.
+The same student sharing the same log by [[export]] delivered the
+milestones.
+
+We therefore name both ref namespaces explicitly rather than leaning
+on a shorthand.
+[[--follow-tags]] is the shorthand that looks right and is not: it
+sends only \emph{annotated} tags, and [[learnlog tag]] forwards to
+[[git tag]], whose default is a lightweight tag---a ref with no tag
+object behind it.
+Every milestone the shipped workflow creates is exactly the kind
+[[--follow-tags]] declines to send, so it would have fixed the
+symptom for nobody.
+A refspec pair does not ask how the tag was made.
+
+The cost is that a tag the student moved locally ([[git tag -f]]) now
+makes the push fail instead of quietly disagreeing with the remote,
+which is the same bargain branches have always been on, and
+[[--force]] settles both at once.
+
+\paragraph{Inherited standard I/O.}
+
+[[push]] uses [[subprocess.run]] with inherited standard I/O---the
+same approach as the [[git]] passthrough command (\cref{sec:git})---so
+that the user sees transfer progress and can answer a credential
+prompt.
+That is also why it stays outside [[LearnlogRepo.git]], even though
+the wrapper now covers the byte-stream case that used to push callers
+out of it (\cref{sec:git-bytes}).
+The wrapper's contract is captured output and a bounded timeout, and
+both are wrong here: capturing turns the progress meter and the
+password prompt into a buffer nobody sees, and any timeout we could
+pick would be a limit on how long the user may take to type a
+passphrase or the network to move a repository.
+Staying out loses nothing either, which is what separates this case
+from the code-state extraction that also thought it had a reason
+(\cref{sec:extract-code-state}): Git's own diagnosis has already
+reached the terminal, and the exit code below is Git's, so a failed
+push is neither silent nor mistaken for a successful one.
 
 <<typer commands>>=
 @app.command()
@@ -2672,10 +4056,10 @@ def push(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    cmd = ["git", "push", "--all", "-u"]
+    cmd = ["git", "push", "-u"]
     if force:
         cmd.append("--force")
-    cmd.append("origin")
+    cmd += ["origin", *PUSH_REFSPECS]
 
     result = subprocess.run(
         cmd,
@@ -2683,11 +4067,26 @@ def push(
         cwd=str(repo.workdir),
     )
     raise typer.Exit(code=result.returncode)
+<<constants>>=
+PUSH_REFSPECS = (
+    "refs/heads/*:refs/heads/*",
+    "refs/tags/*:refs/tags/*",
+)
 @
 
 We test [[push]] by creating a bare repository as the remote target,
 configuring [[origin]] to point at it, and verifying that the commits
-arrive:
+arrive.
+Pushing twice deserves its own test, because it used to fail twice
+over.
+Finishing the first [[push]] rewrote the very commit it had just sent
+(\cref{sec:two-commit-protocol}), and even once that was fixed the
+push still committed a header and a trailer of its own, so the
+sending side moved every time it sent.
+Neither happens now---[[push]] is not a recorded run at all
+(\cref{sec:veto})---so the second push is an ordinary fast-forward
+over whatever the student ran in between, which is what the test
+plays out.
 
 <<test functions>>=
 def test_push_command(workdir, monkeypatch):
@@ -2767,6 +4166,36 @@ def test_push_to_divergent_remote(workdir, monkeypatch):
     result = runner.invoke(app, ["push", "--force"])
     assert result.exit_code == 0
 
+def test_push_twice_succeeds(workdir, monkeypatch):
+    """Pushing twice in a row works.
+
+    The student runs their program between the two pushes, so
+    the second one has something to send.  Nothing the push
+    itself does may rewrite what the first one already sent.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir.parent / "twice-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    runner.invoke(app, ["set-remote", str(bare)])
+    for minute in (0, 5):
+        moment = datetime.datetime(2026, 1, 1, 10, minute)
+        repo.begin_run("hello.py", [], moment)
+        repo.finalize_run(
+            io_log="",
+            exception_info=None,
+            end_time=moment,
+            exit_code=0,
+        )
+        result = runner.invoke(app, ["push"])
+        assert result.exit_code == 0
+
 def test_push_no_remote_fails(workdir, monkeypatch):
     """Push fails when no remote is configured."""
     from learnlog.cli import app
@@ -2776,6 +4205,62 @@ def test_push_no_remote_fails(workdir, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["push"])
     assert result.exit_code != 0
+@
+
+The milestone test walks the student's own path---run a program, mark
+it with [[learnlog tag]], push---and then asks the \emph{remote} what
+tags it holds, because that is the only place the old behaviour was
+visible.
+Locally the tag was always there; the push always exited zero; only
+the receiving side knew the milestone had not arrived.
+Reading the tag off a commit the student actually ran also keeps the
+test honest about what the tag is for: it has to name the run, not
+merely exist.
+
+<<test functions>>=
+def test_push_delivers_tags(workdir, monkeypatch):
+    """Milestones the student tagged reach the remote.
+
+    ``git push --all`` sends refs/heads/* only, so tags stayed
+    behind while ``export``'s bundle carried them.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    bare = workdir.parent / "tags-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    runner.invoke(app, ["set-remote", str(bare)])
+
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], moment)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=moment,
+        exit_code=0,
+    )
+    assert runner.invoke(app, ["tag", "lab1"]).exit_code == 0
+
+    result = runner.invoke(app, ["push"])
+    assert result.exit_code == 0
+
+    tags = subprocess.run(
+        ["git", "--git-dir", str(bare), "tag", "-l"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "lab1" in tags.stdout.split()
+
+    subject = subprocess.run(
+        ["git", "--git-dir", str(bare),
+         "log", "-1", "--format=%s", "lab1"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "hello.py" in subject.stdout
 @
 
 
@@ -2788,10 +4273,11 @@ A teacher cloning a student's pushed learnlog to review it, or a
 student moving to a new machine, both need a way to get the
 [[.learnlog/]] data from the remote.
 
-The command takes a remote URL, performs a standard [[git clone]] into a
-temporary directory, and then moves the resulting [[.git/]] directory
-to [[.learnlog/]] in the target working directory.
-We use a temporary directory rather than [[git clone --bare]] because
+The command takes a remote URL, performs a standard [[git clone]] into
+a staging directory, moves the resulting [[.git/]] directory to
+[[.learnlog/]] in the target working directory, and checks the log's
+files out there.
+We use a staging directory rather than [[git clone --bare]] because
 a standard clone produces a properly configured repository with remote
 tracking branches---so subsequent [[push]] and [[pull]]
 (\cref{sec:pull}) operations work without additional setup.
@@ -2801,6 +4287,23 @@ user sees clone progress and can respond to credential prompts.
 We deliberately avoid constructing a [[LearnlogRepo]] before the
 clone completes, because its constructor auto-initialises an empty
 repository when [[.learnlog/]] is absent.
+Once the repository \emph{is} in place, constructing one is the point:
+that is what configures it.
+
+The guard that refuses to clone over an existing [[.learnlog/]] is
+worth a note, because for most of this command's life it was
+unreachable and its refusal was the only thing it ever did.
+Cloning into an empty directory is the whole point of [[clone]]---a
+teacher fetching a student's pushed log, a student moving machines---
+and every invocation used to be a recorded run, so [[initialize]]
+had already created the very directory the guard then found
+(\cref{sec:veto}).
+The command could report nothing but the state it had itself just
+produced.
+Now that an administrative subcommand leaves no trace, an empty
+directory is still empty when the guard looks, and the check finally
+means what it says: it fires only when the user really is about to
+clone over a log that is already there.
 
 <<typer commands>>=
 @app.command()
@@ -2823,34 +4326,149 @@ def clone(
     ] = None,
 ):
     """Clone a remote learnlog repository into .learnlog/."""
-    import shutil
-
     workdir = pathlib.Path(
         directory or os.getcwd()
     ).resolve()
     learnlog_dir = workdir / ".learnlog"
 
-    if learnlog_dir.exists():
-        raise SystemExit(
-            f".learnlog/ already exists in {workdir}"
-        )
-
-    tmpdir = tempfile.mkdtemp(prefix="learnlog-clone-")
-    try:
-        result = subprocess.run(
-            ["git", "clone", url, tmpdir],
-            cwd=str(workdir),
-        )
-        if result.returncode != 0:
-            raise SystemExit("Clone failed.")
-        shutil.move(
-            str(pathlib.Path(tmpdir, ".git")),
-            str(learnlog_dir),
-        )
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    <<refuse a target we would have to clone over>>
+    <<clone into the target and move the repository into place>>
+    <<check the cloned files out into the work tree>>
 
     typer.echo(f"Cloned into {learnlog_dir}")
+@
+
+The target has to be empty, and not merely free of a [[.learnlog/]],
+because the clone brings files with it.
+A log holds the student's source as it was, and the last thing a clone
+may do is write those versions over a directory where somebody is
+working: an empty directory makes \enquote{check the log's files out}
+a safe operation with nothing to weigh against.
+A student who wants their log next to work they already have can clone
+into an empty directory and move the [[.learnlog/]] across, which is a
+decision they made rather than one we made for them.
+
+Creating the target is what turns a typed path into a directory, and
+it is also where a typed path that is \emph{not} a directory arrives.
+Naming an existing file---a mistyped [[-C]], a tab-completion that
+stopped one component short---makes [[mkdir]] raise, and
+[[exist_ok]] does not cover it: that flag forgives a directory that is
+already there, which is precisely what a file is not.
+The same goes for a path whose parent is a file, where the missing
+component cannot be created at all.
+Left alone, both leave the student looking at a [[FileExistsError]]
+traceback for what is, from where they sit, the same mistake the
+non-empty target above gets a sentence for.
+So we translate them into that sentence, and name the path, because
+the whole content of the answer is which path the student got wrong.
+Dropping the original exception rather than chaining it is part of
+that: the operating system's [[File exists]] is the mechanism, and a
+chained traceback is the thing we came here to stop printing.
+
+<<refuse a target we would have to clone over>>=
+if learnlog_dir.exists():
+    raise SystemExit(
+        f".learnlog/ already exists in {workdir}"
+    )
+try:
+    workdir.mkdir(parents=True, exist_ok=True)
+except (FileExistsError, NotADirectoryError):
+    raise SystemExit(
+        f"{workdir} exists and is not a directory. Clone "
+        f"checks the log's files out into the target, so it "
+        f"needs an empty directory."
+    ) from None
+if any(workdir.iterdir()):
+    raise SystemExit(
+        f"{workdir} is not empty. Clone checks the log's "
+        f"files out into the target, so it needs an empty "
+        f"directory."
+    )
+@
+
+The clone itself goes into a directory inside the target rather than
+into the system temporary directory, and that is what makes it
+atomic.
+The repository has to end up as [[.learnlog/]] inside the target, and
+what moves it there is a rename---which is atomic only within one
+filesystem.
+[[/tmp]] is routinely a different one, where [[shutil.move]] quietly
+degrades into copy-then-delete: an interrupted clone then leaves
+behind half a repository, which the guard above reads as a log that is
+already there and refuses to replace.
+A staging directory beside the destination cannot be on another
+filesystem, so [[os.rename]] applies, and either the repository is
+there in full or it is not there at all.
+
+Cleaning up catches [[BaseException]] so that [[Ctrl-C]] during a slow
+clone is included---an interruption is exactly when a partial
+repository would be left---and re-raises, because the user asked for
+the command to stop, not for it to report success.
+
+<<clone into the target and move the repository into place>>=
+staging = pathlib.Path(
+    tempfile.mkdtemp(
+        prefix=CLONE_STAGING_PREFIX, dir=workdir,
+    )
+)
+try:
+    result = subprocess.run(
+        ["git", "clone", url, str(staging)],
+        cwd=str(workdir),
+    )
+    if result.returncode != 0:
+        raise SystemExit("Clone failed.")
+    os.rename(staging / ".git", learnlog_dir)
+except BaseException:
+    shutil.rmtree(learnlog_dir, ignore_errors=True)
+    raise
+finally:
+    shutil.rmtree(staging, ignore_errors=True)
+<<constants>>=
+CLONE_STAGING_PREFIX = ".learnlog-clone-"
+@
+
+Moving the repository is where the command used to stop, and what it
+left was a work tree with nothing in it.
+Git had checked the files out into the staging directory we then
+deleted, so every file in the log read as deleted, and the first run
+in the clone committed that deletion as the student's work.
+Checking them out is therefore not a convenience: it is what makes the
+cloned log describe the directory it now lives in.
+
+Constructing the [[LearnlogRepo]] before the checkout does the other
+half of the same job.
+A cloned repository arrives with none of learnlog's configuration, and
+the constructor is what supplies it (\cref{sec:ensure-configured})---
+including the exclude file, without which this checkout's own
+[[.learnlog/]] would be the first thing the next run staged.
+
+A checkout that fails leaves the log itself intact, so it is reported
+rather than cleaned up after: the repository is complete, and the
+files can be produced from it at any time with
+\mintinline{bash}{learnlog git checkout .}.
+Like the bundle writer (\cref{sec:export}), it opts out of [[check]]
+so the user gets a sentence instead of a traceback.
+
+A log that holds no files is asked about first, because
+\mintinline{bash}{git checkout .} on an empty index is an error and
+not a no-op---and cloning a remote that nobody has pushed to yet is
+the ordinary way to reach one.
+That is a clone with nothing to report, not a clone that went wrong.
+
+<<check the cloned files out into the work tree>>=
+repo = LearnlogRepo(workdir)
+if repo.git("ls-files").stdout.strip():
+    checkout = repo.git(
+        "checkout", ".", check=False,
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    if checkout.returncode != 0:
+        typer.echo(
+            f"Cloned, but could not check out the files: "
+            f"{checkout.stderr.strip()}",
+            err=True,
+        )
 @
 
 We test [[clone]] by first pushing a learnlog repository to a bare
@@ -2941,21 +4559,209 @@ def test_clone_with_dir_option(workdir, monkeypatch):
     assert (target / ".learnlog").is_dir()
 @
 
+The three properties this command gained have the same shape of test,
+so they share a fixture: a log pushed to a bare remote that the clone
+can be run against for real.
+
+<<test functions>>=
+@pytest.fixture
+def pushed_log(workdir, monkeypatch):
+    """A learnlog pushed to a bare remote, and the remote."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    bare = workdir / "pushed-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    runner = CliRunner()
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    return bare
+@
+
+What a clone has to leave behind is a project, not a bare repository
+in an empty directory.
+The run that follows the clone is what makes the difference visible:
+with no files checked out, every file in the log reads as deleted, and
+that deletion is what the run commits as the student's code state.
+
+<<test functions>>=
+def test_clone_checks_out_the_work_tree(
+    workdir, pushed_log, monkeypatch,
+):
+    """The clone leaves a usable project behind."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    target = workdir / "checked-out"
+    target.mkdir()
+    result = CliRunner().invoke(
+        app, ["clone", str(pushed_log), "-C", str(target)]
+    )
+    assert result.exit_code == 0
+    assert (target / "hello.py").read_text() == \
+        'print("hello")\n'
+    assert (
+        target / ".learnlog" / "info" / "exclude"
+    ).exists()
+
+    cloned = LearnlogRepo(target)
+    cloned.begin_run(
+        "hello.py", [], datetime.datetime.now(),
+    )
+    assert "hello.py" in cloned.git("ls-files").stdout
+    changes = cloned.git(
+        "show", "--name-status", "--format=", "HEAD",
+    ).stdout
+    assert "D\thello.py" not in changes
+@
+
+A target with files in it is refused, and the test has to use a
+remote that would otherwise clone successfully---a refusal is only
+interesting where the command could have gone ahead.
+
+<<test functions>>=
+def test_clone_refuses_a_target_with_files(
+    workdir, pushed_log,
+):
+    """Clone will not write over somebody's working directory."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    target = workdir / "occupied"
+    target.mkdir()
+    (target / "notes.txt").write_text("my work\n")
+    result = CliRunner().invoke(
+        app, ["clone", str(pushed_log), "-C", str(target)]
+    )
+    assert result.exit_code != 0
+    assert not (target / ".learnlog").exists()
+    assert (target / "notes.txt").read_text() == "my work\n"
+@
+
+A target that names a file is the same refusal, and what the test is
+really about is how it is delivered.
+[[CliRunner]] keeps whatever the command raised, so asking for a
+[[SystemExit]] is asking for a sentence rather than the traceback a
+[[FileExistsError]] would have escaped as:
+
+<<test functions>>=
+def test_clone_refuses_a_file_as_the_target(
+    workdir, pushed_log,
+):
+    """A target that is a file is refused, not a traceback."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    target = workdir / "notes.txt"
+    target.write_text("my work\n")
+    result = CliRunner().invoke(
+        app, ["clone", str(pushed_log), "-C", str(target)]
+    )
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    assert str(target) in result.output
+    assert "is not a directory" in result.output
+    assert target.read_text() == "my work\n"
+@
+
+Interrupting the clone must leave the target as it was found, and the
+moment worth interrupting is the one just after the repository has
+been moved into place: that is where a partial [[.learnlog/]] would
+survive, and a surviving [[.learnlog/]] is what makes the next attempt
+refuse.
+The command is called directly rather than through the runner, so the
+interruption arrives as itself.
+
+<<test functions>>=
+def test_clone_interrupted_leaves_nothing_behind(
+    workdir, pushed_log, monkeypatch,
+):
+    """A cancelled clone leaves no half-finished log."""
+    from learnlog import cli
+    target = workdir / "interrupted"
+    target.mkdir()
+    real_rename = cli.os.rename
+
+    def rename_then_interrupt(source, destination):
+        real_rename(source, destination)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        cli.os, "rename", rename_then_interrupt,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        cli.clone(url=str(pushed_log), directory=target)
+    assert list(target.iterdir()) == []
+@
+
+A remote nobody has pushed to yet clones into a log with no files in
+it, and that is a success with nothing to check out rather than a
+checkout that failed:
+
+<<test functions>>=
+def test_clone_of_an_empty_remote_reports_no_failure(
+    workdir, capsys,
+):
+    """An empty remote is not a checkout that went wrong."""
+    from learnlog import cli
+    bare = workdir / "empty-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    target = workdir / "empty-clone"
+    target.mkdir()
+    cli.clone(url=str(bare), directory=target)
+    assert (target / ".learnlog").is_dir()
+    assert "check out" not in capsys.readouterr().err
+@
+
 
 \subsection{The [[pull]] command}
 \label{sec:pull}
 
 The [[pull]] command is the receiving counterpart to [[push]]: it
-fetches new commits from [[origin]] and updates the local branches.
-Where [[push]] uses [[git push --all -u]], [[pull]] uses
-[[git pull --all]] to mirror the operation in the other direction.
+brings the commits another machine recorded into this copy of the
+log.
 
-Merge conflicts are not a practical concern because [[.learnlog/]]
-is a single-writer recording artefact---the same assumption that
-makes [[--force]] safe on [[push]].
+The obvious implementation is [[git pull]] under the learnlog
+environment, and it is the wrong one.
+That environment is [[--git-dir=.learnlog --work-tree=.]], so the
+work tree Git is asked to update \emph{is the student's project
+directory}, and the index it merges into is the shared index the runs
+commit from.
+Merging there fails in three separate ways, and all of them cost the
+student work rather than merely returning an error:
 
-Like [[push]] and [[clone]], we use inherited I/O for transfer
-progress and credential prompts.
+\begin{description}
+\item[A merge that succeeds] writes the incoming files over the
+  student's source.
+  Synchronising a log has no business rewriting the program the log is
+  about, and an edit overwritten this way was never committed
+  anywhere, so nothing can bring it back.
+\item[A merge that races a run] checks the merged files out first and
+  moves the ref last.
+  A run that commits in between takes the ref, the update fails with
+  [[cannot lock ref 'HEAD']], and the merged files are left in the
+  work tree belonging to no commit at all---so the next run commits
+  them as the student's own work.
+\item[A merge that conflicts] leaves [[MERGE_HEAD]] and an unmerged
+  shared index behind in [[.learnlog/]].
+  The next run's [[git commit]] reads both as its own: it consummates
+  somebody else's half-finished merge, and records a code state full
+  of conflict markers.
+\end{description}
+
+The three share one cause---the merge machinery writes through the
+work tree and the shared index, and both of those belong to the
+runs---so we stop using it.
+[[pull]] writes exactly two kinds of thing: objects, which no reader
+can reach until a ref names them, and one branch ref, moved under the
+commit lock.
+It never writes the work tree, never writes the shared index, and
+never leaves state in [[.learnlog/]] for a run to trip over.
+Everything below follows from that rule.
 
 <<typer commands>>=
 @app.command()
@@ -2971,13 +4777,363 @@ def pull(
     """Pull new commits from the remote."""
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
+    <<fetch the remote branches>>
+    <<find the local and remote tips>>
+    <<decide the new tip, or stop at a conflict>>
+    <<advance the branch under the commit lock>>
+@
 
-    result = subprocess.run(
-        ["git", "pull", "--all"],
-        env=repo.env,
-        cwd=str(repo.workdir),
+\paragraph{Fetching.}
+Fetching is the only part that talks to the network, so it keeps
+inherited standard I/O for transfer progress and credential prompts,
+for the reasons spelled out for [[push]] (\cref{sec:push}).
+It is also the only part that could not damage anything even if we
+wanted it to: [[git fetch]] writes remote-tracking refs and objects,
+and touches neither the work tree nor the index.
+A missing or unreachable [[origin]] surfaces here, and its exit code
+is the one worth reporting, so we stop on it.
+
+<<fetch the remote branches>>=
+fetched = subprocess.run(
+    ["git", "fetch", "origin"],
+    env=repo.env,
+    cwd=str(repo.workdir),
+)
+if fetched.returncode != 0:
+    raise typer.Exit(code=fetched.returncode)
+@
+
+\paragraph{Which branch.}
+[[git pull --all]] updated every branch it could reach; we update the
+branch the log is on.
+That is a description of the old behaviour rather than a reduction of
+it: [[.learnlog/]] is created with one branch and only ever grows
+commits on that branch, so that branch \emph{is} the log.
+
+The recorder already answers the question of which branch that is,
+and [[pull]] has to answer it the same way or it stops working
+exactly when the student needs it.
+[[recording_branch]] (\cref{sec:recording-branch}) reads
+[[symbolic-ref]] when [[HEAD]] is attached and, when it is not, the
+branch the log's newest commit sits on.
+A student who runs \mintinline{bash}{learnlog git checkout HEAD~4} to
+look at an older version detaches [[HEAD]], and runs made afterwards
+keep landing on the branch---so a [[pull]] that asked [[HEAD]] instead
+would refuse to sync a log that is still being written to.
+Syncing must work wherever recording works, so both ask the same
+question.
+
+Asking it also decides which commit the pull builds on.
+With [[HEAD]] detached the branch tip and [[HEAD]] are different
+commits, and it is the branch we are about to move: reading the tip
+from [[HEAD]] would hand [[update-ref]] below an expected old value
+that the branch has not had since the student detached, and every pull
+would report a race that never happened.
+
+The one state left over is a repository with no branches at all, which
+is what [[recording_branch]] reports by falling back to [[HEAD]]---the
+answer that is not a branch name.
+There is nothing to fast-forward there and nothing to name in
+[[update-ref]], so this is where the old refusal still belongs.
+A remote that has no such branch is a different matter and not an
+error---a teacher may have created the destination repository moments
+ago---so we say so and stop.
+
+<<find the local and remote tips>>=
+branch_ref = repo.recording_branch()
+if not branch_ref.startswith(BRANCH_REF_PREFIX):
+    raise SystemExit(
+        "The log is not on a branch; cannot pull."
     )
-    raise typer.Exit(code=result.returncode)
+branch = branch_ref.removeprefix(BRANCH_REF_PREFIX)
+remote = repo.git(
+    "rev-parse", "--verify", "--quiet",
+    f"refs/remotes/origin/{branch}", check=False,
+)
+if remote.returncode != 0:
+    typer.echo(
+        f"origin has no {branch} branch; nothing to pull."
+    )
+    return
+remote_tip = remote.stdout.strip()
+local = repo.git(
+    "rev-parse", "--verify", "--quiet", branch_ref,
+    check=False,
+)
+if local.returncode != 0:
+    raise SystemExit(
+        f"The log's branch {branch} has no commits to pull "
+        f"onto.  Use learnlog clone to fetch a remote log "
+        f"into a fresh directory instead."
+    )
+local_tip = local.stdout.strip()
+<<constants>>=
+BRANCH_REF_PREFIX = "refs/heads/"
+@
+
+The local tip is probed with [[check=False]] like the remote one,
+and the probe is defence in depth rather than a reachable branch of
+the ordinary flow.
+An unborn recording branch heals before [[pull]] can see it:
+every command constructs [[LearnlogRepo]] first, and a repository
+whose branch has no commit gets its initial commit right there
+(\cref{sec:init-repo})---verified by trying, since an orphan
+checkout plus a pull comes back as a diverged-histories refusal,
+never as an unborn branch.
+What the probe still catches is a repository damaged past what
+construction repairs, where [[rev-parse]] fails for its own
+reasons---and whoever is standing in one deserves the same kind of
+sentence the other refusals give, not a [[GitError]] traceback.
+
+\paragraph{Three cases, one of which needs a merge.}
+When the remote tip is already an ancestor of ours there is nothing to
+bring in.
+When ours is an ancestor of the remote's, the histories have not
+diverged and the new tip is simply the remote's---no merge, no tree
+computation, one [[update-ref]].
+That fast-forward is the common case, because the usual shape is one
+machine recording and another reading, and it is worth recognising
+explicitly rather than letting a merge discover it.
+
+<<decide the new tip, or stop at a conflict>>=
+if is_ancestor(repo, remote_tip, local_tip):
+    typer.echo("Already up to date.")
+    return
+if is_ancestor(repo, local_tip, remote_tip):
+    new_tip = remote_tip
+    summary = f"Fast-forwarded {branch} to origin."
+else:
+    new_tip, conflicts = merge_log_histories(
+        repo, local_tip, remote_tip,
+    )
+    if new_tip is None:
+        raise SystemExit(describe_pull_conflict(conflicts))
+    summary = f"Merged origin into {branch}."
+@
+
+<<helper functions>>=
+def is_ancestor(repo, candidate, descendant):
+    """Return whether ``candidate`` is an ancestor of ``descendant``.
+
+    Asks Git the question with ``merge-base --is-ancestor``, whose
+    exit status is the answer.
+    """
+    probe = repo.git(
+        "merge-base", "--is-ancestor",
+        candidate, descendant, check=False,
+    )
+    return probe.returncode == 0
+@
+
+\paragraph{Advancing the branch.}
+Everything above is either a read or a write of objects nobody can
+reach yet.
+The single write that makes a pull real is the branch update, and it
+is the one that must not interleave with a run's commit, so it happens
+under the same [[flock]] the run commits take
+(\cref{sec:commit-lock}).
+The lock cannot cover the merge as well---computing a merge over a
+large tree takes long enough that holding the lock would block the
+student's next program from starting---so we hand [[update-ref]] the
+tip we merged from as the expected old value.
+Git then refuses the update if a run moved the branch while we were
+merging, which turns that window into a retry instead of a lost
+commit.
+
+<<advance the branch under the commit lock>>=
+with repo.commit_lock():
+    advanced = repo.git(
+        "update-ref", branch_ref,
+        new_tip, local_tip, check=False,
+    )
+if advanced.returncode != 0:
+    raise SystemExit(
+        "The log moved while pulling; nothing was changed. "
+        "Run learnlog pull again."
+    )
+typer.echo(summary)
+@
+
+\paragraph{Merging without a work tree.}
+A three-way merge needs somewhere to put intermediate state, and the
+whole point of this redesign is that the student's directory is not
+it.
+Git offers two ways out, and which one is available depends on the
+version installed.
+[[git merge-tree --write-tree]] (Git 2.38 and later) performs a full
+merge---rename detection, content merging, the lot---entirely in the
+object database, and prints the object name of the merged tree.
+Older versions have no such command, so we fall back to a three-way
+[[read-tree]] into a private index file, which resolves everything
+that can be resolved by path and reports the rest as a conflict.
+The fallback is weaker: it cannot merge two edits inside one file, so
+it declares a conflict where the newer command would have succeeded.
+That is the right way to be wrong here.
+Refusing to merge leaves both logs intact and tells the student to ask
+for help; the alternative---running the content merge in a checkout
+somewhere---brings back the work tree we just removed from the design.
+
+Either way the result is a tree, and a tree is not yet history: we
+turn it into a merge commit with [[commit-tree]], whose two parents
+record that these two logs became one.
+The message travels on standard input, as every commit message in
+learnlog does (\cref{sec:commit-message-stdin}).
+
+<<helper functions>>=
+def merge_log_histories(repo, ours, theirs):
+    """Merge two diverged log histories.
+
+    Returns a ``(commit, conflicts)`` pair.  On success ``commit`` is
+    the object name of a new merge commit and ``conflicts`` is empty;
+    otherwise ``commit`` is ``None`` and ``conflicts`` lists the paths
+    Git could not merge.
+    """
+    if git_merges_trees(repo):
+        tree, conflicts = merge_trees_directly(
+            repo, ours, theirs,
+        )
+    else:
+        tree, conflicts = merge_trees_in_private_index(
+            repo, ours, theirs,
+        )
+    if tree is None:
+        return None, conflicts
+    merged = repo.git(
+        "commit-tree", tree, "-p", ours, "-p", theirs,
+        input=PULL_MERGE_MESSAGE,
+        timeout=GIT_TREE_TIMEOUT,
+    )
+    return merged.stdout.strip(), []
+<<constants>>=
+PULL_MERGE_MESSAGE = "learnlog: merge origin into the local log\n"
+@
+
+We ask [[git --version]] rather than probing [[merge-tree]] itself
+with a trial merge, because a probe would have to invent two commits
+to merge and would then have to tell \enquote{this Git cannot} apart
+from \enquote{those commits conflict}---which is the very distinction
+the caller needs.
+
+<<helper functions>>=
+def git_merges_trees(repo):
+    """Return whether ``git merge-tree --write-tree`` exists."""
+    probe = repo.git("--version", check=False)
+    found = GIT_VERSION_PATTERN.search(probe.stdout)
+    if found is None:
+        return False
+    version = (int(found.group(1)), int(found.group(2)))
+    return version >= MERGE_TREE_VERSION
+<<constants>>=
+GIT_VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)")
+MERGE_TREE_VERSION = (2, 38)
+@
+
+[[merge-tree]] reports a conflict with exit status~1 and still prints
+the (conflicted) tree, so the exit status alone does not separate
+\enquote{conflict} from \enquote{that is not a commit}: both are 1.
+What separates them is the output---a real merge always prints a tree
+on the first line, a rejected argument prints nothing---so that is
+what we test.
+With [[--name-only]] the lines after the tree are the conflicted
+paths, terminated by a blank line before Git's human-readable
+commentary.
+
+<<helper functions>>=
+def merge_trees_directly(repo, ours, theirs):
+    """Merge two commits with ``git merge-tree``.
+
+    Needs no work tree and no index: the merged tree is written
+    straight to the object database.
+    """
+    merged = repo.git(
+        "merge-tree", "--write-tree", "--name-only",
+        ours, theirs, check=False, timeout=GIT_TREE_TIMEOUT,
+    )
+    lines = merged.stdout.splitlines()
+    if not lines:
+        raise SystemExit(
+            f"Merging the logs failed: {merged.stderr.strip()}"
+        )
+    if merged.returncode == 0:
+        return lines[0].strip(), []
+    conflicts = []
+    for line in lines[1:]:
+        if not line.strip():
+            break
+        conflicts.append(line.strip())
+    return None, conflicts
+@
+
+The fallback merges into a file that is not the shared index, using
+the same [[run_index]] machinery a run uses to keep its staging out of
+everyone else's way (\cref{gitrepo}).
+[[read-tree -i]] is what keeps this honest: it tells Git not to
+compare against the work tree, which is both what makes the merge
+possible with a dirty project directory and what guarantees no file is
+written.
+[[--aggressive]] resolves the cases a three-way index merge can decide
+on its own---one side changed a path, both sides made the same change,
+both sides deleted it---and leaves the rest as unmerged stages, which
+is exactly what [[write-tree]] refuses to turn into a tree.
+
+<<helper functions>>=
+def merge_trees_in_private_index(repo, ours, theirs):
+    """Merge two commits in a private index file.
+
+    The path taken when Git is too old for ``merge-tree``; resolves
+    per-path changes only, and reports anything else as a conflict.
+    """
+    base = repo.git("merge-base", ours, theirs, check=False)
+    if base.returncode != 0:
+        return None, []
+    with repo.run_index(PULL_MERGE_INDEX):
+        read = repo.git(
+            "read-tree", "-m", "-i", "--aggressive",
+            base.stdout.strip(), ours, theirs,
+            check=False, timeout=GIT_TREE_TIMEOUT,
+        )
+        if read.returncode != 0:
+            raise SystemExit(
+                f"Merging the logs failed: {read.stderr.strip()}"
+            )
+        written = repo.git(
+            "write-tree", check=False,
+            timeout=GIT_TREE_TIMEOUT,
+        )
+        if written.returncode == 0:
+            return written.stdout.strip(), []
+        unmerged = repo.git(
+            "ls-files", "--unmerged", check=False,
+        )
+    return None, sorted({
+        line.split("\t", 1)[1]
+        for line in unmerged.stdout.splitlines()
+        if "\t" in line
+    })
+<<constants>>=
+PULL_MERGE_INDEX = "pull-merge"
+@
+
+A conflict is where a student most needs to be told that nothing
+happened, because \enquote{it failed} usually means \enquote{something
+was half-done}.
+Here it does not, and the message says so before it says what to try
+next.
+
+<<helper functions>>=
+def describe_pull_conflict(conflicts):
+    """Explain why a pull stopped and that nothing changed."""
+    if conflicts:
+        reason = "the merge conflicts in " + ", ".join(conflicts)
+    else:
+        reason = "they share no common commit to merge from"
+    return (
+        "Pull stopped: the local log and origin have diverged and "
+        f"{reason}.  Nothing was changed: your files and your local "
+        "log are exactly as they were.  Ask your teacher for help, "
+        "or use learnlog clone to fetch the remote log into a fresh "
+        "directory."
+    )
 @
 
 We test [[pull]] by pushing from the original repository, cloning
@@ -3034,27 +5190,451 @@ def test_pull_no_remote_fails(workdir, monkeypatch):
     assert result.exit_code != 0
 @
 
+The tests that follow all need the same two-machine situation---one
+log, pushed to a remote, cloned back into a second directory---so we
+build it once.
+The clone's work tree starts empty, which is what [[clone]] leaves
+behind (\cref{sec:clone}); the student's files in it are the ones the
+test writes.
+A cloned repository has never been through [[init_repo]], so it lacks
+the settings that make committing work regardless of the developer's
+global Git configuration; the tests below record runs in the clone, so
+the helper applies the one that matters.
+
+<<test functions>>=
+def _two_machine_log(workdir, runner, monkeypatch):
+    """Push a log to a bare remote and clone it back.
+
+    Returns the clone's directory.
+    """
+    from learnlog.cli import app
+    bare = workdir / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(bare)],
+        capture_output=True, check=True,
+    )
+    monkeypatch.chdir(workdir)
+    runner.invoke(app, ["set-remote", str(bare)])
+    runner.invoke(app, ["push"])
+    target = workdir / "clone-target"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    runner.invoke(app, ["clone", str(bare)])
+    LearnlogRepo(target).git(
+        "config", "commit.gpgsign", "false",
+    )
+    return target
+@
+
+The first thing to check is the one the old implementation got wrong
+every time: a student with an uncommitted edit pulls, and the edit
+survives byte for byte even though the incoming commit changes that
+very file.
+Listing the clone directory afterwards is the sharper half of the
+test---a merge into the live work tree would have checked out
+everything the other machine had, so finding nothing but the student's
+own file says the merge went somewhere else entirely:
+
+<<test functions>>=
+def test_pull_leaves_the_work_tree_alone(workdir, monkeypatch):
+    """A fast-forward pull does not write the student's files."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    student = target / "hello.py"
+    student.write_text('print("mine, uncommitted")\n')
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert student.read_text() == 'print("mine, uncommitted")\n'
+    cloned = LearnlogRepo(target)
+    assert 'print("theirs")' in cloned.git(
+        "show", "HEAD:hello.py",
+    ).stdout
+    assert sorted(entry.name for entry in target.iterdir()) == [
+        ".learnlog", "hello.py",
+    ]
+    for artefact in ("MERGE_HEAD", "MERGE_MSG"):
+        assert not (target / ".learnlog" / artefact).exists()
+@
+
+When both machines have changed the same file the merge cannot
+succeed, and the property to check is that failing costs nothing: the
+student's file, the local branch, and [[.learnlog/]] are all as they
+were, and the message says the word the student needs to search for:
+
+<<test functions>>=
+def test_pull_conflict_changes_nothing(workdir, monkeypatch):
+    """A conflicting pull aborts without touching anything."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    student = target / "hello.py"
+    student.write_text('print("mine")\n')
+    cloned = LearnlogRepo(target)
+    monkeypatch.chdir(target)
+    cloned.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    before = cloned.git("rev-parse", "HEAD").stdout.strip()
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 12, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code != 0
+    assert "conflict" in result.output.lower()
+    assert student.read_text() == 'print("mine")\n'
+    assert cloned.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip() == before
+    for artefact in ("MERGE_HEAD", "MERGE_MSG"):
+        assert not (target / ".learnlog" / artefact).exists()
+@
+
+The remaining property is the one a race would violate, and races are
+not something a test can reliably provoke.
+What we can check deterministically is the arrangement that prevents
+it: we wrap [[commit_lock]] and [[git]] on the repository class,
+record whether the lock was held at the moment [[update-ref]] ran, and
+insist it was:
+
+<<test functions>>=
+def test_pull_advances_the_ref_under_the_lock(
+    workdir, monkeypatch,
+):
+    """The branch update runs while the commit lock is held."""
+    import contextlib
+    from learnlog import gitrepo
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    held = []
+    updates = []
+    real_lock = gitrepo.LearnlogRepo.commit_lock
+    real_git = gitrepo.LearnlogRepo.git
+
+    @contextlib.contextmanager
+    def watched_lock(self):
+        held.append(self)
+        try:
+            with real_lock(self):
+                yield
+        finally:
+            held.pop()
+
+    def watched_git(self, *args, **kwargs):
+        if args[:1] == ("update-ref",):
+            updates.append(bool(held))
+        return real_git(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        gitrepo.LearnlogRepo, "commit_lock", watched_lock,
+    )
+    monkeypatch.setattr(gitrepo.LearnlogRepo, "git", watched_git)
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert updates == [True]
+@
+
+Finally, the fallback for older Git needs its own run through the same
+fast-forward-plus-divergence story, because on this machine the
+version check would never choose it.
+Forcing the choice is enough: everything after it is the code under
+test.
+
+<<test functions>>=
+def test_pull_merges_without_merge_tree(workdir, monkeypatch):
+    """The private-index fallback merges divergent logs too."""
+    from learnlog import cli
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    (target / "mine.py").write_text('print("mine")\n')
+    cloned = LearnlogRepo(target)
+    monkeypatch.chdir(target)
+    cloned.begin_run(
+        "mine.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    monkeypatch.chdir(workdir)
+    (workdir / "theirs.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "theirs.py", [], datetime.datetime(2026, 1, 1, 12, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.setattr(cli, "git_merges_trees", lambda repo: False)
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert (target / "mine.py").read_text() == 'print("mine")\n'
+    listed = cloned.git(
+        "ls-tree", "--name-only", "HEAD",
+    ).stdout.split()
+    assert "mine.py" in listed
+    assert "theirs.py" in listed
+    assert not (
+        target / ".learnlog" / "index-pull-merge"
+    ).exists()
+@
+
+The three tests that follow are all the same situation seen from
+different sides: the student detached [[HEAD]] to look at an older
+version and never re-attached.
+The first is the one the student notices, because it is the one that
+used to fail outright---the pull that has something to bring in:
+
+<<test functions>>=
+def test_pull_fast_forwards_from_a_detached_head(
+    workdir, monkeypatch,
+):
+    """A detached HEAD does not stop a pull."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    cloned = LearnlogRepo(target)
+    branch = cloned.recording_branch()
+    detached_at = cloned.git("rev-parse", "HEAD").stdout.strip()
+    cloned.git("checkout", "--detach")
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert cloned.git(
+        "rev-parse", branch,
+    ).stdout.strip() != detached_at
+    assert 'print("theirs")' in cloned.git(
+        "show", f"{branch}:hello.py",
+    ).stdout
+    assert cloned.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip() == detached_at
+@
+
+The last assertion above is the other half of the bargain: the pull
+moved the branch and left [[HEAD]] where the student put it, which is
+the same division of labour a run makes
+(\cref{sec:recording-branch}).
+
+The second side is quieter, and getting it wrong would produce a
+wrong answer rather than a refusal.
+Here the log has grown past what origin knows---runs recorded from
+the detached [[HEAD]] land on the branch---so the honest report is
+that there is nothing to pull.
+Measuring from [[HEAD]] instead would find the remote ahead of it,
+try to fast-forward the branch on top of a value it lost several runs
+ago, and blame a race that never happened:
+
+<<test functions>>=
+def test_pull_measures_from_the_branch_not_the_head(
+    workdir, monkeypatch,
+):
+    """A detached HEAD is not the commit a pull compares against."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    cloned = LearnlogRepo(target)
+    branch = cloned.recording_branch()
+    cloned.git("checkout", "--detach")
+    monkeypatch.chdir(workdir)
+    (workdir / "hello.py").write_text('print("theirs")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 11, 0),
+    )
+    runner.invoke(app, ["push"])
+    monkeypatch.chdir(target)
+    runner.invoke(app, ["pull"])
+    (target / "mine.py").write_text('print("mine")\n')
+    cloned.begin_run(
+        "mine.py", [], datetime.datetime(2026, 1, 1, 12, 0),
+    )
+    ahead = cloned.git("rev-parse", branch).stdout.strip()
+
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code == 0
+    assert "up to date" in result.output.lower()
+    assert cloned.git(
+        "rev-parse", branch,
+    ).stdout.strip() == ahead
+@
+
+The third side is the state that really has no branch to pull onto.
+Deleting the branch a detached [[HEAD]] left behind is an odd thing
+for a student to do deliberately, but it is the one arrangement in
+which there is nothing for [[update-ref]] to name, and the refusal
+that used to greet every detached [[HEAD]] belongs to it alone:
+
+<<test functions>>=
+def test_pull_without_any_branch_still_refuses(
+    workdir, monkeypatch,
+):
+    """A log with no branch left cannot be pulled onto."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+    cloned = LearnlogRepo(target)
+    branch = cloned.recording_branch()
+    cloned.git("checkout", "--detach")
+    cloned.git(
+        "branch", "--delete", "--force",
+        branch.removeprefix("refs/heads/"),
+    )
+
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code != 0
+    assert "not on a branch" in result.output
+@
+
+A branch whose tip cannot be read is the last state left, and no
+repository a command can construct exhibits it---construction heals
+an unborn branch with the initial commit before [[pull]] runs.
+So the test manufactures the failing probe itself: it lets every
+Git call through except the one reading the local tip, which is
+made to fail the way it does in a damaged repository.
+
+<<test functions>>=
+def test_pull_with_unreadable_tip_refuses_plainly(
+    workdir, monkeypatch,
+):
+    """A branch with no readable tip gets a sentence."""
+    from learnlog import gitrepo
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    runner = CliRunner()
+    target = _two_machine_log(workdir, runner, monkeypatch)
+
+    real_git = gitrepo.LearnlogRepo.git
+
+    def failing_local_probe(self, *args, **kwargs):
+        if (
+            args[:3] == ("rev-parse", "--verify", "--quiet")
+            and args[3].startswith("refs/heads/")
+        ):
+            result = real_git(
+                self, "rev-parse", "--verify", "--quiet",
+                "refs/heads/no-such-branch", check=False,
+            )
+            return result
+        return real_git(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        gitrepo.LearnlogRepo, "git", failing_local_probe,
+    )
+    monkeypatch.chdir(target)
+    result = runner.invoke(app, ["pull"])
+
+    assert result.exit_code != 0
+    assert "no commits to pull onto" in result.output
+    if result.exception is not None:
+        assert isinstance(result.exception, SystemExit)
+@
+
 
 \subsection{The [[git]] command}
 \label{sec:git}
 
-Students sometimes need to inspect their development log directly---for
-example, to check what was recorded before exporting, or to search for
-a particular session.
+Sometimes the log has to be inspected or repaired directly---to check
+what was recorded before exporting, to search for a particular
+session, or to untangle a state none of the ordinary commands
+anticipates.
 The natural tool for this is Git itself, but the [[.learnlog/]]
 directory requires setting [[GIT_DIR]] and [[GIT_WORK_TREE]]
-correctly, which is an implementation detail students should not have
-to know.
+correctly, which is an implementation detail nobody should have to
+know.
 
 The [[git]] subcommand hides this: [[learnlog git log --oneline]]
 works exactly like [[git log --oneline]] would if [[.learnlog/]]
 were a normal [[.git/]] directory.
+
+The command itself is hidden from [[learnlog --help]], and the
+audience is why.
+Every ordinary need this command once served has an ordinary command
+of its own---[[list]], [[play]], [[tag]], [[export]]---and each of
+those knows the two-commit protocol it is reading; raw Git does not.
+A student who discovers a general Git passthrough in the help output
+will sooner or later drive the log with advice written for a source
+repository, and \cref{sec:git-guards} is the catalogue of how that
+ends.
+So the escape hatch stays---maintainers and teachers debugging a
+broken log genuinely need it---but it is something one is \emph{told}
+about when the situation calls for it, and whoever types it has
+thereby accepted that they are past the guarantees the ordinary
+commands maintain.
+Hidden is not disabled: the command works exactly as before for
+anyone who knows its name, and the guards below still apply to it.
 We do not capture Git's output---standard input, output, and error
 inherit from the parent process so that pagers, colours, and
 interactive Git commands all work naturally.
 We also forward Git's exit code, which makes the command usable in
 scripts (\eg [[learnlog git diff --quiet]] to test for uncommitted
 changes).
+For the same reason as [[push]] (\cref{sec:push}), this command does
+not go through [[LearnlogRepo.git]]: capturing the output is exactly
+what a passthrough must not do.
+
+Staying outside the wrapper does not mean staying outside its
+environment discipline.
+The passthrough (and [[learnlog tag]] below, which is the same
+mechanism with [[tag]] pre-filled) builds its environment with
+[[git_environment]] (\cref{sec:git-environment}), because the
+redirecting [[GIT_*]] variables reach it the same way they reach a
+run: a pre-commit hook exports [[GIT_INDEX_FILE]], and a
+[[learnlog git add]] issued from inside that hook would rewrite the
+student's own repository's index with it.
+What the allow-list costs here is deliberate: a student who sets
+[[GIT_AUTHOR_NAME]] in the environment and commits through the
+passthrough gets the configured identity instead---the same answer
+every learnlog commit gives since the allow-list was introduced,
+which is the consistency a student debugging an identity surprise
+needs.
 
 Typer normally parses options like [[--oneline]] as its own flags.
 We prevent this with three context settings: [[ignore_unknown_options]]
@@ -3063,9 +5643,47 @@ stops Typer from rejecting flags it does not recognise,
 [[allow_interspersed_args]] set to [[False]] ensures that everything
 after the first positional argument is passed through verbatim.
 
+\paragraph{Two commands the passthrough must not forward as written.}
+\label{sec:git-guards}
+A passthrough inherits its host's assumptions, and this one inherits a
+work tree that is the student's project and a repository that Git
+itself does not recognise as one.
+Two ordinary Git commands become destructive under those assumptions,
+and neither of them looks dangerous to the student typing it.
+
+[[git clean -xdf]] is the command every student is eventually told to
+run to get rid of build output.
+[[.learnlog/]] survives an ordinary [[git clean]] only because it is
+listed in [[info/exclude]], and [[-x]] is precisely the flag that says
+\enquote{ignore the exclude rules}.
+Git's own safety net does not apply either: it protects a directory
+named [[.git]], and this one is not.
+So the command deletes the entire log---and the lock file with
+it---and exits zero without a word.
+
+[[git reset --hard]] is the command students are told to run to undo a
+mess.
+Under [[--work-tree=.]] the mess it undoes is their source code:
+every uncommitted edit in the project, reverted to whatever the last
+run happened to record.
+With [[HEAD~n]] it rewinds the log and the source together.
+
+What both need is not a smaller passthrough but a corrected one.
+For [[clean]] we add an exclusion, because Git applies exclusions
+cumulatively: [[-e .learnlog]] leaves every legitimate use of
+[[clean -xdf]] working exactly as the student expects, and only puts
+the log out of reach.
+For [[reset --hard]] no argument can make the command safe---discarding
+uncommitted work \emph{is} what it does---so we refuse it, say what it
+would have destroyed, and offer the flag that permits it anyway.
+A student who really means it types [[--allow-destructive]]; a student
+who has been handed the incantation by a forum post gets a sentence
+explaining what they were about to lose.
+
 <<typer commands>>=
 @app.command(
     name="git",
+    hidden=True,
     context_settings={
         "allow_extra_args": True,
         "allow_interspersed_args": False,
@@ -3074,32 +5692,184 @@ after the first positional argument is passed through verbatim.
 )
 def git_command(
     ctx: typer.Context,
+    allow_destructive: Annotated[
+        bool,
+        typer.Option(
+            "--allow-destructive",
+            help=(
+                "Permit git commands that throw away "
+                "uncommitted work, such as reset --hard."
+            ),
+        ),
+    ] = False,
 ):
     """Run a git command on the learnlog repository.
+
+    This is an escape hatch for inspecting or repairing the
+    log; the ordinary commands (list, play, tag, export)
+    are the supported way to work with it, and raw git can
+    leave the log in states they do not expect.
 
     All arguments are forwarded to git, configured to
     operate on the .learnlog/ directory.  For example,
     ``learnlog git log`` lists the recorded commits.
+    ``git clean`` is always given an extra exclusion so it
+    cannot delete the log, and ``git reset --hard`` is
+    refused unless ``--allow-destructive`` precedes it.
     """
     workdir = find_learnlog_dir()
     if workdir is None:
         raise SystemExit(
             "No .learnlog/ directory found."
         )
+    args = guard_passthrough(
+        ctx.args, workdir, allow_destructive,
+    )
 
     learnlog_dir = workdir / ".learnlog"
-    env = {
-        **os.environ,
-        "GIT_DIR": str(learnlog_dir),
-        "GIT_WORK_TREE": str(workdir),
-    }
+    env = git_environment(learnlog_dir, workdir)
 
     result = subprocess.run(
-        ["git"] + ctx.args,
+        ["git"] + args,
         env=env,
         cwd=str(workdir),
     )
     raise typer.Exit(code=result.returncode)
+@
+
+Both rules key off the Git subcommand, which is not simply the first
+argument: [[git -C dir clean -xdf]] is a perfectly ordinary
+invocation.
+The subcommand is the first argument that is neither an option nor the
+value of one, so finding it means knowing which of Git's own options
+take a value.
+
+<<helper functions>>=
+def git_subcommand_index(args):
+    """Return the position of the Git subcommand in ``args``.
+
+    Returns ``None`` when the arguments name no subcommand.
+    """
+    skip = False
+    for position, argument in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if argument.startswith("-"):
+            skip = argument in GIT_OPTIONS_WITH_VALUES
+            continue
+        return position
+    return None
+<<constants>>=
+GIT_OPTIONS_WITH_VALUES = (
+    "-C", "-c", "--git-dir", "--work-tree",
+    "--namespace", "--config-env",
+)
+@
+
+<<helper functions>>=
+def guard_passthrough(args, workdir, allow_destructive):
+    """Return the arguments to forward to Git.
+
+    Adds the exclusion that keeps ``git clean`` away from the log,
+    and raises ``SystemExit`` on a ``git reset --hard`` that the
+    student has not explicitly permitted.
+    """
+    position = git_subcommand_index(args)
+    if position is None:
+        return list(args)
+    if args[position] == "clean":
+        return protect_log_from_clean(args, position)
+    if args[position] == "reset" and not allow_destructive:
+        if has_hard_flag(args[position + 1:]):
+            raise SystemExit(describe_reset_refusal(workdir))
+    return list(args)
+@
+
+The exclusion has to be inserted immediately after [[clean]] rather
+than appended, because everything after a [[--]] is a path and an
+option there would be read as one.
+
+Which pattern to insert depends on a flag, and the reason is worth
+spelling out because the two look contradictory.
+Under [[-x]] Git removes everything untracked except what the exclude
+patterns match, so the log is saved by \emph{being} excluded.
+Under [[-X]] Git removes exactly the files the exclude patterns match,
+so the same pattern would order its deletion; what saves the log there
+is the negated pattern [[!.learnlog]], which cancels the
+[[info/exclude]] entry and takes the log out of the set [[-X]] acts
+on.
+One flag needs the log ignored and the other needs it un-ignored, so
+we look at which one is present.
+
+<<helper functions>>=
+def protect_log_from_clean(args, position):
+    """Insert the exclusion that keeps ``git clean`` off the log."""
+    options = list(args[position + 1:])
+    pattern = (
+        CLEAN_UNIGNORE_LOG if clean_removes_ignored_only(options)
+        else CLEAN_EXCLUDE_LOG
+    )
+    return list(args[:position + 1]) + ["-e", pattern] + options
+<<constants>>=
+CLEAN_EXCLUDE_LOG = ".learnlog"
+CLEAN_UNIGNORE_LOG = "!.learnlog"
+@
+
+[[-X]] has no long form, so it can only arrive as a short option,
+possibly bundled with others ([[-Xdf]]).
+Scanning the bundle stops at an [[e]], because the rest of that bundle
+is [[--exclude]]'s pattern rather than more flags.
+
+<<helper functions>>=
+def clean_removes_ignored_only(options):
+    """Return whether a ``git clean`` argument list carries ``-X``."""
+    pattern_follows = False
+    for argument in options:
+        if pattern_follows:
+            pattern_follows = False
+            continue
+        if argument == "--":
+            break
+        if not argument.startswith("-") or argument.startswith("--"):
+            continue
+        for offset, letter in enumerate(argument[1:], start=1):
+            if letter == "e":
+                pattern_follows = offset == len(argument) - 1
+                break
+            if letter == "X":
+                return True
+    return False
+@
+
+[[--hard]] is looked for only before a [[--]], since after one it is a
+file name.
+
+<<helper functions>>=
+def has_hard_flag(options):
+    """Return whether ``--hard`` appears among ``git reset`` options."""
+    for argument in options:
+        if argument == "--":
+            return False
+        if argument == "--hard":
+            return True
+    return False
+@
+
+The refusal names the directory whose contents were at stake, because
+the student's mental model of [[learnlog git]] is \enquote{something
+about the log}, and the surprise worth removing is that this
+particular command was about their source code.
+
+<<helper functions>>=
+def describe_reset_refusal(workdir):
+    """Explain why a ``git reset --hard`` was not forwarded."""
+    return (
+        f"Refusing git reset --hard: it would discard every "
+        f"uncommitted change under {workdir} and rewind the log to "
+        f"match.  Re-run it as 'learnlog git --allow-destructive "
+        f"reset --hard ...' if that is really what you want."
+    )
 @
 
 Let's verify that the command forwards to Git correctly, reports
@@ -3142,6 +5912,185 @@ def test_git_command_forwards_exit_code(
     assert result.exit_code != 0
 @
 
+Hidden means absent from the catalogue and nothing more, so the test
+asks both halves: the help output must not advertise the command, and
+the command must still answer to its name.
+The help is checked against the word as a command entry rather than
+as a substring, because \enquote{git} appears in other commands' help
+texts legitimately.
+Typer draws its command table with the box-drawing character U+2502,
+and the test needs that exact character to recognise a table row---but
+noweave copies code chunks verbatim into the woven \LaTeX{}, where
+pdf\LaTeX{} has no glyph set up for it and stops with an error.
+Spelling it [[chr(0x2502)]] gives the running test the real character
+while the source stays within what the document engine typesets:
+
+<<test functions>>=
+def test_git_command_is_hidden_but_works(workdir, monkeypatch):
+    """The passthrough is absent from --help yet still runs."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+
+    listed = runner.invoke(app, ["--help"])
+    assert listed.exit_code == 0
+    table_edge = chr(0x2502)
+    commands = [
+        line.split()[1]
+        for line in listed.output.splitlines()
+        if line.strip().startswith(table_edge)
+        and len(line.split()) > 1
+    ]
+    assert "git" not in commands
+    assert "list" in commands
+
+    result = runner.invoke(app, ["git", "log", "--oneline"])
+    assert result.exit_code == 0
+@
+
+An inherited [[GIT_INDEX_FILE]] is the passthrough's version of the
+hook scenario: were it forwarded, [[git add]] would write the index
+at that path---the student's repository's---instead of the log's.
+The hijacked path staying absent is the whole assertion, because Git
+creates the file it is told to write:
+
+<<test functions>>=
+def test_git_command_ignores_inherited_index(
+    workdir, monkeypatch, tmp_path,
+):
+    """A hook's GIT_INDEX_FILE does not reach the passthrough."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    (workdir / "junk.txt").write_text("untracked\n")
+    hijacked = tmp_path / "hijacked-index"
+    monkeypatch.setenv("GIT_INDEX_FILE", str(hijacked))
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(app, ["git", "add", "."])
+    assert result.exit_code == 0
+    assert not hijacked.exists()
+@
+
+The two guarded shapes each need a test with two halves: the log
+survives, and the command the student actually asked for still
+happens.
+A guard that stopped [[clean]] from removing anything would pass the
+first half and be useless:
+
+<<test functions>>=
+def test_git_clean_spares_the_log(workdir, monkeypatch):
+    """clean -xdf removes untracked files but not the log."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    junk = workdir / "junk.txt"
+    junk.write_text("build output\n")
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["git", "clean", "-xdf"]
+    )
+    assert result.exit_code == 0
+    assert not junk.exists()
+    assert (workdir / ".learnlog" / "HEAD").is_file()
+
+def test_git_clean_ignored_only_spares_the_log(
+    workdir, monkeypatch,
+):
+    """clean -Xdf removes ignored files but not the log."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    stale = workdir / "hello.pyc"
+    stale.write_text("stale bytecode\n")
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["git", "clean", "-Xdf"]
+    )
+    assert result.exit_code == 0
+    assert not stale.exists()
+    assert (workdir / ".learnlog" / "HEAD").is_file()
+
+def test_git_reset_hard_is_refused(workdir, monkeypatch):
+    """reset --hard is refused, and changes nothing."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    script.write_text('print("uncommitted")\n')
+    monkeypatch.chdir(workdir)
+    before = repo.git("rev-parse", "HEAD").stdout.strip()
+    result = CliRunner().invoke(
+        app, ["git", "reset", "--hard"]
+    )
+    assert result.exit_code != 0
+    assert "--allow-destructive" in result.output
+    assert script.read_text() == 'print("uncommitted")\n'
+    assert repo.git(
+        "rev-parse", "HEAD",
+    ).stdout.strip() == before
+
+def test_git_reset_hard_with_opt_in(workdir, monkeypatch):
+    """The opt-in flag lets reset --hard through."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    script.write_text('print("uncommitted")\n')
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app,
+        ["git", "--allow-destructive", "reset", "--hard"],
+    )
+    assert result.exit_code == 0
+    assert script.read_text() == 'print("hello")\n'
+@
+
+The argument-scanning helpers deserve tests of their own, because the
+shapes they have to get right---a global option before the
+subcommand, a bundled [[-X]], a [[--]] separator---are exactly the
+ones that are awkward to provoke through the CLI:
+
+<<test functions>>=
+def test_git_subcommand_index_skips_global_options():
+    """The subcommand is found past Git's own options."""
+    from learnlog.cli import git_subcommand_index
+    assert git_subcommand_index(["clean", "-xdf"]) == 0
+    assert git_subcommand_index(
+        ["-C", "sub", "clean", "-xdf"]
+    ) == 2
+    assert git_subcommand_index(["--no-pager", "log"]) == 1
+    assert git_subcommand_index(["--version"]) is None
+
+def test_clean_exclusion_follows_the_subcommand():
+    """The exclusion is inserted before any -- separator."""
+    from learnlog.cli import protect_log_from_clean
+    assert protect_log_from_clean(
+        ["clean", "-xdf", "--", "src"], 0
+    ) == ["clean", "-e", ".learnlog", "-xdf", "--", "src"]
+    assert protect_log_from_clean(["clean", "-Xdf"], 0) == [
+        "clean", "-e", "!.learnlog", "-Xdf",
+    ]
+
+def test_clean_ignored_only_detection():
+    """-X is recognised bundled, but not as an -e pattern."""
+    from learnlog.cli import clean_removes_ignored_only
+    assert clean_removes_ignored_only(["-Xdf"])
+    assert clean_removes_ignored_only(["-d", "-X"])
+    assert not clean_removes_ignored_only(["-xdf"])
+    assert not clean_removes_ignored_only(["-xdf", "-e", "X"])
+    assert not clean_removes_ignored_only(["-xdf", "-eX"])
+    assert not clean_removes_ignored_only(["-xdf", "--", "-X"])
+
+def test_hard_flag_after_separator_is_a_path():
+    """--hard past a -- separator is a file name."""
+    from learnlog.cli import has_hard_flag
+    assert has_hard_flag(["--hard", "HEAD~1"])
+    assert not has_hard_flag(["--soft", "HEAD~1"])
+    assert not has_hard_flag(["--", "--hard"])
+@
+
 
 \subsection{The [[tag]] command}
 \label{sec:tag}
@@ -3157,6 +6106,17 @@ The implementation mirrors the [[git]] passthrough
 (\cref{sec:git}): we find the [[.learnlog/]] directory,
 set the Git environment, and forward all arguments to
 [[git tag]].
+
+[[git tag]] with no ref tags HEAD, and which commit that is depends
+on something outside this command: whether [[learnlog tag]] is itself
+recorded.
+It is not (\cref{sec:veto}), and that is what makes the shipped
+workflow work.
+The tag lands on the last thing the student ran, so [[learnlog play
+lab1]] starts where they think they left off.
+While administrative commands still logged themselves, HEAD at this
+moment was the header commit of the [[learnlog tag]] run---so the tag
+named the act of tagging, on a commit that every view filters out.
 
 <<typer commands>>=
 @app.command(
@@ -3184,11 +6144,7 @@ def tag_command(
         )
 
     learnlog_dir = workdir / ".learnlog"
-    env = {
-        **os.environ,
-        "GIT_DIR": str(learnlog_dir),
-        "GIT_WORK_TREE": str(workdir),
-    }
+    env = git_environment(learnlog_dir, workdir)
 
     result = subprocess.run(
         ["git", "tag"] + ctx.args,
@@ -3198,8 +6154,9 @@ def tag_command(
     raise typer.Exit(code=result.returncode)
 @
 
-Let's verify that the command creates and lists tags, and
-reports an error when no repository exists:
+Let's verify that the command creates and lists tags, that the tag
+names the student's run and stays on the history as later runs append,
+and that it reports an error when no repository exists:
 
 <<test functions>>=
 def test_tag_command_creates_tag(workdir, monkeypatch):
@@ -3224,6 +6181,48 @@ def test_tag_command_lists_tags(workdir, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["tag", "-l"])
     assert result.exit_code == 0
+
+def test_tag_lands_on_the_students_own_run(
+    workdir, monkeypatch,
+):
+    """The tag names the student's work, not learnlog's.
+
+    Tagging is not a recorded run, so HEAD when the tag is
+    created is still the student's last run.  Later runs append,
+    which must leave the tag an ancestor of HEAD rather than
+    forking the history playback and bundles read.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], moment)
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=moment,
+        exit_code=0,
+    )
+
+    result = runner.invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0
+    subject = repo.git(
+        "log", "-1", "--format=%s", "lab1",
+    ).stdout
+    assert "hello.py" in subject
+    assert "learnlog" not in subject
+
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    ancestor = repo.git(
+        "merge-base", "--is-ancestor", "lab1", "HEAD",
+    )
+    assert ancestor.returncode == 0
 
 def test_tag_command_no_learnlog_dir(
     tmp_path, monkeypatch
@@ -3261,11 +6260,17 @@ standard output is not a terminal (for example when piped to
 This means [[learnlog play | less]] just works without the user
 having to remember the flag.
 
-By default, learnlog's own runs are filtered from the output
-(\cref{sec:filter-learnlog}).
-The [[--all]] / [[-a]] flag disables this filter, showing every
-run block including those from [[learnlog play]] and
-[[learnlog export]] invocations.
+What playback shows by default is the student's own history: their
+program runs, and the [[play]] and [[list]] runs in which they read
+it back (\cref{sec:filter-learnlog}).
+What it leaves out is learnlog's plumbing---the [[pip]] install that
+[[learnlog init]] performs, and whatever an older version recorded of
+the administrative subcommands that no longer log themselves at all
+(\cref{sec:veto}).
+The [[--all]] / [[-a]] flag disables that filter.
+It is a debugging and archaeology switch rather than a reading one:
+the material it restores is setup noise and history from a policy that
+no longer applies, which is exactly why the default hides it.
 
 <<typer commands>>=
 @app.command()
@@ -3306,8 +6311,9 @@ def play(
         typer.Option(
             "--all", "-a",
             help=(
-                "Include learnlog's own runs in the "
-                "output."
+                "Include learnlog's internal runs "
+                "(e.g. the pip install from "
+                "learnlog init)."
             ),
         ),
     ] = False,
@@ -3336,17 +6342,17 @@ we fall back to TTY detection via [[sys.stdout.isatty()]].
 An explicit [[--batch]] or [[--no-batch]] always wins.
 
 <<choose playback mode>>=
-filter_learnlog = not show_all
+filter_internal = not show_all
 use_batch = (
     batch if batch is not None
     else not sys.stdout.isatty()
 )
 if use_batch:
     play_batch(repo, commits, start_index,
-               filter_learnlog)
+               filter_internal)
 else:
     viewer = PlaybackViewer(
-        repo, commits, start_index, filter_learnlog,
+        repo, commits, start_index, filter_internal,
     )
     viewer.run()
 @
@@ -3371,34 +6377,73 @@ def test_play_batch_via_cli(workdir):
     assert "diff --git" in result.output
 @
 
-We verify that learnlog's own runs are filtered from playback by
-default and that [[--all]] restores them:
+We verify that review runs reach playback without [[--all]], while
+learnlog's internal runs are filtered from it by default and [[--all]]
+restores them:
 
 <<test functions>>=
-def test_play_hides_learnlog_runs(workdir):
-    """Learnlog runs are filtered from batch output."""
+def test_play_shows_review_runs(workdir):
+    """Review runs are played back like student runs."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("learnlog", ["export", "out.bundle"], t1)
     runner = CliRunner()
     result = runner.invoke(
         app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
     assert "Script: hello.py" in result.output
-    assert "Script: learnlog" not in result.output
+    assert "Run: learnlog play" in result.output
+    assert "Run: learnlog export" not in result.output
 
-def test_play_all_shows_learnlog_runs(workdir):
-    """The --all flag includes learnlog runs."""
+def test_play_keeps_student_run_intact(workdir):
+    """A learnlog run overlapping a student run stays separate.
+
+    The student starts a program; while it runs, ``learnlog
+    play`` is invoked and finishes first.  The student's output
+    must be attributed to the student's run---each record keeps
+    its own I/O rather than absorbing the other's.
+    """
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    student = LearnlogRepo(workdir)
+    tool = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    student.begin_run("hello.py", [], t1)
+    tool.begin_run("learnlog", ["play"], t1)
+    tool.finalize_run(
+        io_log="stdout: CURSES SCREEN\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    student.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 2),
+        exit_code=0,
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    review_start = result.output.index("Run: learnlog play")
+    assert result.output.index("stdout: hello") < review_start
+    assert result.output.index("CURSES SCREEN") > review_start
+
+def test_play_all_shows_internal_runs(workdir):
+    """The --all flag includes learnlog's internal runs."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
-    repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("learnlog", ["export", "out.bundle"], t1)
     runner = CliRunner()
     result = runner.invoke(
         app,
@@ -3406,21 +6451,29 @@ def test_play_all_shows_learnlog_runs(workdir):
     )
     assert result.exit_code == 0
     assert "Script: hello.py" in result.output
-    assert "Script: learnlog" in result.output
+    assert "Run: learnlog export" in result.output
 @
 
 We resolve the starting ref through [[git rev-parse]], which
 handles tag names, branch names, and abbreviated hashes
-uniformly.
+uniformly, and then through [[resolve_record_commit]]
+(\cref{sec:run-join}), which turns a ref pointing at a run's
+trailer commit into the run itself---otherwise a tag created
+right after a run finished would name a commit that playback
+does not list.
+Failure of [[rev-parse]] is the ordinary case for an abbreviated
+hash, not an error, so the call opts out of [[check]].
 If [[rev-parse]] fails (for example, a typo), we fall back
 to prefix matching on the commit list---this covers the
 case where a short hash is ambiguous in Git but unique among
 the commits we have.
 
 <<find starting commit index>>=
-resolved = repo.git("rev-parse", start)
+resolved = repo.git("rev-parse", start, check=False)
 if resolved.returncode == 0:
-    full_hash = resolved.stdout.strip()
+    full_hash = resolve_record_commit(
+        repo, resolved.stdout.strip(),
+    )
     for i, c in enumerate(commits):
         if c["hash"] == full_hash:
             start_index = i
