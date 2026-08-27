@@ -44,6 +44,8 @@ from learnlog.gitrepo import LearnlogRepo
 We need [[datetime]] for timestamp parsing and [[LearnlogRepo]]
 for type annotations in docstrings---the functions accept a repo
 instance but do not construct one.
+[[collections]] provides the named tuple that carries the results
+of the shared log scan (\cref{sec:run-index}).
 
 The recorder owns the commit format, so the field names and the
 trailer keyword come from \cref{gitrepo} rather than being spelled
@@ -52,6 +54,7 @@ out a second time here.
 <<commits imports>>=
 from __future__ import annotations
 
+import collections
 import datetime
 
 from learnlog.gitrepo import (
@@ -197,30 +200,49 @@ Refs land on trailer commits (\cref{sec:trailer-refs}), and
 resolving such a ref means going from a trailer commit \emph{back}
 to the header that carries its run's record---the same pairing by
 run id, read in the other direction.
-Every message needed for it is already in hand here, so we come
-away with two maps: run id to trailer text, and trailer commit to
-the header commit of the same run.
 
+The pass also keeps every message it reads, keyed by commit.
+Before it did, the [[list]] command asked Git again for each
+commit's message---one [[git log -1]] per run, right after this
+scan had read them all.  Each Git call costs a fork and an exec
+whatever it does, so a semester's log paid hundreds of forks for
+text that was already in memory here.  Keeping the messages makes
+a listing cost the same three or four Git calls however long the
+log grows.
+
+We therefore come away with three maps, bundled as a named tuple
+so callers can pick their slice by name: run id to trailer text,
+trailer commit to the header commit of the same run, and every
+commit to its message.
+
+<<commits constants>>=
+RunScan = collections.namedtuple(
+    "RunScan",
+    ["trailers", "records", "messages"],
+)
 <<commits functions>>=
 def scan_run_commits(repo):
     """Index the log by run id in a single pass.
 
-    Returns ``(trailers, records)``.  ``trailers`` maps a run id
-    to the trailer text recorded for it; ``records`` maps the hash
+    Returns a `RunScan` named tuple.  `trailers` maps a run id
+    to the trailer text recorded for it; `records` maps the hash
     of a trailer commit to the header commit that carries the same
-    run's record.  Commits that belong to no run are ignored.
+    run's record; `messages` maps every commit hash on the
+    recording branch to its full commit message.
     """
     result = repo.git(
         "log", "-z", "--format=%H%n%B",
         repo.recording_branch(), check=False,
     )
     if result.returncode != 0:
-        return {}, {}
+        return RunScan({}, {}, {})
 
     trailers = {}
     headers = {}
     trailer_runs = {}
+    messages = {}
     for commit_hash, message in iter_log_commits(result.stdout):
+        messages[commit_hash] = message
         parsed = parse_trailer_message(message)
         if parsed is None:
             <<note which commit holds each header block>>
@@ -229,7 +251,7 @@ def scan_run_commits(repo):
         trailers[run_id] = trailer
         trailer_runs[commit_hash] = run_id
     <<pair each trailer commit with its header commit>>
-    return trailers, records
+    return RunScan(trailers, records, messages)
 @
 
 A header commit usually holds one run block, but not always: older
@@ -264,21 +286,22 @@ records = {
 }
 @
 
-Each map has a caller that wants only that half, and asking for
-one should not make the other one's name appear at the call site.
-The two accessors below are what the rest of the program uses;
-[[scan_run_commits]] is the shared walk behind them.
+Most maps have callers that want only that slice, and asking for
+one should not make the others' names appear at the call site.
+The two accessors below are what most of the program uses;
+[[scan_run_commits]] is the shared walk behind them.  A caller
+that needs several slices at once---the [[list]] command reads
+both trailers and messages---calls the walk itself, so the log is
+still read only once.
 
 <<commits functions>>=
 def get_run_trailers(repo):
     """Map run ids to the trailer text recorded for them."""
-    trailers, _ = scan_run_commits(repo)
-    return trailers
+    return scan_run_commits(repo).trailers
 <<commits functions>>=
 def get_record_commits(repo):
     """Map trailer commits to the header commit of their run."""
-    _, records = scan_run_commits(repo)
-    return records
+    return scan_run_commits(repo).records
 @
 
 Asking Git for NUL-separated records ([[-z]]) is what makes the
