@@ -869,13 +869,13 @@ student's virtual environment.
 \enquote{has a Git directory}, because the directory appears at the
 very start of initialisation and the repository only becomes usable at
 the end of it.
-[[git rev-parse --verify]] answers it, and this is one of the places in
-this module where a non-zero exit is the answer rather than a problem:
-[[HEAD]] fails to resolve exactly while the branch is still unborn.
+The [[HEAD]] probe of \cref{sec:head-state} answers it: a tip that
+resolves is a commit, and [[HEAD]] fails to resolve exactly while the
+branch is still unborn---one of the places in this module where a
+non-zero exit is the answer rather than a problem.
 The filesystem answers for free in the one case where it can---a
 directory that is not there cannot hold a commit---but every
-[[LearnlogRepo]] built on an existing log does pay for one
-[[rev-parse]].
+[[LearnlogRepo]] built on an existing log does pay for one probe.
 That is the price of the correctness above, and it is a small one next
 to what the same process is about to do: a run makes two commits, each
 of which walks the work tree.
@@ -885,11 +885,8 @@ def has_commit(self):
     """Return whether the repository exists and has a commit."""
     if not self.git_dir.is_dir():
         return False
-    probe = self.git(
-        "rev-parse", "--verify", "--quiet", "HEAD",
-        check=False,
-    )
-    return probe.returncode == 0
+    tip, _ = self.head_state()
+    return tip is not None
 @
 
 Where [[fcntl]] is missing the lock is a no-op
@@ -933,18 +930,19 @@ def ensure_configured(self):
         self.write_configuration()
 @
 
-Asking costs two [[git config]] probes on top of the [[rev-parse]] of
-[[has_commit]], which is the honest price of not trusting a marker.
+Asking costs one [[git config --list]] probe on top of the [[HEAD]]
+probe of [[has_commit]], which is the honest price of not trusting a
+marker.
 A marker saying \enquote{this repository was configured once} is in
 effect what the old early return believed, and a clone or a
 [[.learnlogignore]] written after the first run is exactly the case
 where that belief is wrong.
-The probes are also the cheapest Git commands there are---they read
-config files and touch no objects.
-Measured on a one-file project, asking costs about 7\,ms against the
-40\,ms the run it precedes spends on its two commits, and that ratio
-only improves on a project with something in it, because the commits
-grow with the tree and the probes do not.
+Listing is barely more work for Git than asking for one key---either
+way it parses every config file in scope---and for us the difference
+is a whole process: this method used to ask twice, once per setting,
+and each ask costs a fork and an exec before Git reads a byte.
+One listing answers both questions, and would answer a third for
+free if configuration ever grows one.
 
 The exclude file is checked first because it is answered by a file
 read rather than by a process, and because it is the setting most
@@ -960,22 +958,136 @@ def is_configured(self):
         return False
     if current != self.exclude_content():
         return False
-    identity = self.git(
-        "config", "user.name", check=False,
-    )
-    if identity.returncode != 0:
+    listing = self.git("config", "--list", "-z", check=False)
+    if listing.returncode != 0:
         return False
-    signing = self.git(
-        "config", "--bool", "commit.gpgsign", check=False,
-    )
-    return signing.stdout.strip() == "false"
+    settings = parse_config_listing(listing.stdout)
+    if "user.name" not in settings:
+        return False
+    return _config_bool(settings.get("commit.gpgsign")) is False
 @
 
-Both probes are among the places in this module where a non-zero exit
-is the answer rather than a problem, so both run with [[check=False]]:
-[[git config user.name]] exits~1 precisely when no scope defines the
-setting.
-Neither asks where the answer came from.
+The probe is among the places in this module where a non-zero exit is
+the answer rather than a problem, so it runs with [[check=False]]: a
+repository whose configuration cannot even be listed is one we should
+configure, not one to fail on.
+
+Reading the listing ourselves means taking over two things
+[[git config <key>]] did for us: picking which of a key's
+occurrences wins, and reading booleans the way Git spells them.
+Git prints the listing in scope order---system, then global, then
+local---and resolves a single-valued key to the occurrence read last,
+so a dictionary that lets later entries overwrite earlier ones gives
+the same answer.
+The NUL framing ([[-z]]) is not decoration: a config value can
+contain newlines, so the newline that separates a key from its value
+is only trustworthy inside a NUL-delimited entry.
+An entry with no newline at all is a key set without [[=]], which for
+a boolean means true---so it must stay distinguishable from an empty
+value, which means false.
+
+<<functions>>=
+def parse_config_listing(output):
+    """Map config keys to values from ``git config --list -z``.
+
+    A later occurrence of a key overrides an earlier one, matching
+    how Git resolves a single-valued key across scopes.  A key set
+    without a value maps to `None`.
+    """
+    settings = {}
+    for entry in output.split("\0"):
+        if not entry:
+            continue
+        key, separator, value = entry.partition("\n")
+        settings[key] = value if separator else None
+    return settings
+@
+
+Git accepts more spellings of a boolean than [[true]] and [[false]],
+and students' global config files use them, so the reader has to
+know the same vocabulary.
+Anything outside it reads as \enquote{neither}, which
+[[is_configured]] treats as not configured: the write that follows
+replaces the unreadable value with one this reader understands, which
+is the repairing direction.
+
+<<functions>>=
+def _config_bool(value):
+    """Read a config value as Git reads booleans.
+
+    Returns `True` or `False` for the spellings Git accepts, and
+    `None` for anything else.  A key set without a value (`None`)
+    is true, an empty value false.
+    """
+    if value is None:
+        return True
+    text = value.strip().lower()
+    if text in ("yes", "on", "true", "1"):
+        return True
+    if text in ("no", "off", "false", "0", ""):
+        return False
+    return None
+@
+
+Let's verify the two things the parse took over from
+[[git config <key>]]: that a later occurrence of a key wins, and
+that a value containing a newline---or no value at all---survives
+the framing.
+
+<<test functions>>=
+def test_parse_config_listing_last_occurrence_wins():
+    """A local value overrides a global one, as Git resolves it."""
+    output = (
+        "user.name\nGlobal\0"
+        "commit.gpgsign\ntrue\0"
+        "user.name\nLocal\0"
+        "commit.gpgsign\nfalse\0"
+    )
+    settings = parse_config_listing(output)
+    assert settings["user.name"] == "Local"
+    assert settings["commit.gpgsign"] == "false"
+
+def test_parse_config_listing_awkward_values():
+    """Newlines stay in values; a bare key maps to None."""
+    output = "alias.lg\nlog\n--graph\0commit.gpgsign\0"
+    settings = parse_config_listing(output)
+    assert settings["alias.lg"] == "log\n--graph"
+    assert settings["commit.gpgsign"] is None
+
+def test_config_bool_reads_gits_spellings():
+    """The boolean vocabulary matches Git's, case-insensitively."""
+    from learnlog.gitrepo import _config_bool
+    assert _config_bool(None) is True
+    for text in ("yes", "On", "TRUE", "1"):
+        assert _config_bool(text) is True
+    for text in ("no", "Off", "FALSE", "0", ""):
+        assert _config_bool(text) is False
+    assert _config_bool("maybe") is None
+@
+
+The parse and the repository have to agree end to end, so one test
+runs the real thing: a student whose \emph{global} configuration
+turns signing on must still count as configured, because the local
+[[false]] learnlog writes is the occurrence Git---and therefore the
+parse---resolves to.
+
+<<test functions>>=
+def test_is_configured_reads_effective_gpgsign(workdir, monkeypatch):
+    """A global gpgsign=true does not unsettle the local false."""
+    global_config = workdir / "globalconfig"
+    global_config.write_text(
+        "[commit]\n\tgpgsign = true\n"
+        "[user]\n\tname = Student\n\temail = s@example.com\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    repo = LearnlogRepo(workdir)
+    assert repo.is_configured()
+    effective = repo.git(
+        "config", "--bool", "commit.gpgsign",
+    ).stdout.strip()
+    assert effective == "false"
+@
+
 An identity the student configured globally is the right one for a log
 of \emph{their} work, so learnlog only supplies a fallback when Git can
 resolve none---which is the lab machine where nobody ever ran
@@ -1927,6 +2039,147 @@ listing = self.git(
 return listing.stdout.strip() or "HEAD"
 @
 
+\subsection{One probe for tip and branch}
+\label{sec:head-state}
+
+Every Git call costs a fork and an exec before Git reads a byte, and
+for the one-object commands of this protocol that startup \emph{is}
+the cost.
+The run protocol asks [[HEAD]] two questions---does a commit exist at
+all (\cref{sec:init-repo}), and which branch at which tip is the next
+commit to build on---and [[git rev-parse]] happens to answer both in
+one process: given a revision and [[--symbolic-full-name]] it prints
+the hash and the ref, one per line, in argument order.
+
+The three states of \cref{sec:recording-branch} come out as three
+shapes of output.
+Attached, the probe prints the hash and the full ref.
+Detached, [[--symbolic-full-name]] echoes the literal [[HEAD]] it
+was given instead of naming a branch---which is why the parse below
+demands a [[refs/]] prefix rather than settling for a second
+line.
+Unborn, the whole command fails, because the hash half has nothing
+to resolve; that non-zero exit is [[has_commit]]'s answer, so the
+probe runs with [[check=False]].
+
+<<repo methods>>=
+def head_state(self):
+    """Return ``(tip, branch)`` for ``HEAD`` in one Git call.
+
+    `tip` is the commit `HEAD` resolves to, or `None` while the
+    branch is unborn.  `branch` is the full ref `HEAD` points at,
+    or `None` when `HEAD` is detached or unborn.
+    """
+    probe = self.git(
+        "rev-parse", "HEAD", "--symbolic-full-name", "HEAD",
+        check=False,
+    )
+    if probe.returncode != 0:
+        return None, None
+    lines = probe.stdout.splitlines()
+    tip = lines[0].strip() if lines else ""
+    branch = lines[1].strip() if len(lines) > 1 else ""
+    if not branch.startswith("refs/"):
+        branch = None
+    return tip or None, branch
+@
+
+Both commits of a run start from this probe, through a helper that
+settles what happens when there is no branch to read.
+Detached, the branch comes from the ref listing as before
+(\cref{sec:recording-branch}), but that branch's tip is \emph{not}
+[[HEAD]]'s, so the helper answers [[RESOLVE_PARENT]] and leaves the
+tip for [[commit_on_branch]] to look up
+(\cref{sec:commit-on-branch}).
+A helper rather than a shared chunk, because the two call sites are
+different methods: a function makes the dependency on the sentinel
+explicit at both.
+
+<<repo methods>>=
+def branch_and_expected_tip(self):
+    """Return the recording branch and the tip to build on.
+
+    The tip is `RESOLVE_PARENT` when `HEAD` is detached or
+    unborn, where `HEAD`'s tip does not answer for the branch.
+    """
+    tip, branch = self.head_state()
+    if branch is None:
+        return self.recording_branch(), RESOLVE_PARENT
+    return branch, tip
+@
+
+Let's verify the probe reads all three states correctly, and that
+the helper falls back to the ref listing when [[HEAD]] is detached.
+The unresolvable state is produced by deleting the branch ref under
+an attached [[HEAD]], which leaves [[HEAD]] pointing at a branch
+that no longer exists---the same shape as an unborn repository.
+
+<<test functions>>=
+def test_head_state_attached(workdir):
+    """Attached HEAD yields both the tip and the branch."""
+    repo = LearnlogRepo(workdir)
+    tip, branch = repo.head_state()
+    assert tip == repo.git("rev-parse", "HEAD").stdout.strip()
+    assert branch == repo.recording_branch()
+    assert branch.startswith("refs/heads/")
+
+def test_head_state_detached(workdir):
+    """Detached HEAD yields the tip and no branch."""
+    repo = LearnlogRepo(workdir)
+    commit = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("checkout", "--detach", commit)
+    assert repo.head_state() == (commit, None)
+
+def test_head_state_unresolvable(workdir):
+    """A HEAD that resolves to nothing yields neither."""
+    repo = LearnlogRepo(workdir)
+    repo.git("update-ref", "-d", repo.recording_branch())
+    assert repo.head_state() == (None, None)
+
+def test_branch_and_expected_tip_detached(workdir):
+    """Detached, the branch is found but the tip left open."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    commit = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.git("checkout", "--detach", commit)
+    found, tip = repo.branch_and_expected_tip()
+    assert found == branch
+    assert tip is RESOLVE_PARENT
+@
+
+The point of the combined probe is the number of processes a run
+starts, so a test pins it: construction asks twice ([[HEAD]] and the
+configuration listing), the header commit five times (probe, add,
+write-tree, commit-tree, update-ref), and the trailer three (probe,
+commit-tree, update-ref).
+The bound is an inequality so that removing a call does not fail the
+test, but any regression toward per-call chatter does.
+
+<<test functions>>=
+def test_run_costs_bounded_git_calls(workdir, monkeypatch):
+    """Construction plus one run makes at most ten Git calls."""
+    counted = []
+    original = LearnlogRepo.git
+
+    def counting_git(self, *args, **kwargs):
+        counted.append(args)
+        return original(self, *args, **kwargs)
+
+    LearnlogRepo(workdir)  # established repository to build on
+    monkeypatch.setattr(LearnlogRepo, "git", counting_git)
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    assert len(counted) <= 10
+@
+
 \subsection{Adding one commit to a branch}
 \label{sec:commit-on-branch}
 
@@ -1946,14 +2199,29 @@ two commands.
 Losing a run to that would be the wrong answer, so we read the tip
 again and rebuild the commit on top of whatever they wrote.
 
+The [[rev-parse]] is usually not needed: both run commits already
+hold the tip from the probe of \cref{sec:head-state}, so the caller
+may pass it as [[parent]] and the first attempt builds on it
+directly.
+The guarded [[update-ref]] is what makes accepting a caller's value
+safe---a hint that has gone stale fails the update exactly like a
+lost race does, and the retry discards it and reads the ref itself.
+The default is a sentinel rather than [[None]] because [[None]] is
+taken: it is how a caller says the branch must not exist yet, which
+no hint may be mistaken for.
+
 <<repo methods>>=
-def commit_on_branch(self, branch, tree, message):
+def commit_on_branch(self, branch, tree, message,
+                     parent=RESOLVE_PARENT):
     """Add a commit holding ``tree`` to the end of ``branch``.
 
     ``tree`` may be any tree-ish; it is resolved afresh on each
     attempt, so a caller may name it relative to the branch.
-    ``message`` becomes the commit message verbatim.  Returns the
-    new commit's hash.
+    ``message`` becomes the commit message verbatim.  ``parent``
+    is the tip the caller believes the branch is at (`None` for a
+    branch that must not exist yet); leave it unset to have each
+    attempt read the tip from the repository.  Returns the new
+    commit's hash.
     """
     if not message.endswith("\n"):
         message += "\n"
@@ -1962,6 +2230,7 @@ def commit_on_branch(self, branch, tree, message):
     raise GitError(update, moved.returncode, moved.stderr)
 <<constants>>=
 BRANCH_UPDATE_ATTEMPTS = 3
+RESOLVE_PARENT = object()
 @
 
 Re-resolving [[tree]] on every attempt is what makes the retry safe
@@ -1976,7 +2245,8 @@ quietly, because the caller is a run that has just been recorded
 half-way; \cref{sec:diagnostics} is where that ends up.
 
 <<build one commit and try to move [[branch]] to it>>=
-parent = self.branch_tip(branch)
+if parent is RESOLVE_PARENT:
+    parent = self.branch_tip(branch)
 commit = self.git(
     "commit-tree", tree, *(("-p", parent) if parent else ()),
     input=message,
@@ -1988,6 +2258,7 @@ update = (
 moved = self.git(*update, check=False)
 if moved.returncode == 0:
     return commit
+parent = RESOLVE_PARENT
 <<constants>>=
 RUN_REFLOG_MESSAGE = "learnlog: record run"
 @
@@ -2055,8 +2326,9 @@ own header commit (\cref{sec:two-commit-protocol}), so the
 [[git diff --cached --quiet]] probe that this section used to describe
 as one of the places in this module where a non-zero exit is data
 rather than trouble went away with the commit folding it served.
-The probes that fill its place are the ref lookups of
-\cref{sec:recording-branch}.
+The probe that fills its place is the combined [[HEAD]] lookup of
+\cref{sec:head-state}, which also hands [[commit_on_branch]] the
+parent it would otherwise read for itself.
 
 <<repo methods>>=
 def begin_run(self, script, args, start_time):
@@ -2091,7 +2363,7 @@ index into the object [[commit_on_branch]] needs
 (\cref{sec:commit-on-branch}).
 
 <<commit the code state with the run header>>=
-branch = self.recording_branch()
+branch, tip = self.branch_and_expected_tip()
 self.reclaim_run_indexes(lock)
 with self.run_index(f"{self.run_id}-begin") as index_path:
     <<seed the private index from the shared one>>
@@ -2102,7 +2374,7 @@ with self.run_index(f"{self.run_id}-begin") as index_path:
     tree = self.git(
         "write-tree", timeout=GIT_TREE_TIMEOUT,
     ).stdout.strip()
-    self.commit_on_branch(branch, tree, header)
+    self.commit_on_branch(branch, tree, header, parent=tip)
     if not unfinished:
         <<publish the private index as the shared one>>
 @
@@ -3106,10 +3378,19 @@ The trailer records results, not code, so the tree it needs is one the
 log already has: the tree at the end of the recording branch.
 Naming it is all there is to it, because [[commit-tree]] takes any
 tree-ish and [[refs/heads/...^{tree}]] is one.
+The branch is resolved afresh rather than remembered from
+[[begin_run]], and the difference is a branch renamed mid-run: a
+remembered name would recreate the old ref---as an orphan root,
+since a ref that is gone has no tip to build on---where asking again
+simply follows the rename (\cref{sec:recording-branch}).
+The probe that answers also hands over the tip as the parent hint,
+so the fresh answer costs no extra process.
 
 <<commit the trailer without touching the tree>>=
-branch = self.recording_branch()
-self.commit_on_branch(branch, f"{branch}^{{tree}}", message)
+branch, tip = self.branch_and_expected_tip()
+self.commit_on_branch(
+    branch, f"{branch}^{{tree}}", message, parent=tip,
+)
 @
 
 We name the \emph{branch's} tree rather than this run's header's, and
