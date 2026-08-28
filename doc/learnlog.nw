@@ -44,10 +44,6 @@
 \input{../src/learnlog/cli.tex}
 \input{../src/learnlog/viewer.tex}
 \input{../src/learnlog/progsnap2.tex}
-\input{../src/learnlog/tutorials/getting-started.tex}
-\input{../src/learnlog/tutorials/playback-and-tagging.tex}
-\input{../src/learnlog/tutorials/export-and-share.tex}
-\input{../src/learnlog/tutorials/analysing-progsnap2.tex}
 
 
 \backmatter
