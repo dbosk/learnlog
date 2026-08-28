@@ -258,6 +258,17 @@ command or default changes here, the student page changes with it,
 eliminating the drift that plagues separately maintained onboarding
 documents.
 
+The page leads with a three-step quick start---install
+[[learnlog]], create a directory for the course, run
+\mintinline{bash}{learnlog init python} there---so a student is
+recording within minutes without reading the whole page.
+The detailed sections that follow remain as reference and
+troubleshooting for the students who need them.
+The page also addresses VSCodium alongside VS~Code: the
+open-source build behaves identically for our purposes, the only
+difference being that its extensions come from the Open~VSX
+registry rather than the Microsoft marketplace.
+
 The page carries YAML frontmatter understood by the [[canvaslms]]
 command-line tool, so the teacher publishes it with a single
 command:
@@ -283,27 +294,55 @@ through a per-course deployment wrapper.
 
 <<[[students.md]]>>=
 ---
-title: Using learnlog in VS Code
+title: Using learnlog in VS Code or VSCodium
 url: using-learnlog-in-vs-code
 published: true
 front_page: false
 editing_roles: teachers
 ---
 
-# Using learnlog in VS Code
+# Using learnlog in VS Code or VSCodium
 
 `learnlog` records your Python development — code changes, inputs,
 outputs, and errors — into a hidden Git repository. You can review
 your own work later, and when asked, share it with your teacher.
 
 This page walks through setup, use, and submission in VS Code.
+Everything works the same in VSCodium, the open-source build of
+VS Code — wherever this page says VS Code, both apply.
+
+## Quick start
+
+1. **Install learnlog.** In a terminal (**View → Terminal** in
+   VS Code), install
+   [pipx](https://pipx.pypa.io/stable/installation/) if you do
+   not already have it, then run:
+
+   ```bash
+   pipx install learnlog
+   ```
+
+2. **Create a directory for the course** and open it in VS Code
+   (**File → Open Folder**). Keep all your work for the course
+   inside it.
+
+3. **Turn on recording.** In the integrated terminal, run:
+
+   ```bash
+   learnlog init python
+   ```
+
+That's it — work as you normally would, and every run of your
+code is recorded. The rest of this page explains each step in
+more detail, how to review and share your log, and what to do if
+something does not work.
 
 ## What you need
 
 - **Python 3.10 or newer.** Check with `python3 --version` in a
   terminal.
-- **Visual Studio Code** with the **Python** extension (by
-  Microsoft).
+- **Visual Studio Code** or **VSCodium** with the **Python**
+  extension (in VSCodium, install it from the Open VSX registry).
 - **Git** on your `PATH` (`git --version`).
 
 ## One-time setup
