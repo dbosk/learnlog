@@ -5,31 +5,26 @@ This tutorial gives a student's first end-to-end pass through
 [[learnlog]]: initialise a project, activate the project-local
 environment, confirm that the environment records runs, run a program,
 and inspect the recorded commit in batch mode.
+The object of learning is this basic workflow as a connected whole, so
+the tutorial contrasts an ordinary directory with an initialised
+learnlog project and delays the explanation of playback until the
+learner has first produced a run to inspect.
+The critical aspects the steps make discernible are that
+[[learnlog init]] anchors the project at the root,
+[[learnlog activate]] selects the project [[.venv/]], and
+[[learnlog play -b]] reveals the resulting commit history.
 
-\ltnote{%
-  The object of learning is the basic learnlog workflow as a connected
-  whole.
-  We use contrast between an ordinary directory and an initialised
-  learnlog project, and we delay the explanation of playback until the
-  learner has first produced a run to inspect.
-  The critical aspects are that [[learnlog init]] anchors the project at
-  the root, [[learnlog activate]] selects the project [[.venv/]], and
-  [[learnlog play -b]] reveals the resulting commit history.
-}
-
-\ltnote{%
-  [[learnlog doctor]] enters where the learner has just wired a project
-  and has nothing yet to look at, so the step asks them to run it and
-  read the report before the prose names the three states it can
-  report.
-  Reading the answer to \enquote{are my runs recorded?} from the tool,
-  rather than being told, is what makes the invisible wiring an object
-  the learner can inspect later on their own.
-  The home-directory refusal is stated as an expectation on \emph{where}
-  to run [[init]] rather than demonstrated: making the learner trip the
-  guard would teach [[--force]] as a step in the workflow, when it is
-  the exception to it.
-}
+The [[learnlog doctor]] step enters where the learner has just wired a
+project and has nothing yet to look at, so the tutorial asks them to
+run it and read the report before the text names the three states it
+can report.
+Reading the answer to \enquote{are my runs recorded?} from the tool,
+rather than being told, is what makes the invisible wiring an object
+the learner can inspect later on their own.
+The home-directory refusal is stated as an expectation on \emph{where}
+to run [[init]] rather than demonstrated: making the learner trip the
+guard would teach [[--force]] as a step in the workflow, when it is
+the exception to it.
 
 The woven chapter records the teaching rationale; the tangled Markdown
 below is the student-facing tutorial consumed by [[pytorial]].

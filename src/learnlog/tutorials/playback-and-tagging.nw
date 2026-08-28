@@ -6,14 +6,10 @@ reviewing the log and tags for naming important commits.
 The learner already has a recorded project, so the new contrast is not
 between \enquote{before and after learnlog}, but between browsing the
 entire history and jumping directly to a named checkpoint.
-
-\ltnote{%
-  We use contrast on the starting point of playback: first the whole
-  log, then playback from a tag.
-  The invariant is the same recorded project.
-  This helps the learner discern that tags are not extra metadata on the
-  side; they are navigation anchors into the existing commit history.
-}
+The tutorial varies only the starting point of playback---first the
+whole log, then playback from a tag---while the recorded project stays
+invariant, so the learner discerns that tags are not extra metadata on
+the side; they are navigation anchors into the existing commit history.
 
 <<[[playback-and-tagging.md]]>>=
 ---

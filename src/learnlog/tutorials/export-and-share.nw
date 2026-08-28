@@ -6,15 +6,12 @@ someone, or as a remote repository that multiple machines can push to
 and pull from.
 This tutorial keeps the project constant and varies only the delivery
 mechanism so the learner can discern when each workflow fits.
-
-\ltnote{%
-  The critical aspect here is the sharing method.
-  We first contrast bundle export with ProgSnap2 export, then contrast
-  file handoff with remote synchronisation through [[set-remote]],
-  [[push]], [[clone]], and [[pull]].
-  Keeping the same project across all steps avoids incidental variation
-  in names and lets the transport choice stand out.
-}
+The critical aspect is the sharing method: the tutorial first contrasts
+bundle export with ProgSnap2 export, then contrasts file handoff with
+remote synchronisation through [[set-remote]], [[push]], [[clone]], and
+[[pull]].
+Keeping the same project across all steps avoids incidental variation
+in names and lets the transport choice stand out.
 
 <<[[export-and-share.md]]>>=
 ---
