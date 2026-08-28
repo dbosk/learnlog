@@ -140,10 +140,23 @@ whose work tree is your project directory---and prepares a local
 
 Recording belongs to the project's own interpreter, and this step's
 object of learning is that activation is how the learner selects it.
-The instruction is identical for both audiences, so the whole step is
-shared; the expert variant appends why it works---per-shell activation
-against per-venv wiring---which the later steps' re-activations then
-build on.
+The step then generalises \emph{who} performs the selection: the
+learner in a plain shell, or an editor---VS Code and PyCharm detect
+the project [[.venv/]] and activate it on their own.
+The agent varies while the selected interpreter stays invariant,
+which carries the practical corollary that in an automatically
+activating editor, [[learnlog init python]] once is all the setup a
+learner needs.
+The corollary rests on recording following the interpreter rather
+than the activation---a run of the venv's Python from an unactivated
+shell is recorded---so the expert variant states the mechanism
+outright, while the novice variant gives only the rule and points at
+the next step's [[learnlog doctor]] as the way to confirm what an
+editor selected.
+The instruction is identical for both audiences, so the step's core
+is shared; the expert variant appends why it works---per-shell
+activation against per-venv wiring---which the later steps'
+re-activations then build on.
 
 <<shared step: activate the project environment>>=
 # Activate the project environment
@@ -156,6 +169,13 @@ hint: Use `eval "$(learnlog activate)"` to enter the project `.venv/`.
 
 Run `eval "$(learnlog activate)"` so that the project's own Python and
 packages are the ones you use in the next steps.
+
+You need this command in a plain terminal, like the one this tutorial
+runs in.
+If you instead open the project folder in an editor such as VS Code or
+PyCharm, the editor finds the project's own Python and uses it
+automatically---then initialising once is all you need, and the next
+step shows you how to confirm that.
 <<novice step: activate the project environment>>=
 <<shared step: activate the project environment>>
 <<expert step: activate the project environment>>=
@@ -166,6 +186,16 @@ project `.venv/` first, and the `eval` applies it to the shell you are
 in.
 The recording wiring itself lives in the venv, not in the shell, so
 any shell that activates this venv runs a recording Python.
+In fact, recording follows the interpreter rather than the
+activation: even `./.venv/bin/python hello.py` from an unactivated
+shell is recorded.
+That is why the editors work without further setup---VS Code and
+PyCharm detect the workspace `.venv/`, select it as the project
+interpreter, and by default activate it in their integrated
+terminals, so both their Run buttons and their terminals use the
+recording Python.
+If you are unsure what your editor selected, the next step's
+`learnlog doctor` answers for exactly the interpreter it runs with.
 @
 
 \subsection{Confirm that runs are being recorded}
