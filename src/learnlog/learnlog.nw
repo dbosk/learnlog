@@ -507,7 +507,7 @@ overview of the code.
 \input{../src/learnlog/tutorials/export-and-share.tex}
 \input{../src/learnlog/tutorials/analysing-progsnap2.tex}
 
-\chapter{Code overview}
+\chapter{Design and code overview}
 
 The design is guided by two constraints:
 \begin{description}
