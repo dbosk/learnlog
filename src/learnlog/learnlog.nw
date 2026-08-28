@@ -494,18 +494,15 @@ Upload `mylog.learnlog` through the course platform as instructed.
   is untouched either way.
 @
 
-The next four chapters are hands-on tutorials that walk through these
-workflows step by step, starting with \cref{tut:getting-started}; they
-are the embedded [[learnlog tutorial]] catalog.
-The chapters after them document the implementation, beginning with an
+The next chapter, \cref{tut:tutorials}, collects the hands-on
+tutorials that walk through these workflows step by step; they are the
+embedded [[learnlog tutorial]] catalog.
+The chapters after it document the implementation, beginning with an
 overview of the code.
 
-% Like the doc wrapper's \input lines, these paths are relative to the
+% Like the doc wrapper's \input lines, this path is relative to the
 % doc/ build directory, where the woven learnlog.tex is compiled.
-\input{../src/learnlog/tutorials/getting-started.tex}
-\input{../src/learnlog/tutorials/playback-and-tagging.tex}
-\input{../src/learnlog/tutorials/export-and-share.tex}
-\input{../src/learnlog/tutorials/analysing-progsnap2.tex}
+\input{../src/learnlog/tutorials/tutorials.tex}
 
 \chapter{Design and code overview}
 

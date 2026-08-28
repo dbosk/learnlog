@@ -12,6 +12,7 @@ weave: learnlog.tex
 ../src/learnlog/progsnap2.tex: ../src/learnlog/progsnap2.nw
 ../src/learnlog/viewer.tex: ../src/learnlog/viewer.nw
 ../src/learnlog/cli.tex: ../src/learnlog/cli.nw
+../src/learnlog/tutorials/tutorials.tex: ../src/learnlog/tutorials/tutorials.nw
 ../src/learnlog/tutorials/getting-started.tex: ../src/learnlog/tutorials/getting-started.nw
 ../src/learnlog/tutorials/playback-and-tagging.tex: ../src/learnlog/tutorials/playback-and-tagging.nw
 ../src/learnlog/tutorials/export-and-share.tex: ../src/learnlog/tutorials/export-and-share.nw
@@ -31,6 +32,7 @@ learnlog.pdf: ../src/learnlog/commits.tex
 learnlog.pdf: ../src/learnlog/progsnap2.tex
 learnlog.pdf: ../src/learnlog/viewer.tex
 learnlog.pdf: ../src/learnlog/cli.tex
+learnlog.pdf: ../src/learnlog/tutorials/tutorials.tex
 learnlog.pdf: ../src/learnlog/tutorials/getting-started.tex
 learnlog.pdf: ../src/learnlog/tutorials/playback-and-tagging.tex
 learnlog.pdf: ../src/learnlog/tutorials/export-and-share.tex

@@ -1,4 +1,4 @@
-\chapter{Tutorial: Getting Started}
+\section{Getting started}
 \label{tut:getting-started}
 
 This tutorial gives a student's first end-to-end pass through
@@ -13,21 +13,37 @@ The critical aspects the steps make discernible are that
 [[learnlog init]] anchors the project at the root,
 [[learnlog activate]] selects the project [[.venv/]], and
 [[learnlog play -b]] reveals the resulting commit history.
+Together the steps follow a separation pattern: the project stays
+invariant while each step rotates one aspect of the workflow into
+focus---anchoring, interpreter selection, wiring, writing,
+running---and the final playback step fuses them by showing every
+earlier aspect in one recorded run.
 
-The [[learnlog doctor]] step enters where the learner has just wired a
-project and has nothing yet to look at, so the tutorial asks them to
-run it and read the report before the text names the three states it
-can report.
-Reading the answer to \enquote{are my runs recorded?} from the tool,
-rather than being told, is what makes the invisible wiring an object
-the learner can inspect later on their own.
-The home-directory refusal is stated as an expectation on \emph{where}
-to run [[init]] rather than demonstrated: making the learner trip the
-guard would teach [[--force]] as a step in the workflow, when it is
-the exception to it.
+\subsection{Two variants, one contract}
 
-The woven chapter records the teaching rationale; the tangled Markdown
-below is the student-facing tutorial consumed by [[pytorial]].
+The tutorial tangles into two catalog entries.
+[[getting-started]] addresses novices who have never programmed
+before; [[getting-started-expert]] addresses experienced programmers.
+Both practise the same workflow, and every step keeps the same title,
+the same commands, and the same machine-checked completion patterns;
+what varies between the variants is whether the mechanism behind each
+step is visible.
+For the expert the mechanism is part of the object of learning---the
+fresh shell each step opens, the per-shell activation, the [[.pth]]
+autostart hook, the Git record---while for the novice it is
+deliberately backgrounded: a learner without a working model of shells
+and interpreters has nothing to attach such explanations to, so they
+cost attention without adding discernment.
+The clearest example is the runner's re-activation: every step opens a
+fresh shell in which the runner replays [[eval "$(learnlog activate)"]]
+before handing over.
+The expert variant explains this; the novice variant simply never
+mentions it.
+
+The sharing is enforced by construction rather than by discipline:
+each step's checks are defined once, in a chunk both variants
+reference, so the tangled tutorials can drift apart only in their
+prose and hints---never in what they ask the learner to do.
 
 <<[[getting-started.md]]>>=
 ---
@@ -36,6 +52,55 @@ title: Getting started with learnlog
 summary: Set up a project, run a script, and inspect the commit it logs.
 ---
 
+<<novice step: create a fresh project>>
+
+<<novice step: activate the project environment>>
+
+<<novice step: confirm that runs are being recorded>>
+
+<<novice step: create a small program>>
+
+<<novice step: run the program>>
+
+<<novice step: inspect the recorded run>>
+<<[[getting-started-expert.md]]>>=
+---
+id: getting-started-expert
+title: Getting started with learnlog, mechanics included
+summary: The same setup, with the wiring under the hood explained.
+---
+
+<<expert step: create a fresh project>>
+
+<<expert step: activate the project environment>>
+
+<<expert step: confirm that runs are being recorded>>
+
+<<expert step: create a small program>>
+
+<<expert step: run the program>>
+
+<<expert step: inspect the recorded run>>
+@
+
+\subsection{Create a fresh project}
+
+The step's object of learning is that a project is anchored at a
+directory root: [[learnlog init]] turns the directory it runs in, and
+everything below it, into the recorded project.
+The contrast that carries this is an ordinary directory against an
+initialised one, in which [[.learnlog/]] and [[.venv/]] appear.
+The home-directory refusal is stated as an expectation on \emph{where}
+to run [[init]] rather than demonstrated: making the learner trip the
+guard would teach [[--force]] as a step in the workflow, when it is
+the exception to it.
+Both variants share the checks and the hint; the prose diverges on
+that refusal---the novice hears what would go wrong in terms of their
+own files, the expert in terms of what would be committed, and only
+the expert meets [[--force]] and learns what the two directories
+really are.
+
+<<shared step: create a fresh project>>=
 # Create a fresh project
 
 ```tutorial-step
@@ -43,6 +108,19 @@ required_patterns:
   - learnlog init python
 hint: Run `learnlog init python` in an empty project directory.
 ```
+<<novice step: create a fresh project>>=
+<<shared step: create a fresh project>>
+
+Start in a new directory made just for this practice project and
+initialise it with `learnlog init python`.
+Use a directory of its own, not your home directory: `learnlog init`
+refuses to turn your home directory into a project, because then it
+would record everything you keep there instead of just this project.
+
+This creates a hidden folder called `.learnlog/`, where your runs will
+be saved, and a `.venv/` folder with the project's own Python.
+<<expert step: create a fresh project>>=
+<<shared step: create a fresh project>>
 
 Start in a new directory for a throwaway practice project and initialise
 it with `learnlog init python`.
@@ -53,9 +131,21 @@ browser cache, into the log.
 The refusal names a `--force` escape hatch for the rare case where you
 really mean it; you do not need it here.
 
-This creates the hidden `.learnlog/` repository and prepares a local
-`.venv/` for the project.
+This creates the hidden `.learnlog/` repository---a Git repository
+whose work tree is your project directory---and prepares a local
+`.venv/` for the project, wired so that its Python records every run.
+@
 
+\subsection{Activate the project environment}
+
+Recording belongs to the project's own interpreter, and this step's
+object of learning is that activation is how the learner selects it.
+The instruction is identical for both audiences, so the whole step is
+shared; the expert variant appends why it works---per-shell activation
+against per-venv wiring---which the later steps' re-activations then
+build on.
+
+<<shared step: activate the project environment>>=
 # Activate the project environment
 
 ```tutorial-step
@@ -66,23 +156,69 @@ hint: Use `eval "$(learnlog activate)"` to enter the project `.venv/`.
 
 Run `eval "$(learnlog activate)"` so that the project's own Python and
 packages are the ones you use in the next steps.
+<<novice step: activate the project environment>>=
+<<shared step: activate the project environment>>
+<<expert step: activate the project environment>>=
+<<shared step: activate the project environment>>
 
-# Confirm that runs are being recorded
+Activation is per shell: the command prints shell code that puts the
+project `.venv/` first, and the `eval` applies it to the shell you are
+in.
+The recording wiring itself lives in the venv, not in the shell, so
+any shell that activates this venv runs a recording Python.
+@
 
-```tutorial-step
+\subsection{Confirm that runs are being recorded}
+
+The step's object of learning is that recording status is an
+inspectable property: the learner runs [[learnlog doctor]] and reads
+the answer from the tool before the text names the possible states.
+Reading the answer to \enquote{are my runs recorded?} from the tool,
+rather than being told, is what makes the invisible wiring an object
+the learner can inspect later on their own.
+The checks are shared through a common chunk, but hint and prose
+diverge: the report is a property of one interpreter, which only means
+something to a reader who knows what an interpreter is.
+The novice variant compresses the report to the one question it
+answers; the expert variant keeps the three states, the per-interpreter
+framing---and with it the runner's re-activation---and the [[.pth]]
+autostart hook behind the wiring.
+
+<<checks: confirm that runs are being recorded>>=
 pre_command: |
   eval "$(learnlog activate)"
 required_patterns:
   - learnlog doctor
   - Runs of this interpreter are recorded in
+<<novice step: confirm that runs are being recorded>>=
+# Confirm that runs are being recorded
+
+```tutorial-step
+<<checks: confirm that runs are being recorded>>
+hint: Run `learnlog doctor` and read where it says runs are recorded.
+```
+
+Run `learnlog doctor` and read what it prints before reading on.
+
+It answers one question: will your runs be recorded?
+Either it says `Runs of this interpreter are recorded in ...` and
+names where, or it tells you that recording is not set up here and
+what to run to fix it.
+Only the first answer means your next run will be recorded.
+<<expert step: confirm that runs are being recorded>>=
+# Confirm that runs are being recorded
+
+```tutorial-step
+<<checks: confirm that runs are being recorded>>
 hint: The tutorial already re-activated the project environment; run `learnlog doctor` and read where it says runs are recorded.
 ```
 
 Run `learnlog doctor` and read what it prints before reading on.
 
 The report is about one Python interpreter, which is why the tutorial
-re-activates the project environment before this step: the answer only
-means something for the Python you are about to run your programs with.
+re-activates the project environment in the fresh shell this step
+opens: the answer only means something for the Python you are about to
+run your programs with.
 It says one of three things.
 Either the environment is wired and `Runs of this interpreter are
 recorded in ...` names the log it writes to, or it is not wired at all,
@@ -92,6 +228,24 @@ In the other two the last line names the fix: `learnlog init python` for
 an environment nobody wired, and `learnlog doctor --repair`, run from
 inside the project directory, for one whose project has gone.
 
+The wiring the report checks is a `.pth` autostart hook inside the
+venv: the interpreter imports learnlog at startup, before your code,
+which is how even `python -c` one-liners and syntax errors end up
+recorded.
+@
+
+\subsection{Create a small program}
+
+The step's object of learning is transparency: the learner's normal
+tools and habits are unchanged---any editor, a plain file.
+The tutorial hands over to a real terminal here, so the step has a
+[[pre_command]] but no completion patterns; both variants share the
+whole check block.
+The novice gets one concrete editor to fall back on; the expert gets
+the choice spelled out and is told about the re-activated terminal,
+which is exactly the mechanism sentence that would lose a novice.
+
+<<shared step: create a small program>>=
 # Create a small program
 
 ```tutorial-step
@@ -99,6 +253,16 @@ pre_command: |
   eval "$(learnlog activate)"
 hint: Create `hello.py` in the terminal with your preferred editor, then return.
 ```
+<<novice step: create a small program>>=
+<<shared step: create a small program>>
+
+Create a file named `hello.py` that prints a short message.
+The tutorial drops you into a terminal so you can use an editor; for
+example, run `nano hello.py`.
+Type `print("Hello, world!")`, save the file, leave the editor, and
+return to the tutorial.
+<<expert step: create a small program>>=
+<<shared step: create a small program>>
 
 Create a file named `hello.py` that prints a short message.
 In this step the tutorial should drop to a terminal so you can run
@@ -109,10 +273,21 @@ Python.
 For example, you might run `code hello.py`, `vim hello.py`, or
 `nano hello.py`.
 Save `print("Hello, world!")` before returning.
+@
 
-# Run the program
+\subsection{Run the program}
 
-```tutorial-step
+The step's object of learning is that capture is automatic on an
+ordinary run: the contrast is between what the learner types---nothing
+beyond [[python hello.py]]---and what gets recorded.
+The checks accept equally valid solutions ([[python3]], a leading
+[[./]], case and punctuation variation in the greeting) so the
+contrast is not muddied by rejecting a correct run.
+The novice variant states the outcome and stops; the expert variant
+points at the dog that did not bark---no import, no wrapper---and
+names the autostart hook as the reason.
+
+<<checks: run the program>>=
 pre_command: |
   eval "$(learnlog activate)"
 required_patterns:
@@ -120,6 +295,23 @@ required_patterns:
     pattern: 'python3?\s+(?:\./)?hello\.py'
   - mode: regex
     pattern: '(?i)hello[,!\s]*world'
+<<novice step: run the program>>=
+# Run the program
+
+```tutorial-step
+<<checks: run the program>>
+hint: Run `python hello.py`.
+```
+
+Run `python hello.py`.
+You should see your message on the screen.
+That is all: learnlog records the run without you typing anything
+extra.
+<<expert step: run the program>>=
+# Run the program
+
+```tutorial-step
+<<checks: run the program>>
 hint: The tutorial already re-activated the project environment; run `python hello.py`.
 ```
 
@@ -128,10 +320,27 @@ re-activated the project environment for you.
 Run `python hello.py`.
 You should see your message on screen, and learnlog should record the
 run automatically.
+Note what you did not type: no import and no wrapper command.
+The venv's autostart hook imported learnlog before your script ran, so
+an ordinary invocation is enough.
+@
 
-# Inspect the recorded run
+\subsection{Inspect the recorded run}
 
-```tutorial-step
+The final step fuses the aspects the earlier steps separated: the
+project, the interpreter, the wiring, and the run all become visible
+in one record that [[learnlog play -b]] prints.
+Its object of learning is that the run became an inspectable record
+joining code state, command, and output.
+The checks match the learner's own artefacts (the file name, the
+greeting, a rendered diff) rather than the viewer's output format, so
+the tutorial does not break when the viewer's formatting changes.
+The novice variant asks the learner to recognise their own work in the
+record; the expert variant names the viewer's field labels and closes
+with the two-commit protocol, which explains a property the learner
+can only appreciate here: even a crashed run leaves a record.
+
+<<checks: inspect the recorded run>>=
 pre_command: |
   eval "$(learnlog activate)"
 required_patterns:
@@ -141,6 +350,22 @@ required_patterns:
   - mode: regex
     pattern: '(?i)hello[,!\s]*world'
   - diff --git
+<<novice step: inspect the recorded run>>=
+# Inspect the recorded run
+
+```tutorial-step
+<<checks: inspect the recorded run>>
+hint: Use `learnlog play -b` and look for your `hello.py` run.
+```
+
+Use `learnlog play -b` to print the recorded run in the terminal.
+You should recognise what you just did: the name `hello.py`, the
+message it printed, and the line you wrote.
+<<expert step: inspect the recorded run>>=
+# Inspect the recorded run
+
+```tutorial-step
+<<checks: inspect the recorded run>>
 hint: The tutorial already re-activated the project environment; use `learnlog play -b` and confirm the recorded `hello.py` run appears.
 ```
 
@@ -149,4 +374,11 @@ re-activated the project environment for you.
 Use `learnlog play -b` to print the recorded commit to the terminal.
 Look for `Script: hello.py`, `stdout: Hello, world!`, and the diff
 showing the file you created.
+
+Under the hood the run is a pair of Git commits in `.learnlog/`: a
+header committed before your program ran, holding the code state, and
+a trailer committed afterwards, holding the results, joined by a run
+id.
+That is why a run that crashes---or is killed---still leaves a record,
+and why `play -b` can show the pair merged as one entry.
 @

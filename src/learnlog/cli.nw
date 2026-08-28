@@ -2218,6 +2218,15 @@ tutorials we ship as package data under [[learnlog/tutorials/]].
 We list those tutorial files explicitly so [[learnlog tutorial
 list]] follows the intended student-to-researcher progression
 instead of an incidental alphabetical order.
+The first three tutorials come in a novice and an expert variant
+tangled from the same literate source; each expert twin is listed
+directly after its novice, so a learner who wants the mechanics
+finds the [[-expert]] entry next to the tutorial they would
+otherwise pick.
+The novice variant keeps the unsuffixed id, so it is the default a
+beginner reaches for.
+The analysis tutorial has no novice variant: its audience is the
+teacher or researcher end of the progression.
 
 <<typer commands>>=
 _builtin_tutorials_dir = resources.files("learnlog") / "tutorials"
@@ -2228,8 +2237,11 @@ pytorial.add_typer_subcommand(
     namespace="learnlog",
     tutorial_paths=(
         str(_builtin_tutorials_dir / "getting-started.md"),
+        str(_builtin_tutorials_dir / "getting-started-expert.md"),
         str(_builtin_tutorials_dir / "playback-and-tagging.md"),
+        str(_builtin_tutorials_dir / "playback-and-tagging-expert.md"),
         str(_builtin_tutorials_dir / "export-and-share.md"),
+        str(_builtin_tutorials_dir / "export-and-share-expert.md"),
         str(_builtin_tutorials_dir / "analysing-progsnap2.md"),
     ),
 )
@@ -2280,28 +2292,48 @@ Order still carries meaning, so one test spells the sequence out in
 full: that keeps the ordering covered while leaving exactly one place
 to update when the walkthrough gains a step.
 
+The split tutorials promise that novice and expert variants share
+their contract, so a further test walks the three pairs and asserts
+that step titles, required patterns, and pre-commands agree step by
+step.
+The shared chunks in the tutorial sources make this true by
+construction today; the test keeps it true if the chunks are ever
+unshared.
+The instruction-content assertions, by contrast, are keyed to the
+variant that carries the text: the mechanics sentences (fresh shells,
+re-activation, the viewer's field labels) live only in the expert
+variant, and the tests say so explicitly.
+
 <<test functions>>=
-def getting_started_tutorial():
-    """Parse the shipped getting-started tutorial resource."""
+def tutorial_resource(filename):
+    """Parse the shipped tutorial resource called ``filename``."""
     from importlib import resources
 
     from pytorial.catalog import parse_tutorial_text
 
     tutorial_path = resources.files("learnlog") / "tutorials"
-    tutorial_path = tutorial_path / "getting-started.md"
+    tutorial_path = tutorial_path / filename
     return parse_tutorial_text(
         tutorial_path.read_text(),
         source_path=tutorial_path,
     )
 
-def getting_started_step(title):
-    """Return the shipped getting-started step called ``title``."""
+def tutorial_step(filename, title):
+    """Return the step called ``title`` from ``filename``."""
     steps = {
         step.title: step
-        for step in getting_started_tutorial().steps
+        for step in tutorial_resource(filename).steps
     }
     assert title in steps, sorted(steps)
     return steps[title]
+
+def getting_started_tutorial():
+    """Parse the shipped getting-started tutorial resource."""
+    return tutorial_resource("getting-started.md")
+
+def getting_started_step(title):
+    """Return the shipped getting-started step called ``title``."""
+    return tutorial_step("getting-started.md", title)
 
 def test_getting_started_keeps_its_step_order():
     """The walkthrough sets up, checks, writes, runs, inspects."""
@@ -2326,30 +2358,67 @@ def test_tutorial_list_lists_builtin_tutorials():
 
     assert result.exit_code == 0
     assert "getting-started" in out
+    assert "getting-started-expert" in out
     assert "playback-and-tagging" in out
+    assert "playback-and-tagging-expert" in out
     assert "export-and-share" in out
+    assert "export-and-share-expert" in out
     assert "analysing-progsnap2" in out
     assert (
         out.index("getting-started")
+        < out.index("getting-started-expert")
         < out.index("playback-and-tagging")
+        < out.index("playback-and-tagging-expert")
         < out.index("export-and-share")
+        < out.index("export-and-share-expert")
         < out.index("analysing-progsnap2")
     )
+
+def test_expert_variants_share_their_novice_contract():
+    """Each expert twin keeps its novice's step titles and checks."""
+    for base in (
+        "getting-started",
+        "playback-and-tagging",
+        "export-and-share",
+    ):
+        novice = tutorial_resource(f"{base}.md")
+        expert = tutorial_resource(f"{base}-expert.md")
+
+        assert [step.title for step in novice.steps] == [
+            step.title for step in expert.steps
+        ], base
+        for novice_step, expert_step in zip(
+            novice.steps, expert.steps
+        ):
+            assert (
+                novice_step.required_patterns
+                == expert_step.required_patterns
+            ), (base, novice_step.title)
+            assert (
+                novice_step.pre_command == expert_step.pre_command
+            ), (base, novice_step.title)
 
 def test_getting_started_uses_shell_step_for_file_creation():
     """File creation stays in the shell, on the project Python."""
     step = getting_started_step("Create a small program")
+    expert = tutorial_step(
+        "getting-started-expert.md", "Create a small program"
+    )
 
     assert step.kind is None
     assert step.edit_file is None
     assert step.required_patterns == ()
     assert step.pre_command == 'eval "$(learnlog activate)"\n'
     assert step.check_command is None
-    assert "vim hello.py" in step.instructions
     assert "nano hello.py" in step.instructions
-    assert "drop to a terminal" in step.instructions
-    assert "re-activates the project environment" in step.instructions
     assert 'print("Hello, world!")' in step.instructions
+    assert "re-activates" not in step.instructions
+
+    assert "vim hello.py" in expert.instructions
+    assert "drop to a terminal" in expert.instructions
+    assert (
+        "re-activates the project environment" in expert.instructions
+    )
 
 def test_getting_started_reactivates_and_checks_playback():
     """Later shell steps pre-activate the venv and require playback."""
@@ -2367,8 +2436,17 @@ def test_getting_started_reactivates_and_checks_playback():
         (r"(?i)hello[,!\s]*world", "regex"),
     )
     assert run_step.check_command is None
-    assert "fresh shell" in run_step.instructions
-    assert "re-activated the project environment" in run_step.instructions
+    assert "python hello.py" in run_step.instructions
+    assert "fresh shell" not in run_step.instructions
+
+    expert_run = tutorial_step(
+        "getting-started-expert.md", "Run the program"
+    )
+    assert "fresh shell" in expert_run.instructions
+    assert (
+        "re-activated the project environment"
+        in expert_run.instructions
+    )
 
     assert play_step.pre_command == 'eval "$(learnlog activate)"\n'
     assert tuple(
@@ -2381,8 +2459,14 @@ def test_getting_started_reactivates_and_checks_playback():
         ("diff --git", "contains"),
     )
     assert play_step.check_command is None
-    assert "Script: hello.py" in play_step.instructions
-    assert "diff" in play_step.instructions
+    assert "learnlog play -b" in play_step.instructions
+    assert "hello.py" in play_step.instructions
+
+    expert_play = tutorial_step(
+        "getting-started-expert.md", "Inspect the recorded run"
+    )
+    assert "Script: hello.py" in expert_play.instructions
+    assert "diff" in expert_play.instructions
 @
 
 One step is keyed to learnlog's \emph{output} rather than to what the

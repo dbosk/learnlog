@@ -1,4 +1,4 @@
-\chapter{Tutorial: Export and Share}
+\section{Export and share}
 \label{tut:export-and-share}
 
 Sharing a log comes in two main forms: as a portable file you hand to
@@ -12,6 +12,22 @@ remote synchronisation through [[set-remote]], [[push]], [[clone]], and
 [[pull]].
 Keeping the same project across all steps avoids incidental variation
 in names and lets the transport choice stand out.
+The remote half is itself a sequence with one object of learning per
+step---name the destination, send, receive elsewhere, stay
+current---so the learner experiences the whole round trip rather than
+being told it exists.
+
+\subsection{Two variants, one contract}
+
+As in \cref{tut:getting-started}, the tutorial tangles into a novice
+entry, [[export-and-share]], and an expert entry,
+[[export-and-share-expert]], sharing every step's checks through
+common chunks.
+The mechanism the expert variant makes visible is the Git machinery
+under the transports: what a bundle is, which refspecs a push ships,
+and what clone and pull promise about the learner's files.
+The novice variant stays with the two workflows---hand over a file,
+or sync through a shared place---in everyday vocabulary.
 
 <<[[export-and-share.md]]>>=
 ---
@@ -20,6 +36,48 @@ title: Export and share a learnlog
 summary: Export bundles, make ProgSnap2 data, and sync through a remote.
 ---
 
+<<novice step: export a portable learnlog bundle>>
+
+<<novice step: export a progsnap2 dataset>>
+
+<<novice step: configure a remote repository>>
+
+<<novice step: push the log to the remote>>
+
+<<novice step: clone the log somewhere else>>
+
+<<novice step: pull later updates>>
+<<[[export-and-share-expert.md]]>>=
+---
+id: export-and-share-expert
+title: Export and share a learnlog, mechanics included
+summary: The same sharing workflows, with the Git machinery explained.
+---
+
+<<expert step: export a portable learnlog bundle>>
+
+<<expert step: export a progsnap2 dataset>>
+
+<<expert step: configure a remote repository>>
+
+<<expert step: push the log to the remote>>
+
+<<expert step: clone the log somewhere else>>
+
+<<expert step: pull later updates>>
+@
+
+\subsection{Export a portable learnlog bundle}
+
+The file-handoff half opens with its simplest representative: one
+command, one file, ready for playback elsewhere.
+The step's object of learning is that the whole log fits in a single
+portable file.
+The expert extra names the format---a Git bundle---and the atomicity
+guarantee that a half-written bundle never exists under the target
+name.
+
+<<shared step: export a portable learnlog bundle>>=
 # Export a portable learnlog bundle
 
 ```tutorial-step
@@ -31,7 +89,28 @@ hint: Pick an output name ending in `.learnlog`.
 
 Create a portable bundle file with `learnlog export -o course.learnlog`.
 This is the easiest format to hand to someone for playback.
+<<novice step: export a portable learnlog bundle>>=
+<<shared step: export a portable learnlog bundle>>
+<<expert step: export a portable learnlog bundle>>=
+<<shared step: export a portable learnlog bundle>>
 
+The file is a Git bundle: the log's whole history in one file.
+It is written to a staging file and atomically renamed into place, so
+a half-written bundle never exists under the name you asked for.
+@
+
+\subsection{Export a ProgSnap2 dataset}
+
+The same project, the same [[export]] command, a different flag: the
+minimal pair against the bundle step makes the purpose of the format
+the only thing that varies.
+The step's object of learning is that the export format follows from
+what the recipient will do---playback wants a bundle, analysis wants
+ProgSnap2.
+The expert extra places the format in its research context and points
+forward to the analysis tutorial that consumes the file.
+
+<<shared step: export a progsnap2 dataset>>=
 # Export a ProgSnap2 dataset
 
 ```tutorial-step
@@ -43,15 +122,50 @@ required_patterns:
 hint: Use `--progsnap2` when the goal is analysis rather than playback.
 ```
 
-Export the same log as a ProgSnap2 zip so it can be used for CS
-education analysis workflows.
+Export the same log as a ProgSnap2 zip, for example with
+`learnlog export --progsnap2 -o course.progsnap2`, so it can be used
+for CS education analysis workflows.
+<<novice step: export a progsnap2 dataset>>=
+<<shared step: export a progsnap2 dataset>>
+<<expert step: export a progsnap2 dataset>>=
+<<shared step: export a progsnap2 dataset>>
 
-# Configure a remote repository
+ProgSnap2 is a standard dataset format in computing-education
+research, meant for analysis tools rather than learnlog playback; the
+`analysing-progsnap2` tutorial picks up exactly this file.
+@
 
-```tutorial-step
+\subsection{Configure a remote repository}
+
+The remote half begins by naming the destination, before anything is
+sent: the learner separates \emph{where} the shared copy lives from
+the acts of sending and receiving.
+Hint and prose diverge by audience vocabulary---the novice hears
+\enquote{a shared place}, the expert \enquote{a bare repository or a
+URL}---while the checks stay shared.
+
+<<checks: configure a remote repository>>=
 required_patterns:
   - mode: regex
     pattern: 'learnlog\s+set-remote\s+\S+'
+<<novice step: configure a remote repository>>=
+# Configure a remote repository
+
+```tutorial-step
+<<checks: configure a remote repository>>
+hint: Point the remote at the shared location, e.g. `../course.git`.
+```
+
+Choose where the shared copy of your log should live and configure it
+with `learnlog set-remote ../course.git`.
+For practising on one machine, a path next to your project works well;
+for sharing across machines, use an address from a Git hosting service
+instead.
+<<expert step: configure a remote repository>>=
+# Configure a remote repository
+
+```tutorial-step
+<<checks: configure a remote repository>>
 hint: Point `origin` at a Git repository URL or local bare repo path.
 ```
 
@@ -59,17 +173,57 @@ Choose a remote repository and configure it with
 `learnlog set-remote ../course.git`.
 For local practice, a bare repository path such as `../course.git`
 works well; for sharing across machines, pass a real URL instead.
+The remote is stored as an ordinary Git remote named `origin` in the
+hidden `.learnlog/` repository.
+@
 
+\subsection{Push the log to the remote}
+
+The step's object of learning is that one command sends the whole
+recorded history to the named destination.
+The novice's hint drops the word \emph{branches}; the expert extra
+explains what travels---explicit branch and tag refspecs---so the
+milestone tags from \cref{tut:playback-and-tagging} arrive too, where
+a plain Git push would leave lightweight tags behind.
+
+<<checks: push the log to the remote>>=
+required_patterns:
+  - learnlog push
+<<novice step: push the log to the remote>>=
 # Push the log to the remote
 
 ```tutorial-step
-required_patterns:
-  - learnlog push
+<<checks: push the log to the remote>>
+hint: Run `learnlog push` after `set-remote` to send your log.
+```
+
+Run `learnlog push` to send the whole recorded history to the shared
+location you configured.
+<<expert step: push the log to the remote>>=
+# Push the log to the remote
+
+```tutorial-step
+<<checks: push the log to the remote>>
 hint: Push after `set-remote` so the remote receives all branches.
 ```
 
 Run `learnlog push` to send the whole recorded history to `origin`.
+The push names explicit branch and tag refspecs, so lightweight
+milestone tags---like the one from the playback tutorial---travel with
+the history instead of being left behind.
+@
 
+\subsection{Clone the log somewhere else}
+
+Receiving completes the round trip: the learner plays the other
+machine.
+The step's object of learning is that a clone reproduces the shared
+log in a fresh place.
+The expert extra states the safety property: the copy is staged and
+only moved into place once complete, and the clone configures itself,
+so an interrupted clone never leaves a half-project behind.
+
+<<shared step: clone the log somewhere else>>=
 # Clone the log somewhere else
 
 ```tutorial-step
@@ -81,7 +235,26 @@ hint: Try cloning into a second directory to simulate another machine.
 
 In another empty directory, use `learnlog clone <remote>` to retrieve
 the shared `.learnlog/` repository.
+<<novice step: clone the log somewhere else>>=
+<<shared step: clone the log somewhere else>>
+<<expert step: clone the log somewhere else>>=
+<<shared step: clone the log somewhere else>>
 
+The copy is staged in a temporary directory and only moved into place
+once complete, and the clone configures itself on first use, so an
+interrupted clone never leaves a half-project behind.
+@
+
+\subsection{Pull later updates}
+
+The closing step turns the one-shot copy into an ongoing
+synchronisation: its object of learning is that a clone can stay
+current.
+The expert extra gives the guarantee that makes pulling safe to
+recommend: the merge happens inside the object database, never touches
+the files the learner is working on, and aborts cleanly on conflict.
+
+<<shared step: pull later updates>>=
 # Pull later updates
 
 ```tutorial-step
@@ -92,4 +265,12 @@ hint: After new commits are pushed, run `learnlog pull` in the clone.
 
 When the original project has received more recorded runs and pushed
 them, update the clone with `learnlog pull`.
+<<novice step: pull later updates>>=
+<<shared step: pull later updates>>
+<<expert step: pull later updates>>=
+<<shared step: pull later updates>>
+
+The pull fetches and merges inside the object database: it never
+touches the files you are working on, and if the histories conflict it
+aborts cleanly and leaves the clone as it was.
 @

@@ -10,7 +10,14 @@ MODULES+=	cli.py cli.tex
 TUTORIAL_IDS=	getting-started playback-and-tagging \
 		export-and-share analysing-progsnap2
 TUTORIAL_MD=	$(TUTORIAL_IDS:%=tutorials/%.md)
+# The expert variants tangle from the same .nw as their novice twin,
+# so they are listed here rather than derived from TUTORIAL_IDS
+# (which would also demand nonexistent -expert.tex weaves).
+TUTORIAL_MD+=	tutorials/getting-started-expert.md \
+		tutorials/playback-and-tagging-expert.md \
+		tutorials/export-and-share-expert.md
 TUTORIAL_TEX=	$(TUTORIAL_IDS:%=tutorials/%.tex)
+TUTORIAL_TEX+=	tutorials/tutorials.tex
 
 MODULES+=	$(TUTORIAL_MD) $(TUTORIAL_TEX)
 
@@ -34,6 +41,10 @@ viewer.py: viewer.nw
 cli.py: cli.nw
 
 tutorials/%.md: tutorials/%.nw
+	@mkdir -p $(dir $@)
+	notangle -R"[[$(notdir $@)]]" $< | ${CPIF} $@ && noroots $<
+
+tutorials/%-expert.md: tutorials/%.nw
 	@mkdir -p $(dir $@)
 	notangle -R"[[$(notdir $@)]]" $< | ${CPIF} $@ && noroots $<
 
