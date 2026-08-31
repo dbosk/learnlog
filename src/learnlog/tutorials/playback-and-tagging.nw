@@ -47,6 +47,8 @@ summary: Review a log in batch and interactive mode, then jump to tags.
 <<novice step: start playback from the tag in batch mode>>
 
 <<novice step: open the interactive viewer from the tag>>
+
+<<novice step: measure one milestone>>
 <<[[playback-and-tagging-expert.md]]>>=
 ---
 id: playback-and-tagging-expert
@@ -63,6 +65,8 @@ summary: The same review workflow, with the Git record explained.
 <<expert step: start playback from the tag in batch mode>>
 
 <<expert step: open the interactive viewer from the tag>>
+
+<<expert step: measure one milestone>>
 @
 
 \subsection{Review the whole log in batch mode}
@@ -105,8 +109,10 @@ Batch playback records a view of each commit it prints.
 
 \subsection{Add a memorable tag}
 
-The step's object of learning is that a checkpoint can carry a name
-the learner chooses.
+The step's object of learning is that a milestone can carry a name
+the learner chooses, and that the name marks a \emph{start}: it
+covers the tagged run and everything after it, until the next tag
+(\cref{sec:metrics-tags}).
 The expert extra says what the name is---a lightweight Git tag on the
 run's commit---and why tagging leaves no trace of its own: [[tag]] is
 not a recorded command, so the learner can tag their most recent run
@@ -122,8 +128,10 @@ required_patterns:
 hint: Tag the current commit with a short name such as `lab1`.
 ```
 
-Pick the current commit as a checkpoint and create a tag for it, for
-example with `learnlog tag lab1`.
+Start a new piece of work, run it once, and name that starting
+point, for example with `learnlog tag lab1`.
+The tag covers this run and everything you run after it, until your
+next tag.
 <<novice step: add a memorable tag>>=
 <<shared step: add a memorable tag>>
 <<expert step: add a memorable tag>>=
@@ -134,6 +142,10 @@ pointing at the run's commit.
 Unlike `play`, `tag` does not record itself, which is what makes it
 possible to name your own most recent run without creating new history
 behind it.
+
+`learnlog metrics --since`, `--by tag` and `learnlog analyse` all
+read the tag as a start marker, the way `git describe` does---which
+is why you tag when you start a milestone, not when you finish one.
 @
 
 \subsection{List the available tags}
@@ -235,4 +247,36 @@ Move around a little, then quit with `q`.
 The viewer also reports what you look at: opening a commit and
 stepping or jumping between commits go into the review trace, while a
 keypress that does not change the displayed commit records nothing.
+@
+
+\subsection{Measure one milestone}
+
+The added step closes the loop the tag opened: the name the learner
+chose is now an argument a report accepts, which is the payoff that
+makes tagging worth the habit.
+It sits here rather than in \cref{tut:metrics} to stay
+next to the tag it reads; the grouped series belongs to the metrics
+tutorial.
+
+<<shared step: measure one milestone>>=
+# Measure one milestone
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+\w+[^\n]*--since\s+\S+'
+hint: Try `learnlog metrics time --since lab1`.
+```
+
+Your tag is also a boundary for the metrics: run
+`learnlog metrics time --since lab1` to summarise only the work from
+that starting point on.
+<<novice step: measure one milestone>>=
+<<shared step: measure one milestone>>
+<<expert step: measure one milestone>>=
+<<shared step: measure one milestone>>
+
+`--since lab1` starts the window at the tagged run, inclusive, and
+`--until` another tag would end it just before that tag's run: the
+half-open window is exactly what start marker means.
 @
