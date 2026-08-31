@@ -1459,14 +1459,30 @@ names, unused imports and variables, and their kin), long lines,
 comparison with [[None]] or [[True]] by [[==]], a bare [[except]], a
 [[lambda]] bound to a name, and ambiguous one-letter names.
 
-The linter is not a dependency.
-[[ruff]] is preferred---one binary, stable rule codes, JSON output;
-[[pylint]] is the fallback, with the same intent expressed in its
-symbols; it is GPL-licensed, which is why it is found rather than
-shipped.
-When neither is present the report says how to get one and shows a
-dash, because a metric that is unavailable is not a failure of the
-student's program.
+Both linters ship with learnlog, and [[ruff]] is the one run by
+default: it has become the Python community's standard linter (its
+documentation at \url{https://docs.astral.sh/ruff/} lists PyTorch,
+Jupyter and Apache Airflow among its users), it is two orders of
+magnitude faster than pylint---which matters when a series lints one
+snapshot per bucket---and it has stable rule codes and JSON output.
+[[pylint]] stays as the alternative because it infers types and so
+catches what ruff's syntactic checks cannot; a course that wants that
+depth chooses it with [[--linter pylint]] for one report, or with
+[[learnlog config linter pylint]] for the project.
+The two rule sets are twins where twins exist---[[E731]] and
+[[unnecessary-lambda-assignment]], [[A001]] and
+[[redefined-builtin]]---so that switching tools changes the depth of
+the analysis, not the questions asked; only ambiguous one-letter names
+([[E741]]) have no pylint counterpart.
+The default is spelled as a member of the enumeration, which is why
+it sits beside the class rather than among the constants: the
+constants are tangled first.
+Each tool is looked for in the project's own [[.venv]] first, so that
+a student's own installation wins, then beside the interpreter running
+learnlog, where the bundled copies live, and last on the [[PATH]].
+When the chosen tool is missing all the same, the report says how to
+get it and shows a dash, because a metric that is unavailable is not
+a failure of the student's program.
 Expectations are kept modest in the prose: nudging students on quality
 had them add more violations than they
 removed~\autocite{Bobadilla2024}, and improvement concentrates where a
@@ -1477,33 +1493,54 @@ outcome~\autocite{Ostlund2023}.
 import json
 import shutil
 import subprocess
+import sys
 <<metrics constants>>=
-RUFF_RULES = ("F", "E501", "E711", "E712", "E722", "E731", "E741")
+RUFF_RULES = (
+    "F", "E501", "E711", "E712", "E722", "E731", "E741", "A001",
+)
 PYLINT_CHECKS = (
     "undefined-variable", "unused-import", "unused-variable",
     "bare-except", "singleton-comparison", "redefined-builtin",
-    "line-too-long",
+    "line-too-long", "unnecessary-lambda-assignment",
 )
-LINT_TOOLS = ("ruff", "pylint")
+<<metrics functions>>=
+class Linter(str, enum.Enum):
+    """The linters that ship with learnlog."""
+
+    RUFF = "ruff"
+    PYLINT = "pylint"
+
+
+DEFAULT_LINTER = Linter.RUFF
+<<metrics constants>>=
+LINTER_CONFIG_KEY = "learnlog.linter"
+INTERPRETER_BIN = pathlib.Path(sys.executable).parent
 LINT_INSTALL_HINT = (
-    "No linter found. Install one in the project venv: "
-    "pip install ruff (or: pip install pylint)"
+    "No linter found. learnlog ships ruff and pylint; reinstall "
+    "learnlog in the project venv, or: pip install ruff"
 )
 LINT_TIMEOUT = 120
 <<metrics functions>>=
-def find_linter(workdir):
-    """Return `(tool, executable)` for the first linter found.
+def find_linter(workdir, tool=None):
+    """Return `(tool, executable)` for the linter to run, or `None`.
 
-    Looks in the project's `.venv/bin` before the `PATH`, so the
-    student's own installation wins.
+    `tool` names the linter to look for (a `Linter` or its value);
+    with none, ruff is looked for first and pylint is the fallback.
+    Each is looked for in the project's `.venv/bin`, then beside the
+    running interpreter, then on the `PATH`, so the student's own
+    installation wins over the copy that came with learnlog.
     """
-    for tool in LINT_TOOLS:
-        local = pathlib.Path(workdir) / ".venv" / "bin" / tool
-        if local.is_file():
-            return tool, str(local)
-        found = shutil.which(tool)
+    names = [Linter(tool).value] if tool else [t.value for t in Linter]
+    for name in names:
+        for candidate in (
+            pathlib.Path(workdir) / ".venv" / "bin" / name,
+            INTERPRETER_BIN / name,
+        ):
+            if candidate.is_file():
+                return name, str(candidate)
+        found = shutil.which(name)
         if found:
-            return tool, found
+            return name, found
     return None
 @
 
@@ -1560,33 +1597,41 @@ return {
 }
 @
 
-The linter test needs a linter, so it is skipped where there is none;
-the not-found path is tested by pointing the search at an empty
-directory with an empty [[PATH]].
+Both linters are dependencies, so the counting test runs each of
+them for real and expects the same two findings---an unused import
+and an undefined name---from both; the not-found path is tested by
+pointing every search location at an empty directory.
 
 <<metrics test functions>>=
-def test_find_linter_absent(tmp_path, monkeypatch):
+def _no_linters(tmp_path, monkeypatch):
   monkeypatch.setenv("PATH", str(tmp_path))
+  monkeypatch.setattr("learnlog.metrics.INTERPRETER_BIN", tmp_path)
+
+def test_find_linter_absent(tmp_path, monkeypatch):
+  _no_linters(tmp_path, monkeypatch)
   assert find_linter(tmp_path) is None
+  assert find_linter(tmp_path, Linter.PYLINT) is None
 
 def test_find_linter_prefers_project_venv(tmp_path, monkeypatch):
-  monkeypatch.setenv("PATH", str(tmp_path))
+  _no_linters(tmp_path, monkeypatch)
   local = tmp_path / ".venv" / "bin"
   local.mkdir(parents=True)
   (local / "pylint").write_text("#!/bin/sh\n")
   assert find_linter(tmp_path) == ("pylint", str(local / "pylint"))
+  assert find_linter(tmp_path, "ruff") is None
+  (local / "ruff").write_text("#!/bin/sh\n")
+  assert find_linter(tmp_path)[0] == "ruff"
+  assert find_linter(tmp_path, Linter.PYLINT)[0] == "pylint"
 
-@pytest.mark.skipif(
-  shutil.which("ruff") is None and shutil.which("pylint") is None,
-  reason="no linter installed",
-)
 def test_run_linter_counts_findings(tmp_path):
-  tool, executable = find_linter(tmp_path)
   (tmp_path / "m.py").write_text("import os\nprint(y)\n")
-  report = run_linter(tool, executable, [tmp_path / "m.py"])
-  assert report["tool"] == tool
-  assert report["total"] >= 2
-  assert run_linter(tool, executable, [])["total"] == 0
+  for tool in Linter:
+    linter = find_linter(tmp_path, tool)
+    assert linter is not None, f"{tool.value} should ship with learnlog"
+    report = run_linter(*linter, [tmp_path / "m.py"])
+    assert report["tool"] == tool.value
+    assert report["total"] == 2, report
+    assert run_linter(*linter, [])["total"] == 0
 
 def test_run_linter_tool_failure_is_none(tmp_path):
   assert run_linter("ruff", str(tmp_path / "missing"),
