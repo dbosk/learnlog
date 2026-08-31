@@ -316,6 +316,13 @@ def test_run_leaves_an_inherited_index_alone(
 @
 
 
+% The page break here is deliberate.  The chunk footers earlier in this
+% chapter list continuation chunks by page-based label; when one of those
+% lists wraps to a second line the page breaks in this section move, the
+% labels change, the list unwraps, and LaTeX never converges ("needed too
+% many passes").  Starting the section on a fresh page absorbs the
+% one-line difference and breaks the loop.
+\clearpage
 \section{Running Git commands}
 
 Every Git command needs the same environment variables and working
