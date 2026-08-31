@@ -496,8 +496,8 @@ when it cannot step back to a parent.
 Reporting \enquote{not a commit} to the caller instead, as [[None]] or
 as an exception, has no shape that suits the callers.
 Both of them are read paths that have to degrade rather than abort:
-[[get_tag_map]] (\cref{sec:tag-resolution}), whose own [[git tag -l]]
-already falls back to an empty map, and [[play --from]]
+[[get_tag_map]] (\cref{sec:tag-resolution}), whose own
+[[for-each-ref]] already falls back to an empty map, and [[play --from]]
 (\cref{sec:play}), which turns a hash it cannot find in the commit
 list into a message naming the ref the user typed.
 Handing them back the hash unchanged leads each of them to the answer
@@ -2165,16 +2165,22 @@ def test_get_commit_detail_diff_before_message(workdir):
 
 Git tags let users mark meaningful points in a development
 log---for instance, the start of each lab session.
-We need a mapping from commit hashes to tag names for two
-purposes: the ProgSnap2 exporter adds an [[X-Tag]] column
-to the event table (\cref{progsnap2}), and the [[play]]
+Several readers need to know what the tags say: the ProgSnap2
+exporter adds an [[X-Tag]] column to the event table and a tag
+table beside it (\cref{progsnap2,sec:tag-table}), the [[play]]
 command resolves tag names to starting commits
-(\cref{sec:play}).
+(\cref{sec:play}), and the metrics turn tags into period
+boundaries (\cref{sec:metrics-tags}).
 
-We query all tags in a single [[git tag -l]] call rather
-than checking each commit individually, because the number
-of tags is small (typically one per lab session) and a
+We query all tags in a single [[git for-each-ref refs/tags]]
+call rather than checking each commit individually, because the
+number of tags is small (typically one per lab session) and a
 single subprocess call is cheaper than one per commit.
+The plumbing rather than [[git tag -l]] because the porcelain
+obeys the student's [[tag.sort]] configuration, so which tag
+came back first depended on a setting nobody knew mattered; the
+plumbing always orders by refname, which is what makes every
+consumer's output deterministic.
 
 Each tagged hash goes through [[resolve_record_commit]]
 (\cref{sec:trailer-refs}) so that a tag created right after a
@@ -2240,10 +2246,141 @@ keeps the two questions apart: that function decides what
 a hash \emph{means}, while which hashes are worth asking
 about is this map's own business.
 
-Each line now carries three fields, and only the last of
-them can contain a space, because Git forbids spaces in
-ref names---so splitting twice from the left recovers all
-three.
+\subsection{What an annotated tag also carries}
+\label{sec:tag-details}
+
+An annotated tag's object records a message, a tagger and a
+date, and the export must carry them
+(\cref{sec:tag-table})---so the reader asks for everything at
+once and lets the cheaper question, which commits carry which
+names, project from the answer.
+
+[[%(contents)]] holds a trap: on a \emph{lightweight} tag it
+falls through to the tagged object and reports the
+\emph{commit's} message.
+A reader that took the field at face value would export every
+run's commit message as if it were a tag message.
+The guard sits inside the format string, next to the peel
+above: [[%(taggername)]] is non-empty exactly on tag objects,
+so making the contents conditional on it keeps the
+annotated-or-lightweight decision inside Git instead of
+restating it in Python.
+
+The fields are NUL-framed rather than space-separated because
+the message is multi-line free text; a NUL is the one byte Git
+never writes into a ref name, an ident or a formatted date.
+The message is the only field Git cannot vouch NUL-free---a
+foreign repository could hold a tag object with a NUL in its
+body---so the walk trusts the declared arity until a record is
+full and then requires the next fragment to look like a record
+opener, gluing it back onto the message when it does not.
+This is the same self-healing [[iter_log_commits]] applies to
+commit messages, for the same reason, with the record opener in
+the anchor role the hash line plays there.
+The opener is checkable because the peeled
+\enquote{hash and type} pair comes first: unlike a tag name,
+it has a shape nothing else can imitate.
+
+<<commits constants>>=
+TAG_DETAIL_FORMAT = (
+    "%00%(if)%(*objectname)%(then)"
+    "%(*objectname) %(*objecttype)%(else)"
+    "%(objectname) %(objecttype)%(end)"
+    "%00%(refname:short)"
+    "%00%(objecttype)"
+    "%00%(taggername)"
+    "%00%(taggerdate:iso-strict)"
+    "%00%(if)%(taggername)%(then)%(contents)%(else)%(end)"
+)
+TAG_DETAIL_FIELDS = 6
+TAG_OBJECT_TYPE = "tag"
+COMMIT_OBJECT_TYPE = "commit"
+
+TagDetail = collections.namedtuple(
+    "TagDetail",
+    ["name", "commit", "annotated", "message", "tagger", "date"],
+)
+<<commits functions>>=
+def _tag_detail_groups(output):
+    """Split `for-each-ref` output into six-field records."""
+    records = []
+    for fragment in output.split("\0")[1:]:
+        if records and len(records[-1]) < TAG_DETAIL_FIELDS:
+            records[-1].append(fragment)
+        elif records and not _is_tag_record_opener(fragment):
+            records[-1][-1] += "\0" + fragment
+        else:
+            records.append([fragment])
+    return [
+        record for record in records
+        if len(record) == TAG_DETAIL_FIELDS
+    ]
+<<commits functions>>=
+def _is_tag_record_opener(fragment):
+    """True if `fragment` is a peeled `<hash> <type>` pair."""
+    target, space, kind = fragment.partition(" ")
+    return (
+        space == " "
+        and kind.isalpha()
+        and len(target) in COMMIT_HASH_LENGTHS
+        and all(
+            character in "0123456789abcdef"
+            for character in target
+        )
+    )
+@
+
+Peeling, type-filtering and trailer resolution then read exactly
+as they did when the map was the product; what changed is only
+that the answer keeps the annotated half instead of dropping it.
+The record terminator is the newline [[for-each-ref]] appends
+after the last field, so the message sheds exactly one.
+
+<<commits functions>>=
+def get_tag_details(repo):
+    """Every tag that names a commit, as a `TagDetail`.
+
+    Ordered by tag name.  `commit` is the run's header commit:
+    annotated tags are reported on the commit their tag object
+    names, and tags on a trailer commit are reported on the
+    run's header commit instead.  `message`, `tagger` and
+    `date` are empty strings for a lightweight tag;
+    `annotated` tells the two kinds apart.  Tags whose object
+    is not a commit are left out.
+    """
+    result = repo.git(
+        "for-each-ref", "refs/tags",
+        f"--format={TAG_DETAIL_FORMAT}",
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    records = get_record_commits(repo)
+    details = []
+    for target, name, kind, tagger, date, contents in \
+            _tag_detail_groups(result.stdout):
+        commit_hash, _, object_type = target.partition(" ")
+        if object_type != COMMIT_OBJECT_TYPE:
+            continue
+        details.append(TagDetail(
+            name=name,
+            commit=resolve_record_commit(
+                repo, commit_hash, records,
+            ),
+            annotated=(kind == TAG_OBJECT_TYPE),
+            message=contents.removesuffix("\n"),
+            tagger=tagger,
+            date=date,
+        ))
+    return details
+@
+
+Two readers of the same refs that could disagree about which
+tags exist is exactly the drift the export cannot afford: the
+tag table must list precisely the names the [[X-Tag]] column
+mentions (\cref{sec:tag-table}).
+So the map is a projection of the details rather than a second
+reading.
 
 <<commits functions>>=
 def get_tag_map(repo):
@@ -2256,32 +2393,10 @@ def get_tag_map(repo):
     are reported on the run's header commit instead.
     Tags whose object is not a commit are left out.
     """
-    result = repo.git(
-        "tag", "-l",
-        "--format=%(if)%(*objectname)%(then)"
-        "%(*objectname) %(*objecttype)%(else)"
-        "%(objectname) %(objecttype)%(end)"
-        " %(refname:short)",
-        check=False,
-    )
-    if result.returncode != 0:
-        return {}
-    records = get_record_commits(repo)
     tag_map = {}
-    for line in result.stdout.strip().split("\n"):
-        parts = line.split(" ", 2)
-        if len(parts) != 3:
-            continue
-        commit_hash, object_type, tag_name = parts
-        if object_type != COMMIT_OBJECT_TYPE:
-            continue
-        tag_map.setdefault(
-            resolve_record_commit(repo, commit_hash, records),
-            [],
-        ).append(tag_name)
+    for tag in get_tag_details(repo):
+        tag_map.setdefault(tag.commit, []).append(tag.name)
     return tag_map
-<<commits constants>>=
-COMMIT_OBJECT_TYPE = "commit"
 @
 
 Let's verify that the tag map correctly associates commits
@@ -2438,4 +2553,72 @@ def test_get_tag_map_overlapping_runs(workdir):
 
     assert list(tag_map) == [outer_header]
     assert tag_map[outer_header] == ["lab1"]
+@
+
+The details reader adds surface the map tests cannot pin: the
+guarded [[%(contents)]], the NUL framing, and the ordering
+promise.
+The lightweight case is the trap from above---the commit's own
+message must not leak into the tag---so the test tags a run
+header, whose commit message is never empty, and requires an
+empty message on the tag:
+
+<<commits test functions>>=
+def test_get_tag_details_lightweight_has_no_message(workdir):
+    """A lightweight tag reports no message of its own."""
+    from learnlog.commits import get_tag_details
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.git("tag", "lab1")
+    detail, = get_tag_details(repo)
+    assert detail.name == "lab1"
+    assert detail.annotated is False
+    assert detail.message == ""
+    assert detail.tagger == ""
+    assert detail.date == ""
+
+def test_get_tag_details_annotated_keeps_multiline_message(workdir):
+    """Message, tagger and date survive the framing."""
+    from learnlog.commits import get_tag_details
+    repo = LearnlogRepo(workdir)
+    repo.git(
+        "tag", "-a", "-F", "-", "submitted",
+        input="first line\n\nbody with\ntwo lines\n",
+    )
+    detail, = get_tag_details(repo)
+    assert detail.annotated is True
+    assert detail.message.rstrip("\n") == \
+        "first line\n\nbody with\ntwo lines"
+    assert detail.tagger
+    assert detail.date
+
+def test_get_tag_details_orders_by_name(workdir):
+    """Creation order does not leak into the answer."""
+    from learnlog.commits import get_tag_details
+    repo = LearnlogRepo(workdir)
+    for name in ["lab2", "lab1", "milestone"]:
+        repo.git("tag", name)
+    names = [tag.name for tag in get_tag_details(repo)]
+    assert names == ["lab1", "lab2", "milestone"]
+@
+
+The re-gluing walk is a guard against foreign repositories, not
+a tested-in-anger path---[[git tag]] will not write a NUL---so
+it is verified on a synthetic record rather than a repository:
+
+<<commits test functions>>=
+def test_tag_detail_groups_reglues_a_nul_in_the_message():
+    """A NUL inside a message does not shift the fields."""
+    from learnlog.commits import _tag_detail_groups
+    opener = "a" * 40 + " commit"
+    output = (
+        "\0" + opener + "\0v1\0tag\0Ada\0date\0body\0with nul\n"
+        "\0" + opener + "\0v2\0commit\0\0\0\n"
+    )
+    first, second = _tag_detail_groups(output)
+    assert first[5] == "body\0with nul\n"
+    assert second[1] == "v2"
 @
