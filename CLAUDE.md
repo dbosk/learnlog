@@ -122,6 +122,13 @@ variant (its audience is the teacher/researcher end of the progression).
 - Commit messages always go in on stdin (`--file=-`/`commit-tree` with
   `input=`), never `-m` (Linux caps a single `argv` string at 128 KiB);
   `commit-tree` also keeps I/O logs verbatim where porcelain would strip them
+- Citations: `\autocite{key}` against `doc/bibliography.bib`, whose
+  entries carry provenance blocks (`backing-claims` skill; validate with its
+  `check_provenance.py`). The document renders citations as *margin*
+  footnotes (didactic + marginfix): never put `\autocite` inside an
+  `\item[...]` label ("Not in outer par mode"), and if `latexmk` stops
+  with "needed too many passes" after adding citations, thin the repeated
+  citations on the offending page rather than adding packages
 - Failures learnlog must swallow are appended to `.learnlog/errors.log` and,
   with `LEARNLOG_DEBUG` set, mirrored to stderr — never `except: pass`
 - Runtime dependencies: `typer>=0.9.0` (CLI), `virtualenv>=20` (used by
