@@ -125,10 +125,12 @@ variant (its audience is the teacher/researcher end of the progression).
 - Citations: `\autocite{key}` against `doc/bibliography.bib`, whose
   entries carry provenance blocks (`backing-claims` skill; validate with its
   `check_provenance.py`). The document renders citations as *margin*
-  footnotes (didactic + marginfix): never put `\autocite` inside an
-  `\item[...]` label ("Not in outer par mode"), and if `latexmk` stops
-  with "needed too many passes" after adding citations, thin the repeated
-  citations on the offending page rather than adding packages
+  footnotes (didactic + marginfix) and uses biblatex's `verbose` style so
+  the margin note carries the full reference (short form on repeats) —
+  keep `style=verbose` while the memoir+didactic pairing stands: never put
+  `\autocite` inside an `\item[...]` label ("Not in outer par mode"), and if
+  `latexmk` stops with "needed too many passes" after adding citations, thin
+  the repeated citations on the offending page rather than adding packages
 - Failures learnlog must swallow are appended to `.learnlog/errors.log` and,
   with `LEARNLOG_DEBUG` set, mirrored to stderr — never `except: pass`
 - Runtime dependencies: `typer>=0.9.0` (CLI), `virtualenv>=20` (used by
