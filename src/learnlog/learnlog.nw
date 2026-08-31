@@ -494,7 +494,17 @@ Upload `mylog.learnlog` through the course platform as instructed.
   is untouched either way.
 @
 
-\section{Code overview}
+The next chapter, \cref{tut:tutorials}, collects the hands-on
+tutorials that walk through these workflows step by step; they are the
+embedded [[learnlog tutorial]] catalog.
+The chapters after it document the implementation, beginning with an
+overview of the code.
+
+% Like the doc wrapper's \input lines, this path is relative to the
+% doc/ build directory, where the woven learnlog.tex is compiled.
+\input{../src/learnlog/tutorials/tutorials.tex}
+
+\chapter{Design and code overview}
 
 The design is guided by two constraints:
 \begin{description}

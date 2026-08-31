@@ -1,4 +1,4 @@
-\chapter{Tutorial: Analysing ProgSnap2}
+\section{Analysing ProgSnap2}
 \label{tut:analysing-progsnap2}
 
 The previous tutorial ended with ProgSnap2 export; this one turns that
@@ -6,24 +6,18 @@ dataset into a report.
 The learner first generates a complete report, then narrows it with
 [[Column=Regex]] boundaries so the effect of the filter syntax becomes
 visible against a stable dataset.
+This contrast between whole-dataset and range-restricted analysis makes
+the critical aspect discernible: [[learnlog analyse]] filters by event
+ranges, not isolated matching events, which is why the boundary syntax
+is introduced only after the learner has seen the unfiltered report.
 
-\ltnote{%
-  This chapter uses contrast between whole-dataset analysis and
-  range-restricted analysis.
-  The critical aspect is that [[learnlog analyse]] filters by event
-  ranges, not isolated matching events, which is why the boundary syntax
-  is introduced only after the learner has seen the unfiltered report.
-}
-
-\ltnote{%
-  The report also surfaces a \enquote{Time since last run} line before
-  the second and later runs within a tag.
-  This gives the teacher a visible think-time signal without requiring
-  them to infer it from raw timestamps.
-  Resetting the timer at tag boundaries keeps the cue aligned with
-  tagged sessions rather than counting overnight or between-lab gaps as
-  a deliberate pause inside one session.
-}
+The report also surfaces a \enquote{Time since last run} line before
+the second and later runs within a tag.
+This gives the teacher a visible think-time signal without requiring
+them to infer it from raw timestamps.
+Resetting the timer at tag boundaries keeps the cue aligned with
+tagged sessions rather than counting overnight or between-lab gaps as
+a deliberate pause inside one session.
 
 <<[[analysing-progsnap2.md]]>>=
 ---

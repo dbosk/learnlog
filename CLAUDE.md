@@ -66,11 +66,24 @@ The core modules, all defined as `.nw` literate source in `src/learnlog/`
 | `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`; refuses `$HOME`-or-above unless `--force`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone` (atomic staging + checkout into an empty target; the cloned repo is configured by `ensure_configured()`), `pull` (fetch + merge in the object database via `merge-tree`/private-index fallback; never touches the student's work tree or shared index, advances the ref with a guarded `update-ref` under the commit lock, aborts clean on conflict), `set-remote`, `push` (explicit `refs/heads/*` + `refs/tags/*` refspecs so lightweight milestone tags ship, matching `export`), `export` (git bundle; written via staging file + `os.replace`), `play` (curses viewer + batch mode), `tag`, `git` (**hidden** escape-hatch passthrough — absent from `--help` so students don't drive the log with raw git, still invocable by name for repair; injects `-e .learnlog`/`-e '!.learnlog'` into `clean`, refuses `reset --hard` without `--allow-destructive`, and builds its env with `git_environment()` — as does `tag`), `doctor` (reports/repairs the interpreter's autostart wiring; dead wiring exits 1), and `analyse`. Only `play` and `list` are recorded runs; every other subcommand leaves no trace, which is what makes `clone` into an empty directory, a fast-forwarding `pull`, and a `tag` on the student's own run possible |
 | `viewer.py` | `viewer.nw` | `PlaybackViewer` (curses) and `play_batch`; both report each commit they display to `learnlog.record_view` — actions `open`/`next`/`prev`/`jump-first`/`jump-last` interactively, `batch` in batch mode. A keypress that does not change the displayed commit records nothing |
 
-Tutorial sources in `src/learnlog/tutorials/`:
+Tutorial sources in `src/learnlog/tutorials/` (woven into one `Tutorials`
+chapter via `tutorials.nw`, which also carries the catalog-level design
+prose and the `\input`s of the per-tutorial sections):
 - `getting-started.nw` — first-run setup, activation, running code, and batch playback
 - `playback-and-tagging.nw` — batch and interactive playback plus tagging workflows
 - `export-and-share.nw` — bundle export, ProgSnap2 export, and remote sharing workflows
 - `analysing-progsnap2.nw` — `learnlog analyse` reports and `Column=Regex` range filtering
+
+The first three each tangle **two** catalog entries from one `.nw`: a
+novice `.md` (unsuffixed id, the default) and an `-expert.md` variant that
+adds mechanism explanations. The step contract (`pre_command`,
+`required_patterns`) lives in shared chunks referenced by both roots, so
+the variants can differ only in prose and hints; `cli.nw`'s
+`test_expert_variants_share_their_novice_contract` locks that in, and the
+catalog tuple in `cli.nw` lists each expert twin right after its novice.
+The expert `.md`s tangle via the `tutorials/%-expert.md: tutorials/%.nw`
+rule in `src/learnlog/Makefile`. `analysing-progsnap2` has no novice
+variant (its audience is the teacher/researcher end of the progression).
 
 ### Key design constraints
 
