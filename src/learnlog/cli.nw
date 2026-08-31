@@ -135,6 +135,7 @@ from learnlog.gitrepo import (
 )
 from learnlog.commits import (
     get_commits,
+    get_tag_map,
     scan_run_commits,
     merge_run_trailers,
     parse_run_summary,
@@ -144,6 +145,7 @@ from learnlog.commits import (
 )
 from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
+    _iter_event_tags,
     do_export_progsnap2,
     read_progsnap2,
     read_progsnap2_as_repo,
@@ -164,6 +166,8 @@ from learnlog.metrics import (
     MI_CAVEAT,
     OutputFormat,
     Period,
+    TAG_BUCKET_NOTE,
+    TAG_TREND_CAVEAT,
     TREND_COLUMNS,
     TREND_RULE,
     bucket_sessions,
@@ -176,11 +180,17 @@ from learnlog.metrics import (
     filter_window,
     find_linter,
     join_buckets,
+    local_naive,
+    parse_boundary,
     period_window,
     render,
     run_records,
     segment_sessions,
+    tag_boundaries,
+    tag_buckets,
+    tag_starts,
     trend_lines,
+    window_header,
     window_label,
 )
 @
@@ -3411,6 +3421,10 @@ When a commit contains multiple runs (because the student ran the
 same code several times without editing), we show the first run's
 details and append [[(N runs)]] so the teacher knows there is more
 to explore.
+A tagged run shows its names in a trailing [[(tag: lab1)]] marker,
+the spelling [[git log --oneline]] made familiar: a tag is a
+boundary every report reads (\cref{sec:metrics-tags}), so the
+listing must show where the milestones sit.
 
 The [[--success]] and [[--failure]] flags narrow the listing to
 commits that contain at least one run of the requested outcome.
@@ -3481,6 +3495,7 @@ def list_commits(
 
         filter_internal = not show_all
         scan = scan_run_commits(repo)
+        tag_map = get_tag_map(repo)
         <<build wanted outcome set>>
         for commit in commits:
             <<get and summarise commit>>
@@ -3540,8 +3555,10 @@ short_hash = commit["hash"][:7]
 suffix = (
     f" ({run_count} runs)" if run_count > 1 else ""
 )
+names = tag_map.get(commit["hash"], [])
+tags = f" (tag: {', '.join(names)})" if names else ""
 typer.echo(
-    f"{short_hash} {start_time} {command}{suffix}"
+    f"{short_hash} {start_time} {command}{suffix}{tags}"
 )
 @
 
@@ -3652,6 +3669,28 @@ def test_list_shows_review_runs(workdir):
     assert result.exit_code == 0
     assert "hello.py" in result.output
     assert "learnlog play" in result.output
+
+def test_list_shows_tags(workdir):
+    """A tagged run's line carries the tag names."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.git("tag", "lab1")
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "(tag: lab1)" in result.output
+    assert result.output.count("(tag:") == 1
 
 def test_list_command_all_shows_internal(workdir):
     """The --all flag lists learnlog's internal runs too."""
@@ -6310,6 +6349,22 @@ While administrative commands still logged themselves, HEAD at this
 moment was the header commit of the [[learnlog tag]] run---so the tag
 named the act of tagging, on a commit that every view filters out.
 
+That checkpoint is read as a \emph{start marker}, the way
+[[git describe]] reads one: the tag names the run it sits on and
+every run after it, until the next tag (\cref{sec:metrics-tags}).
+So the shipped advice is to tag when \emph{starting} a
+milestone---run the first thing of lab~2, then
+[[learnlog tag lab2]]---and the wrong habit, tagging when finishing,
+silently shifts every per-milestone report by one.
+That mistake would otherwise surface weeks later in a report, so a
+successful creation answers by naming the run the tag landed on and
+restating the rule.
+The guard around the confirmation is deliberately narrow---only the
+bare [[learnlog tag name]] form, the one the tutorial teaches, earns
+the line---because a missed confirmation costs nothing while a wrong
+one (after a listing, a deletion, or a tag on an explicit ref) would
+mislead.
+
 <<typer commands>>=
 @app.command(
     name="tag",
@@ -6328,6 +6383,11 @@ def tag_command(
     configured to operate on the ``.learnlog/``
     directory.  For example, ``learnlog tag lab1``
     creates a tag named ``lab1`` on the current HEAD.
+
+    A tag is a start marker: it names your latest run
+    and every run after it, until your next tag.  So
+    tag when you start a milestone, not when you
+    finish one.
     """
     workdir = find_learnlog_dir()
     if workdir is None:
@@ -6343,7 +6403,38 @@ def tag_command(
         env=env,
         cwd=str(workdir),
     )
+    if result.returncode == 0:
+        <<confirm a tag created at HEAD>>
     raise typer.Exit(code=result.returncode)
+@
+
+<<confirm a tag created at HEAD>>=
+if len(ctx.args) == 1 and not ctx.args[0].startswith("-"):
+    <<name the run the tag landed on>>
+@
+
+The confirmation reads the run back through the repository rather
+than trusting its own arguments, because what the student needs to
+check is where the tag \emph{landed}, and [[resolve_record_commit]]
+(\cref{sec:trailer-refs}) is what decides that everywhere else.
+Both reads opt out of [[check]]: a repository the confirmation
+cannot read is a repository the tag still reached, and a missing
+line is the cheap failure.
+
+<<name the run the tag landed on>>=
+repo = LearnlogRepo(workdir)
+head = repo.git("rev-parse", "HEAD", check=False).stdout.strip()
+if head:
+    subject = repo.git(
+        "log", "-1", "--format=%s",
+        resolve_record_commit(repo, head),
+        check=False,
+    ).stdout.strip()
+    if subject:
+        typer.echo(
+            f"{ctx.args[0]} -> {subject}; runs from here "
+            "on count toward this tag"
+        )
 @
 
 Let's verify that the command creates and lists tags, that the tag
@@ -6778,6 +6869,7 @@ def test_play_from_progsnap2_start_tag(workdir):
 
 
 \subsection{The [[analyse]] command}
+\label{sec:analyse-tags}
 
 The [[analyse]] command reads a ProgSnap2 dataset and
 generates \LaTeX{} output that presents the student's
@@ -6791,7 +6883,18 @@ Each takes the form [[Column=Regex]]---for example,
 [[X-Tag=lab1]] to match events tagged [[lab1]], or
 [[X-CommitHash=abc123]] to match by commit hash.
 The regex is matched with [[re.search]], so partial
-patterns work without anchoring.
+patterns work without anchoring---except against [[X-Tag]],
+whose values are names and match in full.
+
+The positional pair is a \emph{generic} event filter---any column,
+inclusive at both ends---and it stays that way:
+[[X-CommitHash=abc123]] has no start-marker reading.
+The tag window of \cref{sec:metrics-tags} gets its own
+vocabulary instead, the one it already has in [[metrics]]:
+[[--since]]/[[--until]], each a tag name or a date, half-open.
+The two vocabularies cannot be combined, for the reason
+[[--period]] refuses [[--since]] there: a report whose header could
+describe two ranges is worse than a refusal.
 
 The source can be:
 \begin{description}
@@ -6839,6 +6942,27 @@ def analyse(
                 "End boundary as Column=Regex. "
                 "Events up to the last match "
                 "are included."
+            ),
+        ),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since",
+            help=(
+                "Start of a tag window: a tag name (its "
+                "run included), or an ISO date/datetime."
+            ),
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option(
+            "--until",
+            help=(
+                "End of a tag window: a tag name (its "
+                "run excluded), a date (inclusive), or "
+                "an ISO datetime."
             ),
         ),
     ] = None,
@@ -6896,9 +7020,22 @@ def analyse(
     ] = None,
 ):
     """Analyse development sessions and generate LaTeX."""
+    <<refuse two range vocabularies>>
     <<resolve analyse source>>
     <<filter events by range>>
+    <<filter events by tag window>>
     <<generate and output latex>>
+@
+
+The refusal comes before the source is resolved, because a usage
+error should not cost an export:
+
+<<refuse two range vocabularies>>=
+if (start is not None or end is not None) and (since or until):
+    raise SystemExit(
+        "Column=Regex boundaries cannot be combined with "
+        "--since/--until."
+    )
 @
 
 We detect whether the source is a ProgSnap2 zip by checking
@@ -6957,13 +7094,109 @@ if start is not None or end is not None:
     )
 @
 
+The tag window lowers to [[Order]] space with no timestamp
+arithmetic for tags, because the exporter assigns contiguous
+[[Order]] values to a commit's events: [[--since lab1]] starts at
+the first event carrying [[lab1]], and [[--until lab2]] ends just
+before the first event carrying [[lab2]]---the start-marker rule
+verbatim, with no repository behind the dataset needed.
+A tag matches by exact name through [[_iter_event_tags]], never by
+substring: [[lab1]] must not match [[lab10]]---and the positional
+filter anchors [[X-Tag]] the same way, so the two vocabularies
+agree on what a tag name means.
+A date boundary lowers the same way, to the first event at or after
+the moment; [[parse_boundary]]'s day-extension keeps a date
+[[--until]] inclusive, exactly as in [[metrics]].
+
+<<filter events by tag window>>=
+if since or until:
+    dataset["events"] = filter_tag_range(
+        dataset["events"], since, until,
+    )
+<<helper functions>>=
+def filter_tag_range(events, since=None, until=None):
+    """Filter events to the half-open window [since, until).
+
+    Each boundary is a tag name or an ISO date or datetime;
+    a tag resolves to the first event carrying it.
+    """
+    start_order = 0
+    end_order = float("inf")
+    if since is not None:
+        start_order = boundary_order(events, since)
+    if until is not None:
+        end_order = boundary_order(
+            events, until, inclusive_end=True,
+        )
+    return [
+        e for e in events
+        if start_order <= int(e["Order"]) < end_order
+    ]
+@
+
+A boundary that is neither a tag in the dataset nor a date refuses
+with the dataset's tags, mirroring [[resolve_boundary]]'s message;
+a date past every event yields an empty range rather than an error,
+because \enquote{nothing after Tuesday} is an answer.
+
+<<helper functions>>=
+def tag_event_orders(events, tag):
+    """The Orders of the events carrying `tag` as one of their tags."""
+    return [
+        int(event["Order"]) for event in events
+        if tag in _iter_event_tags(event.get("X-Tag", ""))
+    ]
+<<helper functions>>=
+def boundary_order(events, text, *, inclusive_end=False):
+    """Lower a `--since`/`--until` value to an event Order.
+
+    A tag name maps to the first Order carrying it; a date or
+    datetime to the first Order at or after that moment.
+    """
+    orders = tag_event_orders(events, text)
+    if orders:
+        return min(orders)
+    try:
+        moment = parse_boundary(text, inclusive_end=inclusive_end)
+    except ValueError as error:
+        known = ", ".join(sorted({
+            tag for event in events
+            for tag in _iter_event_tags(event.get("X-Tag", ""))
+            if tag
+        })) or "none"
+        raise SystemExit(
+            f"not a date, a datetime, or a tag: {text!r} "
+            f"(tags in this dataset: {known})"
+        ) from error
+    matching = [
+        int(event["Order"]) for event in events
+        if (when := event_moment(event)) is not None
+        and when >= moment
+    ]
+    return min(matching) if matching else float("inf")
+<<helper functions>>=
+def event_moment(event):
+    """The event's `ServerTimestamp` as a naive local datetime."""
+    try:
+        return local_naive(datetime.datetime.fromisoformat(
+            event.get("ServerTimestamp", ""),
+        ))
+    except ValueError:
+        return None
+@
+
 The [[filter_event_range]] function parses the
 [[Column=Regex]] format and applies [[re.search]] to find
 matching events.
-Using [[re.search]] rather than [[re.fullmatch]] means
-that [[X-Tag=lab1]] matches both [[lab1]] and
-[[lab1;lab2]], which is the natural expectation when tags
-are semicolon-delimited.
+[[re.search]] keeps partial patterns useful on free-form
+columns---[[X-Script=solv]] finds [[solver.py]].
+[[X-Tag]] is the exception: its cell is a semicolon-joined list of
+\emph{names}, and searching the raw cell made [[lab1]] match
+[[lab10]] as well as [[lab1;lab2]].
+So the tag column is split with [[_iter_event_tags]] and each name
+must match in full---the same exact-name rule the [[--since]]
+window applies---which keeps [[lab1;lab2]] matched by [[lab1]] and
+stops [[lab10]].
 
 <<helper functions>>=
 def filter_event_range(events, start=None, end=None):
@@ -6989,10 +7222,21 @@ def filter_event_range(events, start=None, end=None):
             )
         col, pattern = spec.split("=", 1)
         rx = re.compile(pattern)
-        matching = [
-            int(e["Order"]) for e in events
-            if rx.search(str(e.get(col, "")))
-        ]
+        if col == "X-Tag":
+            matching = [
+                int(e["Order"]) for e in events
+                if any(
+                    rx.fullmatch(tag)
+                    for tag in _iter_event_tags(
+                        e.get(col, ""),
+                    )
+                )
+            ]
+        else:
+            matching = [
+                int(e["Order"]) for e in events
+                if rx.search(str(e.get(col, "")))
+            ]
         if not matching:
             raise SystemExit(
                 f"No events match {spec}"
@@ -7416,17 +7660,24 @@ METRICS_PERIOD_OPTION = typer.Option(
 )
 METRICS_BY_OPTION = typer.Option(
     "--by",
-    help="Report a series with one row per day, week, or month.",
+    help=(
+        "Report a series with one row per day, week, or month, "
+        "or per tag (each tag starts a period that runs to the "
+        "next tag)."
+    ),
 )
 METRICS_SINCE_OPTION = typer.Option(
     "--since",
-    help="Start of an explicit window (YYYY-MM-DD or ISO datetime).",
+    help=(
+        "Start of an explicit window: a tag name (its run "
+        "included), YYYY-MM-DD, or an ISO datetime."
+    ),
 )
 METRICS_UNTIL_OPTION = typer.Option(
     "--until",
     help=(
-        "End of an explicit window, inclusive for a date "
-        "(YYYY-MM-DD or ISO datetime)."
+        "End of an explicit window: a tag name (its run "
+        "excluded), a date (inclusive), or an ISO datetime."
     ),
 )
 METRICS_IDLE_OPTION = typer.Option(
@@ -7450,6 +7701,13 @@ Each command has its own default window ([[week]] for the four
 single-family reports, [[all]] for [[trends]]), which is why the
 option itself defaults to nothing and the command supplies the
 fallback.
+
+A boundary tries the log's tag names before the calendar, so a tag
+named like a date shadows the date deliberately rather than
+vanishing silently (\cref{sec:metrics-tags}).
+The date/tag asymmetry in [[--until]] is intentional: both mean
+\enquote{up to but not including the next thing}---for a date the
+next day, for a tag its own first run.
 
 <<imports>>=
 import datetime
@@ -7481,23 +7739,53 @@ The header names the choices that move the numbers---window, idle
 threshold, and how many runs never finalised---so that two reports can
 be compared only when they were made the same way.
 
+Tag periods change three lines of this resolution and no more.
+The boundaries are read only when something will consume them---a
+[[--by tag]] series, or a [[--since]]/[[--until]] that may name
+one.
+A [[--by tag]] series with no explicit window defaults to [[all]]
+rather than the week the other families default to: a milestone
+series is inherently a whole-history question, and a seven-day
+window would collapse a semester's labs into one or two rows led by
+a tag from far outside the window.
+The header shows the resolved window either way, so the differing
+default is visible in every report, and an explicit [[--period]]
+still wins.
+
 <<resolve the metrics window and buckets>>=
 records = run_records(repo)
 idle_delta = datetime.timedelta(minutes=idle)
+boundaries = (
+    tag_boundaries(repo)
+    if by is Granularity.TAG or since or until else []
+)
+starts = tag_starts(boundaries)
 if since or until:
     try:
-        window = explicit_window(since, until, records)
+        window = explicit_window(
+            since, until, records, starts=starts,
+        )
     except ValueError as error:
         raise SystemExit(str(error)) from error
+elif by is Granularity.TAG and period is None:
+    window = period_window(Period.ALL, records)
 else:
     window = period_window(period or default_period, records)
 in_window = filter_window(records, *window)
-sessions = segment_sessions(in_window, idle_delta)
-buckets = bucket_sessions(sessions, by, window)
+if by is Granularity.TAG:
+    buckets = tag_buckets(
+        in_window, boundaries, window, idle_delta,
+    )
+else:
+    sessions = segment_sessions(in_window, idle_delta)
+    buckets = bucket_sessions(sessions, by, window)
 header = [
-    f"window: {window_label(*window)}, {len(in_window)} runs",
+    f"window: {window_header(window, since, until, starts)}, "
+    f"{len(in_window)} runs",
     f"idle threshold: {idle} min between runs starts a new session",
 ]
+if by is Granularity.TAG:
+    header.append(TAG_BUCKET_NOTE)
 incomplete = sum(run.end is None for run in in_window)
 if incomplete:
     header.append(
@@ -7844,10 +8132,12 @@ if not results:
     return
 unit = {
     Granularity.DAY: "days", Granularity.WEEK: "weeks",
-    Granularity.MONTH: "months",
+    Granularity.MONTH: "months", Granularity.TAG: "milestones",
 }[by]
 lines = trend_lines(results, unit)
 header = [*inputs.header, EQ_VARIANT, MI_CAVEAT, TREND_RULE, lint_note]
+if by is Granularity.TAG:
+    header.append(TAG_TREND_CAVEAT)
 if fmt is OutputFormat.JSON:
     document = json.loads(render(results, TREND_COLUMNS, fmt, header))
     document["trends"] = lines
@@ -7997,4 +8287,208 @@ def test_metrics_trends_and_window_rules(workdir):
     )
     assert result.exit_code == 0, result.output
     assert "3 runs" in result.output
+@
+
+Tag windows and tag series need a history with tags in it; the
+helper tags [[_metrics_history]]'s second and third runs, so
+lab~1's period is exactly one run:
+
+<<test functions>>=
+def _tagged_history(workdir):
+    from learnlog.commits import get_commits
+    repo = _metrics_history(workdir)
+    commits = get_commits(repo)
+    repo.git("tag", "lab1", commits[-2]["hash"])
+    repo.git("tag", "lab2", commits[-1]["hash"])
+    return repo
+
+
+def test_metrics_since_until_tag_names(workdir):
+    """A tag window is [its run, the next tag's run)."""
+    _tagged_history(workdir)
+    result = _metrics(
+        ["eq", "--since", "lab1", "--until", "lab2"], workdir,
+    )
+    assert result.exit_code == 0, result.output
+    assert "lab1 .. lab2 (" in result.output
+    assert "1 runs" in result.output
+
+
+def test_metrics_mixed_tag_and_date_boundaries(workdir):
+    """A tag and a date can bound the same window."""
+    _tagged_history(workdir)
+    result = _metrics(
+        ["time", "--since", "lab1", "--until", "2026-01-06"],
+        workdir,
+    )
+    assert result.exit_code == 0, result.output
+    assert "2 runs" in result.output
+
+
+def test_metrics_unknown_boundary_lists_the_tags(workdir):
+    """A typo'd boundary names the tags that do exist."""
+    _tagged_history(workdir)
+    result = _metrics(["time", "--since", "nosuchtag"], workdir)
+    assert result.exit_code != 0
+    assert "lab1" in result.output
+    assert "lab2" in result.output
+@
+
+The series behaviours: the whole-history default, the row order
+with its untagged lead, the note in the header, an explicit
+[[--period]] still winning, and [[trends]] speaking in milestones:
+
+<<test functions>>=
+def test_metrics_by_tag_defaults_to_all(workdir):
+    """--by tag reads the whole history unless told otherwise."""
+    _tagged_history(workdir)
+    result = _metrics(["time", "--by", "tag"], workdir)
+    assert result.exit_code == 0, result.output
+    assert "3 runs" in result.output
+    assert "tag periods" in result.output
+    out = result.output
+    assert out.index("(untagged)") < out.index("lab1")
+    assert out.index("lab1") < out.index("lab2")
+
+
+def test_metrics_by_tag_period_still_wins(workdir):
+    """An explicit --period beats the whole-history default."""
+    _tagged_history(workdir)
+    result = _metrics(
+        ["time", "--by", "tag", "--period", "today"], workdir,
+    )
+    assert result.exit_code == 0, result.output
+    assert "0 runs" in result.output
+
+
+def test_metrics_trends_by_tag_unit_word(workdir):
+    """trends --by tag compares milestones, and says so."""
+    _tagged_history(workdir)
+    result = _metrics(["trends", "--by", "tag"], workdir)
+    assert result.exit_code == 0, result.output
+    assert "milestones" in result.output
+    assert "equal stretches" in result.output
+@
+
+The [[analyse]] window: [[--since]] keeps its own run,
+[[--until]] excludes its own---the contrast with
+[[test_analyse_with_tag_range]], whose inclusive positional
+range keeps [[v2]] for the same tags---and the two vocabularies
+refuse to combine:
+
+<<test functions>>=
+def _tagged_analyse_history(workdir):
+    from learnlog.commits import get_commits
+    repo = LearnlogRepo(workdir)
+    for minute, version in [(0, "v1"), (5, "v2"), (10, "v3")]:
+        (workdir / "hello.py").write_text(
+            f'print("{version}")\n'
+        )
+        start = datetime.datetime(2026, 1, 1, 10, minute)
+        repo.begin_run("hello.py", [], start)
+        repo.finalize_run(
+            io_log=f"stdout: {version}\n",
+            exception_info=None,
+            end_time=start + datetime.timedelta(seconds=5),
+            exit_code=0,
+        )
+        commits = get_commits(repo)
+        repo.git(
+            "tag", f"lab{minute // 5 + 1}",
+            commits[-1]["hash"],
+        )
+    return repo
+
+
+def test_analyse_since_until_tag_window(workdir, monkeypatch):
+    """--since includes its run; --until excludes its own."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    _tagged_analyse_history(workdir)
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["analyse", "--since", "lab1", "--until", "lab2"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "v1" in result.output
+    assert "v2" not in result.output
+    assert "v3" not in result.output
+
+
+def test_analyse_refuses_two_range_vocabularies(
+    workdir, monkeypatch,
+):
+    """Column=Regex and --since describe two different ranges."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    _tagged_analyse_history(workdir)
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["analyse", "X-Tag=lab1", "--since", "lab1"],
+    )
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+@
+
+And the confirmation: a bare create names the run it landed on,
+while a listing stays silent:
+
+<<test functions>>=
+def test_tag_confirms_where_it_landed(workdir, monkeypatch):
+    """A bare create names the run the tag landed on."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    moment = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], moment)
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=moment, exit_code=0,
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0
+    assert "hello.py" in result.output
+    assert "count toward this tag" in result.output
+    listing = runner.invoke(app, ["tag", "-l"])
+    assert listing.exit_code == 0
+    assert "count toward this tag" not in listing.output
+@
+
+And the anchored tag column: a course past its ninth lab is the
+case the substring match got wrong.
+
+<<test functions>>=
+def test_analyse_tag_filter_matches_whole_names(
+    workdir, monkeypatch,
+):
+    """X-Tag=lab1 must not match lab10."""
+    from learnlog.cli import app
+    from learnlog.commits import get_commits
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    for minute, version, tag in [
+        (0, "v1", "lab1"), (5, "v2", "lab10"),
+    ]:
+        (workdir / "hello.py").write_text(
+            f'print("{version}")\n'
+        )
+        start = datetime.datetime(2026, 1, 1, 10, minute)
+        repo.begin_run("hello.py", [], start)
+        repo.finalize_run(
+            io_log=f"stdout: {version}\n",
+            exception_info=None,
+            end_time=start + datetime.timedelta(seconds=5),
+            exit_code=0,
+        )
+        commits = get_commits(repo)
+        repo.git("tag", tag, commits[-1]["hash"])
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["analyse", "X-Tag=lab1", "X-Tag=lab1"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "v1" in result.output
+    assert "v2" not in result.output
 @
