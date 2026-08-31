@@ -1,0 +1,1149 @@
+% doc/metrics-protocol.tex -- appendix documenting the literature search
+% behind the claims made in the `learnlog metrics' chapter.  Plain LaTeX:
+% no preamble, no \documentclass; \input after \appendix in doc/learnlog.nw.
+% The per-reference provenance blocks summarised here live in
+% doc/bibliography.bib, above each entry.
+
+% A local helper, used nowhere else in the document: verbatim queries are
+% set in the typewriter font, whose interword space has no stretch, so a
+% long query cannot be justified and overflows the measure.  \qy gives such
+% a query a stretchable interword space and changes nothing else.
+\providecommand{\qy}[1]{{\ttfamily\spaceskip=0.5em plus 0.5em minus 0.17em
+  \hyphenpenalty=10000 #1}}
+
+% Long verbatim URLs below are recorded exactly as they were fetched, and
+% several of them contain runs of hyphenated words that url.sty will not
+% break by default.  Allow breaks after hyphens for the duration of this
+% appendix; it is restored at the end of the file.
+\makeatletter
+\def\do@url@hyp{\do\-}
+\makeatother
+\Urlmuskip=0mu plus 1mu\relax
+
+\chapter{Literature search protocol for the metrics}
+\label{app:metrics-protocol}
+
+The metrics that \qy{learnlog metrics} computes are not learnlog's
+inventions.  Each one is defined in a published paper, each carries
+parameters that a reimplementation must choose, and each has a literature
+saying what it does and does not measure.  This appendix records how that
+literature was found, what was verified, and what was not, so that a reader
+can audit every backed claim rather than take it on trust.
+
+\section{The protocol}
+\label{app:protocol:method}
+
+One protocol governs every claim in this appendix, and it is stated here
+once rather than repeated in each chapter.
+
+\begin{description}
+\item[Find, in both directions] Every claim was searched twice: once for
+  literature that supports it, and once, with a separate
+  \emph{counter-search}, for literature that refutes or qualifies it.  A
+  counter-search that returned nothing is recorded as an empty
+  counter-search, not omitted.
+\item[Verify at the source] No claim rests on a title or a search-result
+  snippet.  Where the full text could be obtained it was read; where only
+  the publisher-supplied abstract could be obtained, the claim is stated at
+  abstract strength and says so; where neither could be obtained, the source
+  is listed in \cref{app:protocol:dropped} and backs nothing.
+\item[Record] Each reference carries a provenance block in
+  \nolinkurl{doc/bibliography.bib} immediately above its entry, giving the
+  claim it backs, the verbatim query that found it, why it was picked over
+  the alternatives, the verbatim supporting passage, what was verified, and
+  the counter-search outcome.
+\end{description}
+
+The chapters that follow are organised by \emph{claim}, not by search
+episode: one chapter per claim, each stating the claim as a research
+question and answering it from the evidence gathered for that claim alone.
+
+\section{Sessions, date and providers}
+\label{app:protocol:sessions}
+
+All searching was done on \textbf{2026-08-31} under three named
+\texttt{scholar} sessions, whose exported records are the audit trail behind
+this appendix:
+
+\begin{description}
+\item[\texttt{learnlog-metrics-eq}] Error Quotient, Repeated Error Density,
+  the Watwin score and the Normalized Programming State Model; 24 recorded
+  searches.
+\item[\texttt{learnlog-metrics-time}] time-on-task estimation, session
+  segmentation and effort proxies; 10 recorded searches over 6\,505
+  candidate records.
+\item[\texttt{learnlog-metrics-code}] static code metrics, the
+  maintainability index and linters for novice code; 11 recorded searches
+  over 139 screened papers.
+\end{description}
+
+Each session is stored as a JSON file named after it, under
+\nolinkurl{~/.local/share/scholar/review_sessions/}.
+
+Provider health was checked with \qy{scholar providers check} before
+searching, and the result materially limits what a negative finding in this
+appendix means:
+
+\begin{description}
+\item[\texttt{s2} --- dead in all three sessions] The Semantic Scholar key
+  was rejected with HTTP~403 (\qy{key rejected --- HTTP 403 --- check or
+  replace S2\_API\_KEY}).  Semantic Scholar is the strongest provider for
+  the ACM proceedings that dominate this literature, so its absence is the
+  single largest gap in coverage.  It was partly compensated by direct
+  \nolinkurl{api.semanticscholar.org} retrieval outside the session.
+\item[\texttt{openalex} --- reported healthy, effectively absent] It
+  returned HTTP~429 or 503 on every \texttt{scholar} query in the EQ and
+  time sessions, despite passing the health check; it behaved normally in
+  the code session.  Direct REST retrieval
+  (\nolinkurl{api.openalex.org/works/doi:} followed by the DOI) worked
+  throughout
+  and was used instead.
+\item[\texttt{dblp} --- degraded] Intermittent HTTP~500 and 503, and a hard
+  limit of about three terms per query (every term must match, implicit
+  AND), which forced several precise queries to be shortened.  Its keyword
+  index also conflates \enquote{error quotient} with numerical-analysis
+  \enquote{difference quotients}.
+\item[\texttt{wos} --- healthy, and it carried the sessions] The field-tagged
+  \texttt{TS=(\ldots)} topic syntax was the only reliable discovery route for
+  counter-evidence in all three sessions.
+\item[\texttt{ieee} --- healthy] One transient HTTP~502.
+\item[\texttt{scopus} --- healthy but useless here] Every query in the EQ
+  session returned recency-ranked, off-topic records (2026 nursing, finance
+  and materials papers); all were discarded.
+\end{description}
+
+\paragraph{A method limitation, stated plainly.}
+Natural-language counter-queries did not work on these providers.  In the
+code session, \qy{cyclomatic complexity critique validity} returned zero
+hits and \qy{maintainability index criticism limitations} returned only
+off-topic records (soil erosion, the Barthel Index, positive psychology),
+while the field-tagged Web~of~Science queries that followed surfaced the
+whole critical literature.  Anyone reproducing this work should phrase
+counter-searches as \texttt{TS=(\ldots)} and should not read a
+natural-language \enquote{nothing found} as a negative result.  Two of the
+largest databases were silently absent from the sessions, so a
+\enquote{not found} recorded here is weak evidence; every load-bearing item
+was therefore additionally retrieved by DOI through Crossref or OpenAlex.
+
+\section{Complements outside \texttt{scholar}}
+\label{app:protocol:complements}
+
+The protocol allows any discovery route provided the route is recorded.
+The complements below are every non-\texttt{scholar} tool invocation that
+contributed to the bibliography, grouped by session; each gives the tool,
+the verbatim query or URL, and the outcome.  All are dated 2026-08-31.
+
+\subsection{Session \texttt{learnlog-metrics-eq}}
+
+\begin{description}
+\item[WebSearch] Fifteen queries, verbatim:
+  \begin{itemize}
+  \item \qy{Jadud "Methods and tools for exploring novice compilation
+    behaviour" ICER 2006 error quotient} --- located the author-hosted
+    thesis; retained.
+  \item \qy{Watson Li Godwin "Predicting performance in an introductory
+    programming course\ldots" Watwin ICALT 2013} --- retained.
+  \item \qy{Becker "A new metric to quantify repeated compiler errors
+    for novice programmers" ITiCSE 2016 repeated error density} ---
+    surfaced the RPTEL review and ProgSnap2Analysis; retained.
+  \item \qy{Carter Hundhausen Adesope "normalized programming state
+    model" ICER 2015} --- retained.
+  \item \qy{Watson "Watwin" algorithm score "time penalty" quartile
+    compilation pairs BlueFix thesis pdf} --- located the Durham e-thesis;
+    retained.
+  \item \qy{Petersen Spacco Vihavainen "An exploration of error quotient
+    in multiple contexts" Koli Calling 2015 pdf} --- no open copy.
+  \item \qy{Ihantola "Educational data mining and learning analytics in
+    programming\ldots" ITiCSE-WGR 2015 DOI} --- retained.
+  \item \qy{Jadud Dorn "Aggregate compilation behavior: findings and
+    implications from 27,698 users" ICER 2015 DOI} --- retained; also
+    surfaced the DELFI Python paper.
+  \item \qy{Becker RED "repeated error density" formula "Rn" novice
+    compiler errors pdf brettbecker} --- no open copy.
+  \item \qy{"normalized programming state model" NPSM states
+    "syntactically" "semantically" correct incorrect programming states
+    seconds} --- retained, for the state descriptions.
+  \item \qy{Karvelas Dillane Becker "Compile Much" UKICER 2020 novice
+    compilation error quotient pdf ucd repository} --- abstract only.
+  \item \qy{Karvelas Li Becker "compilation mechanisms" SIGCSE 2020
+    "error quotient" automatic manual compilation results} --- abstract
+    only.
+  \item \qy{Petersen Spacco Vihavainen error quotient multiple contexts
+    findings "free parameters" conclusion EQ did not predict} --- retained;
+    led to Ahadi et al.\ 2018.
+  \item \qy{"error quotient" penalty "13" "3" normalize 16 Petersen 2015
+    many small assignments adapted penalties} --- \textbf{empty}; the
+    targeted search for the penalty values found nothing.
+  \item \qy{Spacco "error quotient" Koli 2015 Petersen Vihavainen author
+    copy pdf knox.edu OR cs.helsinki.fi OR utoronto} --- reached Petersen's
+    publications page; no PDF.
+  \end{itemize}
+\item[alphaXiv] \texttt{discover\_papers} with keywords \qy{["error
+  quotient", "Jadud", "compilation behaviour", "novice programmers",
+  "Watwin", "repeated error density", "Python"]} and the question
+  \qy{"Error Quotient penalty parameters for novice programming, and
+  adaptations of EQ to Python or many-small-assignment contexts"} --- did
+  not hold Petersen et al.\ 2015 (not an arXiv paper); surfaced PyMETA,
+  retained only as a pointer.  Then \texttt{get\_paper\_content} on
+  \url{https://arxiv.org/abs/2606.30610} --- retained.
+\item[WebFetch] \url{https://jadud.com/dl/pdf/jadud-dissertation.pdf};
+  \url{https://etheses.durham.ac.uk/11141/};
+  \url{https://d-nb.info/1212501446/34};
+  \url{https://arxiv.org/pdf/2404.05988};
+  \url{https://dl.gi.de/handle/20.500.12116/44524};
+  \url{https://kth.diva-portal.org/} record \texttt{diva2:1877365};
+  \url{https://utmandrew.bitbucket.io/pubs.html};
+  \url{https://onlinelibrary.wiley.com/doi/full/10.1002/cae.22640}; and the
+  author-hosted copy of Hundhausen et al.\ 2017 --- all retained.
+\item[REST retrieval] Each of these takes the item's DOI as its last path
+  element: \nolinkurl{api.crossref.org/works/} for 27 DOIs;
+  \nolinkurl{api.openalex.org/works/doi:} for 7;
+  \nolinkurl{api.datacite.org/dois/10.18420/delfi2024_40};
+  \nolinkurl{api.unpaywall.org/v2/} for 5;
+  and \nolinkurl{api.semanticscholar.org/graph/v1/paper/DOI:} ---
+  retained; this is where most abstract-level verification came from once
+  \texttt{s2} and \texttt{openalex} were unavailable inside the session.
+\item[GitHub raw] The ProgSnap2Analysis reference implementations
+  \texttt{eq.py}, \texttt{red.py} and \texttt{watwin.py} --- retained; they
+  are the only source for several penalty values, and their own comments
+  document which parts are guesses.
+\item[Local first-party sources] The user's own manuscript sources
+  \nolinkurl{edit-run-error-repeat/conference_101719.tex} and
+  \texttt{base.bib} --- retained; the two-parameter EQ penalties are
+  verified verbatim there and nowhere else.
+\item[Failed tool invocations] \qy{scholar enrich learnlog-metrics-eq}
+  timed out at 300\,s and was abandoned; \qy{scholar pdf quote} on the
+  ACM PDF of Karvelas et al.\ 2020 returned HTTP~403 with no passages.
+\end{description}
+
+\subsection{Session \texttt{learnlog-metrics-time}}
+
+\begin{description}
+\item[WebSearch] Twelve queries, verbatim:
+  \begin{itemize}
+  \item \qy{Leinonen Castro Hellas "time-on-task" metrics predicting
+    performance programming SIGCSE} --- retained; corrected a venue error
+    (ICER 2017, not ICER 2021).
+  \item \qy{Kovanovi\'c "Penetrating the black box of time-on-task
+    estimation" LAK 2015} --- retained; led to the Edinburgh open-access
+    PDF.
+  \item \qy{Leinonen Hellas "comparison of time metrics in programming"
+    ICER 2021} --- retained; surfaced the EDM 2021 paper.
+  \item \qy{Hart Warren Edwards "Accurate Estimation of Time-on-Task
+    While Programming" pdf digitalcommons} --- retained; surfaced the PLOS
+    ONE 2025 follow-up.
+  \item \qy{ProgSnap2 specification SessionID "Session" event definition
+    documentation} --- \textbf{distrusted}: it asserted the 20-minute rule
+    with no primary source.
+  \item \qy{progsnap2 specification pdf "SessionID" column optional
+    "Session.Start"} --- distrusted, same reason.
+  \item \qy{"ProgSnap2" "SessionID" "20 minute" gap between consecutive
+    events session} --- distrusted, same reason; all three were resolved by
+    reading Price et al.\ directly instead.
+  \item \qy{Edwards Snyder Perez-Quinones "Comparing effective and
+    ineffective behaviors of student programmers" ICER 2009 doi} ---
+    retained; corrected a widely circulated wrong DOI.
+  \item \qy{Petersen Spacco Vihavainen "An Exploration of Error Quotient
+    in Multiple Contexts" pdf session 20 minutes} --- \textbf{dropped}; no
+    full text, so the threshold's origin stays a citation of a citation.
+  \item \qy{Jadud "Methods and tools for exploring novice compilation
+    behaviour" 2006 full text pdf error quotient definition} ---
+    \textbf{dropped}; no full text obtained.
+  \item \qy{Snider B\"alter Bosk "Edit, Run, Error, Repeat"
+    time-on-task error quotient Koli Calling 2023 abstract} ---
+    \textbf{dropped}; no abstract retrievable from any provider.
+  \item \qy{"Comparison of Time Metrics in Programming" Leinonen
+    Lepp\"anen Ihantola Hellas pdf helda} --- retained; located the
+    author's PDF.
+  \end{itemize}
+\item[WebFetch, metadata] Again by DOI:
+  \nolinkurl{api.crossref.org/works/} for seventeen DOIs;
+  \nolinkurl{api.openalex.org/works/doi:} for three
+  (verbatim abstracts);
+  \nolinkurl{api.semanticscholar.org/graph/v1/paper/DOI:} for four
+  (two abstracts obtained, two unavailable).
+\item[WebFetch, full text]
+  \url{https://pure.ed.ac.uk/ws/files/19361040/lak15pen.pdf} (10 pp.\ read);
+  \url{https://juholeinonen.com/assets/pdf/leinonen2022time.pdf} (4 pp.);
+  \url{https://juholeinonen.com/assets/pdf/leinonen2017comparison.pdf}
+  (4 pp.);
+  \url{https://educationaldatamining.org/EDM2021/virtual/static/pdf/EDM21_paper_176.pdf}
+  (4 pp.);
+  \url{https://ayaankazerouni.org/papers/2020/iticse20-progsnap2.pdf}
+  (7 pp.); \url{https://digitalcommons.usu.edu/computer_science_stures/24}
+  (abstract);
+  \url{https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0330758}
+  (open-access article page) --- all retained.
+\item[WebFetch, dropped] \url{https://github.com/CSSPLICE/progsnap2} --- the
+  repository README does not define \texttt{SessionID}.
+\item[Direct API query]
+  \nolinkurl{dblp.org/search/publ/api?q=Fine-Grained+Versus+%
+  Coarse-Grained}\ldots{} --- retained; it confirmed that \emph{no}
+  page numbers exist for the EDM 2021 paper, so none were invented.
+\end{description}
+
+\subsection{Session \texttt{learnlog-metrics-code}}
+
+\begin{description}
+\item[Crossref API] \nolinkurl{api.crossref.org/works/} for
+  \nolinkurl{10.1109/TSE.1976.233837} (McCabe), \nolinkurl{10.1109/2.303623}
+  (Coleman et al.), \nolinkurl{10.1049/sej.1988.0003} (Shepperd),
+  \nolinkurl{10.1145/3059009.3059061} (Keuning et al.\ 2017),
+  \nolinkurl{10.1109/ICSM.1992.242525} (Oman \& Hagemeister),
+  \nolinkurl{10.1145/3231711} (Keuning et al.\ 2018),
+  \nolinkurl{10.1002/smr.1760} (Landman et al., volume, issue and pages
+  verified) and
+  \nolinkurl{10.1109/TSE.1983.236460} (metadata only; content unverified);
+  plus the title query
+  \nolinkurl{works?query.bibliographic=Designing+a+rubric+}\allowbreak%
+  \nolinkurl{for+feedback+on+code+}\allowbreak%
+  \nolinkurl{quality+in+programming+courses}, which retained Stegeman et al.\
+  2016 and surfaced Bobadilla et al.\ 2024.
+\item[OpenAlex API] \texttt{works/doi:} for
+  \nolinkurl{10.1145/3639474.3640051}, \nolinkurl{10.1145/3545945.3569829},
+  \nolinkurl{10.1002/smr.1760}, \nolinkurl{10.1109/SDS59856.2023.10329116},
+  \nolinkurl{10.1109/TSE.1983.236460},
+  \nolinkurl{10.1109/FIE63693.2025.11328661},
+  \nolinkurl{10.1145/3287324.3287503} and
+  \nolinkurl{10.1145/2960310.2960325} ---
+  abstracts retained; the last reported \qy{oa\_status: closed} and was
+  therefore dropped as content-unverifiable.
+\item[Unpaywall] \nolinkurl{api.unpaywall.org/v2/10.1145/3639474.3640051} ---
+  only an ACM link (403) and a repository landing page; full text
+  unobtainable.
+\item[WebSearch] \qy{van den Aker Rahimi "Design principles for
+  generating and presenting automated formative feedback on code quality
+  using software metrics" pdf repository} --- retained, via the Open
+  Universiteit research portal.  \qy{Shen Conte Dunsmore "Software
+  Science Revisited" 1983 Purdue technical report pdf "software science"}
+  --- located Purdue e-Pubs TR~81-376, which returns HTTP~403 to every
+  fetch; content dropped.  \qy{Aivaloglou Hermans "How Kids Code and How
+  We Know" Scratch cyclomatic complexity 78\% scripts pdf} --- no
+  open-access primary; the figure is cited as reported by Keuning et al.
+  \qy{SEI maintainability index formula "2.46" OR "2.4" perCM 171 - 5.2
+  ln aveV Software Engineering Institute} --- superseded by reading Coleman
+  et al.\ directly.  \qy{radon 6.0.1 Python 3.13 compatibility issue
+  mando} --- background only.
+\item[WebFetch] \url{https://research.ou.nl/en/publications/design-principles-for-generating-and-presenting-automated-formati}
+  (verbatim abstract, retained);
+  \url{https://learn.microsoft.com/en-us/visualstudio/code-quality/code-metrics-maintainability-index-range-and-meaning}
+  (the Visual Studio variant of the maintainability index and its
+  thresholds, retained);
+  \url{https://openlibrary.org/search.json?q=Elements+of+Software+Science+Halstead}
+  (publisher and ISBN for Halstead's monograph, retained);
+  \url{http://www.ecs.csun.edu/~rlingard/comp589/ColemanPaper.pdf}
+  (\textbf{full text read}, p.~46);
+  \url{https://radon.readthedocs.io/en/latest/intro.html} and the PyPI JSON
+  for \texttt{radon} and \texttt{mando} (tooling facts).
+\item[WebSearch then \texttt{curl}]
+  \url{http://www.literateprogramming.com/mccabe.pdf} ---
+  \textbf{McCabe 1976 full text obtained and read} (13 pp.).  This is the
+  source of the counting rule in \cref{app:claim:cc-definition}.
+\item[GitHub raw and API] \texttt{rubik/radon@master}:
+  \texttt{radon/visitors.py}, \texttt{radon/metrics.py},
+  \texttt{radon/raw.py}, \texttt{radon/complexity.py},
+  \texttt{docs/intro.rst}, \texttt{CHANGELOG}, \texttt{setup.py}; and
+  \texttt{rubik/mando@v0.7.1/mando/core.py} --- read as the source of truth
+  for what the tool actually counts, in preference to its documentation.
+  \nolinkurl{api.github.com/repos/rubik/radon/commits} gave the last commit
+  date.
+\end{description}
+
+\section{Sources dropped as content-unverified}
+\label{app:protocol:dropped}
+
+The following works exist and are bibliographically verified, but their
+content could not be read.  None of them backs a claim in this appendix
+beyond what is stated here; where one appears in
+\nolinkurl{doc/bibliography.bib}, its provenance block says exactly which
+strength it is cited at.
+
+\begin{description}
+\item[Petersen, Spacco \& Vihavainen 2015] The Koli Calling paper
+  \autocite{petersen2015exploration}: full text unobtainable, ACM~403 to
+  every route including the free-access \nolinkurl{?cid=} URL from the
+  author's own publications page, Unpaywall
+  reports it is not open access, four guessed author-copy URLs returned 404
+  or 403, and alphaXiv does not hold it.  Only the publisher-supplied
+  abstract was verified.  Consequently the \(13/3/{\div}16\) penalty
+  attribution in \cref{app:claim:eq-parameters} is \emph{not} verified at
+  source, and neither is the 20-minute value in
+  \cref{app:claim:idle-threshold}.
+\item[Watson, Li \& Godwin 2013] The ICALT paper
+  \autocite{watson2013predicting}: full text 403 from every route.  The
+  Watwin penalty values are therefore reimplementation-derived, not
+  paper-verified.  Watwin is out of scope for the implementation for exactly
+  this reason.
+\item[Becker 2016] The ITiCSE paper \autocite{becker2016new}: ACM~403, and
+  the green open-access copy at the issuing university returned HTTP~405.
+  The RED
+  formula is \emph{triangulated} across three independent sources rather
+  than read in the original (\cref{app:claim:red-formula}).
+\item[\enquote{Watwin Revisited}] Listed in Watson's thesis under work
+  \textcquote{watson2015thesis}{in preparation for submission, or currently
+  under review}.  No published version exists in
+  Crossref.  It is not cited anywhere.
+\item[Aivaloglou \& Hermans 2016] Closed access with no open copy anywhere
+  (OpenAlex \qy{oa\_status: "closed"}).  The finding that most Scratch
+  scripts have cyclomatic complexity one is therefore attributed as
+  \emph{reported by} Keuning et al.\ \autocite{Keuning2017}, in whose full
+  text the sentence appears verbatim.
+\item[Shen, Conte \& Dunsmore 1983] The published abstract is 80 words and
+  stops before any critical content; IEEE and the Purdue technical-report
+  version both return HTTP~403.  It is not used to back any critique of
+  Halstead's measures, only the attribution of software science to
+  Halstead's monograph \autocite{Halstead1977}.
+\item[Snider, B\"alter \& Bosk 2023] The Koli Calling paper
+  \autocite{snider2023edit}: its own full text was not obtained (ACM~403;
+  the institutional repository record carries no abstract).  Nothing is
+  attributed to its
+  findings; the two-parameter EQ penalties come from the first-party
+  manuscript source instead.
+\item[Brocker \& Schroeder 2024] The DELFI paper
+  \autocite{brocker2024correlation}: existence, authorship and metric
+  coverage verified through DataCite and the publisher's landing page; the
+  full text was not obtained, so their
+  operational split between syntax and runtime errors is unverified.
+\item[Abstract- or metadata-strength only] Jadud 2006; Ihantola et al.\
+  2015; Carter et al.\ 2015; Tabanao et al.\ 2011; Ahadi et al.\ 2018; the
+  three Karvelas papers of 2020 and 2022; Kohn 2019; Smith \& Rixner 2019;
+  McCall \& K\"olling 2019; Morrison et al.\ 2023; Stegeman et al.\ 2016;
+  van den Aker \& Rahimi 2024; Prajapati \& Acu\~na 2025; Jay et al.\ 2009;
+  Sj\o berg et al.\ 2012; and Oman \& Hagemeister 1992.  Each is cited in
+  the chapter that uses it and carries a provenance block in the
+  bibliography saying what was and was not read; they are listed together
+  here, without citations, because a wall of sixteen references would say
+  less than the one fact they share.  No claim in this appendix exceeds
+  abstract or metadata strength for any of them.
+\item[PyMETA] An unrefereed arXiv preprint \autocite{li2026pymeta} from a
+  commercial author group.  Cited only as evidence that grounding a Python
+  error taxonomy in the official exception hierarchy is an approach in use.
+\item[Not re-found under a recorded query] Edwards, Kandru \& Rajagopal
+  2017 and Birillo et al.\ 2022 (Hyperstyle) were verified in an earlier,
+  pre-protocol pass but did not resurface under any session query, so they
+  carry no provenance block and are not cited.
+\item[Discarded wholesale] Every \texttt{scopus} result in the EQ session
+  (recency-ranked, off-topic).  The \qy{scholar enrich} run on that
+  session timed out at 300\,s and was abandoned.
+\end{description}
+
+\section{Corrections carried into the bibliography}
+\label{app:protocol:corrections}
+
+Verification turned up seven errors in circulating metadata and in the
+secondary literature.  They are fixed in \nolinkurl{doc/bibliography.bib} and
+recorded here so the fixes are not silently undone.
+
+\begin{enumerate}
+\item \enquote{Comparison of Time Metrics in Programming}
+  \autocite{leinonen2017comparison} is ICER 2017, not ICER 2021.
+\item The DOI \nolinkurl{10.1145/1584322.1584331}, widely circulated for
+  Edwards et al.\ 2009, is wrong: it resolves to a different paper in the
+  same proceedings.  The correct DOI is \nolinkurl{10.1145/1584322.1584325}
+  \autocite{edwards2009comparing}.
+\item Leinonen et al.\ 2022 \autocite{leinonen2022timeontask} has an
+  \emph{ACM Inroads} reprint at \nolinkurl{10.1145/3534564}; the SIGCSE
+  original is cited.
+\item Kovanovi\'c et al.\ 2015 \autocite{kovanovic2015penetrating} is
+  pp.~184--193; some secondary sources give pp.~64--68.
+\item The EDM 2021 paper \autocite{leinonen2021finegrained} has neither a
+  DOI nor recorded page numbers, confirmed against dblp; none were invented.
+\item Landman et al.\ \autocite{Landman2016} appeared online first on
+  2015-12-09 and in issue 28(7) in July 2016; it is cited as 2016, which is
+  why OpenAlex's 2015 disagrees.  Crossref stores no issued year at all for
+  Oman \& Hagemeister \autocite{OmanHagemeister1992}; the year 1992 comes
+  from the proceedings title and the IEEE record.
+\item Jadud's scoring figure is a four-term cascade, not the three-term
+  decision tree that the secondary literature reproduces
+  (\cref{app:claim:eq-parameters}); and the open-access review's sentence
+  \enquote{A program is semantically correct if it produces a runtime
+  exception} is an inverted typo that contradicts its own state table, so it
+  was not relied on.
+\end{enumerate}
+
+\chapter{The 20-minute idle threshold}
+\label{app:claim:idle-threshold}
+
+\paragraph{Question.}
+\qy{learnlog metrics} cuts a run history into sessions wherever the gap
+between one run finishing and the next starting reaches a threshold, and it
+defaults that threshold to 20 minutes.  Is 20 minutes the established
+convention for \emph{coarse} programming events, and does it originate with
+Petersen, Spacco and Vihavainen?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-time}, 2026-08-31, providers \texttt{dblp},
+\texttt{wos}, \texttt{ieee}, \texttt{openalex}, \texttt{scopus}.  Support
+queries: \qy{time-on-task estimation from programming process data};
+\qy{session segmentation inactivity threshold student log data};
+\qy{session inactivity threshold}; \qy{time-on-task programming}.
+Counter-queries: \qy{session timeout threshold arbitrary sensitivity};
+\qy{time-on-task estimation validity limitations}.  Three WebSearch
+queries about the ProgSnap2 specification asserted the rule without a
+primary source and were distrusted; the question was settled instead by
+reading the format paper's own full text at
+\url{https://ayaankazerouni.org/papers/2020/iticse20-progsnap2.pdf}.
+
+\paragraph{Results.}
+The claim is \emph{supported} by one primary source, read in full.  Price et
+al.\ state the convention and apply it:
+\blockcquote[sec.~3.3.1]{price2020progsnap2}{ProgSnap2 allows a dataset to
+provide a SessionID column, and we used this value when it was present.
+Otherwise, we defined a session as a series of events with no more than a 20
+minute gap between any two consecutive events, as in [23].}
+The same reading \emph{qualifies} the claim in a way the secondary sources
+did not: \texttt{SessionID} is an \emph{optional} column of the format, so
+the 20 minutes is an analysis convention, not part of ProgSnap2.
+
+Nothing \emph{refutes} the convention.  What the counter-searches produced
+instead is a family of competing thresholds at other event granularities:
+five minutes for keystrokes \autocite{hart2023accurate}, about ten minutes
+for keystrokes \autocite{leinonen2021finegrained,leinonen2022timeontask},
+three minutes for edit events \autocite{leinonen2017comparison}, sixty
+minutes for \enquote{work sessions}, and ten to sixty minutes across
+web-usage-mining practice \autocite{kovanovic2015penetrating}.  The
+threshold scales with event sparsity, which is precisely why a value must
+not be transplanted between granularities.
+
+The \emph{attribution} half of the question is weaker.  Reference~[23] in
+the passage above is Petersen et al.\ \autocite{petersen2015exploration},
+but that paper's full text could not be obtained
+(\cref{app:protocol:dropped}), so the origin is verified only as a citation
+of a citation.
+
+\paragraph{Conclusion.}
+Yes on the convention, with a caveat on the attribution.  Twenty minutes is
+the documented convention for coarse programming events --- the granularity
+of a program run --- and it is the only such convention the searches found;
+learnlog therefore adopts it as the default.  But it is an analysis
+convention rather than a specification, it is granularity-specific, and the
+attribution to Petersen et al.\ is the format paper's, not one this work
+independently checked.  The documentation says \enquote{following Price et
+al., who follow Petersen et al.} and never attributes the number to Petersen
+directly.  Because the choice of estimation strategy demonstrably moves
+results \autocite{kovanovic2015penetrating}, the threshold is exposed as an
+option and printed in every report.
+
+\chapter{Coarse time-on-task and achievement}
+\label{app:claim:time-not-predictive}
+
+\paragraph{Question.}
+Does coarse, log-derived time-on-task predict student achievement?  If it
+does not, what should a period summary headline instead?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-time}, 2026-08-31, same five providers.
+Support queries: \qy{time-on-task programming}; \qy{novice
+programmer effort metrics compilation events code churn}.  Counter-queries:
+\qy{time on task does not predict performance} (the single largest
+contributor to the session, adding 2\,770 records); \qy{time-on-task
+estimation validity limitations}.  Rather than screening the whole session,
+two targeted screens were run over its stored decisions: a known-item
+presence check, which confirmed that the topic-driven queries had genuinely
+surfaced twelve of fifteen target works (the other three were retrieved by
+DOI), and a counter-evidence screen filtering titles on time-related terms
+conjoined with accuracy- and validity-related terms.  Three hits; two
+verified and retained.
+
+\paragraph{Results.}
+Three independent studies \emph{support} the negative claim.  Leinonen et
+al.\ measured both granularities on one cohort, so the comparison is not
+confounded by dataset:
+\blockcquote[sec.~4.1]{leinonen2022timeontask}{the coarse-grained
+time-on-task does not statistically significantly correlate with the weekly
+exercise points (p = 0.39), while the correlation between the fine-grained
+time-on-task and weekly exercise points is statistically significant (p =
+1.6e-25) albeit weak (r = 0.35).}
+Edwards et al.\ reach the same place from a within-subjects design over
+89\,879 submissions by 1\,101 students, which controls for student ability:
+\blockcquote{edwards2009comparing}{When students received A/B scores, they
+started earlier and finished earlier than when the same students received
+C/D/F scores. They also wrote slightly more program code. They did not
+appear to spend any more time on their work, however.}
+An earlier study in the same line found total time uncorrelated with exam
+scores while active time correlated weakly, and gave the positive half of
+the answer --- what \emph{does} track effort:
+\textcquote[sec.~4.1]{leinonen2017comparison}{active time correlates with
+total count of source code events (r = .79), edit event count (r = .72), run
+event count (r = .53) and focus change event count (r = .54)}, concluding
+that \textcquote[sec.~2]{leinonen2017comparison}{the amount of changes to the
+source code is a good metric for time}.
+
+Two sources \emph{qualify} the claim further rather than refuting it.
+Krieter validated log-derived time against parallel screen recordings ---
+the only external ground truth found --- and reports that
+\textcquote{krieter2022areyoustillthere}{common online time estimation
+strategies do not represent the online time for our students accurately}.
+Hart et al.\ find that
+\textcquote{hart2025multiday}{self-report and objective measures provide
+information on distinct, different aspects} of time-on-task, which supports
+showing a log-derived number \emph{alongside}, not instead of, what a
+student believes they spent.
+
+The nearest thing to a \emph{refutation} is Hilliger et al., where
+surfacing time-on-task did change behaviour \autocite{hilliger2021evaluating};
+but its audience was teachers and its data was student self-report, so it
+does not touch a claim scoped to student-facing, log-derived displays.  It
+is retained as the honest positive counterweight.
+
+\paragraph{Conclusion.}
+No --- coarse time-on-task is not an achievement predictor, and two
+independent designs agree.  So the period report headlines counts and
+timing: active days, when the work started and how it was spread, runs,
+sessions, failed runs, lines changed, and only then time.  Two caveats.
+First, Leinonen et al.'s \enquote{coarse-grained} is a keystroke-derived
+span from first keystroke to first submission, whereas learnlog's number is
+run-to-run active time with idle gaps excluded; the transfer is by analogy
+about \emph{granularity}, not an identity of measures.  Second, Krieter's
+result is a standing qualification on every number the command prints, which
+is why the label is \enquote{active time (run-to-run)} rather than
+\enquote{time spent}.
+
+\chapter{The two-parameter Error Quotient}
+\label{app:claim:eq-parameters}
+
+\paragraph{Question.}
+learnlog scores an EQ pair by adding 13 when both runs end in an error and 3
+more when the error type repeats, then dividing by 16.  Is this
+parameterisation attested, and does it come, as the user's own prior work
+states, from Petersen, Spacco and Vihavainen?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-eq}, 2026-08-31.  Discovery queries:
+\qy{error quotient} on \texttt{dblp}; \qy{error quotient novice
+compilation behaviour} on \texttt{dblp}, \texttt{wos}, \texttt{ieee} and
+\texttt{openalex}.  Counter-query: \qy{TS=("error quotient" AND
+(limitation OR criticism OR replication OR context))} on \texttt{wos}.  The
+targeted search for the numbers themselves,
+\qy{"error quotient" penalty "13" "3" normalize 16 Petersen 2015 many
+small assignments adapted penalties}, returned \emph{nothing}.  Five further
+attempts to reach the Petersen et al.\ full text all failed
+(\cref{app:protocol:dropped}).  Jadud's original scoring figure was read by
+rendering it to an image at 140\,dpi, because text extraction scrambles the
+flowchart.
+
+\paragraph{Results.}
+The parameterisation is \emph{verified verbatim}, but in the user's own
+first-party manuscript source rather than in a retrieved publication.  It
+reads: \enquote{In this work we use the two parameter EQ model, with a
+difference error penalty of 13 and a same error penalty of 3 as suggested in
+previous research}, citing Petersen et al.  The bibliographic record of the
+companion Koli Calling paper \autocite{snider2023edit} was verified through
+Crossref and the institutional repository, but its own full text was not
+obtained, so nothing is attributed to its findings.
+
+The attribution is only \emph{partially} corroborated.  Petersen et al.'s
+publisher-supplied abstract confirms the paper is the right kind of source
+--- it reports \textcquote{petersen2015exploration}{an exploration of the EQ
+parameters to determine the EQ algorithm's sensitivity to its context}
+across courses taught in C, Java and Python --- but the specific values
+13, 3 and 16 could not be checked against it.
+
+Nothing \emph{refutes} the parameterisation, but the search established
+something the implementation must not hide: at least four distinct EQ
+parameterisations are in circulation.  Jadud's original adds 2 when both
+events end in an error, 3 more for the same error type, 3 more for the same
+error line and 1 more for the same edit location, and divides by 9
+\autocite{jadud2005thesis}; his tuned appendix uses different constants
+again; the ProgSnap2Analysis reference implementation uses 8 and 3 over 11
+\autocite{price2020progsnap2}; and the two-parameter set uses 13 and 3 over
+16.  A bare \enquote{EQ} number is therefore not comparable across tools,
+which is why the report prints which variant produced it.
+
+One correction to the secondary literature belongs here.  Jadud's figure is
+a fall-through cascade with \emph{four} additive terms summing to a maximum
+of 9, which is what makes his documented divisor of 9 correct; the widely
+reproduced three-term version leaves the maximum at 8 with an unexplained
+divisor.  The figure's caption mentions a maximum of 8 because it describes
+a worked example whose pair happened not to share an edit location.
+
+\paragraph{Conclusion.}
+The parameterisation is real and verified; its attribution is not.  learnlog
+therefore documents 13, 3 and 16 as named constants belonging to the
+project's own prior work \autocite{snider2023edit}, describes them as
+\enquote{following Petersen et al.}\ in the words of that work rather than
+as a checked fact, and implements Jadud's original four-term scoring
+\autocite{jadud2005thesis} as a documented alternative.  Obtaining the
+Petersen et al.\ full text remains an open item; until then the attribution
+in the prose is the manuscript's, not this project's.
+
+\chapter{Syntax and runtime errors as separate series}
+\label{app:claim:two-error-series}
+
+\paragraph{Question.}
+The Error Quotient was defined on compiler errors.  A Python run produces
+both syntax errors and uncaught runtime exceptions.  Should these be scored
+as one series or two?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-eq}, 2026-08-31.  Support query:
+\qy{repeated error density compiler errors} on \texttt{dblp},
+\texttt{wos}, \texttt{ieee} and \texttt{openalex}, which surfaced the
+comparison study.  Counter-query: \qy{TS=(("syntactic" AND "semantic")
+AND "programming behavior" AND predict*)} on \texttt{wos} ---
+\textbf{empty}.  The comparison study's open preprint was read in full at
+\url{https://arxiv.org/pdf/2404.05988}.
+
+\paragraph{Results.}
+One study \emph{supports} the split directly, and it did the same extension
+this project needs:
+\textcquote[sec.~3.4.2]{svabensky2024comparison}{Although EQ was originally
+defined only for compiler errors, we extended this approach to also process
+runtime errors to obtain a comparison to values for compiler errors}.  Its
+result is the reason to keep the two series apart rather than merge them:
+\blockcquote{svabensky2024comparison}{Compiler errors were significant
+predictors of exam 1 grades but not exam 2 grades; only runtime errors
+significantly predicted exam 2 grades. The findings indicate that leveraging
+Error Quotient with multiple error types (compiler and runtime) may be a
+better measure of students' introductory programming abilities, though still
+not explaining most of the observed variability.}
+The two error classes carry signal at different stages of a course;
+collapsing them would discard that.
+
+A structural argument \emph{corroborates} it from a different direction: the
+Normalized Programming State Model's second axis is defined on exactly this
+distinction, the presence or absence of a runtime exception in the last
+execution attempt \autocite{carter2015npsm}.
+
+Nothing \emph{refutes} the split; the dedicated counter-query was empty, and
+that emptiness is recorded rather than read as endorsement.  Two
+qualifications stand.  The supporting study is Java, on 280 students and
+51\,095 snapshots, and its explanatory power is modest: EQ reached
+\(R^2\) between 0.18 and 0.26, and homework grades outperformed all three
+error measures it compared.  The one published precedent that computes these
+metrics on Python data \autocite{brocker2024correlation} could not be read,
+so its own syntax-versus-runtime split is unverified.
+
+\paragraph{Conclusion.}
+Two series, computed in parallel.  The evidence for the split is a single
+direct study plus a structural argument, which is enough to prefer two
+series over one but not enough to call it settled.  No published work argues
+for restricting a Python EQ to \texttt{SyntaxError} alone, so learnlog's
+choice of which exceptions count is stated in the documentation as a
+documented assumption rather than as an inherited convention.
+
+\chapter{What the Error Quotient is not}
+\label{app:claim:eq-not-at-risk}
+
+\paragraph{Question.}
+Two claims frame how the output is presented.  Do these error metrics
+identify at-risk students?  And do their values transfer between programming
+environments, so that a student's number can be read against published
+cohort figures?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-eq}, 2026-08-31.  This claim is where the
+counter-searching was concentrated: \qy{TS=("error quotient" AND
+(limitation OR criticism OR replication OR context))},
+\qy{TS=("compilation behaviour" OR "compilation behavior") AND
+TS=(novice)} and \qy{TS=("compilation mechanism" AND novice)} on
+\texttt{wos}; \qy{error quotient context dependent limitations},
+\qy{compilation error metric criticism novice programmers} and
+\qy{novice programming process metrics limitations} on
+\texttt{wos}, \texttt{ieee}, \texttt{dblp}, \texttt{openalex} and
+\texttt{scopus}.  A separate WebSearch strand looked for any system that
+shows such a metric to learners.
+
+\paragraph{Results.}
+On prediction, the strongest evidence comes from inside the same research
+lineage, so it cannot be dismissed as an outsider critique.  Tabanao,
+Rodrigo and Jadud built regression models from compilation behaviour and
+report that \textcquote{tabanao2011predicting}{the models derived could not
+accurately predict the at-risk students}.  Ahadi, Lister and Mathieson state
+the general caveat: \textcquote{ahadi2018syntax}{these metrics tend to be
+context dependent and contain free parameters}.  The comparison study caps
+EQ's explanatory power well below the level a detector would need
+\autocite{svabensky2024comparison}.
+
+On transfer, a controlled comparison settles it.  Karvelas, Li and Becker
+held population and language fixed and varied only the environment's
+compilation mechanism, finding that
+\textcquote{karvelas2020effects}{the programming experience and behavior of
+these users can be substantially affected} by that change; the follow-up
+adds that \textcquote{karvelas2022sympathy}{compilation activity differs for
+each version and that students reach successful compilations faster} in the
+newer environment, with a third paper corroborating from a different venue
+\autocite{karvelas2020compilemuch}.  A learnlog run is an explicitly
+triggered event, structurally closer to click-to-compile than to background
+compilation, which supports treating a run as the compile analogue --- and
+by the same result forbids comparing learnlog's EQ values with published
+figures from a different environment.
+
+The \emph{qualifying} side is real and is not suppressed.  These metrics do
+carry signal: a critical review records that Jadud's work
+\textcquote[p.~11:4]{hundhausen2017ide}{led to one of the first predictive
+models of novice programming performance}.  The same review's proposal of a
+\enquote{continuously-updated visual analytics dashboard} is its own
+research agenda, not a reviewed system.  The counter-search for learner-facing
+systems that show such a metric to students came back \textbf{empty}: the
+closest published dashboard turns out to be a tool
+\textcquote{sanchezsantillan2023dashboard}{used by the lecturer}, and
+a systematic review of learner dashboards in general concludes that
+\textcquote{kaliisa2024dashboards}{there is no evidence to support the
+conclusion that LADs have lived up to the promise of improving academic
+achievement}.
+
+\paragraph{Conclusion.}
+No to both.  The Error Quotient is not an at-risk detector and its values do
+not transfer across environments, so \qy{learnlog metrics} presents a
+descriptive trace of a student's own history against their own earlier
+periods, never a score and never a comparison with a literature baseline.
+Two caveats on the evidence: the Karvelas results are verified at abstract
+strength only, so no claim is made about how much any \emph{particular}
+metric shifts; and the dashboard review is general learning analytics rather
+than computing-specific.  The reflective framing is what survives the
+counter-search, which is also why peer comparison is not offered
+\autocite{jivet2018license}.
+
+\chapter{Repeated Error Density and its missing normaliser}
+\label{app:claim:red-formula}
+
+\paragraph{Question.}
+What exactly is the Repeated Error Density formula, and is there an official
+way to normalise it?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-eq}, 2026-08-31.  Support queries:
+\qy{repeated error density compiler errors} on four providers, and
+\qy{repeated error density} on \texttt{dblp}.  Counter-query:
+\qy{TS=("repeated error density" AND (limitation OR criticism OR
+validation OR normalis*))} on \texttt{wos} --- \textbf{empty}.  The
+cross-metric query \qy{TS=("error quotient" AND ("repeated error
+density" OR RED OR watwin))} on \texttt{wos} supplied the qualifying
+evidence the dedicated query did not.  Becker's full text is unobtainable
+(\cref{app:protocol:dropped}), so the formula was triangulated instead.
+
+\paragraph{Results.}
+Three independent sources \emph{agree exactly} on the formula.  The
+open-access review states it in words:
+\blockcquote{villamor2020review}{This submetric is $r_i^2/\lvert[s_i]\rvert$
+where $\lvert[s_i]\rvert$ is the length of the string $s_i$ containing $r_i$
+repeated errors. This can be expressed completely in terms of $r_i$ as
+$r_i^2/(r_i+1)$, since the length of a string $s_i$ containing $r_i$
+consecutive errors is always equal to $r_i+1$.}
+That is, over the maximal strings of consecutive repeated errors in a
+sequence,
+\[
+  \mathrm{RED} = \sum_{i=1}^{n} \frac{r_i^{2}}{\lvert s_i\rvert}
+               = \sum_{i=1}^{n} \frac{r_i^{2}}{r_i + 1}.
+\]
+The ProgSnap2Analysis reference implementation computes exactly this, and
+the worked values in the comparison study discussed below match.  Becker's
+own abstract supplies the motivation, verified through two providers: RED
+\textcquote{becker2016new}{has advantages over EQ including being less
+context dependent, and being useful for short sessions}.
+
+On normalisation the answer is negative and well attested.  The comparison
+study's summary table gives RED's range as \([0,\infty)\) against EQ's
+\([0,1]\) \autocite{svabensky2024comparison}; and the reference
+implementation says in its own source that there is
+\enquote{no official way to normalize RED}, dividing by the number of
+compiles as its own choice --- a decision of the reimplementation, not of
+the paper.
+
+The counter-evidence \emph{qualifies} RED sharply.  The review's comparison
+table lists it as unbounded, outlier-prone and not yet validated against
+student performance \autocite{villamor2020review}, and the same comparison
+study finds RED predicting course grades \emph{worse} than EQ.
+
+\paragraph{Conclusion.}
+The formula is established --- by triangulation across three sources that
+agree exactly, not by reading the original --- and there is no official
+normaliser.  learnlog therefore reports RED unnormalised and prints the run
+count beside it, so the number can be read at all, and does not present RED
+as an improvement on EQ.  Its reason for being included is narrower and
+better supported: Jadud required at least seven events for a session, and
+RED was designed for short sessions, which is what a single project's run
+history usually offers.
+
+\chapter{Cyclomatic complexity: predicates plus one}
+\label{app:claim:cc-definition}
+
+\paragraph{Question.}
+learnlog counts a function's cyclomatic complexity as decision points plus
+one, adding one per condition in a compound boolean.  Are both rules the
+primary source's own, or are they the measuring tool's convention?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-code}, 2026-08-31.  Support query:
+\qy{cyclomatic complexity measure control flow graph} on \texttt{dblp},
+\texttt{wos}, \texttt{ieee} and \texttt{openalex}.  McCabe's own paper did
+not appear in the ranked hits --- a good illustration of relevance ranking
+burying an older known item --- so it was retrieved by DOI through Crossref
+and its full text obtained from an open copy at
+\url{http://www.literateprogramming.com/mccabe.pdf} and read (13 pp.).
+Counter-query: \qy{TS=("cyclomatic complexity" AND (critique OR
+criticism OR "empirical validation" OR invalid))} on \texttt{wos}.  The
+natural-language form of that counter-query,
+\qy{cyclomatic complexity critique validity}, returned zero hits and is
+recorded as a failed query rather than as a negative result.
+
+\paragraph{Results.}
+Both rules are McCabe's own words.  The measure is defined graph
+theoretically --- \textcquote[p.~308]{McCabe1976}{The cyclomatic number V(G)
+of a graph G with n vertices, e edges, and p connected components is v(G) =
+e - n + p} --- and then reduced to the form an implementation can use:
+\textcquote[p.~315]{McCabe1976}{the cyclomatic complexity of a structured
+program equals the number of predicates plus one}.  The compound-predicate
+rule is stated just as explicitly:
+\blockcquote[p.~315]{McCabe1976}{In practice compound predicates such as IF
+\enquote{c1 AND c2} THEN are treated as contributing two to complexity since
+without the connective AND we would have IF c1 THEN IF c2 THEN which has two
+predicates.}
+
+The counter-search \emph{did not} touch the definition.  It surfaced
+Shepperd's critique \autocite{Shepperd1988} and the empirical re-tests
+\autocite{Landman2016}, all of which dispute the measure's validity as a
+proxy for complexity or maintainability --- the subject of
+\cref{app:claim:cc-sloc} --- while taking the definition as given.
+
+\paragraph{Conclusion.}
+Yes: both counting rules come from the primary source, so the documentation
+cites McCabe and not the measuring tool for them.  The caveat is a boundary,
+not a doubt: what is uncontested is the \emph{definition}.  What the same
+counter-search shows to be contested is what the number means, which the
+next chapter takes up.  learnlog's implementation additionally documents the
+tool-specific increments --- for loop and try clauses, comprehensions and
+match statements --- from the tool's source rather than from its
+documentation, because the two disagree.
+
+\chapter{Is cyclomatic complexity redundant with size?}
+\label{app:claim:cc-sloc}
+
+\paragraph{Question.}
+It is often said that cyclomatic complexity carries no information beyond
+lines of code.  Is that established?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-code}, 2026-08-31.  Both sides came from
+two field-tagged Web~of~Science queries: \qy{TS=("cyclomatic complexity"
+AND "lines of code" AND correlat*)} and \qy{TS=("cyclomatic complexity"
+AND (critique OR criticism OR "empirical validation" OR invalid))}.  This is
+a two-sided question by construction, so the same query was read as both
+support and counter-search, and both positions are cited.
+
+\paragraph{Results.}
+The redundancy position is stated most strongly by Jay et al., whose models
+\textcquote{JayEtAl2009}{successfully predict roughly 90\% of CC's variance
+by LOC alone}, concluding that the measure has \enquote{absolutely no
+explanatory power of its own}.  Read at abstract strength; the venue is a
+weak one, which is a further reason not to rest a claim on it alone.
+
+That position is \emph{contradicted} directly, and at much larger scale, by
+Landman et al., on 17.6 million Java methods and 6.3 million C functions:
+\blockcquote{Landman2016}{Our results show that linear correlation between
+SLOC and CC is only moderate as a result of increasingly high variance. We
+further observe that aggregating CC and SLOC as well as performing a power
+transform improves the correlation. Our conclusion is that the observed
+linear correlation between CC and SLOC of Java methods or C functions is not
+strong enough to conclude that CC is redundant with SLOC. This conclusion
+contradicts earlier claims from literature.}
+The disagreement is not a tie: it turns on \emph{aggregation}.  The
+correlation looks strong when methods are aggregated and weak at the level
+of the individual method --- which is the level at which learnlog reports.
+
+Two further findings \emph{qualify} the measure without settling the
+redundancy question.  Shepperd's theoretical objections stand: he attacks
+\textcquote{Shepperd1988}{the very simplistic approach to decision counting},
+since the ease of comprehending a decision \enquote{is not invariant}, and
+\enquote{the arbitrary impact of modularisation upon total program
+complexity}.  And at novice scale the measure is
+near-degenerate: as reported by Keuning et al., in
+\textcquote[p.~2]{Keuning2017}{78\% of over 4 million scripts the cyclomatic
+complexity is one. Only 4\% of the scripts has a complexity over four.}
+
+\paragraph{Conclusion.}
+No, it is not established --- the redundancy claim is contested, and the
+larger and more recent study contradicts it at exactly the granularity
+learnlog uses.  The documentation therefore states the disagreement rather
+than picking a side, reports complexity \emph{with} source lines and never
+alone, and reports the per-function maximum and the count above one rather
+than a mean.  Caveats: neither study concerns novice code or Python, and the
+78\,\% figure is from Scratch and is cited as reported by Keuning et al.,
+the primary being closed access.  The practical consequence for a beginner's
+project is that complexity will sit at one for weeks; the informative event
+is when it first rises.
+
+\chapter{The maintainability index needs its caveats}
+\label{app:claim:mi-caveats}
+
+\paragraph{Question.}
+Should a maintainability index be reported to a student, and if it is
+reported at all, what must accompany it?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-code}, 2026-08-31.  Support query:
+\qy{maintainability index software metrics} on \texttt{dblp},
+\texttt{wos}, \texttt{ieee} and \texttt{openalex}.  The natural-language
+counter-query \qy{maintainability index criticism limitations} returned
+only off-topic records and is recorded as a failed query; the critical
+literature came from the same support query and from the field-tagged
+complexity queries.  Coleman et al.'s full text was retrieved and page~46
+read directly.
+
+\paragraph{Results.}
+The formula's own authors published the first caveat.  Having given the
+polynomial --- 171 less 5.2 times the natural log of average volume, less
+0.23 times average complexity, less 16.2 times the natural log of average
+lines, plus a comment term --- they write:
+\blockcquote[p.~46]{ColemanEtAl1994}{Preliminary results indicated that this
+model was too sensitive to large numbers of comments. That is, large comment
+blocks, especially in small modules, unduly inflated the resulting
+maintainability indices.}
+Small, heavily commented modules are exactly what a beginner writes.
+
+Heitlager et al.\ attack the constants and the comment term:
+\textcquote{Heitlager2007}{there is no logical argument why the MI formula
+contains the particular constants}, asking why complexity is multiplied by
+0.23, and concluding that
+\textcquote{Heitlager2007}{counting the number of lines of comment, in
+general, has no relation with maintainability whatsoever}.  Sjøberg et al.\
+tested such surrogate measures against \emph{measured} maintenance effort on
+four functionally equivalent systems and found that
+\textcquote{Sjoberg2012}{the metrics were not mutually consistent} and that
+\textcquote{Sjoberg2012}{apart from size, surrogate maintainability measures
+may not reflect future maintenance effort}.  Morrison et al.\ ask the
+question closest to this project's --- the index's accuracy for Python as a
+function of module size \autocite{Morrison2023} --- but the paper is closed
+access, so only the existence of the question is verified, not the direction
+of the effect.
+
+No source \emph{defending} the index against measured effort was found; the
+counter-search for one came back empty.  Its adoption in mainstream
+development tools shows implementation, not validity.  The origin of the
+index \autocite{OmanHagemeister1992} is recorded as an attribution only, its
+content unread.
+
+\paragraph{Conclusion.}
+Report it only with its caveats attached, and never as a headline.  The
+supporting evidence is one-sided and includes the original authors' own
+warning.  The honest scope limit is that none of these studies examined
+novice or tiny programs: the argument that the index is meaningless for a
+fifteen-line script rests on Coleman et al.'s small-module admission, on
+Morrison et al.\ having thought the question worth asking, and on the
+arithmetic of the implementation, which returns a perfect score when
+Halstead volume or source lines are zero --- as they are for a first
+program.  No study of novices was found either way.  The caveat is therefore
+printed in the report header rather than left to the documentation.
+
+\chapter{Linter rule sets for novices}
+\label{app:claim:linter-rules}
+
+\paragraph{Question.}
+Can a general-purpose linter's default rule set be pointed at student code,
+or must the rules be selected?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-code}, 2026-08-31.  Support queries:
+\qy{code quality student programs} on \texttt{dblp}, \texttt{wos},
+\texttt{ieee} and \texttt{openalex}, which returned the decisive study as
+its first hit; and \qy{static analysis introductory programming
+feedback} on the same providers, which doubled as the counter-search by
+looking for evidence that student-facing static analysis \emph{does} work.
+The decisive study's full text was read from the authors' institutional
+technical report.
+
+\paragraph{Results.}
+The claim is \emph{supported} by the largest study of the question, over
+453\,526 student files and 2.66 million snapshots, whose own recommendation
+is the design rule:
+\blockcquote{Keuning2017}{many of the checks PMD can perform are not
+suitable for novice programmers \ldots{} We advise educators to customize the
+tool by selecting a small set of relevant issues.}
+Its supporting figures make the point concrete: the most frequent raw
+violations are pedagogically irrelevant, students rarely fix what is
+reported, and students using a code-analysis extension had slightly
+\emph{more} issues per thousand lines than those using none.
+
+An independent Python precedent \emph{corroborates} the restrict-and-rewrite
+pattern: PyTA wraps a general-purpose linter with custom checks and improved
+messages for novices \autocite{LiuPetersen2019}.  Its authors' own scope
+limit is preserved here --- the improvement was observed only for students
+who chose to read the output, a self-selected subgroup, so no causal claim
+is transferred.  Stegeman et al.\ supply a vocabulary for grouping what is
+reported, in three families covering documentation, presentation and
+structure \autocite{Stegeman2016}; that category list was read from Keuning
+et al.'s restatement, not from the rubric paper itself.
+
+The counter-search found positive results for student-facing static analysis
+in general, which narrows the claim rather than refuting it: what is
+unsuitable is the \emph{default rule set}, not the practice of showing
+diagnostics.  It also found the other direction, in a deployed classroom
+study reporting that
+\textcquote{Bobadilla2024}{students add more violations than they remove}.
+
+\paragraph{Conclusion.}
+The rules must be selected.  learnlog therefore runs a small, named rule set
+aimed at mistakes a beginner can act on --- undefined names, unused imports
+and variables, bare excepts, comparisons to singletons --- rather than a
+tool's defaults, and treats the linter as optional, reporting its absence
+instead of failing.  Caveats: the decisive study is Java, one analyser and
+one dataset; the rubric's own text was not read; and the evidence that
+quality feedback changes novice behaviour is genuinely mixed, which is why
+the output is descriptive rather than corrective.
+
+\chapter{Headline aggregates mask the long tail}
+\label{app:claim:long-tail}
+
+\paragraph{Question.}
+Is a single improving summary number an adequate way to report code quality
+over time to a student?
+
+\paragraph{Method.}
+Session \texttt{learnlog-metrics-code}, 2026-08-31.  Query:
+\qy{TS=("code quality" AND (students OR novice*) AND (evolution OR "over
+time" OR trend* OR longitudinal))} on \texttt{wos}.  A related field-tagged
+query, \qy{TS=("software metrics" AND (students OR novice OR
+"introductory programming"))}, was run because an earlier pre-protocol pass
+using natural-language queries without Web~of~Science had concluded that no
+literature existed on metric trends for students.  That conclusion was a
+\textbf{false negative}, and the query overturned it --- which is the
+clearest evidence in this appendix for why the provider and syntax choices
+in \cref{app:protocol:sessions} matter.
+
+\paragraph{Results.}
+The claim is \emph{supported} directly by the longest-running longitudinal
+measurement found, over four course iterations, 200 students and 19
+assignments:
+\blockcquote{Ostlund2023}{Results showed a statistically significant
+improvement in code quality over 19 assignments in all four course
+iterations. In particular, when a single violation was the focus of a
+learning outcome, the effects were both a dramatic fall and sustained low
+occurrence. However, this improvement was mostly focused on the three most
+frequently occurring violations ($>$~70\%), which masked an increase in lesser
+occurring violations throughout the course.}
+The headline improved while part of the distribution got worse.
+
+Two studies \emph{corroborate} the pattern from other angles.  Prajapati and
+Acuña, tracking quality per module across a course, find improvement overall
+while one category stays dominant:
+\textcquote{Prajapati2025}{Formatting errors, such as whitespace violations,
+remain high, comprising nearly half of all detected issues}.  Bobadilla et
+al.\ find net violations rising \autocite{Bobadilla2024}.  Neither reports to
+students --- both address researchers or instructors --- so they establish
+the measurement, not the presentation.
+
+On presentation the evidence is thin and honestly labelled as such.  Van den
+Aker and Rahimi derive nine design principles for generating and presenting
+automated formative feedback on code quality,
+\textcquote{vandenAker2024}{rooted in solid educational constructs about
+feedback and learning dashboards}; but the full text was unobtainable, so
+this backs
+the existence of such principles and nothing about their content.  The gap
+that survives the corrected search is specific: metric \emph{trends} shown
+to students.
+
+\paragraph{Conclusion.}
+No --- a lone headline aggregate is not adequate, and the one longitudinal
+study of exactly this question shows why.  \qy{learnlog metrics}
+therefore reports distributions and long-tail counts beside any summary, and
+describes direction in neutral words without evaluating the student.
+Caveats: the masking finding is a single course sequence in a single
+institution, and the design guidance for presenting such trends to students
+is cited unread and remains to be obtained.
+
+% Restore url.sty's default: no line breaks after hyphens.
+\makeatletter
+\def\do@url@hyp{}
+\makeatother
+\Urlmuskip=0mu\relax

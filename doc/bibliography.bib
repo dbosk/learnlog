@@ -1,1 +1,2159 @@
-% Add bibliography entries here
+% doc/bibliography.bib -- references for the learnlog literate
+% program, with the citation-provenance blocks required by the
+% backing-claims protocol (CLAIM / FOUND-VIA / PICKED / QUOTE /
+% VERIFIED / COUNTER / DATE above every entry).
+%
+% Assembled 2026-08-31 from the three research bibs produced for
+% the `learnlog metrics` command, verbatim including their
+% provenance blocks:
+%
+%   metrics-eq.bib    -- scholar session learnlog-metrics-eq
+%   metrics-time.bib  -- scholar session learnlog-metrics-time
+%   metrics-code.bib  -- scholar session learnlog-metrics-code
+%
+% The sessions live in ~/.local/share/scholar/review_sessions/<name>.json and the search
+% protocol is mirrored, claim by claim, in doc/metrics-protocol.tex.
+%
+% Deduplication (three source files, two works recorded twice or
+% more).  Each such work appears ONCE below, at the position of its
+% first occurrence, with every originating provenance block stacked
+% above it and labelled by a SOURCE-REPORT line:
+%
+%   price2020progsnap2  -- recorded in all three bibs; the
+%     metrics-code.bib copy used the key `Price2020', which is
+%     therefore an ALIAS of price2020progsnap2 and is not defined
+%     separately.  Cite price2020progsnap2.
+%   petersen2015exploration -- recorded in metrics-eq.bib and
+%     metrics-time.bib with different CLAIMs (EQ parameter
+%     sensitivity; origin of the 20-minute session gap); both
+%     blocks are kept.
+%
+% Field values are identical across the copies of both works, so
+% the union of fields is the fullest single copy (the
+% metrics-eq.bib one, which carries `publisher').
+
+%======================================================================
+%  From metrics-eq.bib  (scholar session learnlog-metrics-eq)
+%======================================================================
+
+% metrics-eq.bib -- error-based programming-process metrics for `learnlog metrics`
+% Scholar session: learnlog-metrics-eq
+%   /home/dbosk/.local/share/scholar/review_sessions/learnlog-metrics-eq.json
+% Providers alive on 2026-08-31: openalex (429-throttled), dblp, wos, ieee,
+%   arxiv, scopus, hal, iacr, ssrn and the preprint servers.
+%   s2 DEAD -- "key rejected HTTP 403 -- check or replace S2_API_KEY".
+% Protocol: backing-claims (find -> verify -> record), two-sided.
+%
+% Validation on 2026-08-31:
+%   check_provenance.py -- OK, 19/19 entries carry complete provenance.
+%   check_metadata.py   -- 17 DOI entries checked, 16 match Crossref exactly.
+%     brocker2024correlation is flagged "TITLE mismatch ... crossref=''" because
+%     its DOI is registered with DataCite (Gesellschaft fuer Informatik), not
+%     Crossref; verified instead at
+%     https://api.datacite.org/dois/10.18420/delfi2024_40 -- benign.
+%     jadud2005thesis and watson2015thesis have no DOI; both full texts were
+%     read directly from the issuing repositories.
+
+% === provenance: jadud2005thesis ===
+% CLAIM: The Error Quotient scores consecutive compilation-event pairs
+%   (both-error +2, same error type +3, same error location +-1 line +3, same
+%   edit location +1), divides each pair score by 9, and averages over pairs.
+% FOUND-VIA: scholar search 'error quotient novice compilation behaviour' -n
+%   learnlog-metrics-eq -p dblp -p wos -p ieee -p openalex (2026-08-31);
+%   thesis PDF then retrieved from the author's own site, which no provider
+%   indexes: WebFetch https://jadud.com/dl/pdf/jadud-dissertation.pdf
+% PICKED: primary source AND the only one carrying both the flowchart and the
+%   reference implementation (App. C). The ICER'06 paper states the same
+%   algorithm but without the code; every secondary restatement I checked
+%   (Villamor 2020, Svabensky 2024) drops the fourth term.
+% QUOTE (Sec. 4.3, p. 115): "Collate Create consecutive pairs from the events
+%   in the session, eg. (e1, e2), (e2, e3), (e3, e4), up to (en-1, en).
+%   Calculate Score each pair according to the algorithm presented in Figure
+%   4.4. Normalize Divide the score assigned to each pair by 9 (the maximum
+%   value possible for each pair). Average Sum the scores and divide by the
+%   number of pairs. This average is taken as the error quotient (EQ) for the
+%   session."
+% QUOTE (Sec. 4.3, p. 116, footnote 1): "Compilation pairs with a STRING-EDIT
+%   distance of zero are filtered out before any calculation is carried out."
+% QUOTE (Sec. 4.3.1, p. 120): "we require that a 'session' have at least seven
+%   compilation events, during each of which the student made some kind of
+%   change to their code."
+% VERIFIED: full text read (pdftotext) AND Figure 4.4 rendered to PNG at 140dpi
+%   and read visually (thesis p. 116 = PDF p. 134), because the text layer
+%   scrambles the flowchart. The rendered figure shows a fall-through cascade
+%   with FOUR additive terms; max = 2+3+3+1 = 9, which is what makes the
+%   documented divisor of 9 correct. The caption's "maximum score of 8 per
+%   pair" describes the worked example, not the algorithm.
+% COUNTER: scholar search 'TS=("error quotient" AND (limitation OR criticism OR
+%   replication OR context))' -p wos -- surfaced Ahadi et al. 2018 (caveats,
+%   free parameters) and Petersen et al. 2015 (context sensitivity); neither
+%   disputes the algorithm as stated, both qualify its transferability. Claim
+%   about the algorithm stands; claims about its validity are scoped below.
+% DATE: 2026-08-31
+@phdthesis{jadud2005thesis,
+  author      = {Jadud, Matthew C.},
+  title       = {An Exploration of Novice Compilation Behaviour in {BlueJ}},
+  school      = {University of Kent},
+  year        = {2005},
+  url         = {https://jadud.com/dl/pdf/jadud-dissertation.pdf},
+}
+
+% === provenance: jadud2006methods ===
+% CLAIM: The Error Quotient was introduced as a metric of novice compilation
+%   behaviour derived from consecutive compilation events.
+% FOUND-VIA: scholar search 'error quotient novice compilation behaviour' -n
+%   learnlog-metrics-eq -p dblp -p wos -p ieee -p openalex; metadata confirmed
+%   by DOI retrieval: curl https://api.crossref.org/works/10.1145/1151588.1151600
+% PICKED: the canonical citable venue for EQ -- this is the key the literature
+%   cites (and the key the user's own papers cite). Cite alongside the thesis,
+%   which supplies the algorithmic detail this paper compresses.
+% QUOTE (title/venue, Crossref record): "Methods and tools for exploring novice
+%   compilation behaviour", Proceedings of the second international workshop on
+%   Computing education research, pp. 73-84.
+% VERIFIED: Crossref metadata retrieved and matched (authors, pages, year,
+%   publisher). Content verified through the thesis chapter of the same work;
+%   the ACM full text is paywalled (HTTP 403 to WebFetch and to scholar pdf).
+% COUNTER: see jadud2005thesis; same counter-search covers both.
+% DATE: 2026-08-31
+@inproceedings{jadud2006methods,
+  author    = {Jadud, Matthew C.},
+  title     = {Methods and Tools for Exploring Novice Compilation Behaviour},
+  booktitle = {Proceedings of the Second International Workshop on Computing
+               Education Research (ICER '06)},
+  pages     = {73--84},
+  year      = {2006},
+  publisher = {ACM},
+  doi       = {10.1145/1151588.1151600},
+}
+
+% === provenance: jadud2005first ===
+% CLAIM: Jadud's study of novice compilation behaviour in BlueJ predates and
+%   motivates the Error Quotient.
+% FOUND-VIA: scholar search 'TS=("compilation behaviour" OR "compilation
+%   behavior") AND TS=(novice)' -n learnlog-metrics-eq -p wos (2026-08-31)
+% PICKED: retained as the journal-of-record antecedent surfaced by the
+%   counter-search; corroborates rather than replaces jadud2006methods.
+% QUOTE (Crossref record): "A First Look at Novice Compilation Behaviour Using
+%   BlueJ", Computer Science Education, vol. 15, no. 1, pp. 25-40.
+% VERIFIED: Crossref metadata retrieved and matched. Full text not accessed --
+%   cited only for the existence and framing of the antecedent study, not for
+%   any numerical claim.
+% DATE: 2026-08-31
+@article{jadud2005first,
+  author  = {Jadud, Matthew C.},
+  title   = {A First Look at Novice Compilation Behaviour Using {BlueJ}},
+  journal = {Computer Science Education},
+  volume  = {15},
+  number  = {1},
+  pages   = {25--40},
+  year    = {2005},
+  doi     = {10.1080/08993400500056530},
+}
+
+% === provenance: petersen2015exploration ===
+% SOURCE-REPORT: metrics-eq.bib
+% CLAIM: The EQ algorithm is sensitive to its context and its parameters, and
+%   has been examined in C, Java and Python courses including ones built from
+%   sets of short online exercises.
+% FOUND-VIA: scholar search 'TS=("error quotient" AND (limitation OR criticism
+%   OR replication OR context))' -n learnlog-metrics-eq -p wos (COUNTER-search);
+%   ACM BibTeX record with publisher abstract read from the user's own
+%   base.bib at scratchpad/edit-run-error-repeat/base.bib
+% PICKED: the primary counter/qualifier for EQ's transferability, and the
+%   source the user's own work cites for the adapted penalty set. No survey
+%   substitutes for it here because the claim is about EQ's parameter
+%   sensitivity specifically.
+% QUOTE (abstract, publisher-supplied): "we investigate the application of the
+%   Error Quotient (EQ), a metric based on debugging of syntax errors, in a
+%   varied set of contexts, including courses taught in C, Java, and Python and
+%   courses that use sets of short, online exercises. We perform an exploration
+%   of the EQ parameters to determine the EQ algorithm's sensitivity to its
+%   context and identify factors in our contexts that have an impact on the
+%   process students use to generate code."
+% VERIFIED: abstract verified verbatim (ACM-supplied BibTeX). FULL TEXT NOT
+%   OBTAINED -- ACM 403 to WebFetch, curl and `scholar pdf quote`; unpaywall
+%   reports is_oa false; author-copy URLs tried and 404. THEREFORE the specific
+%   penalty values 13/3 with normaliser 16 attributed to this paper are NOT
+%   verified against it -- see the note on snider2023edit.
+% COUNTER: this entry IS the counter-result for EQ's context-independence; it
+%   qualifies rather than refutes, so EQ claims are scoped to "context- and
+%   parameter-sensitive" throughout.
+% DATE: 2026-08-31
+%
+% === provenance: petersen2015exploration ===
+% SOURCE-REPORT: metrics-time.bib
+% CLAIM: The 20-minute session gap used for programming process data originates
+%   with Petersen, Spacco and Vihavainen (2015).
+% FOUND-VIA: scholar search "novice compilation behaviour" -n
+%   learnlog-metrics-time -p dblp -p wos -p ieee -p openalex -p scopus; metadata
+%   confirmed by curl https://api.crossref.org/works/10.1145/2828959.2828966
+% PICKED: cited only for the attribution of the threshold's origin; it is the
+%   work Price et al. point to as [23].
+% QUOTE (secondary attestation, Price et al. 2020 §3.3.1, read in full text):
+%   "we defined a session as a series of events with no more than a 20 minute
+%   gap between any two consecutive events, as in [23]." -- where [23] is
+%   "Andrew Petersen, Jaime Spacco, and Arto Vihavainen. 2015. An Exploration of
+%   Error Quotient in Multiple Contexts."
+% VERIFIED: bibliographic record only (Crossref). The full text is paywalled and
+%   was NOT read, so this is a citation-of-a-citation: the attribution is
+%   verified, the 20-minute value inside Petersen et al. is NOT independently
+%   confirmed. Cite as "the convention used by Price et al. (2020), following
+%   Petersen et al. (2015)" -- never attribute the number to Petersen directly.
+% COUNTER: none run for a pure attribution claim.
+% DATE: 2026-08-31
+@inproceedings{petersen2015exploration,
+  author    = {Petersen, Andrew and Spacco, Jaime and Vihavainen, Arto},
+  title     = {An Exploration of Error Quotient in Multiple Contexts},
+  booktitle = {Proceedings of the 15th Koli Calling Conference on Computing
+               Education Research},
+  pages     = {77--86},
+  year      = {2015},
+  publisher = {ACM},
+  doi       = {10.1145/2828959.2828966},
+}
+
+% === provenance: ahadi2018syntax ===
+% CLAIM: Error-profile metrics such as the Error Quotient are context dependent
+%   and contain free parameters, a caveat that has prompted proposals for more
+%   general metrics.
+% FOUND-VIA: scholar search 'TS=("error quotient" AND (limitation OR criticism
+%   OR replication OR context))' -n learnlog-metrics-eq -p wos (COUNTER-search,
+%   2026-08-31); abstract via curl
+%   https://api.openalex.org/works/doi:10.1145/3197091.3197121
+% PICKED: the most explicit published statement of the caveat, and it proposes
+%   a successor metric -- so it documents both the criticism and the response.
+% QUOTE (abstract, publisher-supplied): "Recent data-driven research has
+%   produced metrics for quantifying a novice programmer's error profile, such
+%   as Jadud's error quotient. However, these metrics tend to be context
+%   dependent and contain free parameters. This paper reviews the caveats of
+%   such metrics and proposes a more general approach to developing a metric."
+% VERIFIED: abstract verified verbatim via OpenAlex (publisher-supplied
+%   inverted index). Full text not obtained (ACM paywall); cited only for the
+%   caveat it states in its own abstract.
+% DATE: 2026-08-31
+@inproceedings{ahadi2018syntax,
+  author    = {Ahadi, Alireza and Lister, Raymond and Mathieson, Luke},
+  title     = {Syntax Error Based Quantification of the Learning Progress of
+               the Novice Programmer},
+  booktitle = {Proceedings of the 23rd Annual ACM Conference on Innovation and
+               Technology in Computer Science Education (ITiCSE '18)},
+  pages     = {10--14},
+  year      = {2018},
+  publisher = {ACM},
+  doi       = {10.1145/3197091.3197121},
+}
+
+% === provenance: karvelas2020effects ===
+% CLAIM: Novice programming behaviour, as measured from compilation events, is
+%   substantially affected by the compilation mechanism of the environment
+%   (click-to-compile versus automatic background compilation).
+% FOUND-VIA: scholar search 'TS=("compilation behaviour" OR "compilation
+%   behavior") AND TS=(novice)' and 'TS=("compilation mechanism" AND novice)'
+%   -n learnlog-metrics-eq -p wos (COUNTER-searches, 2026-08-31); abstract via
+%   curl https://api.openalex.org/works/doi:10.1145/3328778.3366882
+% PICKED: the load-bearing qualifier for this project. learnlog's event is a
+%   *run* the student triggers explicitly, so whether compile-event metrics
+%   transfer depends on exactly this variable. Controlled comparison (same
+%   population, same language, two BlueJ versions) makes it stronger than the
+%   observational alternatives.
+% QUOTE (abstract, publisher-supplied): "These environments can differ
+%   substantially in compilation behavior and error message presentation -
+%   arguably two of the most important mechanisms through which users interact
+%   with the programming language. ... BlueJ 3 is a click-to-compile editor
+%   that delivers text-based error messages from javac to the user, but only
+%   presents the first error message, even if the compiler produces several.
+%   BlueJ 4 automatically compiles in the background but retains
+%   click-to-compile ability. ... We find that the programming experience and
+%   behavior of these users can be substantially affected by chan[ges]"
+% VERIFIED: abstract verified verbatim via OpenAlex. Full text NOT obtained
+%   (ACM 403 to WebFetch, curl and `scholar pdf quote`; unpaywall is_oa false).
+%   Cited only at abstract strength: "substantially affected". I have NOT
+%   verified any per-metric numbers (e.g. whether EQ specifically shifts), so
+%   no such claim is made.
+% COUNTER: this entry IS a counter-result -- it qualifies the assumption that
+%   EQ/Watwin/RED values transfer across environments. The report scopes the
+%   claim accordingly rather than asserting cross-environment comparability.
+% DATE: 2026-08-31
+@inproceedings{karvelas2020effects,
+  author    = {Karvelas, Ioannis and Li, Annie and Becker, Brett A.},
+  title     = {The Effects of Compilation Mechanisms and Error Message
+               Presentation on Novice Programmer Behavior},
+  booktitle = {Proceedings of the 51st ACM Technical Symposium on Computer
+               Science Education (SIGCSE '20)},
+  pages     = {759--765},
+  year      = {2020},
+  publisher = {ACM},
+  doi       = {10.1145/3328778.3366882},
+}
+
+% === provenance: karvelas2022sympathy ===
+% CLAIM: Compilation activity and error-resolution time differ measurably
+%   between environments whose compilation mechanism differs.
+% FOUND-VIA: scholar search 'TS=("compilation mechanism" AND novice)' -n
+%   learnlog-metrics-eq -p wos (COUNTER-search, 2026-08-31); abstract via curl
+%   https://api.openalex.org/works/doi:10.1145/3478431.3499347
+% PICKED: corroborates karvelas2020effects on the specific quantity learnlog
+%   would compute (resolution time between events), from the same group and
+%   dataset family. Kept as corroboration, not discarded as redundant.
+% QUOTE (abstract, publisher-supplied): "We find that compilation activity
+%   differs for each version and that students reach successful compilations
+%   faster in BlueJ 4. Based on our findings, we discuss the effectiveness of
+%   each version and argue against the constant red underlining of code -- an
+%   error indicator mechanism present in BlueJ 4 -- as this can lead to false
+%   positive errors that may mislead novices during their programming tasks."
+% VERIFIED: abstract verified verbatim via OpenAlex. Full text not obtained
+%   (ACM paywall). Cited at abstract strength only.
+% DATE: 2026-08-31
+@inproceedings{karvelas2022sympathy,
+  author    = {Karvelas, Ioannis and Becker, Brett A.},
+  title     = {Sympathy for the (Novice) Developer: Programming Activity When
+               Compilation Mechanism Varies},
+  booktitle = {Proceedings of the 53rd ACM Technical Symposium on Computer
+               Science Education (SIGCSE '22)},
+  pages     = {962--968},
+  year      = {2022},
+  publisher = {ACM},
+  doi       = {10.1145/3478431.3499347},
+}
+
+% === provenance: watson2013predicting ===
+% CLAIM: The Watwin score scores consecutive compilation pairs with penalties
+%   for repeated full error message, repeated generalised error type and
+%   repeated error location plus a peer-relative resolve-time penalty,
+%   normalised by the maximum possible pair score.
+% FOUND-VIA: scholar search 'watwin programming behavior prediction' -n
+%   learnlog-metrics-eq -p dblp -p wos -p ieee -p openalex (2026-08-31);
+%   metadata by DOI: curl https://api.crossref.org/works/10.1109/ICALT.2013.99
+% PICKED: primary source that introduces Watwin. Cited together with
+%   watson2015thesis, which supersedes its parameters and is the only version I
+%   could read in full.
+% QUOTE (Crossref record): "Predicting Performance in an Introductory
+%   Programming Course by Logging and Analyzing Student Programming Behavior",
+%   2013 IEEE 13th International Conference on Advanced Learning Technologies,
+%   pp. 319-323.
+% VERIFIED: Crossref metadata retrieved and matched (authors, pages, venue,
+%   year). FULL TEXT NOT OBTAINED -- dro.dur.ac.uk, the Durham worktribe
+%   preview and scispace all returned 403/redirect pages. The pairwise penalty
+%   values (4/4/2 and 1/15/25, max 35) are therefore NOT verified against this
+%   paper; they come from the ProgSnap2Analysis reference implementation and
+%   are internally consistent with the "divide by 35" that villamor2020review
+%   attributes to it. Recorded as reimplementation-derived, not paper-verified.
+% COUNTER: scholar search 'TS=("error quotient" AND ("repeated error density"
+%   OR RED OR watwin))' -p wos -- returned svabensky2024comparison and
+%   villamor2020review; villamor2020review lists Watwin's weakness (superficial
+%   source changes can be misflagged) and both note context dependence. No
+%   refutation of the algorithm; the predictive claim is scoped to the cohorts.
+% DATE: 2026-08-31
+@inproceedings{watson2013predicting,
+  author    = {Watson, Christopher and Li, Frederick W. B. and Godwin, Jamie L.},
+  title     = {Predicting Performance in an Introductory Programming Course by
+               Logging and Analyzing Student Programming Behavior},
+  booktitle = {2013 IEEE 13th International Conference on Advanced Learning
+               Technologies (ICALT)},
+  pages     = {319--323},
+  year      = {2013},
+  publisher = {IEEE},
+  doi       = {10.1109/ICALT.2013.99},
+}
+
+% === provenance: watson2015thesis ===
+% CLAIM: The revised Watwin algorithm ("Robust Relative") builds pairings
+%   per-student, per-session, per-file with pair pruning, deletion/commented-fix
+%   filtering, error-message generalisation and invocation-aware time
+%   estimation, then normalises each pair score by 16.
+% FOUND-VIA: scholar search 'watwin programming behavior prediction' -n
+%   learnlog-metrics-eq -p dblp -p wos -p ieee -p openalex surfaced the Watwin
+%   strand; the thesis itself is not provider-indexed and was retrieved from the
+%   Durham e-theses repository: curl
+%   https://etheses.durham.ac.uk/id/eprint/11141/1/...Chris_Watson...pdf
+% PICKED: the only Watwin source I could read in full, and it supersedes the
+%   ICALT parameters. Preferred over the ICALT paper for anything algorithmic.
+% QUOTE (Ch. 6, "Robust Relative"): "Prepare a set of pairings by applying the
+%   procedure presented in Section 6.3.4. Pairings where the first event is a
+%   compilation success should be removed. ... Score each compilation pairing by
+%   using scoring algorithm (Figure 6.9). Normalize each score by dividing by 16
+%   (the maximum possible score). Average the normalized scores of all pairings."
+% QUOTE (Sec. 6.3.4, step 2): "Remove each event pairing {cx, cy} where the
+%   source code snapshots of cx and cy are identical ... rather than performing
+%   string matching directly on the code snapshots, we first tokenize the
+%   snapshots using the BlueJ lexical analyser. Tokenized snapshots are then
+%   compared with comments removed."
+% QUOTE (Ch. 6, on the revision): "in the original algorithm, the resolve time
+%   penalty bounds were based upon the use of a mean resolve time and using
+%   standard deviations to define the bounds. But this approach was sensitive to
+%   deviations from normality, and using percentiles to specify the penalty
+%   bounds allows us to address this shortcoming."
+% VERIFIED: full text read (pdftotext -layout). Figure 6.9 is a raster image, so
+%   the *revised* penalty values are not extractable and are not reported.
+% DATE: 2026-08-31
+@phdthesis{watson2015thesis,
+  author = {Watson, Christopher},
+  title  = {An Exploration of Traditional and Data Driven Predictors of
+            Programming Performance},
+  school = {Durham University},
+  year   = {2015},
+  url    = {https://etheses.durham.ac.uk/11141/},
+}
+
+% === provenance: becker2016new ===
+% CLAIM: Repeated Error Density is defined as the sum, over maximal strings of
+%   consecutive repeated errors, of r_i^2/(r_i+1), and is unbounded above.
+% FOUND-VIA: scholar search 'repeated error density compiler errors' -n
+%   learnlog-metrics-eq -p dblp -p wos -p ieee -p openalex (2026-08-31);
+%   abstract via curl
+%   https://api.openalex.org/works/doi:10.1145/2899415.2899463
+% PICKED: primary source defining RED; no substitute exists.
+% QUOTE (abstract, publisher-supplied): "First we introduce a new metric to
+%   quantify repeated errors, the repeated error density (RED). We compare this
+%   to Jadud's Error Quotient (EQ), the most studied metric, and show that RED
+%   has advantages over EQ including being less context dependent, and being
+%   useful for short sessions."
+% VERIFIED: existence, venue, pages and the claimed advantages verified from the
+%   publisher abstract. FULL TEXT NOT OBTAINED -- ACM 403; the UCD green-OA copy
+%   at hdl.handle.net/10197/7888 returns HTTP 405. The FORMULA is therefore
+%   triangulated, not read in the original: (a) villamor2020review states it
+%   verbatim -- "This submetric is r_i^2/|[s_i]| where |[s_i]| is the length of
+%   the string s_i containing r_i repeated errors. This can be expressed
+%   completely in terms of r_i as r_i^2/(r_i+1)" -- with a 13-row worked table;
+%   (b) the ProgSnap2Analysis red.py reference implementation computes
+%   `red += (repeated ** 2) / (repeated + 1)`; (c) svabensky2024comparison's
+%   worked values (0.5 for one repeat, 1 for two one-repeat strings) match.
+%   Three independent sources agree; recorded as triangulated.
+% COUNTER: scholar search 'TS=("error quotient" AND ("repeated error density" OR
+%   RED OR watwin))' -p wos -- villamor2020review lists RED's drawbacks
+%   (unbounded, outlier-prone, correlation with performance not yet validated)
+%   and svabensky2024comparison finds RED predicts CS1 grades WORSE than EQ.
+%   The report states both rather than presenting RED as a strict improvement.
+% DATE: 2026-08-31
+@inproceedings{becker2016new,
+  author    = {Becker, Brett A.},
+  title     = {A New Metric to Quantify Repeated Compiler Errors for Novice
+               Programmers},
+  booktitle = {Proceedings of the 2016 ACM Conference on Innovation and
+               Technology in Computer Science Education (ITiCSE '16)},
+  pages     = {296--301},
+  year      = {2016},
+  publisher = {ACM},
+  doi       = {10.1145/2899415.2899463},
+}
+
+% === provenance: carter2015npsm ===
+% CLAIM: The Normalized Programming State Model characterises programming
+%   activity by the dynamically changing syntactic and semantic correctness of
+%   the program, and accounted for 41% of assignment-grade and 36% of
+%   final-grade variance.
+% FOUND-VIA: scholar search 'normalized programming state model' -n
+%   learnlog-metrics-eq -p dblp (503 on that call) and by DOI retrieval: curl
+%   https://api.crossref.org/works/10.1145/2787622.2787710 ; abstract via curl
+%   https://api.openalex.org/works/doi:10.1145/2787622.2787710
+% PICKED: primary source. Chosen for learnlog specifically because its semantic
+%   axis is defined on runtime exceptions in an execution attempt -- which is
+%   what learnlog records -- unlike EQ/Watwin, defined on compiler output.
+% QUOTE (abstract, publisher-supplied): "we derive the Normalized Programming
+%   State Model (NPSM), which characterizes students' programming activity in
+%   terms of the dynamically-changing syntactic and semantic correctness of
+%   their programs. In an empirical study, the NPSM accounted for 41% of the
+%   variance in students' programming assignment grades, and 36% of the variance
+%   in students' final course grades."
+% VERIFIED: abstract verified verbatim via OpenAlex; Crossref metadata matched.
+%   Full text not obtained (ACM paywall). The eleven-state table and the
+%   Idle-excluded time normalisation are reported from villamor2020review, which
+%   is open access and restates them -- flagged as secondary in the report.
+% COUNTER: scholar search 'TS=("error quotient" AND (limitation OR criticism OR
+%   replication OR context))' -p wos and the villamor2020review comparison table
+%   -- the recorded limitation is that NPSM "provides only a rough proxy for
+%   determining semantic correctness (e.g., presence or absence of runtime
+%   exceptions in the last execution attempt)". Stated in the report.
+% DATE: 2026-08-31
+@inproceedings{carter2015npsm,
+  author    = {Carter, Adam S. and Hundhausen, Christopher D. and
+               Adesope, Olusola},
+  title     = {The Normalized Programming State Model: Predicting Student
+               Performance in Computing Courses Based on Programming Behavior},
+  booktitle = {Proceedings of the Eleventh Annual International Conference on
+               International Computing Education Research (ICER '15)},
+  pages     = {141--150},
+  year      = {2015},
+  publisher = {ACM},
+  doi       = {10.1145/2787622.2787710},
+}
+
+% === provenance: villamor2020review ===
+% CLAIM: EQ, the Watwin score, PDS, NPSM and RED form one lineage of
+%   process-oriented metrics with documented advantages and disadvantages.
+% FOUND-VIA: scholar search 'error quotient novice compilation behaviour' -n
+%   learnlog-metrics-eq -p dblp -p wos -p ieee -p openalex (first hit, WoS);
+%   open-access PDF retrieved: curl https://d-nb.info/1212501446/34
+% PICKED: the only open-access source that restates all five algorithms side by
+%   side with a comparison table; used as the survey backbone and as the
+%   secondary witness for RED's formula and NPSM's state table. Preferred over
+%   ihantola2015edm for algorithm detail (that one is broader but shallower).
+% QUOTE (Sec. "Repeated Error Density"): "This submetric is r_i^2/|[s_i]| where
+%   |[s_i]| is the length of the string s_i containing r_i repeated errors. This
+%   can be expressed completely in terms of r_i as r_i^2/(r_i+1), since the
+%   length of a string s_i containing r_i consecutive errors is always equal to
+%   r_i+1."
+% QUOTE (Sec. "Watwin Score"): "Normalize each score by dividing by 35 (maximum
+%   possible score for each pairing)."
+% VERIFIED: full text read (pdftotext). NOTE a defect: its NPSM section says "A
+%   program is semantically correct if it produces a runtime exception", which
+%   contradicts its own state table and the next sentence; treated as an
+%   inverted typo and NOT relied on for that point.
+% COUNTER: same source supplies the counter-evidence (Table 5 lists each
+%   metric's disadvantages), so no separate counter-search was needed for the
+%   survey-level claim.
+% DATE: 2026-08-31
+@article{villamor2020review,
+  author  = {Villamor, Maureen M.},
+  title   = {A Review on Process-Oriented Approaches for Analyzing Novice
+             Solutions to Programming Problems},
+  journal = {Research and Practice in Technology Enhanced Learning},
+  volume  = {15},
+  pages   = {8},
+  year    = {2020},
+  doi     = {10.1186/s41039-020-00130-y},
+}
+
+% === provenance: svabensky2024comparison ===
+% CLAIM: Computed over compiler and runtime errors separately, EQ explains more
+%   CS1 exam-grade variance than RED or a raw error count, but compiler errors
+%   predict early exams while only runtime errors predict later ones.
+% FOUND-VIA: scholar search 'repeated error density compiler errors' -n
+%   learnlog-metrics-eq -p dblp -p wos -p ieee -p openalex (2026-08-31);
+%   open preprint retrieved: curl https://arxiv.org/pdf/2404.05988
+% PICKED: the only study I found that computes these metrics separately over
+%   compiler and runtime errors -- the exact question learnlog faces. Recent,
+%   large (280 students, 51,095 snapshots), and open access.
+% QUOTE (abstract): "Compiler errors were significant predictors of exam 1
+%   grades but not exam 2 grades; only runtime errors significantly predicted
+%   exam 2 grades. The findings indicate that leveraging Error Quotient with
+%   multiple error types (compiler and runtime) may be a better measure of
+%   students' introductory programming abilities, though still not explaining
+%   most of the observed variability."
+% QUOTE (Sec. 3.4.2): "Although EQ was originally defined only for compiler
+%   errors, we extended this approach to also process runtime errors to obtain a
+%   comparison to values for compiler errors."
+% QUOTE (Table 2): RED "decimal (R+0)", range "[0, inf)" -- confirming RED is
+%   unnormalised.
+% VERIFIED: full text read (pdftotext of the arXiv preprint); DOI metadata
+%   matched against Crossref.
+% COUNTER: this entry IS partly a counter-result -- it caps EQ's explanatory
+%   power at R^2 = 0.18-0.26 and reports the benchmark predictor (homework
+%   grades) outperforming all three measures. Reported alongside the positive
+%   framing rather than omitted.
+% DATE: 2026-08-31
+@inproceedings{svabensky2024comparison,
+  author    = {{\v S}v{\'a}bensk{\'y}, Valdemar and Pankiewicz, Maciej and
+               Zhang, Jiayi and Cloude, Elizabeth B. and Baker, Ryan S. and
+               Fouh, Eric},
+  title     = {Comparison of Three Programming Error Measures for Explaining
+               Variability in {CS1} Grades},
+  booktitle = {Proceedings of the 2024 on Innovation and Technology in Computer
+               Science Education (ITiCSE '24), Vol. 1},
+  pages     = {87--93},
+  year      = {2024},
+  publisher = {ACM},
+  doi       = {10.1145/3649217.3653563},
+}
+
+% === provenance: tabanao2011predicting ===
+% CLAIM: Compilation-behaviour indicators correlate with exam performance but
+%   were not sufficient to identify at-risk students accurately.
+% FOUND-VIA: scholar search 'TS=("error quotient" AND (limitation OR criticism
+%   OR replication OR context))' -p wos plus DOI retrieval: curl
+%   https://api.crossref.org/works/10.1145/2016911.2016930 ; abstract via curl
+%   https://api.openalex.org/works/doi:10.1145/2016911.2016930
+% PICKED: the strongest published negative result on the intended *use* of these
+%   metrics, from the same research lineage (Jadud is a co-author), so it cannot
+%   be dismissed as an outsider critique.
+% QUOTE (abstract, publisher-supplied): "Based on these findings, we developed
+%   linear regression models that allowed prediction of students' scores on a
+%   midterm exam. However, the models derived could not accurately predict the
+%   at-risk students. Although our goal of identifying at-risk students was not
+%   attained, we have gained insights regarding the compilation behavior of our
+%   students".
+% VERIFIED: abstract verified verbatim via OpenAlex; Crossref metadata matched.
+%   Full text not obtained (ACM paywall); cited only for the negative result its
+%   own abstract states.
+% COUNTER: this entry IS the counter-evidence for the "identify struggling
+%   students" use case; the report scopes learnlog's framing to reflection
+%   rather than at-risk prediction because of it.
+% DATE: 2026-08-31
+@inproceedings{tabanao2011predicting,
+  author    = {Tabanao, Emily S. and Rodrigo, Ma. Mercedes T. and
+               Jadud, Matthew C.},
+  title     = {Predicting At-Risk Novice {Java} Programmers Through the Analysis
+               of Online Protocols},
+  booktitle = {Proceedings of the Seventh International Workshop on Computing
+               Education Research (ICER '11)},
+  pages     = {85--92},
+  year      = {2011},
+  publisher = {ACM},
+  doi       = {10.1145/2016911.2016930},
+}
+
+% === provenance: brocker2024correlation ===
+% CLAIM: EQ, Watwin/Robust Relative and RED have been computed on Python CS1
+%   datasets.
+% FOUND-VIA: WebSearch (tool: WebSearch), query 'Jadud Dorn "Aggregate
+%   compilation behavior: findings and implications from 27,698 users" ICER 2015
+%   DOI' surfaced the adjacent literature; the paper itself was then confirmed
+%   by DOI retrieval: curl https://api.datacite.org/dois/10.18420/delfi2024_40
+%   (GI publishes via DataCite, not Crossref) and WebFetch of
+%   https://dl.gi.de/handle/20.500.12116/44524
+% PICKED: the closest published precedent to this project (same metrics, same
+%   language). Retained despite being grey literature because no indexed
+%   alternative covers Python.
+% QUOTE (DataCite record + GI landing page): title "Correlation of Error Metrics
+%   in Python CS1 Courses"; authors "Brocker, Annabell; Schroeder, Ulrik";
+%   publisher "Gesellschaft fuer Informatik e.V."; year 2024; keywords include
+%   Error Quotient, Watwin, Robuste Relative, Repeated Error Density.
+% VERIFIED: existence, authorship, venue and metric coverage verified via
+%   DataCite and the GI landing page. FULL TEXT NOT OBTAINED (PDF returned
+%   binary/compressed content only). Their operational syntax-vs-runtime split
+%   is therefore NOT verified and no methodological claim is drawn from it.
+% DATE: 2026-08-31
+@inproceedings{brocker2024correlation,
+  author    = {Brocker, Annabell and Schroeder, Ulrik},
+  title     = {Correlation of Error Metrics in {Python} {CS1} Courses},
+  booktitle = {DELFI 2024 -- Die 22. Fachtagung Bildungstechnologien},
+  pages     = {441--448},
+  year      = {2024},
+  publisher = {Gesellschaft f{\"u}r Informatik e.V.},
+  doi       = {10.18420/delfi2024_40},
+}
+
+% === provenance: hundhausen2017ide ===
+% CLAIM: IDE-based learning analytics in computing education has been developed
+%   predominantly as instructor-side prediction, with comparatively little work
+%   turning it into learner-facing intervention.
+% FOUND-VIA: delegated WebSearch strand (tool: WebSearch), queries on
+%   learner-facing programming analytics dashboards; full text retrieved via
+%   WebFetch of
+%   https://dmolivares.com/files/Hundhausen%20et%20al.%20-%202017%20-%20IDE-Based%20Learning%20Analytics%20for%20Computing%20Education.pdf
+%   ; metadata by DOI: curl https://api.crossref.org/works/10.1145/3105759
+% PICKED: a critical review rather than a single study, which is the right
+%   evidence type for a claim about what the field has and has not done.
+% QUOTE (p. 11:4): Jadud's error quotient work "led to one of the first
+%   predictive models of novice programming performance".
+% QUOTE (p. 11:2, on the proposed future design): an IDE that "presents
+%   computing students with a continuously-updated visual analytics dashboard
+%   ... of their progress".
+% VERIFIED: full text read via the author-hosted copy; Crossref metadata
+%   matched. Note the second quote describes the paper's own research agenda,
+%   not an implemented and evaluated system -- the report says so.
+% COUNTER: counter-searched for learner-facing programming dashboards that DO
+%   show such metrics to students (WebSearch, multiple queries) -- found
+%   sanchezsantillan2023 (dashboard is instructor-mediated, not student-facing)
+%   and general LAK evidence that dashboards do not reliably improve
+%   achievement. No paper found showing EQ itself to learners; recorded as an
+%   empty counter-search on that specific point.
+% DATE: 2026-08-31
+@article{hundhausen2017ide,
+  author  = {Hundhausen, Christopher D. and Olivares, Daniel M. and
+             Carter, Adam S.},
+  title   = {{IDE}-Based Learning Analytics for Computing Education: A Process
+             Model, Critical Review, and Research Agenda},
+  journal = {ACM Transactions on Computing Education},
+  volume  = {17},
+  number  = {3},
+  pages   = {11:1--11:26},
+  year    = {2017},
+  doi     = {10.1145/3105759},
+}
+
+% === provenance: snider2023edit ===
+% CLAIM: The user's prior work applies EQ to run-based data using a
+%   two-parameter EQ model with a different-error penalty of 13 and a
+%   same-error penalty of 3.
+% FOUND-VIA: scholar search 'error quotient' -n learnlog-metrics-eq -p dblp
+%   (2026-08-31, first hit); metadata cross-checked by DOI: curl
+%   https://api.crossref.org/works/10.1145/3631802.3631849 and WebFetch of KTH
+%   DiVA record diva2:1877365; the PENALTY VALUES come from the follow-up
+%   manuscript source in this session's scratchpad,
+%   edit-run-error-repeat/conference_101719.tex
+% PICKED: the user's own prior work on exactly this data shape; it fixes the EQ
+%   variant learnlog should default to.
+% QUOTE (follow-up manuscript, Sec. "Error Metrics"): "In this work we use the
+%   two parameter EQ model, with a difference error penalty of 13 and a same
+%   error penalty of 3 as suggested in previous research".
+% QUOTE (same section): "Both EQ and WS have been shown to be context and
+%   programming language dependent".
+% VERIFIED: the penalty values are verified VERBATIM in the first-party
+%   manuscript source read from the scratchpad. The Koli 2023 paper's own full
+%   text was NOT obtained (ACM 403; DiVA record carries no abstract), so nothing
+%   is attributed to the Koli paper's findings. The manuscript attributes the
+%   13/3 penalties to petersen2015exploration, which I could NOT verify --
+%   record the attribution as the manuscript's, not as independently checked.
+% COUNTER: the manuscript itself states the qualifying counter-evidence (context
+%   and language dependence), consistent with ahadi2018syntax and
+%   karvelas2020effects; no contradicting source found.
+% DATE: 2026-08-31
+@inproceedings{snider2023edit,
+  author    = {Snider, Johan Mattias and B{\"a}lter, Olle and Bosk, Daniel},
+  title     = {Edit, Run, Error, Repeat: A Longitudinal Analysis of
+               Time-on-Task and Error Quotient},
+  booktitle = {Proceedings of the 23rd Koli Calling International Conference on
+               Computing Education Research},
+  pages     = {1--2},
+  year      = {2023},
+  publisher = {ACM},
+  doi       = {10.1145/3631802.3631849},
+}
+
+% === provenance: price2020progsnap2 ===
+% SOURCE-REPORT: metrics-eq.bib
+% CLAIM: ProgSnap2 is a standard event-stream format for programming process
+%   data, against which EQ, RED and Watwin have reference implementations.
+% FOUND-VIA: scholar search 'repeated error density compiler errors' and
+%   'TS=("error quotient" AND ("repeated error density" OR RED OR watwin))'
+%   -n learnlog-metrics-eq -p wos (2026-08-31); reference implementations read
+%   from https://github.com/thomaswp/ProgSnap2Analysis (eq.py, red.py,
+%   watwin.py) via raw.githubusercontent.com
+% PICKED: the format paper is the citable anchor for the reference
+%   implementations that supply the penalty values I could not read in the
+%   Watwin and EQ primary sources.
+% QUOTE (Crossref record): "ProgSnap2: A Flexible Format for Programming Process
+%   Data", Proceedings of the 2020 ACM Conference on Innovation and Technology
+%   in Computer Science Education, pp. 356-362.
+% QUOTE (ProgSnap2Analysis red.py, verbatim comment): "TODO: No official way to
+%   normalize RED, so we divide by the number of compiles"
+% QUOTE (ProgSnap2Analysis watwin.py, verbatim comment): "Watson(2013) doesn't
+%   state how they get mean and sd, we assume both mean and sd calculated from
+%   all compilation pairs"
+% VERIFIED: Crossref metadata matched; the three implementation files were
+%   downloaded and read in full. The code comments are quoted because they
+%   document exactly which parts of the published algorithms are
+%   reimplementation guesses -- material to how learnlog should describe its own
+%   choices.
+% DATE: 2026-08-31
+%
+% === provenance: price2020progsnap2 ===
+% SOURCE-REPORT: metrics-time.bib
+% CLAIM: For programming process data without an explicit session marker, the
+%   convention is to define a session as a run of events with no gap longer than
+%   20 minutes; ProgSnap2's SessionID column is optional, so the threshold is an
+%   analysis convention rather than part of the format.
+% FOUND-VIA: scholar search "time-on-task estimation from programming process
+%   data" -n learnlog-metrics-time -p dblp -p wos -p ieee -p openalex -p scopus;
+%   full text at https://ayaankazerouni.org/papers/2020/iticse20-progsnap2.pdf
+% PICKED: the format-defining paper, i.e. the primary source for what ProgSnap2
+%   does and does not specify. Petersen et al. 2015 is the origin of the 20-min
+%   value but is paywalled; Price et al. state and apply it verbatim.
+% QUOTE (§3.3.1): "ProgSnap2 allows a dataset to provide a SessionID column, and
+%   we used this value when it was present. Otherwise, we defined a session as a
+%   series of events with no more than a 20 minute gap between any two
+%   consecutive events, as in [23]."
+% QUOTE (Fig. 1 + §2.1): SessionID is listed among the optional columns; only
+%   EventID, EventType, SubjectID, ToolInstances and CodeStateID are marked
+%   required ("ProgSnap2 defines a small set of mandatory columns").
+% VERIFIED: full text read (7 pages incl. the format diagram). Applies because
+%   learnlog exports ProgSnap2 and its events (runs) are exactly the coarse
+%   granularity this convention was written for.
+% COUNTER: "session timeout threshold arbitrary sensitivity" and "session
+%   inactivity threshold" (session learnlog-metrics-time) surfaced no work
+%   refuting the 20-minute convention, but did surface competing values for
+%   different granularities (5 min for keystrokes, Hart 2023; 10 min for
+%   keystrokes, Leinonen 2021/2022; 3 min for edit events, Leinonen 2017;
+%   60 min for work sessions, Fenwick et al. as cited in Leinonen 2021).
+%   Claim narrowed accordingly: 20 min is the convention FOR COARSE EVENTS, not
+%   a universal value.
+% DATE: 2026-08-31
+%
+% === provenance: Price2020 ===
+% SOURCE-REPORT: metrics-code.bib (recorded there under the key `Price2020')
+% CLAIM: ProgSnap2 is a standardised format for programming process data, intended for
+%   research use.
+% FOUND-VIA: Crossref DOI lookup https://api.crossref.org/works/10.1145/3341525.3387373
+%   (known item -- learnlog already exports this format)
+% PICKED: the defining paper for the format learnlog exports; a known-item verification,
+%   not a sweep.
+% QUOTE (abstract/title): "ProgSnap2: A Flexible Format for Programming Process Data".
+% VERIFIED: bibliographic record via Crossref; applies as the format's definitional
+%   reference only.  Explicitly NOT cited as evidence about showing data to students --
+%   it is a researcher-facing data standard.
+% COUNTER: not a load-bearing empirical claim (definitional); no counter-search run, and
+%   recorded here as deliberately omitted.
+% DATE: 2026-08-31
+@inproceedings{price2020progsnap2,
+  author    = {Price, Thomas W. and Hovemeyer, David and Rivers, Kelly and
+               Gao, Ge and Bart, Austin Cory and Kazerouni, Ayaan M. and
+               Becker, Brett A. and Petersen, Andrew and Gusukuma, Luke and
+               Edwards, Stephen H. and Babcock, David},
+  title     = {{ProgSnap2}: A Flexible Format for Programming Process Data},
+  booktitle = {Proceedings of the 2020 ACM Conference on Innovation and
+               Technology in Computer Science Education (ITiCSE '20)},
+  pages     = {356--362},
+  year      = {2020},
+  publisher = {ACM},
+  doi       = {10.1145/3341525.3387373},
+}
+
+% === provenance: ihantola2015edm ===
+% CLAIM: Educational data mining on programming process data is an established
+%   subfield with a documented body of metrics and methods.
+% FOUND-VIA: WebSearch (tool: WebSearch), query 'Ihantola "Educational data
+%   mining and learning analytics in programming: literature review and case
+%   studies" ITiCSE-WGR 2015 DOI'; metadata by DOI: curl
+%   https://api.crossref.org/works/10.1145/2858796.2858798
+% PICKED: the working-group report is the standard citation for "this is an
+%   established area"; used only for that status claim, never for a specific
+%   algorithm.
+% QUOTE (Crossref record): "Educational Data Mining and Learning Analytics in
+%   Programming", Proceedings of the 2015 ITiCSE on Working Group Reports,
+%   pp. 41-63, with 16 named authors.
+% VERIFIED: Crossref metadata retrieved and matched (all 16 authors, pages,
+%   year). Full text not obtained; cited at status-claim strength only.
+% DATE: 2026-08-31
+@inproceedings{ihantola2015edm,
+  author    = {Ihantola, Petri and Vihavainen, Arto and Ahadi, Alireza and
+               Butler, Matthew and B{\"o}rstler, J{\"u}rgen and
+               Edwards, Stephen H. and Isohanni, Essi and Korhonen, Ari and
+               Petersen, Andrew and Rivers, Kelly and Rubio, Miguel {\'A}ngel
+               and Sheard, Judy and Skupas, Bronius and Spacco, Jaime and
+               Szabo, Claudia and Toll, Daniel},
+  title     = {Educational Data Mining and Learning Analytics in Programming:
+               Literature Review and Case Studies},
+  booktitle = {Proceedings of the 2015 ITiCSE on Working Group Reports},
+  pages     = {41--63},
+  year      = {2015},
+  publisher = {ACM},
+  doi       = {10.1145/2858796.2858798},
+}
+
+% === provenance: jadud2015aggregate ===
+% CLAIM: Compilation behaviour and the Error Quotient have been examined at
+%   large scale on the Blackbox dataset.
+% FOUND-VIA: WebSearch (tool: WebSearch), query 'Jadud Dorn "Aggregate
+%   compilation behavior: findings and implications from 27,698 users" ICER
+%   2015 DOI'; metadata by DOI retrieval: curl
+%   https://api.crossref.org/works/10.1145/2787622.2787718
+% PICKED: the scale replication of Jadud's own 2006 work, by the original
+%   author -- the natural citation for "EQ has been examined beyond its
+%   original cohort".
+% QUOTE (Crossref record): "Aggregate Compilation Behavior", Proceedings of the
+%   eleventh annual International Conference on International Computing
+%   Education Research, pp. 131-139, authors Jadud, Matthew C.; Dorn, Brian.
+% VERIFIED: Crossref metadata retrieved and matched. Full text NOT obtained
+%   (ACM paywall); cited only for the existence and scale of the replication,
+%   never for a numerical finding.
+% DATE: 2026-08-31
+@inproceedings{jadud2015aggregate,
+  author    = {Jadud, Matthew C. and Dorn, Brian},
+  title     = {Aggregate Compilation Behavior: Findings and Implications from
+               27,698 Users},
+  booktitle = {Proceedings of the Eleventh Annual International Conference on
+               International Computing Education Research (ICER '15)},
+  pages     = {131--139},
+  year      = {2015},
+  publisher = {ACM},
+  doi       = {10.1145/2787622.2787718},
+}
+
+% === provenance: karvelas2020compilemuch ===
+% CLAIM: Novice programming behaviour has been compared across differing
+%   compilation and error-message-presentation contexts.
+% FOUND-VIA: scholar search 'TS=("compilation mechanism" AND novice)' -n
+%   learnlog-metrics-eq -p wos (COUNTER-search, 2026-08-31); abstract via curl
+%   https://api.openalex.org/works/doi:10.1145/3416465.3416471
+% PICKED: kept as corroboration for the karvelas2020effects strand (same
+%   question, different venue and analysis), not discarded as redundant.
+% QUOTE (abstract, publisher-supplied): "A variety of feedback mechanisms are
+%   employed by various environments in use in classrooms today. Some, such as
+%   text-based error messages are common to almost all. Other interaction
+%   mechanisms, such as invoking the compiler, can vary rather drastically."
+% VERIFIED: abstract verified verbatim via OpenAlex; Crossref metadata matched.
+%   Full text NOT obtained -- Unpaywall reports an OA PDF at dl.acm.org but that
+%   URL returns 403 to WebFetch, curl and `scholar pdf quote`.
+% DATE: 2026-08-31
+@inproceedings{karvelas2020compilemuch,
+  author    = {Karvelas, Ioannis and Dillane, Joe and Becker, Brett A.},
+  title     = {Compile Much? A Closer Look at the Programming Behavior of
+               Novices in Different Compilation and Error Message Presentation
+               Contexts},
+  booktitle = {Proceedings of the United Kingdom \& Ireland Computing Education
+               Research Conference (UKICER '20)},
+  pages     = {59--65},
+  year      = {2020},
+  publisher = {ACM},
+  doi       = {10.1145/3416465.3416471},
+}
+
+% === provenance: watson2014notests ===
+% CLAIM: The Watwin score has been compared against traditional predictors of
+%   programming success.
+% FOUND-VIA: scholar search 'watwin programming behavior prediction' and
+%   'TS=(watwin AND (limitation OR criticism OR replication OR context))' -n
+%   learnlog-metrics-eq -p wos (2026-08-31); metadata by DOI: curl
+%   https://api.crossref.org/works/10.1145/2538862.2538930
+% PICKED: surfaced by the Watwin counter-search as the follow-up that tests the
+%   metric against alternatives; retained as the Watwin-lineage corroboration.
+% QUOTE (Crossref record): "No tests required", Proceedings of the 45th ACM
+%   technical symposium on Computer science education, pp. 469-474, authors
+%   Watson, Christopher; Li, Frederick W.B.; Godwin, Jamie L.
+% VERIFIED: Crossref metadata retrieved and matched. Full text not obtained;
+%   cited only for the existence of the comparison, no numerical claim drawn.
+% DATE: 2026-08-31
+@inproceedings{watson2014notests,
+  author    = {Watson, Christopher and Li, Frederick W. B. and Godwin, Jamie L.},
+  title     = {No Tests Required: Comparing Traditional and Dynamic Predictors
+               of Programming Success},
+  booktitle = {Proceedings of the 45th ACM Technical Symposium on Computer
+               Science Education (SIGCSE '14)},
+  pages     = {469--474},
+  year      = {2014},
+  publisher = {ACM},
+  doi       = {10.1145/2538862.2538930},
+}
+
+% === provenance: watson2012bluefix ===
+% CLAIM: The Watwin authors' earlier BlueFix tool addressed novice error
+%   diagnosis and repair in BlueJ.
+% FOUND-VIA: WebSearch (tool: WebSearch), query 'Watson "Watwin" algorithm
+%   score "time penalty" quartile compilation pairs BlueFix thesis pdf';
+%   metadata by DOI: curl
+%   https://api.crossref.org/works/10.1007/978-3-642-33642-3_25
+% PICKED: the antecedent tool paper of the Watwin lineage; included for
+%   completeness of the lineage, not relied on for the algorithm.
+% QUOTE (Crossref record): "BlueFix: Using Crowd-Sourced Feedback to Support
+%   Programming Students in Error Diagnosis and Repair", Lecture Notes in
+%   Computer Science, pp. 228-239 (2012).
+% VERIFIED: Crossref metadata retrieved and matched (authors, pages, year).
+%   Full text not obtained; no algorithmic claim drawn from it.
+% DATE: 2026-08-31
+@inproceedings{watson2012bluefix,
+  author    = {Watson, Christopher and Li, Frederick W. B. and Godwin, Jamie L.},
+  title     = {{BlueFix}: Using Crowd-Sourced Feedback to Support Programming
+               Students in Error Diagnosis and Repair},
+  booktitle = {Advances in Web-Based Learning (ICWL 2012)},
+  series    = {Lecture Notes in Computer Science},
+  pages     = {228--239},
+  year      = {2012},
+  publisher = {Springer},
+  doi       = {10.1007/978-3-642-33642-3_25},
+}
+
+% === provenance: rodrigo2009affective ===
+% CLAIM: Compilation-behaviour indicators, including counts of consecutive
+%   error-ending compilation pairs, were used as achievement predictors before
+%   EQ was widely adopted.
+% FOUND-VIA: delegated WebSearch strand (tool: WebSearch) on Rodrigo/Tabanao/
+%   Jadud compilation-behaviour work; metadata by DOI: curl
+%   https://api.crossref.org/works/10.1145/1562877.1562929
+% PICKED: the earliest paper in this lineage using pair-of-error-compilations
+%   as a predictor; provides historical context for EQ's design.
+% QUOTE (Crossref record): "Affective and behavioral predictors of novice
+%   programmer achievement", ITiCSE '09, pp. 156-160, ten authors incl.
+%   Rodrigo, Baker, Jadud and Tabanao.
+% VERIFIED: Crossref metadata retrieved and matched, including the full author
+%   list. Full text not obtained; cited for framing only.
+% DATE: 2026-08-31
+@inproceedings{rodrigo2009affective,
+  author    = {Rodrigo, Ma. Mercedes T. and Baker, Ryan S. and
+               Jadud, Matthew C. and Amarra, Anna Christine M. and
+               Dy, Thomas and Espejo-Lahoz, Maria Beatriz V. and
+               Lim, Sheryl Ann L. and Pascua, Sheila A. M. S. and
+               Sugay, Jessica O. and Tabanao, Emily S.},
+  title     = {Affective and Behavioral Predictors of Novice Programmer
+               Achievement},
+  booktitle = {Proceedings of the 14th Annual ACM SIGCSE Conference on
+               Innovation and Technology in Computer Science Education
+               (ITiCSE '09)},
+  pages     = {156--160},
+  year      = {2009},
+  publisher = {ACM},
+  doi       = {10.1145/1562877.1562929},
+}
+
+% === provenance: kohn2019error ===
+% CLAIM: Diagnosing the cause behind a Python error message often requires more
+%   than the message and its reported line.
+% FOUND-VIA: delegated WebSearch strand (tool: WebSearch) on novice Python error
+%   studies; metadata by DOI: curl
+%   https://api.crossref.org/works/10.1145/3287324.3287381
+% PICKED: the primary Python-specific study of what error messages do and do not
+%   tell a novice -- directly relevant to how much weight a traceback's type and
+%   line can bear in a metric.
+% QUOTE (Crossref record): "The Error Behind The Message: Finding the Cause of
+%   Error Messages in Python", SIGCSE '19, pp. 524-530, author Kohn, Tobias.
+% VERIFIED: Crossref metadata retrieved and matched. Full text NOT obtained
+%   (ACM paywall); the report therefore makes no specific numerical claim from
+%   it and cites it as a pointer for error-cause classification.
+% DATE: 2026-08-31
+@inproceedings{kohn2019error,
+  author    = {Kohn, Tobias},
+  title     = {The Error Behind the Message: Finding the Cause of Error Messages
+               in {Python}},
+  booktitle = {Proceedings of the 50th ACM Technical Symposium on Computer
+               Science Education (SIGCSE '19)},
+  pages     = {524--530},
+  year      = {2019},
+  publisher = {ACM},
+  doi       = {10.1145/3287324.3287381},
+}
+
+% === provenance: smith2019errorlandscape ===
+% CLAIM: The distribution, duration and evolution of novice Python errors has
+%   been characterised at large scale.
+% FOUND-VIA: delegated WebSearch strand (tool: WebSearch) on novice Python error
+%   studies; metadata by DOI: curl
+%   https://api.crossref.org/works/10.1145/3287324.3287394
+% PICKED: the large-scale Python counterpart to the Java/BlueJ error-frequency
+%   literature; the natural reference for what Python error types learnlog will
+%   actually see.
+% QUOTE (Crossref record): "The Error Landscape: Characterizing the Mistakes of
+%   Novice Programmers", SIGCSE '19, pp. 538-544, authors Smith, Rebecca;
+%   Rixner, Scott.
+% VERIFIED: Crossref metadata retrieved and matched. Full text NOT obtained
+%   (ACM paywall). An earlier search summary attributed "330,000+ Python
+%   implementations" to it; that figure is NOT verified and is not reported.
+% DATE: 2026-08-31
+@inproceedings{smith2019errorlandscape,
+  author    = {Smith, Rebecca and Rixner, Scott},
+  title     = {The Error Landscape: Characterizing the Mistakes of Novice
+               Programmers},
+  booktitle = {Proceedings of the 50th ACM Technical Symposium on Computer
+               Science Education (SIGCSE '19)},
+  pages     = {538--544},
+  year      = {2019},
+  publisher = {ACM},
+  doi       = {10.1145/3287324.3287394},
+}
+
+% === provenance: mccall2019newlook ===
+% CLAIM: Ranking novice errors by severity (frequency combined with difficulty)
+%   gives a different ordering than ranking by raw frequency.
+% FOUND-VIA: delegated WebSearch strand (tool: WebSearch) on novice error
+%   taxonomies; metadata by DOI: curl
+%   https://api.crossref.org/works/10.1145/3335814
+% PICKED: methodological caution against a naive count-based error metric, from
+%   a journal-length treatment. Java/BlueJ, so cited for method only.
+% QUOTE (Crossref record): "A New Look at Novice Programmer Errors", ACM
+%   Transactions on Computing Education 19(4), authors McCall, Davin;
+%   K{\"o}lling, Michael.
+% VERIFIED: Crossref metadata retrieved and matched. Full text NOT obtained;
+%   the frequency-vs-difficulty point is reported as the paper's approach, at
+%   the strength a title/venue-level check supports, and flagged as such.
+% DATE: 2026-08-31
+@article{mccall2019newlook,
+  author  = {McCall, Davin and K{\"o}lling, Michael},
+  title   = {A New Look at Novice Programmer Errors},
+  journal = {ACM Transactions on Computing Education},
+  volume  = {19},
+  number  = {4},
+  pages   = {38:1--38:30},
+  year    = {2019},
+  doi     = {10.1145/3335814},
+}
+
+% === provenance: sanchezsantillan2023dashboard ===
+% CLAIM: Dashboard-supported formative feedback on compilation errors has been
+%   evaluated empirically, but mediated by the lecturer rather than shown to
+%   students directly.
+% FOUND-VIA: delegated WebSearch strand (tool: WebSearch) on learner-facing
+%   programming analytics dashboards; verified at
+%   https://onlinelibrary.wiley.com/doi/full/10.1002/cae.22640 ; metadata by
+%   DOI: curl https://api.crossref.org/works/10.1002/cae.22640
+% PICKED: the closest published thing to "showing error metrics as formative
+%   feedback"; picked precisely because its design contradicts the obvious
+%   reading of its title, which matters for how learnlog frames its output.
+% QUOTE (per the verified publisher page): the COLMENA dashboard is "a support
+%   tool used by the lecturer to provide feedback" in class.
+% VERIFIED: Crossref metadata matched and the publisher page fetched. Read at
+%   abstract/description level, not in full; the claim drawn is only about the
+%   instructor-mediated design, which that description states.
+% COUNTER: this entry IS the counter-result to "such dashboards are
+%   student-facing"; combined with kaliisa2024dashboards it is why the report
+%   recommends reflective framing over scores.
+% DATE: 2026-08-31
+@article{sanchezsantillan2023dashboard,
+  author  = {Sanchez-Santillan, Miguel and Fernandez-Medina, Carlos and
+             Perez-Perez, Juan R. and Paule-Ruiz, M. Puerto},
+  title   = {An Empirical Evaluation of the Formative Feedback Supported by
+             Dashboard in the Context of Compilation Error},
+  journal = {Computer Applications in Engineering Education},
+  volume  = {31},
+  number  = {5},
+  pages   = {1289--1305},
+  year    = {2023},
+  doi     = {10.1002/cae.22640},
+}
+
+% === provenance: kaliisa2024dashboards ===
+% CLAIM: Learning analytics dashboards have not been shown to reliably improve
+%   students' academic achievement.
+% FOUND-VIA: delegated WebSearch strand (tool: WebSearch) on learner-facing
+%   dashboards; open preprint read at https://arxiv.org/pdf/2312.15042
+% PICKED: a systematic review, which is the right evidence type for a claim
+%   about whether an intervention class works; deliberately included as the
+%   counterweight to the project's own dashboard ambitions.
+% QUOTE (abstract): "there is no evidence to support the conclusion that LADs
+%   have lived up to the promise of improving academic achievement".
+% VERIFIED: preprint full text read. NOT programming-specific -- the claim is
+%   reported at that general scope in the report, not narrowed to CS1.
+% COUNTER: this entry IS counter-evidence to the project's premise; it is
+%   reported rather than omitted.
+% DATE: 2026-08-31
+@inproceedings{kaliisa2024dashboards,
+  author    = {Kaliisa, Rogers and Misiejuk, Kamila and
+               L{\'o}pez-Pernas, Sonsoles and Khalil, Mohammad and Saqr, Mohammed},
+  title     = {Have Learning Analytics Dashboards Lived Up to the Hype? A
+               Systematic Review of Impact on Students' Achievement,
+               Motivation, Participation and Attitude},
+  booktitle = {Proceedings of the 14th Learning Analytics and Knowledge
+               Conference (LAK '24)},
+  year      = {2024},
+  publisher = {ACM},
+  doi       = {10.1145/3636555.3636884},
+}
+
+% === provenance: li2026pymeta ===
+% CLAIM: A hierarchical taxonomy of student Python errors can be grounded in
+%   Python's official exception hierarchy.
+% FOUND-VIA: mcp__claude_ai_alphaXiv__discover_papers, keywords ["error
+%   quotient", "Jadud", "compilation behaviour", "novice programmers",
+%   "Watwin", "repeated error density", "Python"], question "Error Quotient
+%   penalty parameters for novice programming, and adaptations of EQ to Python
+%   or many-small-assignment contexts" (2026-08-31); full text then read via
+%   mcp__claude_ai_alphaXiv__get_paper_content on arxiv.org/abs/2606.30610
+% PICKED: the only source found that addresses how to bucket Python exception
+%   types for educational analysis at scale -- the open question in adapting
+%   EQ/RED to tracebacks. Included as a pointer, not as authority.
+% QUOTE (abstract): "The dataset uses a three-level hierarchical taxonomy, from
+%   a binary error/no-error split down to 14 fine-grained error types grounded
+%   in Python's official exception hierarchy."
+% VERIFIED: abstract and taxonomy section read from the retrieved full text.
+%   CAVEAT: this is an UNREFEREED arXiv preprint (2026) from a commercial
+%   outfit (CircleCat), not a peer-reviewed venue. Cited only for the existence
+%   of the taxonomy approach, never as evidence about learning.
+% COUNTER: no counter-search run specifically for this entry, because no claim
+%   in the report rests on it beyond "this approach exists"; recorded as such
+%   rather than implying a two-sided review was done.
+% DATE: 2026-08-31
+@misc{li2026pymeta,
+  author       = {Li, Chuyue and Tang, Ziqi and Wang, Jingyi and Wu, Yu and
+                  Hashimoto, Kazuma and Gao, Lingyu},
+  title        = {{PyMETA}: A Benchmark Dataset for Hierarchical Student Code
+                  Error Classification with {Python}-Interpreter-Based Labels},
+  year         = {2026},
+  howpublished = {arXiv preprint arXiv:2606.30610},
+  note         = {Unrefereed preprint},
+  eprint       = {2606.30610},
+  archiveprefix = {arXiv},
+}
+
+%======================================================================
+%  From metrics-time.bib  (scholar session learnlog-metrics-time)
+%======================================================================
+
+% Provenance-backed references for `learnlog metrics` (time-on-task / effort
+% metrics from coarse run logs).
+%
+% scholar session: learnlog-metrics-time
+%   /home/dbosk/.local/share/scholar/review_sessions/learnlog-metrics-time.json
+% Providers alive at search time (scholar providers check, 2026-08-31):
+%   openalex, dblp, wos, ieee, arxiv, scopus (+ preprint servers) = ok
+%   s2 = KEY REJECTED (HTTP 403) -- Semantic Scholar coverage missing from the
+%        scholar session; partially compensated via direct api.semanticscholar.org
+%        WebFetch and via Crossref/OpenAlex DOI retrieval.
+%   openalex returned 503/429 on EVERY query in this session despite reporting
+%        ok, so its coverage is effectively missing from the session too; it was
+%        used successfully for direct DOI retrieval outside the session.
+%
+% Support queries run in the session (all with -p dblp -p wos -p ieee -p openalex -p scopus):
+%   "time-on-task estimation from programming process data"
+%   "session segmentation inactivity threshold student log data"
+%   "novice programmer effort metrics compilation events code churn"
+%   "time-on-task programming"
+%   "session inactivity threshold"
+%   "novice compilation behaviour"
+%   "learning analytics dashboard self-regulated learning"
+% Counter queries run in the same session:
+%   "time-on-task estimation validity limitations"
+%   "time on task does not predict performance"
+%   "session timeout threshold arbitrary sensitivity"
+
+% === provenance: kovanovic2015penetrating ===
+% CLAIM: The choice of time-on-task estimation strategy from coarse event logs
+%   materially changes analytic results, so the strategy must be reported.
+% FOUND-VIA: not returned by the topic-driven session queries (relevance ranking
+%   buried it); retrieved as a known item by DOI:
+%   curl https://api.crossref.org/works/10.1145/2723576.2723623 ;
+%   full text from the publisher-deposited copy at
+%   https://www.pure.ed.ac.uk/ws/files/19361040/lak15pen.pdf
+% PICKED: the primary and canonical methodological source that systematically
+%   varies estimation strategy and measures the consequence. Alternatives
+%   (Krieter 2022, Hart 2023) measure accuracy against ground truth rather than
+%   the effect of the strategy choice on downstream models, which is the claim.
+% QUOTE (§5, p. 191): "we can confirm that the choice of a particular
+%   time-on-task estimation strategy plays an important role in the overall
+%   model fit and subsequent model interpretation. The average R^2 range of 0.15
+%   implies that a large proportion of variability can be explained by the
+%   adopted estimation strategy."
+% QUOTE (§3.2, p. 187, the two named problems): "We refer to this problem as the
+%   'last-action estimation' problem." and "We refer to this problem as the
+%   'outlier detection' problem, where by outliers we refer to the unusually
+%   long activities."
+% VERIFIED: full text read (10 pages, incl. Table 5 listing all 15 strategies:
+%   x:x x:ev x:rm x:l60 x:l30 x:l10 | l60 l30 l10 | l60:ev l30:ev l10:ev |
+%   +60ev +30ev +10ev). Applies directly: our data is exactly the coarse
+%   event-stream case they study.
+% COUNTER: "time-on-task estimation validity limitations" and "time on task does
+%   not predict performance" (session learnlog-metrics-time). No work refuting
+%   that the choice matters; the counter-searches instead surfaced work
+%   STRENGTHENING it (Krieter 2022, below) by showing all common strategies
+%   deviate from ground truth. Claim stands, and is strengthened.
+% DATE: 2026-08-31
+@inproceedings{kovanovic2015penetrating,
+  title = {Penetrating the Black Box of Time-on-task Estimation},
+  author = {Kovanovi{\'c}, Vitomir and Ga{\v{s}}evi{\'c}, Dragan and Dawson,
+            Shane and Joksimovi{\'c}, Sre{\'c}ko and Baker, Ryan S. and
+            Hatala, Marek},
+  booktitle = {Proceedings of the Fifth International Conference on Learning
+               Analytics and Knowledge (LAK '15)},
+  pages = {184--193},
+  year = {2015},
+  publisher = {ACM},
+  doi = {10.1145/2723576.2723623},
+}
+
+% === provenance: krieter2022areyoustillthere ===
+% CLAIM: Common log-based online-time estimation strategies do not accurately
+%   reproduce students' actual time, as measured against ground truth.
+% FOUND-VIA: scholar search "time-on-task estimation from programming process
+%   data" -n learnlog-metrics-time -p dblp -p wos -p ieee -p openalex -p scopus
+%   (first hit); abstract via curl https://api.openalex.org/works/doi:10.1109/TLT.2022.3154828
+% PICKED: the strongest counter-evidence found -- it is the only hit that
+%   validates log-derived time against an external ground truth (parallel screen
+%   recordings) rather than against another log-derived proxy.
+% QUOTE (abstract): "We visualize the results and show that common online time
+%   estimation strategies do not represent the online time for our students
+%   accurately. By using modified online time estimation methods, we find
+%   estimations that fit the data of our students better on an individual basis."
+% VERIFIED: abstract read via OpenAlex (hybrid OA; full text at
+%   https://ieeexplore.ieee.org/ielx7/4620076/9794661/09722960.pdf). Applies as a
+%   limitation on ALL log-derived time metrics, learnlog's included.
+% COUNTER: this entry IS the counter-source for the time-on-task claims; it is
+%   cited to qualify them rather than being refuted itself.
+% DATE: 2026-08-31
+@article{krieter2022areyoustillthere,
+  title = {Are You Still There? An Exploratory Case Study on Estimating
+           Students' LMS Online Time by Combining Log Files and Screen
+           Recordings},
+  author = {Krieter, Philipp},
+  journal = {IEEE Transactions on Learning Technologies},
+  year = {2022},
+  doi = {10.1109/TLT.2022.3154828},
+}
+
+% [price2020progsnap2: recorded in this bib too; the entry and this bib's
+%  provenance block are merged into the single price2020progsnap2 entry above.]
+
+% [petersen2015exploration: recorded in this bib too; the entry and this bib's
+%  provenance block are merged into the single petersen2015exploration entry above.]
+
+% === provenance: leinonen2022timeontask ===
+% CLAIM: Coarse-grained time-on-task (first event to submission) is a
+%   substantially weaker correlate of performance than fine-grained time-on-task
+%   with idle gaps removed; the coarse metric may not correlate at all.
+% FOUND-VIA: scholar search "time-on-task programming" -n learnlog-metrics-time
+%   -p dblp -p wos -p ieee -p openalex -p scopus; full text at
+%   https://juholeinonen.com/assets/pdf/leinonen2022time.pdf
+% PICKED: the primary source that measures BOTH metrics on the same cohort, so
+%   the comparison is not confounded by dataset. Note: also reprinted as ACM
+%   Inroads 13(2):42-49, doi 10.1145/3534564 -- cite the SIGCSE original.
+% QUOTE (§3.2, definitions): "Coarse-grained time-on-task: The time elapsed
+%   between the first keystroke and the first submission of the exercise." /
+%   "Fine-grained time-on-task: The sum of latencies between keystrokes until
+%   the first submission of the exercise with all breaks of ten minutes and
+%   longer removed."
+% QUOTE (§4.1): "the coarse-grained time-on-task does not statistically
+%   significantly correlate with the weekly exercise points (p = 0.39), while
+%   the correlation between the fine-grained time-on-task and weekly exercise
+%   points is statistically significant (p = 1.6e-25) albeit weak (r = 0.35)."
+% VERIFIED: full text read. Applies as a direct warning about learnlog's metric,
+%   which is coarse by construction; it forbids presenting our number as an
+%   achievement predictor.
+% COUNTER: "time on task does not predict performance" (session
+%   learnlog-metrics-time). Rather than refuting, this counter-search
+%   corroborated the weak-predictor direction (see edwards2009comparing, which
+%   finds no time difference at all within subjects). Claim kept at the weaker
+%   strength the evidence supports.
+% DATE: 2026-08-31
+@inproceedings{leinonen2022timeontask,
+  title = {Time-on-Task Metrics for Predicting Performance},
+  author = {Leinonen, Juho and Castro, Francisco Enrique Vicente and Hellas, Arto},
+  booktitle = {Proceedings of the 53rd ACM Technical Symposium on Computer
+               Science Education (SIGCSE '22)},
+  volume = {1},
+  pages = {871--877},
+  year = {2022},
+  publisher = {ACM},
+  doi = {10.1145/3478431.3499359},
+}
+
+% === provenance: leinonen2021finegrained ===
+% CLAIM: A break threshold of about 10 minutes is a defensible cut-off for
+%   segmenting programming activity, because the number of sessions stops
+%   changing appreciably beyond it.
+% FOUND-VIA: scholar search "time-on-task programming" -n learnlog-metrics-time
+%   -p dblp -p wos -p ieee -p openalex -p scopus; full text at
+%   https://educationaldatamining.org/EDM2021/virtual/static/pdf/EDM21_paper_176.pdf
+% PICKED: the only source found that DERIVES a threshold from data (sweeping
+%   30-1200 s and inspecting where the session count plateaus) rather than
+%   asserting one. Hart 2023 derives 5 min but against self-reported engagement.
+% QUOTE (§4.1): "if a student takes a short break of under 200 seconds or so,
+%   they are quite likely to return to the task, but if the break is longer
+%   (e.g. over 10 minutes), they are not likely to return to the task soon.
+%   Based on this, in our data, a break threshold of around 600 seconds would
+%   seem reasonable as at that point, the rate of decrease plateaus."
+% QUOTE (§5.1): "We observed that our coarse-grained time-on-task metric poorly
+%   approximated our fine-grained time-on-task metric."
+% VERIFIED: full text read. Applies with a scope caveat: their events are
+%   KEYSTROKES, so 10 min is a keystroke-latency threshold, not a run-latency
+%   threshold. Used to justify the METHOD (derive the threshold from where the
+%   session count plateaus), not to import the value.
+% COUNTER: "session inactivity threshold" and "session timeout threshold
+%   arbitrary sensitivity" (session learnlog-metrics-time) -- no work refuting
+%   the plateau method; competing values found at other granularities, which is
+%   why the value is not transferred to learnlog. Claim scoped to keystroke data.
+% DATE: 2026-08-31
+@inproceedings{leinonen2021finegrained,
+  title = {Fine-Grained Versus Coarse-Grained Data for Estimating Time-on-Task
+           in Learning Programming},
+  author = {Leinonen, Juho and Castro, Francisco Enrique Vicente and Hellas, Arto},
+  booktitle = {Proceedings of the 14th International Conference on Educational
+               Data Mining (EDM 2021)},
+  year = {2021},
+  note = {No DOI and no page numbers are recorded for this paper in dblp;
+          verified against the proceedings PDF at educationaldatamining.org},
+}
+
+% === provenance: leinonen2017comparison ===
+% CLAIM: Counts of coarse programming events -- in particular the number of
+%   program runs and the amount of source-code change -- are strong correlates
+%   of active programming time, and are therefore usable effort proxies.
+% FOUND-VIA: scholar search "time-on-task programming" -n learnlog-metrics-time
+%   -p dblp -p wos -p ieee -p openalex -p scopus; full text at
+%   https://juholeinonen.com/assets/pdf/leinonen2017comparison.pdf
+% PICKED: the primary source that puts run counts, edit counts and active time
+%   in ONE correlation matrix on one cohort, which is exactly the substitution
+%   learnlog needs to justify. Cited in preference to Jadud 2006 / Watson 2013,
+%   whose full texts could not be obtained (see the dropped list in the report).
+% QUOTE (§3.3.1, the definitions): "The total time spent on the assignment was
+%   calculated based on the first event and the last event where the student
+%   modified the source code, similar to Munson's work [26]. The total active
+%   time was the same, but excluding pauses longer than 3 minutes."
+% QUOTE (§4.1): "active time correlates with total count of source code events
+%   (r = .79), edit event count (r = .72), run event count (r = .53) and focus
+%   change event count (r = .54)."
+% QUOTE (§2, on churn): "total session time and the amount of change events were
+%   highly correlated, which could indicate that the amount of changes to the
+%   source code is a good metric for time."
+% VERIFIED: full text read. Applies directly: run count and lines-changed are
+%   both computable from learnlog's commit pairs.
+% COUNTER: "novice programmer effort metrics compilation events code churn"
+%   (session learnlog-metrics-time). No refuting work found; the qualification
+%   that emerged is that these are correlates of TIME, not of ACHIEVEMENT --
+%   the same paper reports total time does not correlate with exam scores.
+%   Claim scoped to "effort proxy", never "attainment proxy".
+% DATE: 2026-08-31
+@inproceedings{leinonen2017comparison,
+  title = {Comparison of Time Metrics in Programming},
+  author = {Leinonen, Juho and Lepp{\"a}nen, Leo and Ihantola, Petri and
+            Hellas, Arto},
+  booktitle = {Proceedings of the 2017 ACM Conference on International Computing
+               Education Research (ICER '17)},
+  pages = {200--208},
+  year = {2017},
+  publisher = {ACM},
+  doi = {10.1145/3105726.3106181},
+}
+
+% === provenance: edwards2009comparing ===
+% CLAIM: Within the same students, higher-scoring work is distinguished by
+%   starting earlier, not by spending more time -- so *when* effort is spread
+%   matters more than *how much* total time is logged.
+% FOUND-VIA: not returned by the topic-driven session queries; retrieved as a
+%   known item by DOI: curl https://api.crossref.org/works/10.1145/1584322.1584325
+%   and curl https://api.openalex.org/works/doi:10.1145/1584322.1584325
+%   (abstract reconstructed verbatim from abstract_inverted_index).
+%   NOTE: the DOI 10.1145/1584322.1584331, widely circulated for this paper, is
+%   WRONG -- it resolves to Miller, "Computer science innovation in Thailand".
+% PICKED: large-N (89,879 submissions, 1,101 students) within-subjects design,
+%   which controls for student ability -- the strongest available evidence that
+%   total time is the wrong thing to headline.
+% QUOTE (abstract): "When students received A/B scores, they started earlier and
+%   finished earlier than when the same students received C/D/F scores. They
+%   also wrote slightly more program code. They did not appear to spend any more
+%   time on their work, however."
+% VERIFIED: abstract read (OpenAlex, verbatim reconstruction); full text
+%   paywalled and NOT read, so only the abstract-level finding is relied on.
+%   Applies because learnlog can compute both quantities (start timing relative
+%   to a period, and total time).
+% COUNTER: this entry IS a counter/qualifying source for the time-on-task
+%   claims; it is cited to narrow them. It converges with leinonen2022timeontask
+%   (coarse time n.s. against weekly points) from an independent dataset and
+%   design -- two strands agreeing.
+% DATE: 2026-08-31
+@inproceedings{edwards2009comparing,
+  title = {Comparing Effective and Ineffective Behaviors of Student Programmers},
+  author = {Edwards, Stephen H. and Snyder, Jason and P{\'e}rez-Qui{\~n}ones,
+            Manuel A. and Allevato, Anthony and Kim, Dongkwan and Tretola, Betsy},
+  booktitle = {Proceedings of the Fifth International Workshop on Computing
+               Education Research (ICER '09)},
+  pages = {3--14},
+  year = {2009},
+  publisher = {ACM},
+  doi = {10.1145/1584322.1584325},
+}
+
+% === provenance: hart2023accurate ===
+% CLAIM: A simple inactivity threshold is a reasonable on-task/off-task
+%   discriminator for keystroke-level programming data, with 5 minutes working
+%   well in at least one context.
+% FOUND-VIA: scholar search "time-on-task programming" -n learnlog-metrics-time
+%   -p dblp -p wos -p ieee -p openalex -p scopus; abstract from the authors'
+%   institutional repository,
+%   https://digitalcommons.usu.edu/computer_science_stures/24
+% PICKED: the only source found that validates thresholds against prompted
+%   self-reported engagement and reports cross-validated error bounds, i.e. it
+%   tests the threshold rather than assuming it.
+% QUOTE (abstract): "We compare with threshold approaches and find that, in at
+%   least one context, a simple 5-minute threshold of inactivity is a reasonable
+%   estimate for whether a student is on-task or not."
+% VERIFIED: abstract read at the publisher-affiliated repository; full text not
+%   read. Applies ONLY as evidence that thresholding works at all -- the 5-min
+%   value is keystroke-scale and must not be transferred to run-scale events.
+% COUNTER: "time-on-task estimation validity limitations" (session
+%   learnlog-metrics-time) surfaced krieter2022areyoustillthere, which shows
+%   threshold strategies deviate from screen-recorded ground truth. The claim is
+%   therefore stated as "reasonable in at least one context" (the authors' own
+%   hedge), not as a general endorsement.
+% DATE: 2026-08-31
+@inproceedings{hart2023accurate,
+  title = {Accurate Estimation of Time-on-Task While Programming},
+  author = {Hart, Kaden and Warren, Christopher M. and Edwards, John},
+  booktitle = {Proceedings of the 54th ACM Technical Symposium on Computer
+               Science Education (SIGCSE '23)},
+  volume = {1},
+  pages = {708--714},
+  year = {2023},
+  publisher = {ACM},
+  doi = {10.1145/3545945.3569804},
+}
+
+% === provenance: hart2025multiday ===
+% CLAIM: Time-on-task for work spread over multiple days is better estimated by
+%   a probabilistic engagement model over inter-event latencies than by
+%   self-report, and self-report and log-derived measures capture different things.
+% FOUND-VIA: WebSearch "Hart Warren Edwards 'Accurate Estimation of Time-on-Task
+%   While Programming' pdf digitalcommons" (2026-08-31) surfaced the PLOS ONE
+%   follow-up; confirmed in the scholar session by the title match "spread over
+%   multiple days"; page fetched at
+%   https://journals.plos.org/plosone/article?id=10.1371%2Fjournal.pone.0330758
+% PICKED: the only source found addressing the multi-day case explicitly, which
+%   is learnlog's case (runs spread over weeks).
+% QUOTE (abstract, via the PLOS article page): "self-report and objective
+%   measures provide information on distinct, different aspects" of time-on-task.
+% VERIFIED: article page read (open access); the estimation model uses keystroke
+%   latencies with thresholds bounded between 45 seconds and 2 hours. Applies as
+%   support for reporting a log-derived number ALONGSIDE, not instead of, what
+%   the student believes they spent.
+% COUNTER: covered by the shared counter-searches; krieter2022areyoustillthere
+%   remains the standing qualification for all log-derived estimates.
+% DATE: 2026-08-31
+@article{hart2025multiday,
+  title = {Time-on-Task Estimation for Tasks Lasting Hours Spread over Multiple Days},
+  author = {Hart, Kaden and Warren, Christopher M. and Edwards, John},
+  journal = {PLOS ONE},
+  volume = {20},
+  number = {9},
+  pages = {e0330758},
+  year = {2025},
+  doi = {10.1371/journal.pone.0330758},
+}
+
+% === provenance: jivet2018license ===
+% CLAIM: Student-facing analytics displays should not default to peer comparison
+%   as the reference frame, because learners do not uniformly receive it well.
+% FOUND-VIA: not returned by the session's dashboard query (which surfaced
+%   unrelated recent dashboard papers); retrieved as a known item by DOI,
+%   curl https://api.crossref.org/works/10.1145/3170358.3170421 , abstract via
+%   WebFetch https://api.semanticscholar.org/graph/v1/paper/DOI:10.1145/3170358.3170421
+% PICKED: a systematic review specifically of LEARNER-facing dashboards and
+%   their theoretical grounding, matching the claim's scope (what to show a
+%   student). Bodily & Verbert 2017 is broader but its full text was not obtained.
+% QUOTE (abstract): "we report findings suggesting that comparison with peers, a
+%   common reference frame for contextualising information on learning analytics
+%   dashboards, was not perceived positively by all learners."
+% VERIFIED: abstract read; full text not read, so only the abstract-level
+%   recommendation is relied on. Applies because learnlog's period summaries
+%   must pick a reference frame, and the self-referenced one (this week vs your
+%   own previous weeks) is what week-by-week reporting naturally gives.
+% COUNTER: "learning analytics dashboard self-regulated learning" (session
+%   learnlog-metrics-time) surfaced hilliger2021evaluating, which reports a
+%   POSITIVE reception for a time-on-task dashboard -- but for TEACHERS, not
+%   students, so it does not refute a claim scoped to learners. Claim stands,
+%   scoped to student-facing displays.
+% DATE: 2026-08-31
+@inproceedings{jivet2018license,
+  title = {License to Evaluate: Preparing Learning Analytics Dashboards for
+           Educational Practice},
+  author = {Jivet, Ioana and Scheffel, Maren and Specht, Marcus and
+            Drachsler, Hendrik},
+  booktitle = {Proceedings of the 8th International Conference on Learning
+               Analytics and Knowledge (LAK '18)},
+  pages = {31--40},
+  year = {2018},
+  publisher = {ACM},
+  doi = {10.1145/3170358.3170421},
+}
+
+% === provenance: hilliger2021evaluating ===
+% CLAIM: Visualising time-on-task back to its audience changes behaviour --
+%   in this case teachers became aware of out-of-class hours and redesigned
+%   activities.
+% FOUND-VIA: scholar search "learning analytics dashboard self-regulated
+%   learning" -n learnlog-metrics-time -p dblp -p wos -p ieee -p openalex
+%   -p scopus; abstract via curl https://api.openalex.org/works/doi:10.1145/3448139.3448203
+% PICKED: retained as CORROBORATION for the value of surfacing time summaries,
+%   and as the honest counterweight to jivet2018license (a positive reception
+%   report). Kept rather than pruned even though jivet2018license is cited for
+%   the stronger design claim.
+% QUOTE (abstract): "Preliminary findings reveal that the dashboard helped
+%   instructors became aware about the number of hours spent outside of class
+%   time. Furthermore, data visualizations of time-on-task evidence enabled them
+%   to redesign subject activities."
+% VERIFIED: abstract read via OpenAlex. Scope caveat recorded: the audience is
+%   TEACHERS and the data is student SELF-REPORT, not logs, so it corroborates
+%   the usefulness of the display, not the accuracy of a log-derived number.
+% COUNTER: n/a -- this entry was itself found by a counter-search and is
+%   retained as the qualifying/positive side of the dashboard question.
+% DATE: 2026-08-31
+@inproceedings{hilliger2021evaluating,
+  title = {Evaluating a Learning Analytics Dashboard to Visualize Student
+           Self-Reports of Time-on-Task},
+  author = {Hilliger, Isabel and Miranda, Constanza and Schuit, Gregory and
+            Duarte, Fernando and Anselmo, Martin and Parra, Denis},
+  booktitle = {LAK21: 11th International Learning Analytics and Knowledge
+               Conference},
+  pages = {592--598},
+  year = {2021},
+  publisher = {ACM},
+  doi = {10.1145/3448139.3448203},
+}
+
+%======================================================================
+%  From metrics-code.bib  (scholar session learnlog-metrics-code)
+%======================================================================
+
+% metrics-code.bib -- references backing the `learnlog metrics` static-code-metric
+% subcommands.  All literature searches recorded in scholar session
+% "learnlog-metrics-code" (~/.local/share/scholar/review_sessions/learnlog-metrics-code.json).
+% Providers alive on 2026-08-31: openalex, dblp, wos, ieee, arxiv, scopus (+ preprint
+% servers).  s2 DEAD: "key rejected -- HTTP 403 -- check or replace S2_API_KEY".
+% Non-scholar complements (WebSearch/WebFetch/Crossref/OpenAlex/Unpaywall) are named
+% verbatim in the FOUND-VIA / COUNTER lines below.
+
+% === provenance: McCabe1976 ===
+% CLAIM: Cyclomatic complexity is defined graph-theoretically as v(G)=e-n+p (e-n+2p for
+%   a program graph), and for a structured program equals the number of predicates plus
+%   one; compound predicates count once per condition.
+% FOUND-VIA: scholar search "cyclomatic complexity measure control flow graph"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8
+%   (McCabe himself not in the ranked hits -- retrieved as a known item via
+%   Crossref DOI 10.1109/TSE.1976.233837, then full text via WebSearch-located OA copy
+%   http://www.literateprogramming.com/mccabe.pdf)
+% PICKED: the original primary source defining the measure; the derived "decision
+%   points + 1" rule and the compound-predicate rule are both stated by McCabe himself,
+%   which is exactly what the implementation's counting rules must rest on.
+% QUOTE (p.308, Definition 1): "The cyclomatic number V(G) of a graph G with n vertices,
+%   e edges, and p connected components is v(G) = e - n + p."
+% QUOTE (p.315): "the cyclomatic complexity of a structured program equals the number of
+%   predicates plus one" ... "In practice compound predicates such as IF 'c1 AND c2' THEN
+%   are treated as contributing two to complexity since without the connective AND we
+%   would have IF c1 THEN IF c2 THEN which has two predicates."
+% VERIFIED: full-text PDF read (13pp, pdftotext); the second quote directly licenses the
+%   +1-per-boolean-operator rule that radon implements and learnlog will replicate.
+% COUNTER: scholar search 'TS=("cyclomatic complexity" AND (critique OR criticism OR
+%   "empirical validation" OR invalid))' -p wos -l 10 -- surfaced Shepperd1988,
+%   ShepperdInce1994, Landman2016, VinjuGodfrey2012.  The DEFINITION is not disputed;
+%   what is disputed is its validity as a complexity/maintainability proxy.  Claim is
+%   therefore stated as a definition only, and the validity critiques are cited
+%   separately (see Shepperd1988, Landman2016).
+% DATE: 2026-08-31
+@article{McCabe1976,
+  author  = {McCabe, Thomas J.},
+  title   = {A Complexity Measure},
+  journal = {IEEE Transactions on Software Engineering},
+  volume  = {SE-2},
+  number  = {4},
+  pages   = {308--320},
+  year    = {1976},
+  doi     = {10.1109/TSE.1976.233837},
+}
+
+% === provenance: Halstead1977 ===
+% CLAIM: The software-science measures (n1, n2, N1, N2, and the derived vocabulary,
+%   length, volume, difficulty and effort) originate with Halstead's 1977 monograph
+%   "Elements of Software Science".
+% FOUND-VIA: scholar search "halstead software science metrics" -n learnlog-metrics-code
+%   -p dblp -p wos -p ieee -p openalex -l 8 (the monograph itself is a book and is not
+%   indexed by these providers; metadata retrieved as a known item via
+%   WebFetch https://openlibrary.org/search.json?q=Elements+of+Software+Science+Halstead)
+% PICKED: attribution/origin claim -- the monograph is the canonical unified presentation.
+%   This is a known-item verification, not a sweep: no competing origin exists.
+% QUOTE (Shen, Conte & Dunsmore 1983, abstract): "The theory of software science was
+%   developed by the late M. H. Halstead of Purdue University during the early 1970's.
+%   It was first presented in unified form in the monograph Elements of Software Science
+%   published by Elsevier North-Holland in 1977."
+% VERIFIED: bibliographic record (Open Library: Elsevier, 1977, ISBN 0444002057) plus the
+%   attribution quote above, taken from the verified abstract of Shen1983 (retrieved via
+%   OpenAlex + IEEE).  NOTE: the book itself was NOT read -- the entry backs the
+%   ATTRIBUTION only.  The operational formulas used in the implementation are taken from
+%   radon's source, not from this entry.
+% COUNTER: scholar search "halstead software science metrics" -p dblp -p wos -p ieee
+%   -p openalex -- surfaced Shen1983 ("A Critical Analysis of the Theory and Its Empirical
+%   Support") and Curtis et al. 1979.  Halstead's DERIVED measures are contested (see
+%   Heitlager2007); the attribution of the measures to this monograph is not.
+% DATE: 2026-08-31
+@book{Halstead1977,
+  author    = {Halstead, Maurice H.},
+  title     = {Elements of Software Science},
+  publisher = {Elsevier North-Holland},
+  year      = {1977},
+  isbn      = {0444002057},
+}
+
+% === provenance: OmanHagemeister1992 ===
+% CLAIM: The maintainability index originates in Oman and Hagemeister's work on
+%   metric-based assessment of system maintainability.
+% FOUND-VIA: scholar search "maintainability index software metrics"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8
+%   (returned directly from the ieee provider, DOI 10.1109/ICSM.1992.242525)
+% PICKED: the earliest of the two origin papers; cited together with Coleman1994, which
+%   is where the polynomial actually used by tools is published.
+% QUOTE (title/record): "Metrics for assessing a software system's maintainability",
+%   Proceedings Conference on Software Maintenance 1992, pp. 337--344.
+% VERIFIED: bibliographic record via the ieee provider and Crossref
+%   (https://api.crossref.org/works/10.1109/ICSM.1992.242525).  NOTE: Crossref stores no
+%   issued year for this record; 1992 is taken from the proceedings title ("Proceedings
+%   Conference on Software Maintenance 1992") and the IEEE record.  Content NOT read --
+%   this entry backs the ORIGIN attribution only; the formula claim rests on Coleman1994,
+%   whose full text was read.
+% COUNTER: scholar search "maintainability index criticism limitations" -p dblp -p wos
+%   -p ieee -p openalex -- that natural-language query returned only off-topic hits
+%   (soil erosion, Barthel Index, positive psychology); the productive counter-evidence
+%   came from the field-tagged CC/MI queries and is recorded under Heitlager2007,
+%   Sjoberg2012 and Morrison2023.
+% DATE: 2026-08-31
+@inproceedings{OmanHagemeister1992,
+  author    = {Oman, Paul and Hagemeister, Jack},
+  title     = {Metrics for assessing a software system's maintainability},
+  booktitle = {Proceedings Conference on Software Maintenance 1992},
+  pages     = {337--344},
+  year      = {1992},
+  publisher = {IEEE Computer Society Press},
+  doi       = {10.1109/ICSM.1992.242525},
+}
+
+% === provenance: ColemanEtAl1994 ===
+% CLAIM: The four-metric maintainability index is
+%   171 - 5.2*ln(aveVol) - 0.23*aveV(g') - 16.2*ln(aveLOC) + 50*sin(sqrt(2.46*perCM)),
+%   using natural logarithms and the constant 2.46; and its authors report that comment
+%   volume inflated the index especially in SMALL modules.
+% FOUND-VIA: scholar search "maintainability index software metrics"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8 (surfaced the
+%   Oman/Hagemeister strand); paper retrieved as a known item via Crossref DOI
+%   10.1109/2.303623 and full text via WebFetch
+%   https://www.ecs.csun.edu/~rlingard/comp589/ColemanPaper.pdf
+% PICKED: the primary source that publishes the exact polynomial tools implement.
+%   Preferred over the many later "improved MI" papers (e.g. Kaur et al. 2014), which
+%   propose variants rather than document the original.
+% QUOTE (p.46): "Maintainability = 171 - 5.2 x ln(aveVol) - 0.23 x ave V(g') - 16.2 x
+%   ln(aveLOC) + (50 x sin(sqrt(2.46 x perCM)))"
+% QUOTE (p.46): "Preliminary results indicated that this model was too sensitive to large
+%   numbers of comments. That is, large comment blocks, especially in small modules,
+%   unduly inflated the resulting maintainability indices."
+% VERIFIED: full-text PDF read (p.46 rendered and read as an image); settles that the
+%   original constant is 2.46 and the logs are natural -- radon's DOCS say 2.4 and log2,
+%   radon's CODE says 2.46 and ln.  The second quote is the authors' own warning that the
+%   comment term misbehaves on small modules, which is exactly the novice-code case.
+% COUNTER: scholar search 'TS=("cyclomatic complexity" AND "lines of code" AND correlat*)'
+%   -p wos -l 10 and "maintainability index software metrics" -- surfaced Sjoberg2012,
+%   Heitlager2007 and Morrison2023, all critical of MI's validity.  The FORMULA claim is
+%   unaffected (it is documentary); the VALIDITY claim is cited two-sided and the report
+%   recommends against surfacing MI to students.
+% DATE: 2026-08-31
+@article{ColemanEtAl1994,
+  author  = {Coleman, Don and Ash, Dan and Lowther, Bruce and Oman, Paul},
+  title   = {Using metrics to evaluate software system maintainability},
+  journal = {Computer},
+  volume  = {27},
+  number  = {8},
+  pages   = {44--49},
+  year    = {1994},
+  doi     = {10.1109/2.303623},
+}
+
+% === provenance: Shepperd1988 ===
+% CLAIM: Cyclomatic complexity has been criticised on theoretical grounds -- decision
+%   counting with a constant weight, independence from program structuring, and the
+%   arbitrary effect of modularisation.
+% FOUND-VIA: scholar search 'TS=("cyclomatic complexity" AND (critique OR criticism OR
+%   "empirical validation" OR invalid))' -n learnlog-metrics-code -p wos -l 10
+%   (COUNTER-search; also retrieved by DOI via https://api.crossref.org/works/
+%   10.1049/sej.1988.0003, full text at
+%   https://www.cs.du.edu/~snarayan/sada/teaching/COMP3705/lecture/p1/cycl-1.pdf)
+% PICKED: the canonical early critique, cited by essentially all later ones; preferred
+%   over ShepperdInce1994 ("A critique of three metrics", JSS) because it is specific to
+%   cyclomatic complexity rather than a three-metric survey.
+% QUOTE: "the very simplistic approach to decision counting" -- the ease of comprehending
+%   a decision "is not invariant"; and on modularisation, "the arbitrary impact of
+%   modularisation upon total program complexity".
+% VERIFIED: full-text PDF read; the three objections are stated as the paper's own
+%   structure, and the modularisation objection applies directly to novice code split
+%   across small functions.
+% COUNTER: the support direction for this claim is McCabe1976 itself plus the continued
+%   practical use of CC; also surfaced Kafura2025 ("Reflections on McCabe's Cyclomatic
+%   Complexity", IEEE TSE, DOI 10.1109/TSE.2025.3534580) and Landman2016, which defends
+%   measuring CC alongside SLOC.  The claim is therefore stated as "has been criticised",
+%   not "is invalid".
+% DATE: 2026-08-31
+@article{Shepperd1988,
+  author  = {Shepperd, Martin},
+  title   = {A critique of cyclomatic complexity as a software metric},
+  journal = {Software Engineering Journal},
+  volume  = {3},
+  number  = {2},
+  pages   = {30--36},
+  year    = {1988},
+  doi     = {10.1049/sej.1988.0003},
+}
+
+% === provenance: JayEtAl2009 ===
+% CLAIM: Cyclomatic complexity has been reported to correlate strongly and linearly with
+%   lines of code, such that LOC alone explains most of CC's variance.
+% FOUND-VIA: scholar search 'TS=("cyclomatic complexity" AND "lines of code" AND
+%   correlat*)' -n learnlog-metrics-code -p wos -l 10; DOI verified at
+%   https://api.crossref.org/works/10.4236/jsea.2009.23020
+% PICKED: the most-cited statement of the "CC is redundant with LOC" position and the
+%   one Landman2016 explicitly sets out to test.  Cited ONLY as one side of a contested
+%   question -- see COUNTER.
+% QUOTE (abstract): the models "successfully predict roughly 90% of CC's variance by LOC
+%   alone", concluding CC "can be said to have absolutely no explanatory power of its own".
+% VERIFIED: abstract read (open access, SCIRP); the venue (J. Software Engineering and
+%   Applications) is a weak one, which is a further reason not to rest the claim on it
+%   alone.
+% COUNTER: scholar search 'TS=("cyclomatic complexity" AND "lines of code" AND correlat*)'
+%   -p wos -l 10 -- surfaced Landman2016, which tested the same claim on 17.6M Java
+%   methods and 6.3M C functions and CONTRADICTS it.  The claim has accordingly been
+%   softened in the report from "CC carries no independent information" to "the
+%   redundancy claim is contested", and both sides are cited.
+% DATE: 2026-08-31
+@article{JayEtAl2009,
+  author  = {Jay, Graylin and Hale, Joanne E. and Smith, Randy K. and Hale, David and
+             Kraft, Nicholas A. and Ward, Charles},
+  title   = {Cyclomatic Complexity and Lines of Code: Empirical Evidence of a Stable
+             Linear Relationship},
+  journal = {Journal of Software Engineering and Applications},
+  volume  = {2},
+  number  = {3},
+  pages   = {137--143},
+  year    = {2009},
+  doi     = {10.4236/jsea.2009.23020},
+}
+
+% === provenance: Landman2016 ===
+% CLAIM: The claim that cyclomatic complexity is redundant with SLOC does not hold at the
+%   level of individual methods/functions: the linear correlation is only moderate, and
+%   aggregation is what makes it look strong.
+% FOUND-VIA: scholar search 'TS=("cyclomatic complexity" AND (critique OR criticism OR
+%   "empirical validation" OR invalid))' -n learnlog-metrics-code -p wos -l 10
+%   (COUNTER-search against JayEtAl2009); abstract verified via
+%   https://api.openalex.org/works/doi:10.1002/smr.1760
+% PICKED: the largest and most direct re-test of the redundancy claim (17.6M Java methods,
+%   6.3M C functions) and the one that explicitly reviews the prior correlation
+%   literature.  Preferred over the 2014 ICSME conference version
+%   (DOI 10.1109/ICSME.2014.44), which covers Java only.
+% QUOTE (abstract): "Our results show that linear correlation between SLOC and CC is only
+%   moderate as a result of increasingly high variance. We further observe that
+%   aggregating CC and SLOC as well as performing a power transform improves the
+%   correlation. Our conclusion is that the observed linear correlation between CC and
+%   SLOC of Java methods or C functions is not strong enough to conclude that CC is
+%   redundant with SLOC. This conclusion contradicts earlier claims from literature"
+% VERIFIED: abstract read in full via OpenAlex; it is explicitly framed as contradicting
+%   the earlier redundancy claims, i.e. exactly the counter-evidence to JayEtAl2009.
+%   Applies at method granularity, which is the granularity learnlog reports.
+%   Metadata cross-checked against https://api.crossref.org/works/10.1002/smr.1760:
+%   vol 28, issue 7, pp. 589-618; published online 2015-12-09, in print 2016-07 -- cite
+%   as 2016 (issue year); OpenAlex reports 2015 because it uses the online-first date.
+% COUNTER: this entry IS the counter-search result for JayEtAl2009.  Counter-direction for
+%   Landman itself: JayEtAl2009 and the general practice of reporting CC and LOC together.
+%   Both sides are cited in the report; neither is stated as settled.
+% DATE: 2026-08-31
+@article{Landman2016,
+  author  = {Landman, Davy and Serebrenik, Alexander and Bouwers, Eric and Vinju, Jurgen J.},
+  title   = {Empirical analysis of the relationship between {CC} and {SLOC} in a large
+             corpus of {Java} methods and {C} functions},
+  journal = {Journal of Software: Evolution and Process},
+  volume  = {28},
+  number  = {7},
+  pages   = {589--618},
+  year    = {2016},
+  doi     = {10.1002/smr.1760},
+}
+
+% === provenance: Heitlager2007 ===
+% CLAIM: The maintainability index is criticised for having unexplained fitted constants,
+%   for averaging cyclomatic complexity, and for treating comment density as a
+%   maintainability signal.
+% FOUND-VIA: scholar search "maintainability index software metrics"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8; OA full text at
+%   https://www.ou.nl/documents/40554/349790/T66311_02.pdf
+% PICKED: the most specific and most-cited critique of the MI formula itself (as opposed
+%   to critiques of maintainability measurement in general), and the origin of the
+%   SIG/practical maintainability model that replaced it.
+% QUOTE: "there is no logical argument why the MI formula contains the particular
+%   constants ... Why is the cyclomatic complexity multiplied by 0.23?"; and "counting the
+%   number of lines of comment, in general, has no relation with maintainability
+%   whatsoever".
+% VERIFIED: full-text PDF read; the second quote directly undercuts radon's
+%   comment-percentage term, which is the term that inflates MI for small commented files.
+% COUNTER: support direction -- ColemanEtAl1994 and the metric's adoption in Visual Studio
+%   and radon show it is widely implemented.  Adoption is not validity: the report cites
+%   both, and recommends not surfacing MI to students.
+% DATE: 2026-08-31
+@inproceedings{Heitlager2007,
+  author    = {Heitlager, Ilja and Kuipers, Tobias and Visser, Joost},
+  title     = {A Practical Model for Measuring Maintainability},
+  booktitle = {6th International Conference on the Quality of Information and
+               Communications Technology (QUATIC 2007)},
+  pages     = {30--39},
+  year      = {2007},
+  doi       = {10.1109/QUATIC.2007.8},
+}
+
+% === provenance: Sjoberg2012 ===
+% CLAIM: Composite maintainability metrics, including the maintainability index, were not
+%   mutually consistent and did not predict actual maintenance effort; only size and low
+%   cohesion did.
+% FOUND-VIA: scholar search "maintainability index software metrics"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8; DOI verified at
+%   https://api.crossref.org/works/10.1145/2372251.2372269
+% PICKED: the rare study that measures maintainability metrics against REAL measured
+%   maintenance effort (four functionally equivalent systems, six hired developers),
+%   rather than against other metrics.
+% QUOTE (abstract): "the metrics were not mutually consistent"; "apart from size,
+%   surrogate maintainability measures may not reflect future maintenance effort".
+% VERIFIED: abstract read via Crossref/OpenAlex; applies because MI is exactly such a
+%   surrogate measure, and the study's conclusion is that size carries the signal.
+% COUNTER: the counter-direction (MI is useful) is represented by ColemanEtAl1994 and by
+%   the many "improved MI" papers surfaced in the same search (e.g. Kaur et al. 2014,
+%   Yenduri & Naralasetti 2021); none of those validate MI against measured effort, which
+%   is why this study is given more weight.  NOTE: scope caveat -- industrial systems,
+%   not novice code.
+% DATE: 2026-08-31
+@inproceedings{Sjoberg2012,
+  author    = {Sj{\o}berg, Dag I. K. and Anda, Bente and Mockus, Audris},
+  title     = {Questioning software maintenance metrics: a comparative case study},
+  booktitle = {Proceedings of the ACM-IEEE International Symposium on Empirical Software
+               Engineering and Measurement (ESEM '12)},
+  pages     = {107--110},
+  year      = {2012},
+  doi       = {10.1145/2372251.2372269},
+}
+
+% === provenance: Morrison2023 ===
+% CLAIM: The maintainability index's accuracy for Python programs is affected by module
+%   size, i.e. it behaves differently on small modules.
+% FOUND-VIA: scholar search "maintainability index software metrics"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8 (ieee provider);
+%   abstract verified via https://api.openalex.org/works/doi:10.1109/SDS59856.2023.10329116
+% PICKED: the only hit in the whole session that evaluates MI specifically for PYTHON and
+%   specifically as a function of module size -- the closest published source to
+%   learnlog's situation (small Python files).
+% QUOTE (abstract): "we empirically evaluate the accuracy of the maintainability index as
+%   a measure of maintainability for Python programs. ... We also evaluated the effect of
+%   the module size on the accuracy of the maintainability index."
+% VERIFIED: abstract read via OpenAlex.  NOTE: closed access, no OA copy located; the
+%   DIRECTION of the module-size effect is NOT verified, so the report cites this only as
+%   evidence that the question is live for Python, and rests the small-module argument on
+%   ColemanEtAl1994's own warning plus the arithmetic of radon's implementation.
+% COUNTER: none found specifically defending MI's accuracy on small Python modules;
+%   counter-searches "maintainability index criticism limitations" (dblp/wos/ieee/openalex)
+%   and 'TS=("cyclomatic complexity" AND "lines of code" AND correlat*)' (wos) returned no
+%   such defence.  Recorded as an empty counter-search.
+% DATE: 2026-08-31
+@inproceedings{Morrison2023,
+  author    = {Morrison, Rachael and Wedyan, Fadi and Abuomar, Osama},
+  title     = {Empirical Evaluation of Maintainability Index Accuracy for Measuring
+               Maintainability of {Python} Programs},
+  booktitle = {2023 Tenth International Conference on Software Defined Systems (SDS)},
+  year      = {2023},
+  doi       = {10.1109/SDS59856.2023.10329116},
+}
+
+% === provenance: Keuning2017 ===
+% CLAIM: Student programs contain many code-quality issues that students rarely fix, and
+%   general-purpose static-analysis rule sets are largely unsuitable for novices, so
+%   educators should select a small relevant subset.
+% FOUND-VIA: scholar search "code quality student programs" -n learnlog-metrics-code
+%   -p dblp -p wos -p ieee -p openalex -l 8 (returned as hit #1 from dblp);
+%   full text at https://ics-archive.science.uu.nl/research/techreps/repo/CS-2017/2017-006.pdf
+% PICKED: the largest and most-cited study of quality issues in novice code (453,526 files,
+%   2.66M snapshots from Blackbox) and the source of the "customise the rule set" advice
+%   that drives learnlog's linter design.
+% QUOTE: "many of the checks PMD can perform are not suitable for novice programmers ...
+%   We advise educators to customize the tool by selecting a small set of relevant issues."
+% QUOTE (p.2, reporting Aivaloglou & Hermans): "In 78% of over 4 million scripts the
+%   cyclomatic complexity is one. Only 4% of the scripts has a complexity over four."
+% VERIFIED: full-text PDF read (pdftotext; both quotes located and read in context).  The
+%   second quote is Keuning et al. REPORTING Aivaloglou & Hermans 2016 -- attributed as
+%   such, because the primary (DOI 10.1145/2960310.2960325) is closed access with no OA
+%   copy (confirmed via OpenAlex: oa_status "closed").
+% COUNTER: scholar search "static analysis introductory programming feedback"
+%   -p dblp -p wos -p ieee -p openalex -l 8 -- surfaced tools reporting POSITIVE effects
+%   from student-facing static analysis (LiuPetersen2019, Luukkainen et al. 2022 ASPA).
+%   Claim therefore stated as "issues are common and rarely fixed", not "feedback does not
+%   work"; Keuning's own null result on tool use is reported alongside.
+% DATE: 2026-08-31
+@inproceedings{Keuning2017,
+  author    = {Keuning, Hieke and Heeren, Bastiaan and Jeuring, Johan},
+  title     = {Code Quality Issues in Student Programs},
+  booktitle = {Proceedings of the 2017 ACM Conference on Innovation and Technology in
+               Computer Science Education (ITiCSE '17)},
+  pages     = {110--115},
+  year      = {2017},
+  doi       = {10.1145/3059009.3059061},
+}
+
+% === provenance: Keuning2018 ===
+% CLAIM: Automated feedback on programming exercises concentrates on correctness; feedback
+%   on style and code quality is comparatively rare.
+% FOUND-VIA: scholar search "static analysis introductory programming feedback"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8; record verified via
+%   https://api.crossref.org/works/10.1145/3231711
+% PICKED: the standard systematic review of the area (101 tools), appropriate because the
+%   claim asserts a field-level consensus rather than a single finding.
+% QUOTE (abstract): "feedback mostly focuses on identifying mistakes and less on fixing
+%   problems and taking a next step"
+% VERIFIED: abstract read via Crossref; green OA full text at
+%   https://dspace.library.uu.nl/handle/1874/374365 consulted for the style-vs-correctness
+%   split (style issues appear in 36.4% of open-ended tools vs 8.3% of the more
+%   constrained class).
+% COUNTER: scholar search "code quality student programs" and "static analysis
+%   introductory programming feedback" -- the 2024-2026 hits (van den Aker & Rahimi 2024,
+%   Cui/Denny/Luxton-Reilly 2026, Hyperstyle 2022) show quality feedback is growing since
+%   the review; the claim is scoped as "as of the 2018 review" rather than as current.
+% DATE: 2026-08-31
+@article{Keuning2018,
+  author  = {Keuning, Hieke and Jeuring, Johan and Heeren, Bastiaan},
+  title   = {A Systematic Literature Review of Automated Feedback Generation for
+             Programming Exercises},
+  journal = {ACM Transactions on Computing Education},
+  volume  = {19},
+  number  = {1},
+  pages   = {1--43},
+  year    = {2018},
+  doi     = {10.1145/3231711},
+}
+
+% === provenance: Stegeman2016 ===
+% CLAIM: Code quality for teaching purposes can be decomposed into a small set of
+%   assessable criteria spanning documentation, presentation and structure.
+% FOUND-VIA: scholar search "code quality student programs" -n learnlog-metrics-code
+%   -p dblp -p wos -p ieee -p openalex -l 8 (and Crossref title search
+%   https://api.crossref.org/works?query.bibliographic=Designing+a+rubric+for+feedback+on+code+quality+in+programming+courses)
+% PICKED: the rubric that Keuning2017 itself adopts as its category scheme, which makes it
+%   the natural vocabulary for grouping learnlog's reported metrics.
+% QUOTE (abstract): the rubric was built from an existing code-quality model and
+%   preliminary design rules and "appears to be complete for the assignments it was tested
+%   on".
+% VERIFIED: abstract read via Crossref/OpenAlex.  NOTE: the rubric's category list was NOT
+%   read from this paper (the Radboud/OU PDFs returned 403); the ten categories used in the
+%   report are taken from Keuning2017's full text, which restates them, and are attributed
+%   there rather than quoted from Stegeman.
+% COUNTER: scholar search "code quality student programs" -- surfaced later competing
+%   schemes (Cui, Denny & Luxton-Reilly 2026 "A Framework to Detect, Classify, and
+%   Prioritise Student Quality Defects", DOI 10.1145/3770762.3772537).  Claim is stated as
+%   "one established decomposition", not "the" decomposition.
+% DATE: 2026-08-31
+@inproceedings{Stegeman2016,
+  author    = {Stegeman, Martijn and Barendsen, Erik and Smetsers, Sjaak},
+  title     = {Designing a rubric for feedback on code quality in programming courses},
+  booktitle = {Proceedings of the 16th Koli Calling International Conference on Computing
+               Education Research},
+  pages     = {160--164},
+  year      = {2016},
+  doi       = {10.1145/2999541.2999555},
+}
+
+% === provenance: LiuPetersen2019 ===
+% CLAIM: pylint can be adapted for novice Python programmers by restricting and rewriting
+%   its checks, and such adapted static analysis has been associated with improved student
+%   outcomes.
+% FOUND-VIA: scholar search "static analysis introductory programming feedback"
+%   -n learnlog-metrics-code -p dblp -p wos -p ieee -p openalex -l 8; DOI verified at
+%   https://api.crossref.org/works/10.1145/3287324.3287503
+% PICKED: the direct precedent for learnlog's situation -- Python, introductory course,
+%   built on a general-purpose linter (PyTA wraps pylint) rather than a bespoke analyser.
+% QUOTE (abstract): "we introduce PyTA, a wrapper for pylint that provides custom checks
+%   for common novice errors as well as improved messages to help students fix the errors
+%   that are found. ... This analysis demonstrates that, for students who chose to read the
+%   PyTA output, we observed a decrease in time to solve errors, occurrences of repeated
+%   errors, and submissions to complete a programming problem."
+% VERIFIED: abstract read in full via OpenAlex; applies because it establishes the
+%   restrict-and-rewrite pattern the report recommends.  Note the authors' own scope
+%   limit -- the effect is reported only "for students who chose to read the PyTA output",
+%   i.e. a self-selected subgroup, so no causal claim is transferred to the report.
+% COUNTER: scholar search "code quality student programs" -- Keuning2017 found students
+%   using code-analysis extensions had slightly MORE issues per KLOC (19.7 vs 18.2), and
+%   Bobadilla2024 found students add more violations than they remove.  The claim is
+%   therefore stated as "associated with", not "causes", and the null/negative results are
+%   cited alongside.
+% DATE: 2026-08-31
+@inproceedings{LiuPetersen2019,
+  author    = {Liu, David and Petersen, Andrew},
+  title     = {Static Analyses in {Python} Programming Courses},
+  booktitle = {Proceedings of the 50th ACM Technical Symposium on Computer Science
+               Education (SIGCSE '19)},
+  pages     = {666--671},
+  year      = {2019},
+  doi       = {10.1145/3287324.3287503},
+}
+
+% === provenance: Bobadilla2024 ===
+% CLAIM: Automated code-quality nudges delivered to students during a course do not
+%   reliably reduce violations: students add more violations than they remove.
+% FOUND-VIA: Crossref title search
+%   https://api.crossref.org/works?query.bibliographic=Designing+a+rubric+for+feedback+on+code+quality+in+programming+courses
+%   (appeared as an adjacent result); preprint read at https://arxiv.org/abs/2303.07187
+% PICKED: a deployed, quantified classroom study (130+ students, 1,687 repos, 8,443
+%   messages) that reports its own negative result honestly -- the strongest available
+%   corrective to optimism about metric feedback.
+% QUOTE: "students add more violations than they remove"; 513 violations were fixed.
+% VERIFIED: arXiv preprint full text read; applies directly because learnlog is proposing
+%   the same kind of non-graded, automated quality feedback.
+% COUNTER: support direction -- LiuPetersen2019 and Ostlund2023 report improvements.  Both
+%   sides are cited; the report states that quality feedback's effect on novices is mixed.
+% DATE: 2026-08-31
+@article{Bobadilla2024,
+  author  = {Bobadilla, Sofia and Glassey, Richard and Bergel, Alexandre and
+             Monperrus, Martin},
+  title   = {{SOBO}: A Feedback Bot to Nudge Code Quality in Programming Courses},
+  journal = {IEEE Software},
+  volume  = {41},
+  number  = {2},
+  pages   = {68--76},
+  year    = {2024},
+  doi     = {10.1109/MS.2023.3298729},
+}
+
+% === provenance: vandenAker2024 ===
+% CLAIM: There are theory-grounded design principles for generating AND PRESENTING
+%   automated formative feedback on code quality using software metrics, derived from
+%   research on feedback and learning dashboards.
+% FOUND-VIA: scholar search 'TS=("software metrics" AND (students OR novice OR
+%   "introductory programming"))' -n learnlog-metrics-code -p wos -l 10
+%   (this is the query that overturned an earlier "no such literature" conclusion);
+%   abstract verified via https://api.openalex.org/works/doi:10.1145/3639474.3640051 and
+%   WebFetch of https://research.ou.nl/en/publications/design-principles-for-generating-and-presenting-automated-formati
+% PICKED: the only source found that addresses the PRESENTATION of metric-based quality
+%   feedback to students as its explicit research object, which is precisely what
+%   `learnlog metrics` must decide.
+% QUOTE (abstract): the study "provides nine contextualized design principles for
+%   generating automated formative feedback on code quality. These design principles are
+%   rooted in solid educational constructs about feedback and learning dashboards" and
+%   were "empirically validated and contextualized by two focus group sessions consisting
+%   of 8 senior SE students and 2 teachers."
+% VERIFIED: abstract read via OpenAlex and the Open Universiteit research portal (the
+%   publisher-side record); ICSE-SEET 2024, pp. 139-150, CC BY.  Full text NOT read: the
+%   ACM and IEEE PDFs both return 403 to automated fetch, and Unpaywall lists no third
+%   location.  IMPORTANT SCOPE NOTE: the abstract does NOT mention trends or progress over
+%   time, so this entry backs "design principles exist for presenting metric feedback",
+%   NOT "trends over time have been shown to students".
+% COUNTER: scholar search 'TS=("code quality" AND (students OR novice*) AND (evolution OR
+%   "over time" OR trend* OR longitudinal))' -p wos -l 10 -- found no work refuting the
+%   value of such feedback; found Ostlund2023 and Prajapati2025, which measure quality
+%   over time but report to RESEARCHERS/INSTRUCTORS, not to students.  The gap that
+%   remains is specifically student-facing metric TRENDS.
+% DATE: 2026-08-31
+@inproceedings{vandenAker2024,
+  author    = {van den Aker, Eddy and Rahimi, Ebrahim},
+  title     = {Design principles for generating and presenting automated formative
+               feedback on code quality using software metrics},
+  booktitle = {Proceedings of the 46th International Conference on Software Engineering:
+               Software Engineering Education and Training (ICSE-SEET '24)},
+  pages     = {139--150},
+  year      = {2024},
+  doi       = {10.1145/3639474.3640051},
+}
+
+% === provenance: Ostlund2023 ===
+% CLAIM: Code quality in first-year students improves measurably over a course, and the
+%   improvement is concentrated in the violations that are made explicit learning outcomes.
+% FOUND-VIA: scholar search 'TS=("code quality" AND (students OR novice*) AND (evolution
+%   OR "over time" OR trend* OR longitudinal))' -n learnlog-metrics-code -p wos -l 10;
+%   abstract verified via https://api.openalex.org/works/doi:10.1145/3545945.3569829
+% PICKED: the longest-run longitudinal measurement of novice code quality found (four
+%   course iterations, n=200, 19 assignments), and the one that isolates the effect of
+%   making a violation an explicit learning outcome.
+% QUOTE (abstract): "Results showed a statistically significant improvement in code
+%   quality over 19 assignments in all four course iterations. In particular, when a
+%   single violation was the focus of a learning outcome, the effects were both a dramatic
+%   fall and sustained low occurrence. However, this improvement was mostly focused on the
+%   three most frequently occurring violations (> 70%), which masked an increase in lesser
+%   occurring violations throughout the course."
+% VERIFIED: abstract read in full via OpenAlex (gold OA); applies because it establishes
+%   both that quality-over-time is measurable in novices AND the masking caveat that a
+%   headline trend can hide worsening in the long tail -- directly relevant to how
+%   learnlog should aggregate.
+% COUNTER: scholar search "code quality student programs" -p dblp -p wos -p ieee
+%   -p openalex -- Keuning2017 reports students rarely fix issues and that tool use did not
+%   help; Bobadilla2024 reports violations increasing.  Both are cited; the claim is scoped
+%   to "improves when quality is an explicit learning outcome", which is what this study
+%   actually isolates.
+% DATE: 2026-08-31
+@inproceedings{Ostlund2023,
+  author    = {{\"O}stlund, Linus and Wicklund, Niklas and Glassey, Richard},
+  title     = {It's Never too Early to Learn About Code Quality: A Longitudinal Study of
+               Code Quality in First-year Computer Science Students},
+  booktitle = {Proceedings of the 54th ACM Technical Symposium on Computer Science
+               Education (SIGCSE 2023)},
+  year      = {2023},
+  doi       = {10.1145/3545945.3569829},
+}
+
+% === provenance: Prajapati2025 ===
+% CLAIM: Code-quality metrics tracked across a course show that student code quality
+%   improves over time without additional guidance, while formatting violations remain
+%   dominant.
+% FOUND-VIA: scholar search 'TS=("code quality" AND (students OR novice*) AND (evolution
+%   OR "over time" OR trend* OR longitudinal))' -n learnlog-metrics-code -p wos -l 10;
+%   abstract verified via https://api.openalex.org/works/doi:10.1109/FIE63693.2025.11328661
+% PICKED: the closest published analogue to what `learnlog metrics` would compute -- code
+%   quality metrics tracked per module across a course and analysed as trends.
+% QUOTE (abstract): "Our findings show that, without additional guidance, code quality
+%   improves over time, with reductions in readability and maintainability errors as the
+%   course progresses. Formatting errors, such as whitespace violations, remain high,
+%   comprising nearly half of all detected issues."
+% VERIFIED: abstract read in full via OpenAlex.  Closed access, full text not read.  Scope
+%   note: second-year Java DS&A course, not CS1 Python, and the analysis is presented to
+%   researchers/instructors rather than to students.
+% COUNTER: same search -- no work found showing quality DEGRADES over a course; the
+%   nearest contrary evidence is Bobadilla2024 (violations added faster than removed) and
+%   Ostlund2023's masking caveat, both cited.
+% DATE: 2026-08-31
+@inproceedings{Prajapati2025,
+  author    = {Prajapati, Devanshi and Acu{\~n}a, Ruben},
+  title     = {Tracing Code Quality Evolution: Insights from a Data Structures and
+               Algorithms Course},
+  booktitle = {2025 IEEE Frontiers in Education Conference (FIE)},
+  year      = {2025},
+  doi       = {10.1109/FIE63693.2025.11328661},
+}
+
+% [price2020progsnap2: recorded in this bib too (as `Price2020'); the entry and this bib's
+%  provenance block are merged into the single price2020progsnap2 entry above.]
