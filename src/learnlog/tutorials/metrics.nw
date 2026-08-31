@@ -434,10 +434,10 @@ hint: Run `learnlog metrics lint`.
 ```
 
 Run `learnlog metrics lint`.
-If a linter is installed in your project, the row counts what it found
-by rule; if not, the header tells you how to install one and the row
-shows dashes.
-Either answer completes the step.
+The row counts what the linter found, by rule, and the header names
+the linter that ran: `ruff` unless you asked for `pylint`.
+Should the header instead say that no linter was found, that answer
+completes the step too.
 
 ## How to read it
 
@@ -454,15 +454,19 @@ import or variable is something you meant to use or meant to delete.
 <<expert step: ask a linter>>=
 <<shared step: ask a linter>>
 
-learnlog looks for `ruff` and then `pylint`, in the project's `.venv`
-before the `PATH`, and runs whichever it finds with a deliberately
-small rule set: undefined names, unused imports and variables, bare
-`except`, comparison with `None` by `==`, long lines.
+learnlog ships both `ruff` and `pylint` and runs `ruff` by default,
+with a deliberately small rule set: undefined names, unused imports
+and variables, bare `except`, comparison with `None` by `==`, long
+lines.
 General-purpose rule sets flood novices with findings that do not
 matter to them; a short list is what the code-quality literature
 recommends.
-Neither tool is a dependency of learnlog, so a missing linter is
-reported, not raised.
+`pylint` asks the same questions but infers types on the way, so it
+sees a little more and takes a little longer: `--linter pylint` runs
+it once, and `learnlog config linter pylint` makes it the project's
+default.
+A linter you installed yourself in the project's `.venv` is preferred
+over the bundled copy.
 
 The one-rule-at-a-time reading comes from two classroom studies:
 students nudged about all their quality issues at once added more
