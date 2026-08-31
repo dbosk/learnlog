@@ -25,6 +25,40 @@ runs) to the one that needs the most caveats (trends), and ends where
 the playback tutorial ended: in [[learnlog list]], seeing that the
 reflection itself was recorded.
 
+Every metric step closes with a \emph{How to read it} part, because a
+number the learner cannot interpret is worse than none: an error
+quotient shown without a reading invites the one reading the literature
+rules out, a grade.
+The readings are kept to what the research supports.
+A low quotient means errors were rare or fixed at once, which is what
+fluency looks like---but the quotient was tuned on students meeting
+the same error repeatedly~\autocite{jadud2006methods}, so a low value
+on easy problems says nothing, and the reading says so.
+The two series are read as a progression, since syntax errors carried
+signal early in a course and runtime errors
+later~\autocite{svabensky2024comparison}.
+Time is read through its spread rather than its sum, because within the
+same students the better work was started earlier, not worked on
+longer~\autocite{edwards2009comparing}, and coarse time-on-task did not
+correlate with results~\autocite{leinonen2022timeontask}.
+The pair of quotient and time is read the way our own earlier work
+read it~\autocite{snider2023edit}: high effort with a falling quotient
+is practice paying off, high effort with a high quotient is
+perseverance through a hard problem, and low effort with a low
+quotient is the ambiguous corner where both the fluent and the
+disengaged sit.
+Complexity is read against the finding that most novice programs have
+none~\autocite{Keuning2017}, so its first appearance is growth; lint
+counts are read as a to-do list to be worked one rule at a time,
+because students nudged on everything at once added more findings than
+they removed~\autocite{Bobadilla2024} while a single targeted rule
+fell and stayed low~\autocite{Ostlund2023}.
+None of the readings compares the learner with anyone but their
+earlier self~\autocite{jivet2018license}, and none is offered as a
+prediction~\autocite{tabanao2011predicting}.
+The novice variant gives the readings as plain advice; the expert
+variant names the studies they rest on.
+
 \subsection{Two variants, one contract}
 
 As in \cref{tut:getting-started}, the tutorial tangles into a novice
@@ -159,6 +193,18 @@ a break between sessions; the row below counts your days, runs and
 sessions, how many runs failed, how many lines you added and removed,
 and how long you were active from run to run.
 Compare the session count with your guess.
+
+## How to read it
+
+More is not better on its own.
+Look at `days` and `first run` first: they show how you spread your
+work, and spreading work over more days and starting earlier is what
+distinguishes students' better work from their weaker work---not the
+number of hours.
+`runs` and `+lines`/`-lines` show how much you actually did in the
+window.
+`active time` is only the clock around your runs, so read it as a
+rough lower bound, and never as the time you spent thinking.
 <<novice step: summarise your time and effort>>=
 <<shared step: summarise your time and effort>>
 
@@ -180,6 +226,14 @@ spent thinking.
 By default the report covers the last seven days; `--period all`, an
 explicit `--since`/`--until`, or `--by day|week|month` for a series
 change that.
+
+The reading rests on three findings.
+Within the same students, higher-scored work was started earlier and
+finished earlier, with no more time spent (Edwards et al., 2009);
+coarse time-on-task---first event to last---did not correlate with
+weekly results at all (Leinonen et al., 2022); and run and edit counts
+track active time closely (Leinonen et al., 2017), which is why the
+counts come before the clock.
 @
 
 \subsection{Score the repeated errors}
@@ -212,6 +266,28 @@ your history: `EQ (syntax)`, which counts only syntax errors, or
 Then run `learnlog metrics eq --period all` and check.
 `pairs` tells you how many consecutive runs were compared, and `RED`
 counts how long your streaks of the same error were.
+
+## How to read it
+
+EQ runs from 0 to 1.
+Higher means your runs often ended in an error right after another
+error, and often the same kind; lower means errors were rare or you
+fixed each one in one go.
+A low EQ on a problem that was hard for you is a good sign: you seem
+to know what you are doing.
+A low EQ can also mean the problems were too easy to make you stumble,
+so always read it next to what you were working on---if it stays low
+week after week, try something harder.
+A high EQ is what a hard bug looks like from the outside; it is not a
+grade.
+If RED is high as well, one error kept coming back: stop, read the
+error message and the line it points to, and change one thing between
+runs.
+The two columns tell you where you are: syntax errors dominate while
+the language is new; later the runtime errors (`NameError`,
+`TypeError`, wrong values) are the ones with something to say, so an
+`EQ (syntax)` that falls while `EQ (all errors)` stays up is normal
+progress, not a setback.
 <<novice step: score the repeated errors>>=
 <<shared step: score the repeated errors>>
 
@@ -234,6 +310,25 @@ consecutive repeats it adds `r^2/(r+1)`, so one long streak weighs more
 than two short ones.
 Neither number is a score of you; the literature that introduced them
 could not predict who was at risk with them, and the header says so.
+
+The readings come from the studies behind the metric.
+Jadud (2006) built EQ after seeing that struggling students met the
+same error again and again, which is why a high value reads as a
+hard patch rather than carelessness.
+Švábenský et al. (2024) found that syntax errors predicted early
+exams and runtime errors later ones, which is why the two series are
+read as a progression.
+Our own earlier work (Snider et al., 2023) read EQ together with
+time-on-task: high effort with a low or falling EQ is practice paying
+off, high effort with a high EQ is perseverance through a hard
+problem, low effort with a high EQ is the pattern of the students who
+struggled most, and low effort with a low EQ is ambiguous---the fluent
+and the disengaged both sit there, which is why a persistently low EQ
+is an invitation to pick harder problems.
+Tabanao, Rodrigo and Jadud (2011) could not identify at-risk students
+from these numbers, and Karvelas et al. (2020) showed the values shift
+with the tools used, so the only comparison that means anything is
+with your own earlier weeks.
 @
 
 \subsection{Measure the code}
@@ -266,6 +361,21 @@ The row also gives the number of source lines, of functions, and of
 functions with a complexity above one, plus two maintainability
 figures; read the header line about the maintainability index before
 trusting those.
+
+## How to read it
+
+Most beginners' programs have complexity 1 in every function: they run
+straight through.
+The first function with `max CC` above one is your program starting
+to make decisions---that is growth, not a problem.
+A function whose complexity keeps climbing, past ten or so, is one to
+split into smaller functions with names that say what they do.
+`SLOC` growing together with complexity is normal; complexity growing
+while the lines stay put means your conditions are getting denser,
+which is worth a second look.
+Treat the maintainability index as a curiosity: it reads 100 for a
+tiny program and drops as you write more, without your code getting
+worse.
 <<novice step: measure the code>>=
 <<shared step: measure the code>>
 
@@ -286,6 +396,21 @@ It is shown because it is widely used, with that caveat in the header.
 With `--by week` each row measures the tree of the week's last run,
 extracted from the hidden repository, so a file that did not parse
 that week shows dashes rather than numbers.
+
+The reading rests on what is known about these numbers for small
+programs.
+In a corpus of four million novice scripts, 78% had complexity one
+and only 4% went above four (Aivaloglou and Hermans, as reported by
+Keuning et al., 2017), so the first decision in your code is the
+event worth noticing.
+Whether complexity says more than size is contested---Jay et al.
+(2009) found it nearly redundant with lines of code, Landman et al.
+(2016) found it not so at function level---which is why the two are
+shown side by side.
+The maintainability index's own authors warned that comments inflate
+it in small modules (Coleman et al., 1994), its constants have no
+derivation (Heitlager et al., 2007), and against measured maintenance
+effort only size carried signal (Sjøberg et al., 2012).
 @
 
 \subsection{Ask a linter}
@@ -313,6 +438,17 @@ If a linter is installed in your project, the row counts what it found
 by rule; if not, the header tells you how to install one and the row
 shows dashes.
 Either answer completes the step.
+
+## How to read it
+
+The count by rule is a to-do list, not a score.
+Pick the one rule with the most findings and clear those first; then
+run `learnlog metrics lint` again.
+Trying to fix everything at once tends to add findings faster than it
+removes them, while one kind of issue worked on deliberately goes away
+and stays away.
+An undefined name (`F821`) is a bug waiting to happen; an unused
+import or variable is something you meant to use or meant to delete.
 <<novice step: ask a linter>>=
 <<shared step: ask a linter>>
 <<expert step: ask a linter>>=
@@ -327,6 +463,12 @@ matter to them; a short list is what the code-quality literature
 recommends.
 Neither tool is a dependency of learnlog, so a missing linter is
 reported, not raised.
+
+The one-rule-at-a-time reading comes from two classroom studies:
+students nudged about all their quality issues at once added more
+violations than they removed (Bobadilla et al., 2024), while quality
+improved sharply and durably for the single violation a course made
+its explicit focus (Östlund et al., 2023).
 @
 
 \subsection{Look for trends}
@@ -356,6 +498,21 @@ You have a day or two of history: do you expect it to say anything
 yet?
 Run `learnlog metrics trends --by day` to see one row per day and
 read the direction lines.
+
+## How to read it
+
+Read the directions in pairs, once there are enough weeks.
+EQ falling while lines and complexity rise is the pattern you want:
+harder programs with fewer repeated errors.
+EQ falling while runs, lines and days also fall may just mean you did
+less, or easier, work.
+EQ rising together with `max complexity` is what learning a new
+construct looks like from the outside; expect it to fall again in a
+few weeks, and if it does not, that is the problem to bring to a
+teacher.
+Rising days with everything else steady is steady practice.
+No direction compares you with anyone else, and none of them is a
+grade.
 <<novice step: look for trends>>=
 <<shared step: look for trends>>
 
@@ -373,6 +530,18 @@ within; the header prints the rule so the word can be checked.
 The vocabulary is closed on purpose: whether a falling error quotient
 is good news depends on what you were doing, so the report shows the
 first and last values beside the word and leaves the judgement to you.
+
+The paired readings follow the trajectory our earlier work described
+(Snider et al., 2023): students tend to move from low effort and few
+errors, through a stretch of many repeated errors as the problems get
+harder, to sustained effort with falling errors, and finally to
+solving problems quickly with few errors again---so the same falling
+EQ means different things at different points, and only the other
+columns say which.
+Self-comparison is the frame learners receive best (Jivet et al.,
+2018), and no study has managed to predict outcomes from these
+numbers (Tabanao et al., 2011), which is why the words stop at
+rising, falling and steady.
 @
 
 \subsection{See the reflection in the log}
