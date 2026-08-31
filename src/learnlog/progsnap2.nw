@@ -16,6 +16,9 @@ A ProgSnap2 dataset is a zip file containing:
   subdirectory per unique code state.
 \item[Resources/] Individual I/O text files referenced by the
   [[ProgramOutput]] and [[ProgramInput]] columns.
+\item[LinkTables/X-Tag.csv] Tag metadata---type, message,
+  tagger, date---one row per tag, present only when the log
+  has tags (\cref{sec:tag-table}).
 \end{description}
 
 We use the [[.progsnap2]] extension to distinguish these
@@ -108,6 +111,7 @@ from learnlog.commits import (
     format_elapsed,
     get_commits,
     get_run_trailers,
+    get_tag_details,
     get_tag_map,
     filter_internal_runs,
     is_internal_run,
@@ -127,6 +131,7 @@ from learnlog.gitrepo import (
     format_run_header,
     format_run_trailer,
     parse_run_arguments,
+    report_error,
 )
 @
 
@@ -921,6 +926,20 @@ only the one that was never written gets noticed.
 The timeout is the tree-sized one for the same reason [[git add .]]
 uses it---the command reads every file in the tree.
 
+One success case still cannot be unpacked: a commit whose tree is
+\emph{empty}.
+[[git archive]] exits zero on it but emits a stream [[tarfile]]
+rejects, so the empty tree---the initial commit of a repository
+created in a directory with nothing in it yet---crashed the export
+from underneath the failure handling above.
+The distinction that matters is the same one as before: an empty
+state that is \emph{true} (the tree really holds nothing) is a fine
+code state, while an unreadable archive for a non-empty tree is
+corruption and must still stop the export.
+[[git ls-tree]] answers which one we have without hard-coding the
+empty tree's hash, which differs between SHA-1 and SHA-256
+repositories.
+
 <<progsnap2 functions>>=
 def extract_code_state(repo, commit_hash, state_dir):
     """Extract the file tree of a commit into a directory.
@@ -928,20 +947,33 @@ def extract_code_state(repo, commit_hash, state_dir):
     Uses ``git archive`` to produce a tar stream and unpacks
     it into ``state_dir``.  Raises ``GitError`` if Git cannot
     produce the archive, rather than leaving an empty state
-    behind.
+    behind; a commit whose tree is genuinely empty yields an
+    empty directory.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     result = repo.git(
         "archive", "--format=tar", commit_hash,
         text=False, timeout=GIT_TREE_TIMEOUT,
     )
-    with tarfile.open(
-        fileobj=io.BytesIO(result.stdout)
-    ) as tar:
-        tar.extractall(
-            path=str(state_dir),
-            filter="data",
-        )
+    try:
+        with tarfile.open(
+            fileobj=io.BytesIO(result.stdout)
+        ) as tar:
+            tar.extractall(
+                path=str(state_dir),
+                filter="data",
+            )
+    except tarfile.ReadError:
+        <<accept only a genuinely empty tree>>
+@
+
+<<accept only a genuinely empty tree>>=
+listing = repo.git(
+    "ls-tree", commit_hash,
+    timeout=GIT_TREE_TIMEOUT,
+)
+if listing.stdout.strip():
+    raise
 @
 
 Unpacking needs no path check of its own.
@@ -950,6 +982,37 @@ members whose names are absolute, escape the destination, or link
 outside it, which is precisely the guarantee the read-back path has to
 establish by hand (\cref{sec:reconstruct}) because there the names
 arrive from a zip index that no filter has vetted.
+
+Let's verify the empty-tree acceptance end to end: the initial
+commit of a repository begun in an empty directory extracts to an
+empty state, and the export it once crashed completes:
+
+<<progsnap2 test functions>>=
+def test_extract_code_state_empty_initial_tree(tmp_path):
+    """A repo begun in an empty directory still exports."""
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        extract_code_state,
+        read_progsnap2,
+    )
+    workdir = tmp_path / "empty"
+    workdir.mkdir()
+    repo = LearnlogRepo(workdir)
+    first = repo.git(
+        "rev-list", "--max-parents=0", "HEAD",
+    ).stdout.strip()
+    state = tmp_path / "state"
+    extract_code_state(repo, first, state)
+    assert list(state.iterdir()) == []
+    (workdir / "hello.py").write_text("print(1)\n")
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    out = tmp_path / "out.progsnap2"
+    do_export_progsnap2(repo, str(out))
+    assert read_progsnap2(out)["events"]
+@
 
 <<progsnap2 test functions>>=
 def test_get_code_state_id_deduplicates(workdir):
@@ -1390,6 +1453,7 @@ with tempfile.TemporaryDirectory(
     <<extract code states to temp directory>>
     <<build metadata csv string>>
     <<build main table csv string>>
+    <<build tag link table csv string>>
     <<assemble zip file>>
 @
 
@@ -1537,6 +1601,8 @@ with zipfile.ZipFile(
 ) as zf:
     zf.writestr("DatasetMetadata.csv", metadata_csv)
     zf.writestr("MainTable.csv", main_csv)
+    if tag_table_csv:
+        zf.writestr(TAG_TABLE_NAME, tag_table_csv)
 
     for state_subdir in sorted(states_dir.iterdir()):
         for fpath in sorted(state_subdir.rglob("*")):
@@ -1553,6 +1619,188 @@ with zipfile.ZipFile(
 
     for arcname, text in resource_files:
         zf.writestr(arcname, text)
+@
+
+\subsection{The tag table}
+\label{sec:tag-table}
+
+The [[X-Tag]] column carries names, and names are not all a tag
+holds: an annotated tag records a message, a tagger and a date, and
+a dataset that drops them loses the milestone's own words.
+ProgSnap2 has a place for exactly this shape: a \emph{link table}
+(v8, lines~439--477), a CSV under [[LinkTables/]] whose first
+column keys into a main-table column and whose extra columns wear
+the [[X-]] prefix; the [[URL]] column is optional once other
+columns exist, and there is no resource to link to here.
+The key is [[X-Tag]] itself, one row per tag: a tag name is unique
+within a repository and names exactly one commit, so \enquote{one
+row per tag} \emph{is} \enquote{one row per commit and tag}, and
+the join direction matches how every reader already splits the
+main-table cell with [[_iter_event_tags]].
+The spec's naming rule---strip [[ID]] from each key column,
+concatenate, prepend [[LinkTables/]]---applied to a column with no
+[[ID]] suffix is the identity, hence the file name.
+
+The rows come from [[get_tag_details]] (\cref{sec:tag-details}),
+the same reader whose projection fills [[X-Tag]], so the table can
+never list a name the column omits, or the other way around.
+[[X-TagType]] is a word rather than a boolean because a reader who
+has never heard of Git learns more from \enquote{lightweight} than
+from \enquote{false}.
+The tagger's \emph{name} is exported deliberately, and the email
+never is: [[SubjectID]] already names the author, but a tag made in
+a clone can carry someone else's name---a teacher marking a
+submission point---so a dataset may name teachers or TAs, and a
+consumer of the export must treat the column accordingly.
+An export with no tags writes no table at all: link tables are
+optional, and an empty one is noise.
+
+<<progsnap2 constants>>=
+TAG_TABLE_NAME = "LinkTables/X-Tag.csv"
+TAG_TABLE_COLUMNS = [
+    "X-Tag", "X-CommitHash", "X-TagType",
+    "X-TagMessage", "X-Tagger", "X-TagDate",
+]
+ANNOTATED_TAG_TYPE = "annotated"
+LIGHTWEIGHT_TAG_TYPE = "lightweight"
+<<build tag link table csv string>>=
+details = get_tag_details(repo)
+tag_table_csv = ""
+if details:
+    tag_table_buf = io.StringIO()
+    tag_writer = csv.DictWriter(
+        tag_table_buf, fieldnames=TAG_TABLE_COLUMNS,
+    )
+    tag_writer.writeheader()
+    for detail in details:
+        tag_writer.writerow({
+            "X-Tag": detail.name,
+            "X-CommitHash": detail.commit,
+            "X-TagType": (
+                ANNOTATED_TAG_TYPE if detail.annotated
+                else LIGHTWEIGHT_TAG_TYPE
+            ),
+            "X-TagMessage": detail.message,
+            "X-Tagger": detail.tagger,
+            "X-TagDate": detail.date,
+        })
+    tag_table_csv = tag_table_buf.getvalue()
+@
+
+Let's verify the table on a mixed export---a lightweight and an
+annotated tag on one run, a lightweight one on the next---including
+the trap that the lightweight rows' messages stay empty, and that
+no email address travels:
+
+<<progsnap2 test functions>>=
+def _tagged_export(workdir, tmp_path):
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text('print("v1")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+    repo.git("tag", "lab1")
+    repo.git(
+        "tag", "-a", "-F", "-", "lab2",
+        input="handed in\n\nsecond line\n",
+        env={
+            "GIT_COMMITTER_NAME": "Taggy Teacher",
+            "GIT_COMMITTER_EMAIL": "t@learnlog.invalid",
+            "GIT_COMMITTER_DATE": "2026-01-02T03:04:05+01:00",
+        },
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 5),
+        exit_code=0,
+    )
+    repo.git("tag", "lab3")
+    path = tmp_path / "out.progsnap2"
+    do_export_progsnap2(repo, str(path))
+    return path
+
+def test_progsnap2_tag_table_columns(workdir, tmp_path):
+    """The table carries type, message, tagger and date."""
+    path = _tagged_export(workdir, tmp_path)
+    with zipfile.ZipFile(path) as zf:
+        text = zf.read("LinkTables/X-Tag.csv").decode("utf-8")
+    rows = {
+        row["X-Tag"]: row
+        for row in csv_mod.DictReader(io.StringIO(text))
+    }
+    assert set(rows) == {"lab1", "lab2", "lab3"}
+    assert rows["lab1"]["X-TagType"] == "lightweight"
+    assert rows["lab1"]["X-TagMessage"] == ""
+    assert rows["lab1"]["X-Tagger"] == ""
+    assert rows["lab2"]["X-TagType"] == "annotated"
+    assert "handed in" in rows["lab2"]["X-TagMessage"]
+    assert "second line" in rows["lab2"]["X-TagMessage"]
+    assert rows["lab2"]["X-Tagger"] == "Taggy Teacher"
+    assert rows["lab2"]["X-TagDate"].startswith("2026-01-02")
+    assert rows["lab1"]["X-CommitHash"] == \
+        rows["lab2"]["X-CommitHash"]
+    assert "t@learnlog.invalid" not in text
+
+def test_progsnap2_no_tag_table_without_tags(workdir, tmp_path):
+    """A tagless export writes no link table."""
+    from learnlog.progsnap2 import do_export_progsnap2
+    repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text("print(1)\n")
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 5),
+        exit_code=0,
+    )
+    path = tmp_path / "out.progsnap2"
+    do_export_progsnap2(repo, str(path))
+    with zipfile.ZipFile(path) as zf:
+        assert "LinkTables/X-Tag.csv" not in zf.namelist()
+@
+
+The repository clock ([[tag_boundaries]]) and the dataset's
+[[Order]] ([[tag_event_orders]]) are two implementations of
+\enquote{when does a tag start}, and they cannot be collapsed:
+[[analyse]] must work on foreign datasets with no repository behind
+them.
+This agreement test is what keeps them from drifting:
+
+<<progsnap2 test functions>>=
+def test_tag_boundaries_agree_with_event_orders(
+    workdir, tmp_path,
+):
+    """The repo clock and the dataset Order tell one story."""
+    from learnlog.metrics import tag_boundaries
+    from learnlog.cli import tag_event_orders
+    from learnlog.progsnap2 import read_progsnap2
+    path = _tagged_export(workdir, tmp_path)
+    repo = LearnlogRepo(workdir)
+    events = read_progsnap2(path)["events"]
+    by_time = [
+        name
+        for boundary in tag_boundaries(repo)
+        for name in boundary.names
+    ]
+    assert by_time == ["lab1", "lab2", "lab3"]
+    orders = [
+        min(tag_event_orders(events, name)) for name in by_time
+    ]
+    assert orders == sorted(orders)
 @
 
 Let's verify the complete export pipeline:
@@ -2121,6 +2369,10 @@ The reader returns a dict with four keys:
   files that decode as UTF-8 and [[bytes]] for the rest.
 \item[ [[resources]] ] A dict mapping resource paths
   (e.g.\ [[Resources/io_3.txt]]) to their text content.
+\item[ [[tags]] ] The tag table's rows keyed by tag name,
+  when the archive carries [[LinkTables/X-Tag.csv]]
+  (\cref{sec:tag-table}); empty for archives written before
+  the table existed.
 \end{description}
 
 <<progsnap2 functions>>=
@@ -2131,19 +2383,21 @@ def read_progsnap2(source):
     a file-like object (e.g. ``BytesIO``).
 
     Returns a dict with keys ``metadata``, ``events``,
-    ``code_states``, and ``resources``.
+    ``code_states``, ``resources``, and ``tags``.
     """
     with zipfile.ZipFile(source, "r") as zf:
         <<read metadata csv>>
         <<read main table csv>>
         <<read code states from zip>>
         <<read resource files from zip>>
+        <<read the tag link table>>
 
     return {
         "metadata": metadata,
         "events": events,
         "code_states": code_states,
         "resources": resources,
+        "tags": tags,
     }
 @
 
@@ -2246,6 +2500,48 @@ for name in zf.namelist():
     resources[name] = zf.read(name).decode(
         "utf-8", errors="replace"
     )
+@
+
+The tag table is younger than the format's first archives, so its
+absence is an answer, not an error; rows without a name are noise a
+foreign tool might write, and a nameless row can never be joined,
+so they are dropped rather than kept under an empty key.
+
+<<read the tag link table>>=
+tags = {}
+if TAG_TABLE_NAME in zf.namelist():
+    tag_text = zf.read(TAG_TABLE_NAME).decode("utf-8")
+    tags = {
+        row["X-Tag"]: row
+        for row in csv.DictReader(io.StringIO(tag_text))
+        if row.get("X-Tag")
+    }
+@
+
+Let's verify both directions of the reader's tolerance---a table
+that is there, and one that is not:
+
+<<progsnap2 test functions>>=
+def test_read_progsnap2_reads_the_tag_table(workdir, tmp_path):
+    """The reader keys the rows by tag name."""
+    from learnlog.progsnap2 import read_progsnap2
+    path = _tagged_export(workdir, tmp_path)
+    dataset = read_progsnap2(path)
+    assert set(dataset["tags"]) == {"lab1", "lab2", "lab3"}
+    assert dataset["tags"]["lab2"]["X-TagType"] == "annotated"
+
+def test_read_progsnap2_tolerates_a_missing_tag_table():
+    """Archives from before the table still read."""
+    from learnlog.progsnap2 import read_progsnap2
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "DatasetMetadata.csv",
+            "Property,Value\nVersion,8\n",
+        )
+        zf.writestr("MainTable.csv", "EventType,EventID,Order\n")
+    buf.seek(0)
+    assert read_progsnap2(buf)["tags"] == {}
 @
 
 We verify the reader by round-tripping through the export
@@ -2373,7 +2669,9 @@ reuse the existing Git-based code.
 The reconstruction groups events by [[X-CommitHash]], restores
 each commit's full code snapshot from [[CodeStates/]], rebuilds
 the run blocks from the [[Run.Program]] and child I/O events,
-and recreates any tags recorded in [[X-Tag]].
+and recreates any tags recorded in [[X-Tag]]---annotated again,
+with message, tagger and date, when the tag table
+(\cref{sec:tag-table}) carries them.
 Using full snapshots matters because ProgSnap2 stores complete
 code states, not incremental patches: if a file disappears from
 the next state, we must delete it from the temporary working
@@ -2459,10 +2757,19 @@ to the same [[SubjectID]].
 
 <<configure reconstructed repository identity>>=
 repo.git("config", "user.name", subject_id)
-repo.git(
-    "config", "user.email",
-    f"{subject_id.lower().replace(' ', '.')}@learnlog.invalid",
-)
+repo.git("config", "user.email", invalid_email(subject_id))
+@
+
+The synthetic address is a function because two writers need the
+same rule: the repository identity here, and the tagger identity a
+recreated annotated tag carries (\cref{sec:tag-table}).
+[[.invalid]] is the reserved top-level domain for names that must
+never resolve.
+
+<<progsnap2 functions>>=
+def invalid_email(name):
+    """A syntactically valid, never-deliverable address for `name`."""
+    return f"{name.lower().replace(' ', '.')}@learnlog.invalid"
 @
 
 Taking the placeholder down is a deletion of the \emph{branch}, not
@@ -2619,8 +2926,79 @@ reuse [[_iter_event_tags]] to split them consistently.
 
 <<recreate tags for reconstructed commit>>=
 for tag in _iter_event_tags(group["tags"]):
-    if tag:
+    if not tag:
+        continue
+    detail = dataset.get("tags", {}).get(tag, {})
+    if detail.get("X-TagType") == ANNOTATED_TAG_TYPE:
+        <<recreate an annotated tag>>
+    else:
         repo.git("tag", tag)
+@
+
+An annotated tag is rebuilt with its message on standard
+input---the same [[argv]]-limit rule commit messages follow, and a
+tag message in somebody's dataset is untrusted input besides---and
+the tagger travels through the committer-identity overlay
+(\cref{sec:committer-overlay}), the one caller that overlay exists
+for.
+A detail Git refuses---a malformed date, an empty message---costs
+the metadata, not the import: the failure is recorded the way every
+swallowed failure is, and the tag degrades to lightweight, matching
+[[safe_snapshot_path]]'s warn-and-continue policy.
+The \emph{name} must survive in some form, because [[X-Tag]]
+references it and [[play --from]] resolves it.
+
+<<recreate an annotated tag>>=
+tagger = detail.get("X-Tagger") or subject_id
+tag_env = {
+    "GIT_COMMITTER_NAME": tagger,
+    "GIT_COMMITTER_EMAIL": invalid_email(tagger),
+}
+if detail.get("X-TagDate"):
+    tag_env["GIT_COMMITTER_DATE"] = detail["X-TagDate"]
+try:
+    repo.git(
+        "tag", "-a", "-F", "-", tag,
+        input=detail.get("X-TagMessage", ""),
+        env=tag_env,
+    )
+except GitError as error:
+    report_error(
+        "recreate annotated tag", error, repo.workdir,
+    )
+    repo.git("tag", tag)
+@
+
+Let's verify the round trip end to end---the annotated tag is a
+tag object again, its neighbours stay lightweight, and message,
+tagger and date all survive:
+
+<<progsnap2 test functions>>=
+def test_reconstruction_recreates_an_annotated_tag(
+    workdir, tmp_path,
+):
+    """Message, tagger and date survive the round trip."""
+    import shutil as shutil_mod
+    from learnlog.progsnap2 import read_progsnap2_as_repo
+    path = _tagged_export(workdir, tmp_path)
+    repo, tmpdir = read_progsnap2_as_repo(str(path))
+    try:
+        assert repo.git(
+            "cat-file", "-t", "lab2",
+        ).stdout.strip() == "tag"
+        assert repo.git(
+            "cat-file", "-t", "lab1",
+        ).stdout.strip() == "commit"
+        shown = repo.git(
+            "for-each-ref", "refs/tags/lab2",
+            "--format=%(taggername) %(taggerdate:iso-strict) "
+            "%(contents)",
+        ).stdout
+        assert "Taggy Teacher" in shown
+        assert "2026-01-02" in shown
+        assert "handed in" in shown
+    finally:
+        shutil_mod.rmtree(tmpdir, ignore_errors=True)
 @
 
 We group events by [[X-CommitHash]] in their event order.
@@ -4146,14 +4524,21 @@ Edge cases: an edit with no following run gets
 [[run=None]], and a re-run without a preceding edit gets
 [[edit=None]].
 
-We group by [[X-Tag]] because tags represent logical
-milestones (lab sessions, exercises) that the instructor
-defined.
+We group by tag because tags are milestones, and a milestone
+is a \emph{start marker} (\cref{sec:metrics-tags}): a tag
+names the run it sits on and every run after it, until the
+next tag.
+So the tag carries forward---a pair belongs to the most recent
+tag at or before it---and only the pairs before the first tag
+are grouped under the key [[""]].
 When a commit has multiple Git tags, the exporter stores them
-as a semicolon-delimited [[X-Tag]] value; the analyser splits
-that field back into individual tags so the same pair appears
-under each relevant heading.
-Events with an empty tag are grouped under the key [[""]].
+as a semicolon-delimited [[X-Tag]] value; they carry forward
+together, and the analyser splits the value so the same pair
+appears under each relevant heading.
+That duplication is deliberate, and it diverges from
+[[learnlog metrics --by tag]], which merges the names into one
+row: a report is read, a table is summed, and a duplicated
+metrics bucket would double-count the work.
 
 <<progsnap2 functions>>=
 def _iter_event_tags(tag_value):
@@ -4233,17 +4618,33 @@ for sid, subj_events in by_subject.items():
 
         if etype == "File.Edit":
             <<flush pending edit without run>>
+            if tag:
+                current_tag = tag
             current_edit = event
-            current_tag = tag
         elif etype == "Run.Program":
+            if tag:
+                current_tag = tag
             <<create pair from edit and run>>
         elif etype in IO_EVENT_COLUMNS:
             <<attach I/O to parent run>>
+        elif tag:
+            current_tag = tag
 
     <<flush final pending edit>>
 
     grouped[sid] = pairs_by_tag
 @
+
+Two orderings in the walk are load-bearing.
+The pending edit flushes \emph{before} a new tag is adopted,
+because an edit nobody ran belongs to the milestone in force
+when it was made, not to the one its successor opened.
+And the final [[elif]] lets any other event carry the tag
+forward---an [[X-Review]] run sits on a commit like any other,
+so a tag on it opens the milestone there---while still opening
+no pair: the review must stay outside the edit--run cycle for
+the reason given above, and the two properties are decided by
+two different clauses.
 
 If a new [[File.Edit]] arrives while a previous edit has
 no run yet, we flush the orphan edit as a pair with
@@ -4270,16 +4671,19 @@ When a [[Run.Program]] arrives we pair it with the pending
 edit (or [[None]] if there was no edit).
 We record the pair index in [[run_io_map]] so that
 subsequent I/O events can find their parent pair.
+The special case that once chose between [[tag]] and
+[[current_tag]] for an edit-less re-run is gone: with the tag
+carried forward, [[current_tag]] is always the tag in force,
+which is some evidence the carried rule is the simpler one.
 
 <<create pair from edit and run>>=
-tag_value = tag if current_edit is None else current_tag
 pair = {
     "edit": current_edit,
     "run": event,
     "io": [],
     "code_state_id": event["CodeStateID"],
 }
-for t in _iter_event_tags(tag_value):
+for t in _iter_event_tags(current_tag):
     if t not in pairs_by_tag:
         pairs_by_tag[t] = []
     pairs_by_tag[t].append(pair)
@@ -4482,6 +4886,99 @@ def test_group_edit_run_pairs_run_without_edit():
     assert len(pairs) == 1
     assert pairs[0]["edit"] is None
     assert pairs[0]["run"] is not None
+@
+
+Let's verify the carry-forward itself: the milestone extends to
+untagged pairs, opens only at its tag, merges a multi-tag
+commit, yields to the next tag, and moves---without
+pairing---on a review event.
+The tests share one event factory, because what varies between
+them is only the tag sequence:
+
+<<progsnap2 test functions>>=
+def _tagged_event(etype, order, tag):
+    event = {
+        "EventType": etype,
+        "EventID": str(order), "Order": str(order),
+        "SubjectID": "Alice",
+        "CodeStateID": "0",
+        "ParentEventID": "",
+        "X-Tag": tag,
+        "ProgramOutput": "", "ProgramInput": "",
+    }
+    if etype == "Run.Program":
+        event["X-EndTime"] = ""
+    return event
+
+def test_group_edit_run_pairs_tag_carries_forward():
+    """An untagged pair belongs to the last tag before it."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    grouped = group_edit_run_pairs([
+        _tagged_event("File.Edit", 1, "lab1"),
+        _tagged_event("Run.Program", 2, "lab1"),
+        _tagged_event("File.Edit", 3, ""),
+        _tagged_event("Run.Program", 4, ""),
+    ])
+    assert "" not in grouped["Alice"]
+    assert len(grouped["Alice"]["lab1"]) == 2
+
+def test_group_edit_run_pairs_before_first_tag_is_untagged():
+    """Pairs before the first tag stay under the empty key."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    grouped = group_edit_run_pairs([
+        _tagged_event("File.Edit", 1, ""),
+        _tagged_event("Run.Program", 2, ""),
+        _tagged_event("File.Edit", 3, "lab1"),
+        _tagged_event("Run.Program", 4, "lab1"),
+    ])
+    assert len(grouped["Alice"][""]) == 1
+    assert len(grouped["Alice"]["lab1"]) == 1
+
+def test_group_edit_run_pairs_multi_tag_carries_both():
+    """Tags sharing a commit stay in force together."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    grouped = group_edit_run_pairs([
+        _tagged_event("File.Edit", 1, "lab1;lab2"),
+        _tagged_event("Run.Program", 2, "lab1;lab2"),
+        _tagged_event("File.Edit", 3, ""),
+        _tagged_event("Run.Program", 4, ""),
+    ])
+    assert len(grouped["Alice"]["lab1"]) == 2
+    assert grouped["Alice"]["lab1"][1] \
+        is grouped["Alice"]["lab2"][1]
+
+def test_group_edit_run_pairs_new_tag_replaces_the_old():
+    """A later tag closes the earlier milestone."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    grouped = group_edit_run_pairs([
+        _tagged_event("File.Edit", 1, "lab1"),
+        _tagged_event("Run.Program", 2, "lab1"),
+        _tagged_event("File.Edit", 3, ""),
+        _tagged_event("Run.Program", 4, ""),
+        _tagged_event("File.Edit", 5, "lab2"),
+        _tagged_event("Run.Program", 6, "lab2"),
+        _tagged_event("File.Edit", 7, ""),
+        _tagged_event("Run.Program", 8, ""),
+    ])
+    assert len(grouped["Alice"]["lab1"]) == 2
+    assert len(grouped["Alice"]["lab2"]) == 2
+
+def test_group_edit_run_pairs_review_carries_the_tag():
+    """A review event moves the tag but opens no pair."""
+    from learnlog.progsnap2 import group_edit_run_pairs
+    review = _tagged_event("X-Review", 3, "lab1")
+    grouped = group_edit_run_pairs([
+        _tagged_event("File.Edit", 1, ""),
+        _tagged_event("Run.Program", 2, ""),
+        review,
+        _tagged_event("File.Edit", 4, ""),
+        _tagged_event("Run.Program", 5, ""),
+    ])
+    assert len(grouped["Alice"][""]) == 1
+    lab1 = grouped["Alice"]["lab1"]
+    assert len(lab1) == 1
+    assert lab1[0]["edit"] is not None
+    assert all(p["run"] is not review for p in lab1)
 @
 
 
@@ -4705,6 +5202,15 @@ option lets users type real-world titles like
 satisfy \LaTeX{} syntax; escaping them as if they
 were raw data would mangle that intent.
 
+An annotated tag's first message line joins its heading---the
+milestone's own words---read from the tag table when the dataset
+carries one (\cref{sec:tag-table}).
+The [[(untagged)]] label is the shared [[UNTAGGED_LABEL]], the same
+word [[metrics --by tag]] prints, so the two reports name the one
+idea one way.
+
+<<progsnap2 constants>>=
+UNTAGGED_LABEL = "(untagged)"
 <<emit subject section>>=
 heading = (
     title
@@ -4722,7 +5228,8 @@ for tag in sorted(tags.keys()):
     pairs = tags[tag]
     gaps = compute_run_gaps(pairs)
     if not only_untagged:
-        tag_label = tag if tag else "(untagged)"
+        tag_label = tag if tag else UNTAGGED_LABEL
+        <<append the tag's message to its heading>>
         lines.append(
             "\\subsection{"
             f"{_latex_escape(tag_label)}"
@@ -4734,6 +5241,17 @@ for tag in sorted(tags.keys()):
         <<emit pairs side by side>>
     else:
         <<emit pairs sequentially>>
+@
+
+Only the first message line joins the heading: a heading is a name,
+and the rest of the message is the body's business.
+
+<<append the tag's message to its heading>>=
+message = dataset.get("tags", {}).get(tag, {}).get(
+    "X-TagMessage", "",
+)
+if message:
+    tag_label += f" --- {message.splitlines()[0]}"
 @
 
 \subsection{Sequential mode}
