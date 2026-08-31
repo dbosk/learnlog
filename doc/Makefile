@@ -10,12 +10,14 @@ weave: learnlog.tex
 ../src/learnlog/gitrepo.tex: ../src/learnlog/gitrepo.nw
 ../src/learnlog/commits.tex: ../src/learnlog/commits.nw
 ../src/learnlog/progsnap2.tex: ../src/learnlog/progsnap2.nw
+../src/learnlog/metrics.tex: ../src/learnlog/metrics.nw
 ../src/learnlog/viewer.tex: ../src/learnlog/viewer.nw
 ../src/learnlog/cli.tex: ../src/learnlog/cli.nw
 ../src/learnlog/tutorials/tutorials.tex: ../src/learnlog/tutorials/tutorials.nw
 ../src/learnlog/tutorials/getting-started.tex: ../src/learnlog/tutorials/getting-started.nw
 ../src/learnlog/tutorials/playback-and-tagging.tex: ../src/learnlog/tutorials/playback-and-tagging.nw
 ../src/learnlog/tutorials/export-and-share.tex: ../src/learnlog/tutorials/export-and-share.nw
+../src/learnlog/tutorials/metrics.tex: ../src/learnlog/tutorials/metrics.nw
 ../src/learnlog/tutorials/analysing-progsnap2.tex: ../src/learnlog/tutorials/analysing-progsnap2.nw
 
 %.tex: %.nw
@@ -30,12 +32,15 @@ learnlog.pdf: ../src/learnlog/capture.tex
 learnlog.pdf: ../src/learnlog/gitrepo.tex
 learnlog.pdf: ../src/learnlog/commits.tex
 learnlog.pdf: ../src/learnlog/progsnap2.tex
+learnlog.pdf: ../src/learnlog/metrics.tex
+learnlog.pdf: metrics-protocol.tex
 learnlog.pdf: ../src/learnlog/viewer.tex
 learnlog.pdf: ../src/learnlog/cli.tex
 learnlog.pdf: ../src/learnlog/tutorials/tutorials.tex
 learnlog.pdf: ../src/learnlog/tutorials/getting-started.tex
 learnlog.pdf: ../src/learnlog/tutorials/playback-and-tagging.tex
 learnlog.pdf: ../src/learnlog/tutorials/export-and-share.tex
+learnlog.pdf: ../src/learnlog/tutorials/metrics.tex
 learnlog.pdf: ../src/learnlog/tutorials/analysing-progsnap2.tex
 learnlog.pdf: bibliography.bib preamble.tex
 

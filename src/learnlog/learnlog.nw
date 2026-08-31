@@ -879,9 +879,9 @@ research-valuable data.
 That argument was half right and the half it got wrong was expensive.
 
 What it got right is that reflection matters, and reflection is what
-[[learnlog play]] and [[learnlog list]] are: the student reading their
-own history back.
-Those two stay recorded---indeed they become \emph{visible} records
+[[learnlog play]], [[learnlog list]] and [[learnlog metrics]] are: the
+student reading their own history back.
+Those three stay recorded---indeed they become \emph{visible} records
 rather than hidden ones (\cref{commits})---because a log that shows
 only writing and never reading tells half the story of how someone
 learns to program.
@@ -908,8 +908,9 @@ One policy, four defects, all of the same shape: a command cannot
 safely be a participant in the history it is manipulating.
 
 So the allow-list is inverted.
-[[play]] and [[list]] are recorded (\cref{sec:review-subcommands}
-names them, since the readers need the same list); everything
+[[play]], [[list]] and [[metrics]] are recorded
+(\cref{sec:review-subcommands} names them, since the readers need the
+same list); everything
 else---[[init]], [[tutorial]], [[tag]], [[clone]], [[pull]],
 [[push]], [[set-remote]], [[export]], [[git]], [[activate]],
 [[deactivate]], [[doctor]], [[analyse]]---leaves no trace whatsoever.
@@ -3019,8 +3020,9 @@ def test_a_run_without_standard_input_is_recorded(workdir, test_env):
 
 Both capture chunks above sit under [[if not review_run]], and the
 reason is quantitative.
-Everything [[learnlog play]] and [[learnlog list]] print \emph{is} the
-log: commit subjects, code diffs, captured output of earlier runs.
+Everything [[learnlog play]], [[learnlog list]] and
+[[learnlog metrics]] print \emph{is} the log, or a summary of it:
+commit subjects, code diffs, captured output of earlier runs.
 Capturing that output back into the trailer would copy the history
 into itself, and since the copy is committed, the next review copies
 the copy---a log that grows quadratically in the number of times the
@@ -7015,4 +7017,30 @@ def test_batch_playback_is_recorded_and_traced(cli_project):
     } == shown
     assert "--- I/O ---\n(no I/O)" in trailer
     assert "diff --git" not in trailer
+@
+
+A metrics run is the third kind of review run, and the shape of its
+record is the contrast with playback: it is recorded, it captures
+nothing of what it printed, and it carries no view trace, because it
+showed the student a summary rather than any commit
+(\cref{sec:review-subcommands}).
+
+<<autostart test functions>>=
+def test_metrics_is_recorded_without_a_view_trace(cli_project):
+    project, venv_dir, learnlog = cli_project
+    _run_student_program(
+        venv_dir, project, "print('measure me')\n",
+    )
+
+    report = _run_cli(
+        learnlog, ["metrics", "time", "--period", "all"], cwd=project,
+    )
+    assert "active time (run-to-run)" in report.stdout
+
+    listed = _run_cli(learnlog, ["list"], cwd=project)
+    assert "learnlog metrics time" in listed.stdout
+
+    trailer = _commit_body(project, "^Run-End: learnlog metrics")
+    assert "Viewed:" not in trailer
+    assert "--- I/O ---\n(no I/O)" in trailer
 @

@@ -1,0 +1,416 @@
+\section{Reading your own log as numbers}
+\label{tut:metrics}
+
+This tutorial turns the recorded project back on its author.
+The previous tutorials read the log as a sequence---play it back, jump
+to a tag---and this one reads it as summaries: how many days and runs,
+how often an error was followed by the same error, how large and how
+branched the program is, and whether any of that is moving.
+The invariant is the same recorded project; what varies across the
+steps is the \emph{question} asked of it, one metric family at a time,
+so the learner can attribute each new number to the question that
+produced it rather than to a change in the data.
+
+Two design choices shape every step.
+First, the learner makes the history before measuring it: the opening
+step has them run a program that fails twice in the same way and then
+succeeds, so that every later number has a visible cause the learner
+remembers typing.
+Second, each step asks for a prediction before the command---how many
+sessions, which error series will be higher, whether the trend is
+decidable yet---because a number the learner has guessed at first is
+one they read, and a number that merely appears is one they skim.
+The order runs from the metric with the most obvious meaning (days and
+runs) to the one that needs the most caveats (trends), and ends where
+the playback tutorial ended: in [[learnlog list]], seeing that the
+reflection itself was recorded.
+
+\subsection{Two variants, one contract}
+
+As in \cref{tut:getting-started}, the tutorial tangles into a novice
+entry, [[metrics]], and an expert entry, [[metrics-expert]], sharing
+every step's checks through common chunks.
+The mechanism the expert variant makes visible is the definition
+behind each number: what a session is and where the twenty minutes
+come from, which pairs of runs the error quotient scores, which tool
+counts the complexity and why the maintainability index carries a
+warning, how a linter is found, and what rule turns a series into the
+word \enquote{rising}.
+The novice variant keeps to reading the tables and never names a
+paper or a tool.
+
+<<[[metrics.md]]>>=
+---
+id: metrics
+title: Reading your own log as numbers
+summary: Summarise your time, errors, and code, and watch them over time.
+---
+
+<<novice step: produce a few runs to measure>>
+
+<<novice step: summarise your time and effort>>
+
+<<novice step: score the repeated errors>>
+
+<<novice step: measure the code>>
+
+<<novice step: ask a linter>>
+
+<<novice step: look for trends>>
+
+<<novice step: see the reflection in the log>>
+<<[[metrics-expert.md]]>>=
+---
+id: metrics-expert
+title: Reading your own log as numbers, definitions included
+summary: The same summaries, with the definition behind each number.
+---
+
+<<expert step: produce a few runs to measure>>
+
+<<expert step: summarise your time and effort>>
+
+<<expert step: score the repeated errors>>
+
+<<expert step: measure the code>>
+
+<<expert step: ask a linter>>
+
+<<expert step: look for trends>>
+
+<<expert step: see the reflection in the log>>
+@
+
+\subsection{Produce a few runs to measure}
+
+The opening step manufactures the data the rest of the tutorial reads,
+and does so deliberately: a run that fails, the same failure after an
+edit, then success.
+Its object of learning is that the numbers to come describe
+\emph{these} runs---the learner will recognise the repeated
+[[NameError]] again in the error quotient step.
+The check is only that the program was run; how many times and with
+which mistakes is the learner's to arrange, since the point is that
+they know what they did.
+The expert extra names what the log keeps per run, because the
+definitions in later steps are stated in those terms.
+
+<<shared step: produce a few runs to measure>>=
+# Produce a few runs to measure
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'python\S*\s+\S+\.py'
+hint: Run your program with `python` a few times, fixing it between runs.
+```
+
+In your learnlog project, write a short program that uses a variable
+before defining it, for example:
+
+```python
+print(total)
+```
+
+Run it with `python` and watch it fail with a `NameError`.
+Change something small---add a comment, say---and run it again, so that
+it fails the same way twice.
+Then define the variable above the `print` and run it a third time.
+<<novice step: produce a few runs to measure>>=
+<<shared step: produce a few runs to measure>>
+<<expert step: produce a few runs to measure>>=
+<<shared step: produce a few runs to measure>>
+
+Each run leaves two commits in the hidden repository: a header with
+the code as it was about to run, and a trailer with the exit code, the
+traceback if there was one, and the end time.
+Every number in this tutorial is computed from those fields alone; the
+metrics never read the exit code to decide whether a run failed, only
+the traceback, because `sys.exit(1)` is not a mistake and a caught
+exception exits with zero.
+@
+
+\subsection{Summarise your time and effort}
+
+The step's object of learning is the shape of a metrics report: a
+header stating the window and the settings, then one row per period.
+The learner is asked to predict the session count before looking,
+which is what makes the idle threshold in the header a thing they
+notice rather than a line they skip.
+The expert extra gives the definition and its source: a session ends
+at twenty minutes without a run, measured from the end of a run, and
+the clock counts run-to-run activity only.
+
+<<shared step: summarise your time and effort>>=
+# Summarise your time and effort
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+time\b'
+hint: Run `learnlog metrics time --period all`.
+```
+
+Before you run anything: how many sessions do you think your runs so
+far make---one, or several?
+Then run `learnlog metrics time --period all`.
+The first lines say which window the report covers and what counts as
+a break between sessions; the row below counts your days, runs and
+sessions, how many runs failed, how many lines you added and removed,
+and how long you were active from run to run.
+Compare the session count with your guess.
+<<novice step: summarise your time and effort>>=
+<<shared step: summarise your time and effort>>
+
+By default `learnlog metrics time` covers the last seven days; `--period
+today`, `--period month` and `--period all` change that.
+<<expert step: summarise your time and effort>>=
+<<shared step: summarise your time and effort>>
+
+A session ends when twenty minutes pass between the end of one run and
+the start of the next; that is the convention used for program-run
+data in the ProgSnap2 literature, and it is a parameter (`--idle`)
+because estimates like this one change materially with the threshold.
+Active time adds up each run's duration (capped at the threshold, so a
+program waiting on `input()` for an hour does not count an hour) and
+the gaps between runs in a session, and credits nothing before the
+first run.
+It is labelled run-to-run for that reason: it is not the time you
+spent thinking.
+By default the report covers the last seven days; `--period all`, an
+explicit `--since`/`--until`, or `--by day|week|month` for a series
+change that.
+@
+
+\subsection{Score the repeated errors}
+
+This is the step the opening step was staged for.
+Its object of learning is that the error quotient measures
+\emph{repetition}, not failure: the pair of identical [[NameError]]
+runs scores the maximum, the pair ending in success scores nothing.
+The prediction contrasts the two series the report prints---syntax
+errors only, and all errors---and the learner's history contains no
+syntax error, so the contrast is decided by their own data.
+The expert extra states the scoring and its parameters, and the
+caveat every report prints.
+
+<<shared step: score the repeated errors>>=
+# Score the repeated errors
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+eq\b'
+hint: Run `learnlog metrics eq --period all`.
+```
+
+The error quotient (EQ) looks at consecutive runs of the same program
+and asks: did both end in an error, and was it the same kind of error?
+Before running it, predict which of the two columns will be higher for
+your history: `EQ (syntax)`, which counts only syntax errors, or
+`EQ (all errors)`, which counts every uncaught exception.
+Then run `learnlog metrics eq --period all` and check.
+`pairs` tells you how many consecutive runs were compared, and `RED`
+counts how long your streaks of the same error were.
+<<novice step: score the repeated errors>>=
+<<shared step: score the repeated errors>>
+
+These numbers describe how your runs followed one another.
+They are not a grade, and a high value after a hard bug is exactly
+what a hard bug looks like.
+<<expert step: score the repeated errors>>=
+<<shared step: score the repeated errors>>
+
+Two consecutive runs of the same script form a pair only if the code
+changed between them---the header commits have different trees---so
+re-running unchanged code is not a repeated mistake.
+A pair scores 13 if both runs ended in an error and 3 more if the
+error type is the same, out of a possible 16, and EQ is the mean over
+pairs; that is the two-parameter form used in the Python literature,
+and the header names it so that two reports can be compared only when
+they were computed the same way.
+RED is Becker's repeated error density: for each streak of `r`
+consecutive repeats it adds `r^2/(r+1)`, so one long streak weighs more
+than two short ones.
+Neither number is a score of you; the literature that introduced them
+could not predict who was at risk with them, and the header says so.
+@
+
+\subsection{Measure the code}
+
+The step changes the object of measurement from the history to the
+program, which is the contrast that separates the code family from the
+two before it: [[code]] reads files, not runs.
+Its object of learning is that size and branching are reported
+together---lines beside complexity---and that a first program scores
+a suspiciously perfect maintainability index, which the header
+explains.
+The prediction is the maximum complexity, a number the learner can
+work out by counting the `if`s and loops in their own file.
+
+<<shared step: measure the code>>=
+# Measure the code
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+code\b'
+hint: Run `learnlog metrics code`.
+```
+
+Count the `if`, `for` and `while` statements in the most complicated
+function of your program and add one; that is roughly its cyclomatic
+complexity.
+Run `learnlog metrics code` and find `max CC` in the row.
+The row also gives the number of source lines, of functions, and of
+functions with a complexity above one, plus two maintainability
+figures; read the header line about the maintainability index before
+trusting those.
+<<novice step: measure the code>>=
+<<shared step: measure the code>>
+
+For one window the report measures your files as they are now; with
+`--by week` it measures the code as it stood at the end of each week.
+<<expert step: measure the code>>=
+<<shared step: measure the code>>
+
+The counts come from `radon`: complexity is McCabe's predicates plus
+one, counting every `if`, loop, `except`, comprehension clause and
+boolean operand beyond the first.
+The maintainability index is Coleman's 1994 formula over Halstead
+volume, complexity and lines, rescaled to 0--100; it reads 100 for any
+program whose Halstead volume is zero---which, with radon's operator
+definitions, is every program that only calls functions---and its own
+authors warned that comments inflate it in small files.
+It is shown because it is widely used, with that caveat in the header.
+With `--by week` each row measures the tree of the week's last run,
+extracted from the hidden repository, so a file that did not parse
+that week shows dashes rather than numbers.
+@
+
+\subsection{Ask a linter}
+
+A short step whose object of learning is that a metric can be
+unavailable without being a failure: the report either counts
+findings by rule or says how to install a linter.
+The learner does not need a linter to complete the step, which is why
+the check accepts either outcome.
+The expert extra explains the small rule set and how the tool is
+found.
+
+<<shared step: ask a linter>>=
+# Ask a linter
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+lint\b'
+hint: Run `learnlog metrics lint`.
+```
+
+Run `learnlog metrics lint`.
+If a linter is installed in your project, the row counts what it found
+by rule; if not, the header tells you how to install one and the row
+shows dashes.
+Either answer completes the step.
+<<novice step: ask a linter>>=
+<<shared step: ask a linter>>
+<<expert step: ask a linter>>=
+<<shared step: ask a linter>>
+
+learnlog looks for `ruff` and then `pylint`, in the project's `.venv`
+before the `PATH`, and runs whichever it finds with a deliberately
+small rule set: undefined names, unused imports and variables, bare
+`except`, comparison with `None` by `==`, long lines.
+General-purpose rule sets flood novices with findings that do not
+matter to them; a short list is what the code-quality literature
+recommends.
+Neither tool is a dependency of learnlog, so a missing linter is
+reported, not raised.
+@
+
+\subsection{Look for trends}
+
+The final metric step's object of learning is restraint: a trend
+needs enough periods to exist, and with a day or two of history the
+honest answer is that it is too early to say.
+Asking the learner to predict whether [[trends]] will report a
+direction makes the minimum-bucket rule the thing they discover.
+The expert extra states the rule and the closed vocabulary, and why
+the words are the only judgement the report makes.
+
+<<shared step: look for trends>>=
+# Look for trends
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+trends\b'
+hint: Run `learnlog metrics trends --by day`.
+```
+
+`learnlog metrics trends` puts the headline number of every family
+side by side, one row per week by default, and follows the table with
+one line per metric saying whether it is rising, falling or steady.
+You have a day or two of history: do you expect it to say anything
+yet?
+Run `learnlog metrics trends --by day` to see one row per day and
+read the direction lines.
+<<novice step: look for trends>>=
+<<shared step: look for trends>>
+
+Come back to this command later in the course; with a few weeks of
+rows the directions appear, and each compares you with your own
+earlier weeks and nobody else.
+<<expert step: look for trends>>=
+<<shared step: look for trends>>
+
+A direction needs at least four periods with a value.
+Given those, the report fits a least-squares line over the periods,
+scales its slope to the whole span, divides by the median value, and
+calls the result rising or falling beyond ten percent and steady
+within; the header prints the rule so the word can be checked.
+The vocabulary is closed on purpose: whether a falling error quotient
+is good news depends on what you were doing, so the report shows the
+first and last values beside the word and leaves the judgement to you.
+@
+
+\subsection{See the reflection in the log}
+
+The closing step returns to \cref{tut:playback-and-tagging}'s lesson
+with a new member: metrics runs record themselves, as playback does.
+Its object of learning is that reading the summaries is part of the
+history the summaries describe, and---a contrast the expert variant
+makes explicit---that the metrics nevertheless leave their own runs
+out of the counts.
+
+<<shared step: see the reflection in the log>>=
+# See the reflection in the log
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+list\b'
+hint: Run `learnlog list`.
+```
+
+Run `learnlog list`.
+The `learnlog metrics` commands you just ran appear as runs of their
+own, next to your program's runs.
+<<novice step: see the reflection in the log>>=
+<<shared step: see the reflection in the log>>
+
+Looking back at your work is part of your work, so learnlog records
+it; the metrics themselves do not count these runs, only your
+program's.
+<<expert step: see the reflection in the log>>=
+<<shared step: see the reflection in the log>>
+
+`play`, `list` and `metrics` are the review subcommands: they record
+a header and a trailer like any run, but capture no output (the output
+*is* the log) and, for `metrics`, no view trace (it showed no
+commit).
+When the metrics read the log they drop learnlog's own runs first,
+including the header commit of the very invocation that is running,
+so a report never counts itself.
+@

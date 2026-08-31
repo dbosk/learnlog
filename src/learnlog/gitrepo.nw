@@ -3065,14 +3065,23 @@ rather than a fact.
 Most of what [[learnlog]] does for a student is housekeeping---wiring a
 venv, cloning a repository, pushing, tagging, exporting---and
 housekeeping is not learning data.
-Two subcommands are different in kind: [[learnlog play]] and
-[[learnlog list]] are the student \emph{reading their own history},
-and that act of reflection is behaviour worth recording.
-So those two are logged as ordinary runs and every other subcommand
+Three subcommands are different in kind: [[learnlog play]],
+[[learnlog list]] and [[learnlog metrics]] are the student
+\emph{reading their own history}---as a replay, as a listing, or as
+the summaries of \cref{metrics}---and that act of reflection is
+behaviour worth recording.
+So those three are logged as ordinary runs and every other subcommand
 leaves no trace at all, not even a repository
 (\cref{sec:veto}).
+A metrics run is recorded without a view trace: it displays no
+commit, and a [[Viewed:]] line for every commit it aggregated would
+turn into review events (\cref{progsnap2}) for commits nobody looked
+at.
+(As with [[learnlog list --help]], the [[--help]] of a recorded
+subcommand is recorded too; the veto reads the subcommand name, not
+what it went on to do.)
 
-Naming the two here, rather than in the CLI that implements them, is
+Naming the three here, rather than in the CLI that implements them, is
 what keeps the dependencies pointing the right way.
 The list has two consumers and the CLI is neither: the recorder in
 [[learnlog/__init__.py]] reads it before deciding to start a run, and
@@ -3083,7 +3092,7 @@ vocabulary---[[RUN_ID_FIELD]], [[TRAILER_PREFIX]]---and both are
 imported \emph{by} [[learnlog.cli]] rather than the other way round.
 
 <<constants>>=
-REVIEW_SUBCOMMANDS = ("play", "list")
+REVIEW_SUBCOMMANDS = ("play", "list", "metrics")
 @
 
 

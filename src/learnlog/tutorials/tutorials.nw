@@ -12,14 +12,16 @@ The catalog is ordered as a progression from student to researcher.
 record--review loop; \cref{tut:playback-and-tagging} stays inside one
 recorded project and adds the reading tools;
 \cref{tut:export-and-share} moves a log between people and machines;
-and \cref{tut:analysing-progsnap2} turns an exported dataset into a
-report.
+\cref{tut:metrics} turns the log back on its author as numbers to
+reflect on; and \cref{tut:analysing-progsnap2} turns an exported
+dataset into a report.
 Across the catalog the recorded project is the invariant, and each
 tutorial rotates one part of the CLI surface into
-focus---creating, reading, moving, analysing---so a learner can
-attribute what is new in each tutorial to that part alone.
+focus---creating, reading, moving, measuring, analysing---so a
+learner can attribute what is new in each tutorial to that part
+alone.
 
-The first three tutorials each come in two variants for two
+The first four tutorials each come in two variants for two
 audiences: a novice variant for learners who have never programmed
 before, and an expert variant, suffixed [[-expert]] in the catalog,
 for experienced programmers.
@@ -46,4 +48,5 @@ progression.
 \input{../src/learnlog/tutorials/getting-started.tex}
 \input{../src/learnlog/tutorials/playback-and-tagging.tex}
 \input{../src/learnlog/tutorials/export-and-share.tex}
+\input{../src/learnlog/tutorials/metrics.tex}
 \input{../src/learnlog/tutorials/analysing-progsnap2.tex}

@@ -44,7 +44,10 @@
 \input{../src/learnlog/cli.tex}
 \input{../src/learnlog/viewer.tex}
 \input{../src/learnlog/progsnap2.tex}
+\input{../src/learnlog/metrics.tex}
 
+\appendix
+\input{metrics-protocol.tex}
 
 \backmatter
 \printbibliography

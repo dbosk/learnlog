@@ -810,10 +810,11 @@ def test_format_elapsed_human_readable():
 
 A [[Run: learnlog ...]] block can mean two quite different things to
 whoever reads the log.
-[[learnlog play]] and [[learnlog list]] are the student stepping back
-through their own history, and the recorder logs exactly those two
-subcommands because that reflection is itself evidence of learning
-(\cref{learnlog}); every view therefore shows them by default.
+[[learnlog play]], [[learnlog list]] and [[learnlog metrics]] are the
+student stepping back through their own history, and the recorder
+logs exactly those three subcommands because that reflection is itself
+evidence of learning (\cref{learnlog}); every view therefore shows
+them by default.
 Everything else learnlog leaves behind is plumbing: the [[pip]] install
 that [[learnlog init]] performs, and---in repositories written before
 the recorder narrowed to review runs---records of the remaining
@@ -915,9 +916,9 @@ not one---the recorder does not log it either.
 def is_review_command(command):
     """Return true if ``command`` is a learnlog review run.
 
-    Review runs are ``learnlog play`` and ``learnlog list``:
-    the subcommands with which a student looks back at their
-    own history.
+    Review runs are ``learnlog play``, ``learnlog list`` and
+    ``learnlog metrics``: the subcommands with which a student
+    looks back at their own history.
     """
     parts = command.split()
     return (
@@ -956,11 +957,13 @@ def test_is_review_command():
     )
     assert is_review_command("learnlog play")
     assert is_review_command("learnlog list --all")
+    assert is_review_command("learnlog metrics eq --by week")
     assert not is_review_command("learnlog")
     assert not is_review_command("learnlog export out.bundle")
     assert not is_review_command("pip install learnlog")
     assert not is_review_command("play.py list")
     assert not is_internal_command("learnlog play")
+    assert not is_internal_command("learnlog metrics time")
     assert is_internal_command("learnlog export out.bundle")
     assert is_internal_command("pip install learnlog")
     assert not is_internal_command("hello.py")
@@ -1477,7 +1480,7 @@ def filter_internal_runs(message):
 
     Splits on the ``---`` block separator and removes blocks
     whose header records learnlog's own plumbing.  Review runs
-    (``learnlog play`` and ``learnlog list``) are kept, as are
+    (``learnlog play``, ``list`` and ``metrics``) are kept, as are
     the student's own programs.  Returns the filtered message,
     which may be empty if every block was internal.
     """

@@ -1,0 +1,2007 @@
+\chapter{Metrics}
+\label{metrics}
+
+The log records what a student did; the metrics in this chapter say
+something about \emph{how} they did it.
+Three families are computed, all from data the log already holds:
+\begin{description}
+\item[Time and effort] how many days the student worked, how many runs
+  and sessions those days held, how much code changed, and how long the
+  run-to-run activity lasted (\cref{sec:metrics-time}).
+\item[Error behaviour] how often a run that ended in an error was
+  followed by another error, and whether it was the same error: the
+  error quotient and repeated error density
+  (\cref{sec:metrics-eq,sec:metrics-red}).
+\item[Code] the size and branching of the program as it stands, or as
+  it stood at the end of each week, plus whatever a linter finds
+  (\cref{sec:metrics-code,sec:metrics-lint}).
+\end{description}
+A fourth command, [[trends]], joins the three into one table over
+time and says, per metric, whether it is rising, falling or steady
+(\cref{sec:metrics-trends}).
+
+Every one of these numbers is for the student to look at their own
+history with, and nothing else.
+The literature is clear on what they are not: compilation-behaviour
+metrics failed to identify at-risk students even in the hands of their
+inventors~\autocite{tabanao2011predicting}; their values shift with the
+environment that produced them, so they cannot be compared with
+published cohorts~\autocite{karvelas2020effects}; and coarse
+time-on-task barely correlates with course
+results~\autocite{leinonen2022timeontask,edwards2009comparing}.
+What survives that evidence is \emph{self-referenced description}: this
+week beside the student's own earlier weeks, in numbers with no
+judgement attached---which is also the reference frame learners
+receive best~\autocite{jivet2018license}.
+The wording rules in \cref{sec:metrics-trends} and the header lines
+every report prints exist to keep the output inside that frame.
+The literature behind each claim, with the searches that found it and
+the searches that looked for its refutation, is in the appendix; that
+appendix is hand-written \LaTeX{} rather than a literate source,
+because it documents a search, not a program.
+
+\ltnote{The chapter follows the data flow rather than the command
+list: records, then the two derived structures every metric shares
+(error events and sessions), then the metrics, then the periods that
+slice them, and only at the end the rendering.  A reader who wants one
+metric can enter at its section; a reader who wants to change what a
+\enquote{session} is finds it once, before any metric depends on it.}
+
+
+\section{Code overview}
+
+The module is pure computation: it reads a repository through the
+functions of \cref{commits} and \cref{progsnap2}, and returns plain
+data structures that the command-line layer (\cref{cli}) renders.
+Nothing here imports Typer, and nothing here writes to the log.
+
+<<[[metrics.py]]>>=
+"""Metrics over a learnlog history and the code it records.
+
+Computes time-on-task and effort counts, the error quotient and
+repeated error density, static code metrics (via radon) and linter
+counts, over a whole history or per day, week, or month.  The
+results are plain dicts; the CLI renders them.
+"""
+
+from __future__ import annotations
+
+<<metrics imports>>
+
+<<metrics constants>>
+<<metrics functions>>
+@
+
+The pipeline that every subcommand runs is short enough to state once:
+
+\begin{center}
+\begin{tabular}{lll}
+step & function & result \\ \hline
+read the log & [[run_records]] & [[RunRecord]] list, oldest first \\
+cut to the window & [[filter_window]] & the records in the period \\
+group into sessions & [[segment_sessions]] & lists of records \\
+slice by period & [[bucket_sessions]] & [[Bucket]] list \\
+compute & [[compute_time]] etc. & [[BucketResult]] list \\
+render & [[render]] & text, CSV, JSON or \LaTeX{} \\
+\end{tabular}
+\end{center}
+
+<<test [[metrics.py]]>>=
+"""Tests for the metrics module."""
+import datetime
+import json
+import shutil
+import pytest
+from learnlog.gitrepo import LearnlogRepo
+from learnlog.metrics import *
+
+<<metrics test helpers>>
+<<metrics test functions>>
+@
+
+Most tests build records by hand, because every metric is a function of
+the record fields alone and a Git repository is only needed to test the
+reading step.
+The factory fills in everything a test does not care about:
+
+<<metrics test helpers>>=
+T0 = datetime.datetime(2026, 8, 31, 10, 0)
+
+def _rec(minutes, *, end=1, script="main.py", tree=None,
+         exc=None, exit_code=0, added=0, removed=0):
+  """A run starting `minutes` after `T0` lasting `end` minutes."""
+  start = T0 + datetime.timedelta(minutes=minutes)
+  finish = None if end is None else \
+    start + datetime.timedelta(minutes=end)
+  return RunRecord(
+    commit=f"c{minutes}", tree=tree or f"t{minutes}",
+    script=script, arguments="", start=start, end=finish,
+    exit_code=exit_code, exception_info=exc,
+    lines_added=added, lines_removed=removed,
+  )
+
+SYNTAX_TRACE = (
+  '  File "main.py", line 3\n'
+  "    print(x\n"
+  "         ^\n"
+  "SyntaxError: '(' was never closed\n"
+)
+NAME_TRACE = (
+  "Traceback (most recent call last):\n"
+  '  File "/usr/lib/python3.13/runpy.py", line 88, in _run_code\n'
+  "    exec(code, run_globals)\n"
+  '  File "main.py", line 2, in <module>\n'
+  "    print(x)\n"
+  "NameError: name 'x' is not defined\n"
+)
+
+def _syntax(minutes, **kw):
+  return _rec(minutes, exc=SYNTAX_TRACE, exit_code=1, **kw)
+
+def _name(minutes, **kw):
+  return _rec(minutes, exc=NAME_TRACE, exit_code=1, **kw)
+@
+
+
+\section{From the log to run records}
+\label{sec:metrics-records}
+
+A run lives in two commits (\cref{sec:run-join}); the metrics want it
+as one value with the fields they read.
+[[RunRecord]] is that value.
+It carries the tree hash of the header commit, because the error
+quotient needs to know whether the code changed between two runs and
+comparing tree object ids answers that exactly and for free
+(\cref{sec:metrics-eq}); and it carries the line counts of the edit
+that preceded the run, because lines changed is one of the effort
+counts (\cref{sec:metrics-time}).
+
+<<metrics imports>>=
+import collections
+import dataclasses
+import datetime
+import enum
+import re
+<<metrics functions>>=
+@dataclasses.dataclass(frozen=True)
+class RunRecord:
+    """One recorded run of the student's program.
+
+    `start` and `end` are naive local datetimes; `end`,
+    `exit_code` and `exception_info` are `None` when the run
+    never finalised.  `lines_added` and `lines_removed` count
+    the edit between this run's code state and the previous
+    commit's.
+    """
+
+    commit: str
+    tree: str
+    script: str | None
+    arguments: str | None
+    start: datetime.datetime
+    end: datetime.datetime | None
+    exit_code: int | None
+    exception_info: str | None
+    lines_added: int = 0
+    lines_removed: int = 0
+
+    @property
+    def command(self):
+        """The command line as the log recorded it."""
+        return f"{self.script or ''} {self.arguments or ''}".strip()
+@
+
+Two facts about a commit are not in its message: its tree, and the
+size of the change it made.
+Both come from one [[git log]] call each over the whole recording
+branch, which is the same shape as [[scan_run_commits]]
+(\cref{sec:run-join}) and for the same reason---a listing must not
+cost one fork per commit.
+The numstat output names the commit on a line of its own and then one
+[[added\trmoved\tpath]] line per file, with [[-]] for binary files,
+which we count as zero.
+
+<<metrics functions>>=
+def commit_trees(repo):
+    """Map every commit on the recording branch to its tree hash."""
+    result = repo.git(
+        "log", "--format=%H %T", repo.recording_branch(),
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    trees = {}
+    for line in result.stdout.split("\n"):
+        parts = line.split()
+        if len(parts) == 2:
+            trees[parts[0]] = parts[1]
+    return trees
+<<metrics functions>>=
+def commit_churn(repo):
+    """Map every commit to the `(added, removed)` lines of its diff."""
+    result = repo.git(
+        "log", "--numstat", "--format=%H", repo.recording_branch(),
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    churn = {}
+    current = None
+    for line in result.stdout.split("\n"):
+        if NUMSTAT_LINE.match(line):
+            added, removed, _ = line.split("\t", 2)
+            old = churn.get(current, (0, 0))
+            churn[current] = (
+                old[0] + (int(added) if added.isdigit() else 0),
+                old[1] + (int(removed) if removed.isdigit() else 0),
+            )
+        elif COMMIT_HASH_LINE.match(line):
+            current = line.strip()
+    return churn
+<<metrics constants>>=
+NUMSTAT_LINE = re.compile(r"^(\d+|-)\t(\d+|-)\t")
+COMMIT_HASH_LINE = re.compile(r"^[0-9a-f]{40}$")
+@
+
+The recorder writes [[datetime.now().isoformat()]], a naive local time,
+and every comparison in this chapter is between such values.
+A history that went through a ProgSnap2 round trip or another machine
+may carry an offset, so timestamps are normalised on the way in rather
+than compared as they come: an aware value is moved to local time and
+its offset dropped, a naive one is trusted.
+[[utcnow]] never appears, because the student's day boundaries are
+local ones.
+
+<<metrics functions>>=
+def local_naive(value):
+    """Return `value` as a naive local datetime, or `None`."""
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+@
+
+Reading the log combines the three per-branch scans with the
+per-commit parsing the exporter already does.
+Learnlog's own runs are dropped by default: a [[learnlog list]] is not
+work on the program, and the [[learnlog metrics]] invocation that is
+running right now already has its header commit in the log---counting
+it would make every report inflate the next.
+This is [[is_learnlog_run]], not [[filter_internal_runs]]
+(\cref{sec:filter-learnlog}), because the latter deliberately keeps the
+review runs that listing and playback want to show.
+A commit's diff is the edit made before its first kept run, so the
+churn is attributed to that run and to no other run of the same commit.
+
+<<metrics imports>>=
+from learnlog.commits import (
+    _parse_iso,
+    get_commits,
+    is_learnlog_run,
+    merge_run_trailers,
+    scan_run_commits,
+)
+from learnlog.progsnap2 import (
+    extract_code_state,
+    parse_commit_runs,
+    parse_exception_line,
+)
+<<metrics functions>>=
+def run_records(repo, *, include_learnlog=False):
+    """Return every run in the log as a `RunRecord`, oldest first.
+
+    Runs of learnlog itself are left out unless
+    `include_learnlog` is set.  Runs whose start time cannot be
+    read are left out always.
+    """
+    scan = scan_run_commits(repo)
+    trees = commit_trees(repo)
+    churn = commit_churn(repo)
+    records = []
+    for commit in get_commits(repo):
+        commit_hash = commit["hash"]
+        message = merge_run_trailers(
+            scan.messages.get(commit_hash, ""), scan.trailers,
+        )
+        <<append a record for each kept run of the commit>>
+    records.sort(key=lambda record: record.start)
+    return records
+<<append a record for each kept run of the commit>>=
+edit = churn.get(commit_hash, (0, 0))
+for run in parse_commit_runs(message):
+    if not include_learnlog and is_learnlog_run(run):
+        continue
+    start = local_naive(_parse_iso(run["start_time"]))
+    if start is None:
+        continue
+    records.append(RunRecord(
+        commit=commit_hash,
+        tree=trees.get(commit_hash, ""),
+        script=run["script"],
+        arguments=run["arguments"],
+        start=start,
+        end=local_naive(_parse_iso(run["end_time"])),
+        exit_code=_int_or_none(run["exit_code"]),
+        exception_info=run["exception_info"],
+        lines_added=edit[0],
+        lines_removed=edit[1],
+    ))
+    edit = (0, 0)
+<<metrics functions>>=
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+@
+
+Let's verify the reading step against a real repository (the shared
+[[workdir]] fixture of \cref{gitrepo} supplies it): two runs of the
+student's program and one of learnlog's own, where only the student's
+runs come back, with the edit between them counted once.
+
+<<metrics test helpers>>=
+def _record_run(repo, script, start, *, exc=None, code=0,
+                seconds=1):
+  repo.begin_run(script, [], start)
+  repo.finalize_run(
+    io_log="", exception_info=exc,
+    end_time=start + datetime.timedelta(seconds=seconds),
+    exit_code=code,
+  )
+<<metrics test functions>>=
+def test_run_records_reads_student_runs_only(workdir):
+  (workdir / "main.py").write_text("print(1)\n")
+  repo = LearnlogRepo(workdir)
+  _record_run(repo, "main.py", T0)
+  (workdir / "main.py").write_text("print(1)\nprint(2)\n")
+  _record_run(repo, "main.py", T0 + datetime.timedelta(minutes=5),
+              exc=NAME_TRACE, code=1)
+  _record_run(repo, "learnlog list", T0 + datetime.timedelta(minutes=6))
+  records = run_records(repo)
+  assert [r.script for r in records] == ["main.py", "main.py"]
+  assert records[0].start == T0
+  assert records[0].end == T0 + datetime.timedelta(seconds=1)
+  assert records[0].exit_code == 0
+  assert records[1].exception_info.endswith("not defined")
+  assert records[1].tree != records[0].tree
+  assert (records[1].lines_added, records[1].lines_removed) == (1, 0)
+  assert len(run_records(repo, include_learnlog=True)) == 3
+@
+
+And the normalisation: an aware timestamp is compared in local time,
+a naive one untouched.
+
+<<metrics test functions>>=
+def test_local_naive_drops_offset_after_conversion():
+  aware = datetime.datetime(
+    2026, 8, 31, 10, 0, tzinfo=datetime.timezone.utc,
+  )
+  converted = local_naive(aware)
+  assert converted.tzinfo is None
+  assert converted == aware.astimezone().replace(tzinfo=None)
+  assert local_naive(T0) is T0
+  assert local_naive(None) is None
+@
+
+
+\section{What counts as an error}
+\label{sec:metrics-errors}
+
+The error metrics were defined over compiler events: in BlueJ a
+compilation is the student asking the toolchain to judge their code,
+and the metric scores what the judgement said
+\autocite{jadud2006methods}.
+For a Python script the same speech act is [[python main.py]], and
+its verdict is whatever traceback the run left behind.
+That is the only evidence used.
+The exit status is not: [[sys.exit(1)]] ends a run non-zero with no
+error in sight, and a caught exception ends it with zero after an
+error the student may well have been fighting.
+
+Python blurs the compile/run line the metrics were drawn on, but not
+beyond recovery.
+The interpreter compiles the whole file before executing any of it, so
+a [[SyntaxError]] (or its subclasses [[IndentationError]] and
+[[TabError]]) is the compile-time verdict and everything else is a
+run-time one.
+Both matter: scored separately, syntax errors carried signal early in
+a course and runtime errors later~\autocite{svabensky2024comparison},
+which is why every error metric below is computed twice, over
+syntax errors alone and over all uncaught exceptions.
+An interruption---[[KeyboardInterrupt]], or a [[SystemExit]] that
+escaped---is the student stopping the program, not the program
+failing, and belongs to neither series.
+
+The classification keys on the exception \emph{type}, not on the
+traceback text.
+A syntax error in the script itself arrives without the
+[[Traceback (most recent call last):]] header, because no frame ever
+ran; one raised by [[exec]] inside a running program arrives with one.
+The header is recorded as a field for anyone who wants it, but a rule
+built on it would misfile the second case.
+
+<<metrics constants>>=
+SYNTAX_EXCEPTIONS = frozenset({
+    "SyntaxError", "IndentationError", "TabError",
+})
+INTERRUPT_EXCEPTIONS = frozenset({"KeyboardInterrupt", "SystemExit"})
+TRACEBACK_HEADER = "Traceback (most recent call last):"
+<<metrics functions>>=
+@dataclasses.dataclass(frozen=True)
+class ErrorEvent:
+    """How a run ended.
+
+    `kind` is `"none"`, `"syntax"`, `"runtime"` or
+    `"interrupt"`; `location` is `(file, line)` of the deepest
+    frame in the student's own code, when there is one.
+    """
+
+    kind: str
+    type: str | None
+    message: str | None
+    location: tuple[str, int] | None
+    has_traceback_header: bool
+<<metrics functions>>=
+def classify_error(record):
+    """Classify the traceback a run left, if any."""
+    info = record.exception_info
+    if not info:
+        return ErrorEvent("none", None, None, None, False)
+    exc_type, message = parse_exception_line(info)
+    if exc_type in SYNTAX_EXCEPTIONS:
+        kind = "syntax"
+    elif exc_type in INTERRUPT_EXCEPTIONS:
+        kind = "interrupt"
+    else:
+        kind = "runtime"
+    return ErrorEvent(
+        kind, exc_type, message, deepest_frame(info),
+        TRACEBACK_HEADER in info,
+    )
+@
+
+The location the error quotient compares is where the student's code
+failed, not where the interpreter noticed.
+A traceback lists frames outermost first, so the deepest frame is the
+last [[File "...", line N]] line---but the last frame is often inside
+the standard library or a package, which the student did not write and
+will not edit.
+We therefore take the last frame outside those places, and fall back
+to the last frame of all when every frame is foreign.
+
+<<metrics constants>>=
+FRAME_LINE = re.compile(
+    r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+)', re.M,
+)
+FOREIGN_FRAME_MARKERS = ("site-packages", "/lib/python", "<frozen")
+<<metrics functions>>=
+def deepest_frame(exception_info):
+    """Return `(file, line)` of the deepest frame in the student's code."""
+    frames = [
+        (match.group("file"), int(match.group("line")))
+        for match in FRAME_LINE.finditer(exception_info)
+    ]
+    own = [
+        frame for frame in frames
+        if not any(marker in frame[0]
+                   for marker in FOREIGN_FRAME_MARKERS)
+    ]
+    if own:
+        return own[-1]
+    return frames[-1] if frames else None
+@
+
+The two series share one predicate, parameterised by which errors
+count: [[kind="syntax"]] for the compile-time series, [[kind="any"]]
+for both.
+
+<<metrics functions>>=
+def is_error(event, kind):
+    """True if `event` counts as an error in the `kind` series."""
+    if kind == "syntax":
+        return event.kind == "syntax"
+    return event.kind in ("syntax", "runtime")
+@
+
+Let's verify each shape of ending: a syntax error without header, a
+runtime error whose deepest own frame is below a library frame, an
+interruption, and a non-zero exit with no traceback at all.
+
+<<metrics test functions>>=
+def test_classify_error_syntax_without_header():
+  event = classify_error(_syntax(0))
+  assert event.kind == "syntax"
+  assert event.type == "SyntaxError"
+  assert event.location == ("main.py", 3)
+  assert not event.has_traceback_header
+
+def test_classify_error_runtime_uses_own_deepest_frame():
+  event = classify_error(_name(0))
+  assert event.kind == "runtime"
+  assert event.type == "NameError"
+  assert event.message == "name 'x' is not defined"
+  assert event.location == ("main.py", 2)
+  assert event.has_traceback_header
+
+def test_classify_error_interrupt_and_plain_exit():
+  interrupted = classify_error(
+    _rec(0, exc="Traceback (most recent call last):\n"
+                "  File \"main.py\", line 1, in <module>\n"
+                "KeyboardInterrupt\n"),
+  )
+  assert interrupted.kind == "interrupt"
+  assert interrupted.type == "KeyboardInterrupt"
+  assert classify_error(_rec(0, exit_code=1)).kind == "none"
+  assert not is_error(classify_error(_rec(0, exit_code=1)), "any")
+  assert is_error(classify_error(_name(0)), "any")
+  assert not is_error(classify_error(_name(0)), "syntax")
+@
+
+
+\section{Sessions}
+\label{sec:metrics-sessions}
+
+Both the time metrics and the error metrics are defined over a
+\emph{session}: a stretch of work with no long break in it.
+Nothing in the log marks where one ends, so a threshold decides: a gap
+of at least the idle threshold between the end of one run and the
+start of the next opens a new session.
+
+The threshold is twenty minutes.
+That is the convention Price et al.\ apply to ProgSnap2 data without a
+session column, following Petersen et al.\
+\autocite{price2020progsnap2,petersen2015exploration}, and it is the
+only one defined for events as sparse as program runs.
+The values in the keystroke literature are far smaller---five minutes
+in one validation against self-report~\autocite{hart2023accurate},
+ten where the session count was seen to plateau
+\autocite{leinonen2021finegrained}, three in our own earlier work on
+keystroke-scale data~\autocite{snider2023edit}---and they are not
+transferable: the threshold scales with how sparse the events are, and
+at run granularity a three-minute cut would shatter every session.
+Because the choice of estimator moves results
+materially~\autocite{kovanovic2015penetrating}, the threshold is a
+parameter and every report prints the value it used.
+
+The gap is measured from the end of a run, not its start, so a program
+that ran for eight minutes does not spend the idle budget while it
+runs.
+A run that never finalised has no end; its start stands in.
+
+<<metrics constants>>=
+DEFAULT_IDLE_MINUTES = 20
+<<metrics functions>>=
+def segment_sessions(records, idle):
+    """Group chronological `records` into sessions.
+
+    A gap of at least `idle` (a timedelta) between one run's end
+    and the next run's start starts a new session.
+    """
+    sessions = []
+    for record in records:
+        if sessions:
+            previous = sessions[-1][-1]
+            gap = record.start - (previous.end or previous.start)
+            if gap >= idle:
+                sessions.append([record])
+                continue
+            sessions[-1].append(record)
+        else:
+            sessions.append([record])
+    return sessions
+@
+
+Let's verify the boundary exactly: a gap one second short of the
+threshold keeps the session, the threshold itself ends it, and the gap
+is counted from the run's end.
+
+<<metrics test helpers>>=
+IDLE = datetime.timedelta(minutes=DEFAULT_IDLE_MINUTES)
+<<metrics test functions>>=
+def test_segment_sessions_splits_at_threshold():
+  runs = [_rec(0), _rec(20), _rec(41), _rec(61, end=None), _rec(81)]
+  sessions = segment_sessions(runs, IDLE)
+  # 0 ends 10:01, 20 starts 10:20: gap 19 min -> same session.
+  # 20 ends 10:21, 41 starts 10:41: gap 20 min -> new session.
+  # 41 ends 10:42, 61 starts 11:01: 19 min -> same session.
+  # 61 never ended: its start 11:01 -> 81 starts 11:21: 20 -> new.
+  assert [[r.start.minute for r in s] for s in sessions] == \
+    [[0, 20], [41, 1], [21]]
+  assert segment_sessions([], IDLE) == []
+@
+
+
+\section{Time on task}
+\label{sec:metrics-time}
+
+Kovanović et al.\ name the two problems every log-based time estimate
+faces: an \emph{outlier}---a gap that spans time off task---and the
+\emph{last action}, whose duration no later event
+reveals~\autocite{kovanovic2015penetrating}.
+Sessions dispose of the first.
+The two-commit protocol disposes of the second by construction: a
+learnlog run has a trailer, so the duration of the last action in a
+session is measured, not estimated.
+This is a real advantage of recording a header before and a trailer
+after each run (\cref{sec:run-join}), and it is why the run's own
+duration is counted.
+
+Counted with a cap: a program blocked on [[input()]] for forty minutes
+is wall-clock, not engagement, and the idle threshold is the largest
+duration we are prepared to believe.
+Active time in a session is therefore the runs' capped durations plus
+the gaps between them, each of which is below the threshold by
+construction.
+Nothing is credited before the first run---the coarse convention
+\autocite{leinonen2022timeontask}---so the number is honestly labelled
+\emph{active time, run-to-run}, never \emph{time spent}.
+
+<<metrics constants>>=
+ZERO = datetime.timedelta()
+<<metrics functions>>=
+def active_time(session, idle):
+    """Run-to-run active time of one session, as a timedelta."""
+    total = ZERO
+    for index, run in enumerate(session):
+        if run.end is not None:
+            total += min(max(run.end - run.start, ZERO), idle)
+        if index + 1 < len(session):
+            gap = session[index + 1].start - (run.end or run.start)
+            total += max(gap, ZERO)
+    return total
+@
+
+Time is not the headline.
+Within the same students, better-scored work was started earlier, not
+worked on longer~\autocite{edwards2009comparing}; coarse time-on-task
+did not correlate with weekly points at
+all~\autocite{leinonen2022timeontask}; and log-derived time deviates
+from screen-recorded ground truth~\autocite{krieter2022areyoustillthere}.
+What does track active time are the counts---runs ($r=.53$) and edits
+($r=.72$)~\autocite{leinonen2017comparison}---so the summary leads
+with days, when the first run fell, runs, sessions, failed runs and
+lines changed, and puts the clock last.
+A run that never finalised is counted and reported as incomplete
+rather than silently treated as instantaneous.
+
+<<metrics functions>>=
+def time_summary(sessions, idle):
+    """Effort counts and active time over `sessions`, as a dict."""
+    runs = [run for session in sessions for run in session]
+    seconds = sum(
+        (active_time(session, idle) for session in sessions), ZERO,
+    ).total_seconds()
+    return {
+        "active_days": len({run.start.date() for run in runs}),
+        "first_run": min((run.start for run in runs), default=None),
+        "runs": len(runs),
+        "sessions": len(sessions),
+        "failed_runs": sum(
+            is_error(classify_error(run), "any") for run in runs
+        ),
+        "lines_added": sum(run.lines_added for run in runs),
+        "lines_removed": sum(run.lines_removed for run in runs),
+        "active_seconds": seconds if runs else None,
+        "incomplete_runs": sum(run.end is None for run in runs),
+    }
+@
+
+Let's verify the cap, the gap, and that nothing is credited before the
+first run: a 45-minute run counts 20, a 5-minute gap counts whole, and
+two runs a minute long with that gap sum to seven minutes.
+
+<<metrics test functions>>=
+def test_active_time_caps_runs_and_credits_gaps():
+  assert active_time([_rec(0, end=45)], IDLE) == IDLE
+  session = [_rec(0), _rec(6)]      # ends 10:01, next starts 10:06
+  assert active_time(session, IDLE) == datetime.timedelta(minutes=7)
+  assert active_time([_rec(0, end=None)], IDLE) == ZERO
+
+def test_time_summary_counts():
+  runs = [_rec(0, added=3, removed=1), _name(6, end=None),
+          _rec(60 * 24)]
+  summary = time_summary(segment_sessions(runs, IDLE), IDLE)
+  assert summary["active_days"] == 2
+  assert summary["first_run"] == T0
+  assert summary["runs"] == 3
+  assert summary["sessions"] == 2
+  assert summary["failed_runs"] == 1
+  assert (summary["lines_added"], summary["lines_removed"]) == (3, 1)
+  assert summary["active_seconds"] == 6 * 60 + 60
+  assert summary["incomplete_runs"] == 1
+  assert time_summary([], IDLE)["active_seconds"] is None
+@
+
+
+\section{Error quotient}
+\label{sec:metrics-eq}
+
+Jadud noticed, reading novices' compilation logs by hand, that the
+students who struggled met the same error again and
+again~\autocite{jadud2006methods}.
+The error quotient turns that into a number: pair each event with the
+next, score each pair for how much the second error repeats the first,
+normalise by the largest score a pair can have, and average.
+His scoring cascade has four terms---both events errors, same error
+type, same line (within one), same edit location---worth $2+3+3+1$,
+so the divisor is nine~\autocite{jadud2005thesis}.
+(Secondary accounts often drop the fourth term and then divide by nine
+anyway; the thesis figure has all four.)
+The thesis also filters out pairs between which the code did not
+change: a re-run of the same file is the same verdict twice, not a
+repeated mistake.
+
+The parameters are not universal.
+Petersen et al.\ explored them across C, Java and Python courses and
+found the algorithm sensitive to its
+context~\autocite{petersen2015exploration}; Ahadi et al.\ list the
+free parameters as the metric's standing
+caveat~\autocite{ahadi2018syntax}.
+For run-based Python data our own earlier work uses a two-parameter
+model---a penalty of 13 when both runs error and 3 more when the
+error type repeats, normalised by 16---attributed there to Petersen et
+al.'s exploration~\autocite{snider2023edit}.
+That is the default here, named in every report; the four-term
+original is implemented beside it so the citation-faithful formula is
+available, and so that the difference is visible in the code rather
+than in a footnote.
+
+<<metrics constants>>=
+EQ_BOTH_ERROR_PENALTY = 13
+EQ_SAME_TYPE_PENALTY = 3
+EQ_MAX_PAIR_SCORE = 16
+EQ_VARIANT = (
+    "two-parameter EQ: both runs error +13, same error type +3, "
+    "normalised by 16"
+)
+JADUD_TERMS = (2, 3, 3, 1)
+JADUD_MAX_PAIR_SCORE = sum(JADUD_TERMS)
+JADUD_LINE_TOLERANCE = 1
+@
+
+Which runs form a pair?
+Watson's revision of the idea pairs events per file, because a student
+who compiles a different file has not resolved the error in the first
+one~\autocite{watson2015thesis}; learnlog records the script each run
+executed, so pairs are consecutive runs of the same script within a
+session.
+Jadud's zero-edit filter is exact here: two header commits with the
+same tree hash enclose no change at all.
+It is stricter than Watson's tokenised comparison---a comment-only
+edit survives ours and not his---which the prose of the report should
+not hide.
+
+<<metrics functions>>=
+def run_pairs(session):
+    """Consecutive runs of the same script with a change between."""
+    chains = collections.defaultdict(list)
+    for run in session:
+        chains[run.script].append(run)
+    pairs = []
+    for chain in chains.values():
+        for first, second in zip(chain, chain[1:]):
+            if first.tree and first.tree == second.tree:
+                continue
+            pairs.append((first, second))
+    return pairs
+<<metrics functions>>=
+def score_pair(first, second, kind):
+    """Two-parameter EQ score of one pair, in $[0, 1]$."""
+    before, after = classify_error(first), classify_error(second)
+    if not (is_error(before, kind) and is_error(after, kind)):
+        return 0.0
+    score = EQ_BOTH_ERROR_PENALTY
+    if before.type == after.type:
+        score += EQ_SAME_TYPE_PENALTY
+    return score / EQ_MAX_PAIR_SCORE
+@
+
+The fourth of Jadud's terms asks whether the student edited the same
+place both times.
+Runs do not record where the edit was, so the caller says whether it
+knows; the default is that it does not, and the report prints as much.
+
+<<metrics functions>>=
+def score_pair_jadud(first, second, kind, *,
+                     same_edit_location=False):
+    """Jadud's original four-term EQ score of one pair."""
+    before, after = classify_error(first), classify_error(second)
+    if not (is_error(before, kind) and is_error(after, kind)):
+        return 0.0
+    both, same_type, same_line, same_edit = JADUD_TERMS
+    score = both
+    if before.type == after.type:
+        score += same_type
+    if (
+        before.location and after.location
+        and before.location[0] == after.location[0]
+        and abs(before.location[1] - after.location[1])
+        <= JADUD_LINE_TOLERANCE
+    ):
+        score += same_line
+    if same_edit_location:
+        score += same_edit
+    return score / JADUD_MAX_PAIR_SCORE
+@
+
+Jadud averaged per session and required at least seven events in
+one~\autocite{jadud2005thesis}.
+Learnlog sessions are shorter than a BlueJ class period, so the
+quotient for a period is the mean over all its pairs, pooled across
+sessions; with no pairs there is no quotient, and the report shows a
+dash rather than a zero that would read as \enquote{no repeated
+errors}.
+
+<<metrics functions>>=
+def error_quotient(sessions, kind, scorer=score_pair):
+    """Mean pair score over all pairs in `sessions`, or `None`."""
+    pairs = [pair for session in sessions for pair in run_pairs(session)]
+    if not pairs:
+        return None
+    return sum(
+        scorer(first, second, kind) for first, second in pairs
+    ) / len(pairs)
+@
+
+Let's verify the hand-computed values: a different-type error pair
+scores $13/16$, a same-type pair $16/16$, a pair with a clean run
+scores zero, and the mean of those three is $29/48$; Jadud's form
+scores the same-type same-line pair $8/9$ without the edit term and
+$9/9$ with it, and a pair of different types one line apart $5/9$;
+an unchanged re-run forms no pair, and syntax errors do
+not pair with runtime ones in the syntax series.
+
+<<metrics test functions>>=
+def test_error_quotient_two_parameter_values():
+  session = [_syntax(0), _name(2), _name(4), _rec(6)]
+  assert score_pair(session[0], session[1], "any") == 13 / 16
+  assert score_pair(session[1], session[2], "any") == 1.0
+  assert score_pair(session[2], session[3], "any") == 0.0
+  assert error_quotient([session], "any") == pytest.approx(29 / 48)
+  assert error_quotient([session], "syntax") == 0.0
+  assert error_quotient([[_rec(0)]], "any") is None
+
+def test_error_quotient_jadud_terms_and_zero_edit_filter():
+  a, b = _name(0), _name(2)
+  assert score_pair_jadud(a, b, "any") == 8 / 9
+  assert score_pair_jadud(a, b, "any", same_edit_location=True) == 1.0
+  assert score_pair_jadud(_syntax(0), _name(2), "any") == 5 / 9
+  unchanged = [_name(0, tree="same"), _name(2, tree="same")]
+  assert run_pairs(unchanged) == []
+  assert error_quotient([unchanged], "any") is None
+  other_file = [_name(0), _name(2, script="other.py")]
+  assert run_pairs(other_file) == []
+@
+
+
+\section{Repeated error density}
+\label{sec:metrics-red}
+
+The error quotient scores \enquote{xx}, \enquote{xxx} and
+\enquote{xx\ldots xx} alike; Becker's repeated error density separates
+them and penalises one long string of the same error above two short
+ones~\autocite{becker2016new}.
+For each maximal string of $r_i$ consecutive repeated errors it adds
+$r_i^2/(r_i+1)$, the square of the repeats over the length of the
+string, and it was designed for sessions too short for the quotient
+\autocite{becker2016new}---which learnlog's are.
+It has no official normaliser and is unbounded above; the
+reimplementations that divide it by something say so in a comment, and
+we do not divide.
+Its predictive power is weaker than the
+quotient's~\autocite{svabensky2024comparison}: its value is diagnostic
+granularity, and it is reported beside the quotient, not instead.
+
+A \emph{repeated error} is two consecutive runs of the same script
+ending in the same error type; the pairs are the ones the quotient
+scores, so an unchanged re-run does not count as a repeat here either.
+
+<<metrics functions>>=
+def repeated_error_density(sessions, kind):
+    """Becker's RED over all sessions, or `None` with no pairs."""
+    total = 0.0
+    seen_pair = False
+    for session in sessions:
+        chains = collections.defaultdict(list)
+        for first, second in run_pairs(session):
+            chains[first.script].append((first, second))
+        for pairs in chains.values():
+            repeats = 0
+            for first, second in pairs:
+                seen_pair = True
+                before, after = (
+                    classify_error(first), classify_error(second),
+                )
+                if (
+                    is_error(before, kind) and is_error(after, kind)
+                    and before.type == after.type
+                ):
+                    repeats += 1
+                else:
+                    total += _red_term(repeats)
+                    repeats = 0
+            total += _red_term(repeats)
+    return total if seen_pair else None
+<<metrics functions>>=
+def _red_term(repeats):
+    return repeats ** 2 / (repeats + 1) if repeats else 0.0
+@
+
+Let's verify Becker's worked values: one repeat scores $1/2$, two
+separate repeats $1$, a string of two repeats $4/3$.
+
+<<metrics test functions>>=
+def test_repeated_error_density_worked_values():
+  assert repeated_error_density(
+    [[_name(0), _name(2)]], "any") == 0.5
+  assert repeated_error_density(
+    [[_name(0), _name(2), _rec(4), _name(6), _name(8)]], "any") == 1.0
+  assert repeated_error_density(
+    [[_name(0), _name(2), _name(4)]], "any") == pytest.approx(4 / 3)
+  assert repeated_error_density([[_name(0), _rec(2)]], "any") == 0.0
+  assert repeated_error_density([[_name(0)]], "any") is None
+@
+
+
+\section{Out of scope: Watwin and NPSM}
+
+Two relatives of the quotient are not computed.
+The Watwin score adds a penalty for how long the student took to
+resolve an error, bounded by percentiles of \emph{the cohort's} resolve
+times~\autocite{watson2013predicting,watson2015thesis}; a single
+student's log has no cohort, and the published penalty values could
+only be recovered from a reimplementation.
+The normalized programming state model tracks the fraction of time
+spent in each combination of syntactic and semantic
+correctness~\autocite{carter2015npsm}; its semantic axis is exactly
+what learnlog records (did the last execution raise?), but two of its
+states need a debugger learnlog does not see, and it has not been
+replicated.
+Both are surveyed side by side with the quotient and the density by
+Villamor~\autocite{villamor2020review}.
+
+
+\section{Periods and buckets}
+\label{sec:metrics-periods}
+
+A report covers either one \emph{window} or a series of
+\emph{buckets}.
+The two are deliberately different shapes.
+A window is rolling: \enquote{last week} means the last seven days,
+because an ISO week is empty every Monday morning, and a default that
+says nothing two days out of seven is the wrong default; \enquote{today}
+is the local calendar day, since it is not a rolling notion.
+Buckets are calendar units---days, ISO weeks, months---because a series
+is read across its labels, and \enquote{2026-W35} is a name the student
+can put beside a course schedule where \enquote{the seven days ending
+Tuesday} is not.
+An explicit [[--since]]/[[--until]] pair replaces the window; a report
+whose header could describe two windows is worse than an error, so the
+command layer refuses the combination.
+
+<<metrics constants>>=
+class Period(str, enum.Enum):
+    """The rolling windows a single report can cover."""
+
+    TODAY = "today"
+    WEEK = "week"
+    MONTH = "month"
+    ALL = "all"
+
+
+class Granularity(str, enum.Enum):
+    """The calendar units a series is sliced by."""
+
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+
+
+PERIOD_DAYS = {Period.WEEK: 7, Period.MONTH: 30}
+@
+
+The two enumerations and the day counts are constants of the same
+kind---vocabularies the command line and the reports share---so they
+sit in the constants bucket, which also puts them ahead of the
+functions that read [[PERIOD_DAYS]] when the module loads.
+
+<<metrics functions>>=
+def period_window(period, records, now=None):
+    """Return the `(start, end)` datetimes of a rolling window."""
+    now = now or datetime.datetime.now()
+    if period is Period.TODAY:
+        return midnight(now), now
+    if period is Period.ALL:
+        start = records[0].start if records else now
+        return min(start, now), now
+    return now - datetime.timedelta(days=PERIOD_DAYS[period]), now
+<<metrics functions>>=
+def midnight(moment):
+    """The start of `moment`'s day."""
+    return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+@
+
+A boundary given as a date means the whole day: [[--since]] a date is
+its midnight and [[--until]] a date runs through its end.
+A boundary given as a datetime is taken as it is.
+
+<<metrics functions>>=
+def parse_boundary(text, *, inclusive_end=False):
+    """Parse a `YYYY-MM-DD` or ISO datetime boundary."""
+    try:
+        moment = datetime.datetime.fromisoformat(text)
+    except ValueError as error:
+        raise ValueError(f"not a date or datetime: {text!r}") from error
+    if inclusive_end and len(text) == len("YYYY-MM-DD"):
+        moment += datetime.timedelta(days=1)
+    return local_naive(moment)
+<<metrics functions>>=
+def explicit_window(since, until, records, now=None):
+    """Return the `(start, end)` of a `--since`/`--until` window."""
+    now = now or datetime.datetime.now()
+    start = parse_boundary(since) if since else (
+        records[0].start if records else now
+    )
+    end = parse_boundary(until, inclusive_end=True) if until else now
+    return start, end
+<<metrics functions>>=
+def filter_window(records, start, end):
+    """The records whose start lies in `[start, end)`."""
+    return [record for record in records if start <= record.start < end]
+@
+
+Sessions are cut over the whole window first and assigned to buckets
+afterwards, each session going to the bucket of its \emph{first} run.
+One rule instead of two keeps every metric additive across buckets;
+its price is that a session begun at 23:40 on a Sunday contributes its
+Monday runs to the Sunday bucket, and, at the other end, that a
+session straddling the start of the window is cut there, so
+[[--period week]] can show a shorter first session than
+[[--period all]] does over the same runs.
+Empty buckets between the first and last non-empty ones are emitted: a
+week with no work is information, and the trend rule must see the
+zero.
+@
+
+The week arithmetic has to agree with itself: [[bucket_start]] steps
+back to Monday with [[weekday()]], and [[bucket_label]] names the
+week with [[isocalendar()]], which also starts weeks on Monday---so
+the first days of January can carry the previous year's label
+([[2026-W53]]), and that is correct.
+
+<<metrics functions>>=
+def bucket_start(moment, by):
+    """The start of the calendar unit containing `moment`."""
+    day = midnight(moment)
+    if by is Granularity.DAY:
+        return day
+    if by is Granularity.WEEK:
+        return day - datetime.timedelta(days=day.weekday())
+    return day.replace(day=1)
+<<metrics functions>>=
+def next_bucket(start, by):
+    """The start of the calendar unit after the one at `start`."""
+    if by is Granularity.DAY:
+        return start + datetime.timedelta(days=1)
+    if by is Granularity.WEEK:
+        return start + datetime.timedelta(days=7)
+    if start.month == 12:
+        return start.replace(year=start.year + 1, month=1)
+    return start.replace(month=start.month + 1)
+<<metrics functions>>=
+def bucket_label(start, by):
+    """The label of the calendar unit starting at `start`."""
+    if by is Granularity.DAY:
+        return start.strftime("%Y-%m-%d")
+    if by is Granularity.WEEK:
+        year, week, _ = start.isocalendar()
+        return f"{year}-W{week:02d}"
+    return start.strftime("%Y-%m")
+<<metrics functions>>=
+@dataclasses.dataclass(frozen=True)
+class Bucket:
+    """The sessions of one calendar unit (or of the whole window)."""
+
+    label: str
+    start: datetime.datetime
+    end: datetime.datetime
+    sessions: list
+
+    @property
+    def runs(self):
+        """Every run of the bucket, in order."""
+        return [run for session in self.sessions for run in session]
+<<metrics functions>>=
+def bucket_sessions(sessions, by, window):
+    """Slice `sessions` into `Bucket`s.
+
+    With `by` `None`, one bucket labelled by the `window`
+    holds everything.  Otherwise a session belongs to the
+    calendar unit of its first run, and empty units between the
+    first and last non-empty ones are included.
+    """
+    start, end = window
+    if by is None:
+        return [Bucket(window_label(start, end), start, end, sessions)]
+    grouped = {}
+    for session in sessions:
+        key = bucket_start(session[0].start, by)
+        grouped.setdefault(key, []).append(session)
+    if not grouped:
+        return []
+    buckets = []
+    current, last = min(grouped), max(grouped)
+    while current <= last:
+        following = next_bucket(current, by)
+        buckets.append(Bucket(
+            bucket_label(current, by), current, following,
+            grouped.get(current, []),
+        ))
+        current = following
+    return buckets
+<<metrics functions>>=
+def window_label(start, end):
+    """A label for a rolling window."""
+    return f"{start:%Y-%m-%d} to {end:%Y-%m-%d}"
+@
+
+Let's verify the calendar arithmetic where it is easiest to get wrong:
+a month boundary at midnight, an ISO week that belongs to the previous
+year, an empty bucket in the middle, and the inclusive [[--until]].
+
+<<metrics test functions>>=
+def test_bucket_sessions_month_boundary_and_gaps():
+  late = [_rec(13 * 60 + 50)]          # 31 Aug 23:50
+  spill = [_rec(13 * 60 + 50), _rec(13 * 60 + 65)]   # into 1 Sep
+  october = [_rec(31 * 24 * 60)]       # 1 Oct 10:00
+  window = (T0, T0 + datetime.timedelta(days=40))
+  buckets = bucket_sessions([spill, october], Granularity.MONTH, window)
+  assert [b.label for b in buckets] == ["2026-08", "2026-09", "2026-10"]
+  assert len(buckets[0].runs) == 2
+  assert buckets[1].sessions == []
+  assert bucket_sessions([late], None, window)[0].label == \
+    "2026-08-31 to 2026-10-10"
+
+def test_bucket_labels_iso_week_and_day():
+  new_year = datetime.datetime(2027, 1, 1, 9, 0)      # a Friday
+  assert bucket_label(bucket_start(new_year, Granularity.WEEK),
+                      Granularity.WEEK) == "2026-W53"
+  assert bucket_start(new_year, Granularity.WEEK) == \
+    datetime.datetime(2026, 12, 28)
+  assert bucket_label(new_year, Granularity.DAY) == "2027-01-01"
+  assert next_bucket(datetime.datetime(2026, 12, 1),
+                     Granularity.MONTH) == datetime.datetime(2027, 1, 1)
+
+def test_windows():
+  now = T0
+  assert period_window(Period.TODAY, [], now) == (midnight(T0), T0)
+  assert period_window(Period.WEEK, [], now)[0] == \
+    T0 - datetime.timedelta(days=7)
+  assert period_window(Period.ALL, [_rec(-60)], now)[0] == \
+    T0 - datetime.timedelta(hours=1)
+  start, end = explicit_window("2026-08-01", "2026-08-31", [], now)
+  assert start == datetime.datetime(2026, 8, 1)
+  assert end == datetime.datetime(2026, 9, 1)
+  assert filter_window([_rec(0), _rec(-10)], T0, T0 + IDLE) == [_rec(0)]
+  with pytest.raises(ValueError):
+    parse_boundary("last tuesday")
+@
+
+
+\section{Code snapshots}
+\label{sec:metrics-snapshots}
+
+The code metrics need files to read.
+For a single window they read the working directory as it is: the
+\enquote{current version} of the program.
+For a series they need the program as it stood at the end of each
+bucket, which is the tree of the bucket's last run---extracted with
+the exporter's [[extract_code_state]] (\cref{progsnap2}), one
+[[git archive]] per bucket, into a temporary directory the command
+layer owns.
+The trees are already free of [[.venv]] and [[__pycache__]]
+([[EXCLUDE_PATTERNS]] in \cref{gitrepo}), but a repository reconstructed from
+someone else's ProgSnap2 export need not be, so the file walk filters
+by path component as well.
+
+<<metrics imports>>=
+import pathlib
+<<metrics constants>>=
+SNAPSHOT_EXCLUDED_DIRS = frozenset({
+    ".venv", "venv", "env", ".learnlog", ".git", "__pycache__",
+    "node_modules", "site-packages",
+})
+<<metrics functions>>=
+def snapshot_files(root):
+    """The Python files under `root`, excluding tool directories."""
+    root = pathlib.Path(root)
+    return sorted(
+        path for path in root.rglob("*.py")
+        if not set(path.relative_to(root).parts[:-1])
+        & SNAPSHOT_EXCLUDED_DIRS
+    )
+<<metrics functions>>=
+def bucket_snapshot(repo, bucket, root):
+    """Extract the tree of the bucket's last run under `root`.
+
+    Returns the snapshot directory, or `None` for an empty bucket.
+    """
+    runs = bucket.runs
+    if not runs:
+        return None
+    state_dir = pathlib.Path(root) / bucket.label
+    extract_code_state(repo, runs[-1].commit, state_dir)
+    return state_dir
+<<metrics test functions>>=
+def test_snapshot_files_skips_tool_directories(tmp_path):
+  (tmp_path / "main.py").write_text("")
+  (tmp_path / "pkg").mkdir()
+  (tmp_path / "pkg" / "mod.py").write_text("")
+  (tmp_path / ".venv" / "lib").mkdir(parents=True)
+  (tmp_path / ".venv" / "lib" / "x.py").write_text("")
+  (tmp_path / "__pycache__").mkdir()
+  (tmp_path / "__pycache__" / "y.py").write_text("")
+  names = [p.relative_to(tmp_path).as_posix()
+           for p in snapshot_files(tmp_path)]
+  assert names == ["main.py", "pkg/mod.py"]
+@
+
+
+\section{Cyclomatic complexity, size, and the rest}
+\label{sec:metrics-code}
+
+McCabe defined complexity on the control-flow graph, $v(G) = e - n +
+2p$, and then gave the rule everyone implements: \enquote{the
+cyclomatic complexity of a structured program equals the number of
+predicates plus one}, with a compound predicate counting once per
+condition, since [[if c1 and c2]] is [[if c1: if c2]] in
+disguise~\autocite{McCabe1976}.
+Radon implements that rule for Python, and radon is what we use.
+Its counting, read from its source rather than its documentation
+(which disagrees on two points), is: one for the function; one per
+[[if]], [[elif]] and conditional expression; one per [[for]] or
+[[while]], plus one when the loop has an [[else]]; one per [[except]]
+handler, plus one for a [[try]]'s [[else]]; one per boolean operand
+beyond the first; one per [[for]] and per [[if]] in a comprehension;
+one per [[match]] case, less one when a case is the wildcard; one per
+[[assert]]; and nothing for [[with]], [[lambda]], [[else]] and
+[[finally]].
+
+What the number means is contested, and the report says so.
+Shepperd objected that every decision weighs the same, that structure
+is invisible to it, and that splitting a program into functions changes
+the total arbitrarily~\autocite{Shepperd1988}; Jay et al.\ found it
+nearly a linear function of lines of code~\autocite{JayEtAl2009};
+Landman et al.\ re-tested that on seventeen million methods and found
+the correlation only moderate at function
+level~\autocite{Landman2016}.
+Function level is where learnlog reports, so complexity is shown per
+function beside the size, never alone and never as a mean: for novice
+programs it is one in the great majority of
+cases~\autocite{Keuning2017}, and the interesting event is the first
+function where it is not.
+
+Halstead's measures count operators and operands~\autocite{Halstead1977}.
+Halstead never said which Python tokens those are; radon's answer is
+five node types (binary, unary and boolean operators, augmented
+assignment, comparison), so a first program that only calls
+[[input]] and [[print]] has volume zero.
+The maintainability index built on them,
+$171 - 5.2\ln V - 0.23\,v(G) - 16.2\ln L + 50\sin\sqrt{2.46\,C}$
+\autocite{ColemanEtAl1994}, inherits that: radon reports it rescaled
+to $[0, 100]$ and returns 100 when the volume is zero.
+Its authors already warned that comments inflate it \enquote{especially
+in small modules}~\autocite{ColemanEtAl1994}, and we count multi-line
+strings as comments (radon's [[multi=True]]), which is what a novice's
+docstring is;
+its constants have no derivation~\autocite{Heitlager2007}, and against
+measured maintenance effort only size carried
+signal~\autocite{Sjoberg2012,Morrison2023}.
+Both are reported, because they are what a code report is expected
+to contain; both are labelled as radon's definitions, and the index
+comes with its caveat in the report header.
+
+<<metrics imports>>=
+import statistics
+from radon.complexity import cc_visit
+from radon.metrics import h_visit, mi_visit
+from radon.raw import analyze as raw_analyze
+<<metrics constants>>=
+MI_CAVEAT = (
+    "Maintainability index (radon): inflated by comments in small "
+    "files and 100 for programs with no operators; read with care."
+)
+HALSTEAD_NOTE = (
+    "Halstead volume uses radon's operator definitions (binary, "
+    "unary and boolean operators, augmented assignment, comparison)."
+)
+@
+
+Every radon entry point raises [[SyntaxError]] on a file that does
+not parse, and many novice snapshots do not.
+A file's metrics are therefore all-or-nothing with the parse error
+recorded, and every summary below is over the files that parsed, with
+the count of those that did not beside it.
+A class block in radon carries its methods; the class's own complexity
+is their mean, which is not a function and is not listed.
+
+<<metrics functions>>=
+@dataclasses.dataclass(frozen=True)
+class FileMetrics:
+    """Radon's metrics for one file, or its parse error."""
+
+    path: str
+    parse_error: str | None
+    loc: int | None = None
+    sloc: int | None = None
+    lloc: int | None = None
+    comments: int | None = None
+    blank: int | None = None
+    functions: tuple = ()
+    volume: float | None = None
+    vocabulary: int | None = None
+    maintainability: float | None = None
+<<metrics functions>>=
+def analyse_source(path, source):
+    """Compute `FileMetrics` for one source text."""
+    try:
+        raw = raw_analyze(source)
+        blocks = cc_visit(source)
+        halstead = h_visit(source).total
+        index = mi_visit(source, True)
+    except SyntaxError as error:
+        return FileMetrics(str(path), str(error))
+    functions = []
+    for block in blocks:
+        for unit in getattr(block, "methods", None) or [block]:
+            functions.append((unit.name, unit.lineno, unit.complexity))
+    return FileMetrics(
+        str(path), None,
+        loc=raw.loc, sloc=raw.sloc, lloc=raw.lloc,
+        comments=raw.comments + raw.multi, blank=raw.blank,
+        functions=tuple(functions),
+        volume=halstead.volume, vocabulary=halstead.vocabulary,
+        maintainability=index,
+    )
+<<metrics functions>>=
+def analyse_snapshot(root):
+    """Summarise the Python files under `root` as a dict."""
+    files = [
+        analyse_source(path.relative_to(root), path.read_text(
+            encoding="utf-8", errors="replace",
+        ))
+        for path in snapshot_files(root)
+    ]
+    parsed = [metrics for metrics in files if metrics.parse_error is None]
+    complexities = [
+        unit[2] for metrics in parsed for unit in metrics.functions
+    ]
+    indices = [metrics.maintainability for metrics in parsed]
+    return {
+        "files": len(files),
+        "unparsable": len(files) - len(parsed),
+        "sloc": sum(m.sloc for m in parsed) if parsed else None,
+        "lloc": sum(m.lloc for m in parsed) if parsed else None,
+        "comments": sum(m.comments for m in parsed) if parsed else None,
+        "functions": len(complexities) if parsed else None,
+        "max_cc": max(complexities, default=None),
+        "complex_functions": sum(
+            complexity > 1 for complexity in complexities
+        ) if parsed else None,
+        "volume": sum(m.volume for m in parsed) if parsed else None,
+        "mi_min": min(indices) if indices else None,
+        "mi_median": statistics.median(indices) if indices else None,
+    }
+@
+
+Let's verify radon's counting on the constructs the prose lists, that
+the documented hello-world scores an index of 100 with volume zero,
+and that a file that does not parse leaves a null row rather than an
+exception.
+
+<<metrics test functions>>=
+CC_CASES = [
+  ("def f(a):\n    if a:\n        return 1\n    elif a > 1:\n"
+   "        return 2\n    return 0\n", 3),
+  ("def f(xs):\n    for x in xs:\n        pass\n    else:\n"
+   "        pass\n", 3),
+  ("def f():\n    try:\n        pass\n    except ValueError:\n"
+   "        pass\n    except KeyError:\n        pass\n", 3),
+  ("def f(a, b, c):\n    return a and b or c\n", 3),
+  ("def f(xs):\n    return [x for x in xs if x]\n", 3),
+  ("def f():\n    with open('x') as fh:\n        return fh\n", 1),
+  ("def f():\n    return lambda: 1\n", 1),
+]
+
+@pytest.mark.parametrize("source, expected", CC_CASES)
+def test_analyse_source_complexity(source, expected):
+  metrics = analyse_source("f.py", source)
+  assert metrics.parse_error is None
+  assert [unit[2] for unit in metrics.functions] == [expected]
+
+def test_analyse_source_hello_world_and_parse_error():
+  hello = analyse_source("hello.py", 'name = input()\nprint(name)\n')
+  assert hello.volume == 0
+  assert hello.maintainability == 100.0
+  assert hello.sloc == 2 and hello.functions == ()
+  broken = analyse_source("b.py", "def f(:\n    pass\n")
+  assert broken.parse_error and broken.sloc is None
+
+def test_analyse_snapshot_summary(tmp_path):
+  (tmp_path / "a.py").write_text(CC_CASES[0][0] + CC_CASES[5][0]
+                                 .replace("def f", "def g"))
+  (tmp_path / "b.py").write_text("def f(:\n")
+  summary = analyse_snapshot(tmp_path)
+  assert (summary["files"], summary["unparsable"]) == (2, 1)
+  assert summary["functions"] == 2
+  assert summary["max_cc"] == 3
+  assert summary["complex_functions"] == 1
+  assert summary["sloc"] == 9
+  assert summary["mi_min"] == summary["mi_median"]
+  assert analyse_snapshot(tmp_path / "nowhere")["sloc"] is None
+@
+
+
+\section{Linting}
+\label{sec:metrics-lint}
+
+Keuning et al.\ ran a general-purpose analyser over two and a half
+million student snapshots and found its most frequent findings
+pedagogically irrelevant, its relevant ones rarely fixed, and
+concluded that educators should \enquote{customize the tool by
+selecting a small set of relevant issues}~\autocite{Keuning2017}.
+Liu and Petersen did exactly that for Python by wrapping pylint with a
+restricted, reworded rule set~\autocite{LiuPetersen2019}.
+The set here is small on purpose: the pyflakes family (undefined
+names, unused imports and variables, and their kin), long lines,
+comparison with [[None]] or [[True]] by [[==]], a bare [[except]], a
+[[lambda]] bound to a name, and ambiguous one-letter names.
+
+The linter is not a dependency.
+[[ruff]] is preferred---one binary, stable rule codes, JSON output;
+[[pylint]] is the fallback, with the same intent expressed in its
+symbols; it is GPL-licensed, which is why it is found rather than
+shipped.
+When neither is present the report says how to get one and shows a
+dash, because a metric that is unavailable is not a failure of the
+student's program.
+Expectations are kept modest in the prose: nudging students on quality
+had them add more violations than they
+removed~\autocite{Bobadilla2024}, and improvement concentrates where a
+violation was made an explicit learning
+outcome~\autocite{Ostlund2023}.
+
+<<metrics imports>>=
+import json
+import shutil
+import subprocess
+<<metrics constants>>=
+RUFF_RULES = ("F", "E501", "E711", "E712", "E722", "E731", "E741")
+PYLINT_CHECKS = (
+    "undefined-variable", "unused-import", "unused-variable",
+    "bare-except", "singleton-comparison", "redefined-builtin",
+    "line-too-long",
+)
+LINT_TOOLS = ("ruff", "pylint")
+LINT_INSTALL_HINT = (
+    "No linter found. Install one in the project venv: "
+    "pip install ruff (or: pip install pylint)"
+)
+LINT_TIMEOUT = 120
+<<metrics functions>>=
+def find_linter(workdir):
+    """Return `(tool, executable)` for the first linter found.
+
+    Looks in the project's `.venv/bin` before the `PATH`, so the
+    student's own installation wins.
+    """
+    for tool in LINT_TOOLS:
+        local = pathlib.Path(workdir) / ".venv" / "bin" / tool
+        if local.is_file():
+            return tool, str(local)
+        found = shutil.which(tool)
+        if found:
+            return tool, found
+    return None
+@
+
+Both tools signal findings through their exit status---ruff exits 1
+when it found something, pylint sets a bit per message category and
+reserves 32 for its own failure---so the status is the answer, not an
+error, and only a status that means the tool did not run counts as
+failure.
+Ruff is run [[--isolated]]: the snapshot may contain the student's own
+[[pyproject.toml]], which would otherwise silently redefine the rule
+set.
+
+<<metrics functions>>=
+def run_linter(tool, executable, files):
+    """Count a linter's findings by rule over `files`.
+
+    Returns `{"tool", "total", "findings"}` with `findings` a
+    `Counter` by rule code, or `None` when the tool did not run.
+    """
+    if not files:
+        return {"tool": tool, "total": 0,
+                "findings": collections.Counter()}
+    if tool == "ruff":
+        command = [
+            executable, "check", "--isolated", "--no-cache",
+            "--select", ",".join(RUFF_RULES),
+            "--output-format", "json", *map(str, files),
+        ]
+        accepted, key = (0, 1), "code"
+    else:
+        command = [
+            executable, "--disable=all",
+            "--enable=" + ",".join(PYLINT_CHECKS),
+            "--output-format=json", "--score=n", *map(str, files),
+        ]
+        accepted, key = range(32), "symbol"
+    <<run the linter and count its findings>>
+<<run the linter and count its findings>>=
+try:
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False,
+        timeout=LINT_TIMEOUT,
+    )
+    if result.returncode not in accepted:
+        return None
+    findings = collections.Counter(
+        item.get(key, "?") for item in json.loads(result.stdout or "[]")
+    )
+except (OSError, subprocess.TimeoutExpired, ValueError):
+    return None
+return {
+    "tool": tool, "total": sum(findings.values()),
+    "findings": findings,
+}
+@
+
+The linter test needs a linter, so it is skipped where there is none;
+the not-found path is tested by pointing the search at an empty
+directory with an empty [[PATH]].
+
+<<metrics test functions>>=
+def test_find_linter_absent(tmp_path, monkeypatch):
+  monkeypatch.setenv("PATH", str(tmp_path))
+  assert find_linter(tmp_path) is None
+
+def test_find_linter_prefers_project_venv(tmp_path, monkeypatch):
+  monkeypatch.setenv("PATH", str(tmp_path))
+  local = tmp_path / ".venv" / "bin"
+  local.mkdir(parents=True)
+  (local / "pylint").write_text("#!/bin/sh\n")
+  assert find_linter(tmp_path) == ("pylint", str(local / "pylint"))
+
+@pytest.mark.skipif(
+  shutil.which("ruff") is None and shutil.which("pylint") is None,
+  reason="no linter installed",
+)
+def test_run_linter_counts_findings(tmp_path):
+  tool, executable = find_linter(tmp_path)
+  (tmp_path / "m.py").write_text("import os\nprint(y)\n")
+  report = run_linter(tool, executable, [tmp_path / "m.py"])
+  assert report["tool"] == tool
+  assert report["total"] >= 2
+  assert run_linter(tool, executable, [])["total"] == 0
+
+def test_run_linter_tool_failure_is_none(tmp_path):
+  assert run_linter("ruff", str(tmp_path / "missing"),
+                    [tmp_path / "m.py"]) is None
+@
+
+
+\section{Per-bucket results and trends}
+\label{sec:metrics-trends}
+
+Each family of metrics produces the same shape---one row of named
+values per bucket---so that [[trends]] can join the rows instead of
+recomputing anything.
+
+<<metrics functions>>=
+@dataclasses.dataclass(frozen=True)
+class BucketResult:
+    """The values of one metric family for one bucket."""
+
+    label: str
+    start: datetime.datetime
+    end: datetime.datetime
+    values: dict
+<<metrics functions>>=
+def compute_time(buckets, idle):
+    """Time and effort summaries, one per bucket."""
+    return [
+        BucketResult(bucket.label, bucket.start, bucket.end,
+                     time_summary(bucket.sessions, idle))
+        for bucket in buckets
+    ]
+<<metrics functions>>=
+def compute_errors(buckets):
+    """Error quotients and densities, one row per bucket."""
+    results = []
+    for bucket in buckets:
+        pairs = sum(len(run_pairs(s)) for s in bucket.sessions)
+        results.append(BucketResult(
+            bucket.label, bucket.start, bucket.end, {
+                "pairs": pairs,
+                "eq_syntax": error_quotient(bucket.sessions, "syntax"),
+                "eq_any": error_quotient(bucket.sessions, "any"),
+                "red_syntax": repeated_error_density(
+                    bucket.sessions, "syntax"),
+                "red_any": repeated_error_density(bucket.sessions, "any"),
+            },
+        ))
+    return results
+@
+
+The code and lint families take a function from bucket to snapshot
+directory, so that the same code serves the working directory (one
+window) and extracted trees (a series); a bucket without a snapshot
+gets a row of nulls, which renders as dashes.
+
+<<metrics functions>>=
+def compute_code(buckets, snapshot):
+    """Static code metrics of each bucket's snapshot."""
+    results = []
+    for bucket in buckets:
+        root = snapshot(bucket)
+        values = analyse_snapshot(root) if root else \
+            {key: None for key in CODE_KEYS}
+        results.append(BucketResult(
+            bucket.label, bucket.start, bucket.end, values,
+        ))
+    return results
+<<metrics constants>>=
+CODE_KEYS = (
+    "files", "unparsable", "sloc", "lloc", "comments", "functions",
+    "max_cc", "complex_functions", "volume", "mi_min", "mi_median",
+)
+<<metrics functions>>=
+def compute_lint(buckets, snapshot, linter):
+    """Linter counts of each bucket's snapshot.
+
+    `linter` is `(tool, executable)` or `None`; with none, or
+    when the tool fails, every value is `None`.
+    """
+    results = []
+    for bucket in buckets:
+        root = snapshot(bucket)
+        report = None
+        if root and linter:
+            report = run_linter(*linter, snapshot_files(root))
+        values = {
+            "lint_tool": report["tool"] if report else None,
+            "lint_total": report["total"] if report else None,
+            "lint_findings": dict(report["findings"]) if report else None,
+        }
+        results.append(BucketResult(
+            bucket.label, bucket.start, bucket.end, values,
+        ))
+    return results
+<<metrics functions>>=
+def join_buckets(*series):
+    """Merge parallel `BucketResult` lists by label."""
+    merged = {}
+    order = []
+    for results in series:
+        for result in results:
+            if result.label not in merged:
+                merged[result.label] = BucketResult(
+                    result.label, result.start, result.end, {},
+                )
+                order.append(result.label)
+            merged[result.label].values.update(result.values)
+    return [merged[label] for label in order]
+@
+
+A direction is a word about a series, and the rule that produces it is
+printed so the word can be checked.
+Missing values are dropped; with fewer than four remaining the answer
+is that it is too early to say.
+Otherwise the least-squares slope over the buckets that have a value,
+scaled to their span and divided by the magnitude of the median value,
+is compared with a ten-percent threshold.
+The vocabulary is closed---rising, falling, steady---because the
+metric's meaning is not: an error quotient that falls is an error
+quotient that fell, and whether that is good news is the student's to
+say~\autocite{jivet2018license}.
+A single improving number can hide a worsening long
+tail~\autocite{Ostlund2023}, so the direction never stands alone: the
+first and last values, and the row of numbers above it, are always
+beside it.
+
+<<metrics constants>>=
+TREND_MIN_BUCKETS = 4
+TREND_RELATIVE_THRESHOLD = 0.10
+TREND_RULE = (
+    f"direction: least-squares slope over at least {TREND_MIN_BUCKETS} "
+    f"buckets with a value, scaled to the span and divided by the "
+    f"median; rising or falling beyond "
+    f"{TREND_RELATIVE_THRESHOLD:.0%}, steady within"
+)
+<<metrics functions>>=
+def direction(values, unit="buckets"):
+    """Describe how `values` (with `None`s) move over the series."""
+    points = [value for value in values if value is not None]
+    if len(points) < TREND_MIN_BUCKETS:
+        return f"not enough {unit} yet"
+    count = len(points)
+    mean_x = (count - 1) / 2
+    mean_y = sum(points) / count
+    slope = sum(
+        (index - mean_x) * (value - mean_y)
+        for index, value in enumerate(points)
+    ) / sum((index - mean_x) ** 2 for index in range(count))
+    scale = max(abs(statistics.median(points)), 1e-9)
+    relative = slope * (count - 1) / scale
+    if relative > TREND_RELATIVE_THRESHOLD:
+        return "rising"
+    if relative < -TREND_RELATIVE_THRESHOLD:
+        return "falling"
+    return "steady"
+@
+
+The trend lines name the metric, the direction, the span and the
+end points, and nothing else; when the answer is that it is too
+early, they say only that, since a span and end points would dress
+up an absence of evidence as a finding.
+
+<<metrics constants>>=
+TREND_COLUMNS = (
+    ("active_days", "active days"),
+    ("runs", "runs"),
+    ("sessions", "sessions"),
+    ("active_seconds", "active time"),
+    ("failed_runs", "failed runs"),
+    ("eq_syntax", "EQ (syntax)"),
+    ("eq_any", "EQ (all errors)"),
+    ("red_any", "RED (all errors)"),
+    ("max_cc", "max complexity"),
+    ("sloc", "source lines"),
+    ("lint_total", "lint findings"),
+)
+<<metrics functions>>=
+def trend_lines(results, unit="buckets"):
+    """One direction line per metric over `results`."""
+    lines = []
+    for key, name in TREND_COLUMNS:
+        series = [result.values.get(key) for result in results]
+        word = direction(series, unit)
+        present = [value for value in series if value is not None]
+        if word.startswith("not enough") or not present:
+            lines.append(f"{name}: {word}")
+            continue
+        span = f"over your last {len(results)} {unit}"
+        ends = (f"({format_value(key, present[0])} to "
+                f"{format_value(key, present[-1])})")
+        lines.append(f"{name}: {word} {span} {ends}")
+    return lines
+@
+
+Let's verify the direction rule at its edges and that a join keeps the
+first series' order.
+
+<<metrics test functions>>=
+def test_direction_rule():
+  assert direction([1, 2, 3], "weeks") == "not enough weeks yet"
+  assert direction([1, None, 2, 3, 4]) == "rising"
+  assert direction([0.8, 0.6, 0.5, 0.2]) == "falling"
+  assert direction([5, 5, 5, 5, 5]) == "steady"
+  assert direction([10, 10.2, 9.9, 10.1]) == "steady"
+  assert direction([0, 0, 0, 0]) == "steady"
+
+def test_compute_and_join_buckets():
+  sessions = [[_name(0), _name(2)], [_rec(30)]]
+  window = (T0, T0 + datetime.timedelta(days=1))
+  buckets = bucket_sessions(sessions, Granularity.DAY, window)
+  times = compute_time(buckets, IDLE)
+  errors = compute_errors(buckets)
+  code = compute_code(buckets, lambda bucket: None)
+  lint = compute_lint(buckets, lambda bucket: None, None)
+  joined = join_buckets(times, errors, code, lint)
+  assert [r.label for r in joined] == ["2026-08-31"]
+  values = joined[0].values
+  assert values["runs"] == 3 and values["pairs"] == 1
+  assert values["eq_any"] == 1.0 and values["eq_syntax"] == 0.0
+  assert values["red_any"] == 0.5
+  assert values["sloc"] is None and values["lint_total"] is None
+  assert trend_lines(joined, "days")[0] == \
+    "active days: not enough days yet"
+  longer = [BucketResult(f"d{i}", T0, T0, {"runs": i})
+            for i in range(1, 6)]
+  assert trend_lines(longer, "days")[1] == \
+    "runs: rising over your last 5 days (1 to 5)"
+@
+
+
+\section{Rendering}
+\label{sec:metrics-render}
+
+A report is a header of the parameters it was computed with, then one
+row per bucket.
+The header is not decoration: the idle threshold, the EQ variant and
+the window are the choices the literature says change the
+numbers~\autocite{kovanovic2015penetrating,ahadi2018syntax}, and a
+number without them cannot be compared with another.
+Values that do not exist print as a dash; a zero would claim something
+was measured.
+
+<<metrics imports>>=
+import csv
+import io
+<<metrics functions>>=
+class OutputFormat(str, enum.Enum):
+    """The renderings a report can take."""
+
+    TABLE = "table"
+    CSV = "csv"
+    JSON = "json"
+    LATEX = "latex"
+<<metrics constants>>=
+DURATION_KEYS = frozenset({"active_seconds"})
+MISSING = "\u2014"
+<<metrics functions>>=
+def format_value(key, value):
+    """Render one cell for a text table."""
+    if value is None:
+        return MISSING
+    if key in DURATION_KEYS:
+        minutes = int(round(value / 60))
+        return f"{minutes // 60}h {minutes % 60:02d}m"
+    if isinstance(value, datetime.datetime):
+        return value.strftime("%a %Y-%m-%d %H:%M")
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    if isinstance(value, dict):
+        return " ".join(
+            f"{code}:{count}" for code, count in sorted(value.items())
+        ) or "0"
+    return str(value)
+<<metrics functions>>=
+def render(results, columns, fmt, header_lines):
+    """Render `results` in `fmt`.
+
+    `columns` is a sequence of `(key, heading)` pairs; the label
+    column comes first without being listed.  Text and LaTeX put
+    `header_lines` above the table; CSV prints them as comment
+    lines starting with `#`; JSON carries them as `parameters`.
+    """
+    fmt = OutputFormat(fmt)
+    if fmt is OutputFormat.JSON:
+        return render_json(results, columns, header_lines)
+    if fmt is OutputFormat.CSV:
+        return render_csv(results, columns, header_lines)
+    if fmt is OutputFormat.LATEX:
+        return render_latex(results, columns, header_lines)
+    return render_table(results, columns, header_lines)
+<<metrics functions>>=
+def render_table(results, columns, header_lines):
+    """Aligned plain-text table."""
+    headings = ["period", *[heading for _, heading in columns]]
+    rows = [
+        [result.label, *[
+            format_value(key, result.values.get(key)) for key, _ in columns
+        ]]
+        for result in results
+    ]
+    widths = [
+        max(len(row[index]) for row in [headings, *rows])
+        for index in range(len(headings))
+    ]
+    lines = [*header_lines, ""] if header_lines else []
+    for row in [headings, *rows]:
+        lines.append("  ".join(
+            cell.ljust(width) if index == 0 else cell.rjust(width)
+            for index, (cell, width) in enumerate(zip(row, widths))
+        ).rstrip())
+    return "\n".join(lines) + "\n"
+<<metrics functions>>=
+def render_csv(results, columns, header_lines):
+    """CSV with the parameters as `#` comment lines."""
+    buffer = io.StringIO()
+    for line in header_lines:
+        buffer.write(f"# {line}\n")
+    writer = csv.writer(buffer)
+    writer.writerow(["period", *[key for key, _ in columns]])
+    for result in results:
+        writer.writerow([result.label, *[
+            _csv_value(result.values.get(key)) for key, _ in columns
+        ]])
+    return buffer.getvalue()
+<<metrics functions>>=
+def _csv_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
+    return value
+<<metrics functions>>=
+def render_json(results, columns, header_lines):
+    """JSON with `parameters` and `rows`."""
+    rows = [{
+        "period": result.label,
+        "start": result.start.isoformat(),
+        "end": result.end.isoformat(),
+        **{key: _json_value(result.values.get(key))
+           for key, _ in columns},
+    } for result in results]
+    return json.dumps(
+        {"parameters": list(header_lines), "rows": rows}, indent=2,
+    ) + "\n"
+<<metrics functions>>=
+def _json_value(value):
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    return value
+@
+
+The \LaTeX{} rendering escapes the characters that scripts and rule
+codes can contain; the parameters go in as comments, where a
+[[\caption]] can quote them.
+
+<<metrics constants>>=
+LATEX_SPECIALS = {
+    "\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+    "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
+    "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
+}
+<<metrics functions>>=
+def latex_escape(text):
+    """Escape `text` for use in LaTeX body text."""
+    return "".join(LATEX_SPECIALS.get(char, char) for char in str(text))
+<<metrics functions>>=
+def render_latex(results, columns, header_lines):
+    """A `tabular` with the parameters as comments."""
+    lines = [f"% {line}" for line in header_lines]
+    lines.append("\\begin{tabular}{l" + "r" * len(columns) + "}")
+    lines.append(" & ".join(
+        ["period", *[latex_escape(h) for _, h in columns]]
+    ) + r" \\ \hline")
+    for result in results:
+        cells = [latex_escape(result.label), *[
+            latex_escape(format_value(key, result.values.get(key)))
+            for key, _ in columns
+        ]]
+        lines.append(" & ".join(cells) + r" \\")
+    lines.append("\\end{tabular}")
+    return "\n".join(lines) + "\n"
+@
+
+Let's verify each rendering on one row with a missing value.
+
+<<metrics test functions>>=
+RESULT = BucketResult(
+  "2026-W36", T0, T0 + IDLE,
+  {"runs": 3, "active_seconds": 7860.0, "eq_any": None,
+   "lint_findings": {"F821": 2}, "first_run": T0},
+)
+COLUMNS = [("runs", "runs"), ("active_seconds", "active time"),
+           ("eq_any", "EQ"), ("lint_findings", "findings"),
+           ("first_run", "first run")]
+
+def test_render_table_aligns_and_dashes():
+  text = render([RESULT], COLUMNS, "table", ["idle: 20 min"])
+  lines = text.splitlines()
+  assert lines[0] == "idle: 20 min" and lines[1] == ""
+  assert lines[2].startswith("period")
+  assert "2h 11m" in lines[3] and MISSING in lines[3]
+  assert "F821:2" in lines[3] and "Mon 2026-08-31 10:00" in lines[3]
+
+def test_render_csv_json_latex():
+  text = render([RESULT], COLUMNS, "csv", ["idle: 20 min"])
+  assert text.startswith("# idle: 20 min\nperiod,runs,")
+  assert ',7860.0,,"{""F821"": 2}",2026-08-31T10:00:00' in text
+  data = json.loads(render([RESULT], COLUMNS, "json", ["p"]))
+  assert data["parameters"] == ["p"]
+  assert data["rows"][0]["eq_any"] is None
+  assert data["rows"][0]["first_run"] == "2026-08-31T10:00:00"
+  latex = render([RESULT], COLUMNS, "latex", ["a_b"])
+  assert latex.startswith("% a_b\n\\begin{tabular}{lrrrrr}")
+  assert "F821:2" in latex and r"2026-W36 & 3 & 2h 11m" in latex
+  assert latex_escape("a_b & 100%") == r"a\_b \& 100\%"
+@

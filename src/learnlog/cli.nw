@@ -4,7 +4,7 @@
 The [[learnlog]] command lets students prepare projects for
 logging and lets both students and teachers manage and review
 the development logs that are produced.
-It provides fifteen subcommands: [[init]] prepares a project
+It provides sixteen subcommands: [[init]] prepares a project
 directory (creating [[.learnlog/]] and installing [[learnlog]]
 for the student's chosen language), [[doctor]] reports whether
 the running interpreter still records runs and can repair the
@@ -19,9 +19,11 @@ education analysis), [[set-remote]], [[push]], [[clone]], and
 [[git]] forwards Git commands to the log repository, [[tag]]
 manages named markers in the log (such as [[lab1]] or
 [[lab2]]), [[play]] gives an interactive viewer for browsing
-the commit history, and [[analyse]] generates \LaTeX{} reports
+the commit history, [[analyse]] generates \LaTeX{} reports
 of edit--run cycles from a ProgSnap2 dataset, optionally
-filtered by a [[Column=Regex]] range.
+filtered by a [[Column=Regex]] range, and [[metrics]] summarises
+the student's own time, errors and code per day, week or month
+(\cref{sec:metrics-command}).
 
 We use Typer for the CLI framework because it gives us type-checked
 arguments with minimal boilerplate, and the modern
@@ -45,7 +47,9 @@ with a remote repository, playing back the development log
 stored in ``.learnlog/``, and analysing ProgSnap2 datasets to
 produce LaTeX reports of student edit--run cycles.  The
 ``analyse`` command accepts ``Column=Regex`` range boundaries
-to restrict analysis to a subset of events.
+to restrict analysis to a subset of events.  The ``metrics``
+group (``time``, ``eq``, ``code``, ``lint``, ``trends``)
+summarises the log per period.
 """
 
 <<imports>>
@@ -68,6 +72,7 @@ import subprocess
 import sys
 import datetime
 import zipfile
+import json
 import pytest
 from learnlog.gitrepo import LearnlogRepo
 
@@ -146,6 +151,35 @@ from learnlog.progsnap2 import (
     generate_analysis_latex,
 )
 from learnlog.viewer import PlaybackViewer, play_batch
+from learnlog.metrics import (
+    CODE_KEYS,
+    DEFAULT_IDLE_MINUTES,
+    EQ_VARIANT,
+    Granularity,
+    HALSTEAD_NOTE,
+    LINT_INSTALL_HINT,
+    MI_CAVEAT,
+    OutputFormat,
+    Period,
+    TREND_COLUMNS,
+    TREND_RULE,
+    bucket_sessions,
+    bucket_snapshot,
+    compute_code,
+    compute_errors,
+    compute_lint,
+    compute_time,
+    explicit_window,
+    filter_window,
+    find_linter,
+    join_buckets,
+    period_window,
+    render,
+    run_records,
+    segment_sessions,
+    trend_lines,
+    window_label,
+)
 @
 
 
@@ -2181,7 +2215,7 @@ def test_marker_contents_reports_unreadable_marker(tmp_path):
 \section{Typer application}
 
 We define the Typer app at module level with fifteen
-commands.
+commands and one command group, [[metrics]].
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
 
@@ -2242,6 +2276,8 @@ pytorial.add_typer_subcommand(
         str(_builtin_tutorials_dir / "playback-and-tagging-expert.md"),
         str(_builtin_tutorials_dir / "export-and-share.md"),
         str(_builtin_tutorials_dir / "export-and-share-expert.md"),
+        str(_builtin_tutorials_dir / "metrics.md"),
+        str(_builtin_tutorials_dir / "metrics-expert.md"),
         str(_builtin_tutorials_dir / "analysing-progsnap2.md"),
     ),
 )
@@ -2363,6 +2399,8 @@ def test_tutorial_list_lists_builtin_tutorials():
     assert "playback-and-tagging-expert" in out
     assert "export-and-share" in out
     assert "export-and-share-expert" in out
+    assert "metrics" in out
+    assert "metrics-expert" in out
     assert "analysing-progsnap2" in out
     assert (
         out.index("getting-started")
@@ -2371,6 +2409,8 @@ def test_tutorial_list_lists_builtin_tutorials():
         < out.index("playback-and-tagging-expert")
         < out.index("export-and-share")
         < out.index("export-and-share-expert")
+        < out.index("metrics")
+        < out.index("metrics-expert")
         < out.index("analysing-progsnap2")
     )
 
@@ -2380,6 +2420,7 @@ def test_expert_variants_share_their_novice_contract():
         "getting-started",
         "playback-and-tagging",
         "export-and-share",
+        "metrics",
     ):
         novice = tutorial_resource(f"{base}.md")
         expert = tutorial_resource(f"{base}-expert.md")
@@ -7323,4 +7364,478 @@ def test_analyse_title_override(workdir, monkeypatch):
         "\\section{Daniel's debug session}"
         in result.output
     )
+@
+
+
+\subsection{The [[metrics]] command group}
+\label{sec:metrics-command}
+
+[[learnlog metrics]] is one pipeline with five views
+(\cref{metrics}): [[time]], [[eq]], [[code]] and [[lint]] each
+render one family of metrics, and [[trends]] joins them over time.
+A Typer sub-application gives the five a common prefix and a common
+help page; it is mounted on [[app]] the way pytorial mounts
+[[tutorial]] (\cref{sec:tutorial}), except that here the commands are
+our own.
+
+<<typer commands>>=
+metrics_app = typer.Typer(
+    name="metrics",
+    help=(
+        "Summarise your own development log: time, errors, "
+        "code, and how they change."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(metrics_app, name="metrics")
+@
+
+The five commands take the same options, so the options are defined
+once and each command lists them.
+Typer has no option groups; declaring the [[Option]] objects as
+constants and naming them in each signature is the nearest thing, and
+it keeps the help texts in one place.
+
+<<constants>>=
+METRICS_SOURCE_OPTION = typer.Option(
+    "--from", "-f",
+    help=(
+        "Source: directory with .learnlog/, a ProgSnap2 zip, or "
+        "a .learnlog bundle file. Defaults to current directory."
+    ),
+)
+METRICS_PERIOD_OPTION = typer.Option(
+    "--period",
+    help=(
+        "Window to summarise: today (calendar day), week (last 7 "
+        "days, the default), month (last 30 days), or all."
+    ),
+)
+METRICS_BY_OPTION = typer.Option(
+    "--by",
+    help="Report a series with one row per day, week, or month.",
+)
+METRICS_SINCE_OPTION = typer.Option(
+    "--since",
+    help="Start of an explicit window (YYYY-MM-DD or ISO datetime).",
+)
+METRICS_UNTIL_OPTION = typer.Option(
+    "--until",
+    help=(
+        "End of an explicit window, inclusive for a date "
+        "(YYYY-MM-DD or ISO datetime)."
+    ),
+)
+METRICS_IDLE_OPTION = typer.Option(
+    "--idle",
+    help=(
+        "Minutes of inactivity between runs that start a new "
+        "session."
+    ),
+)
+METRICS_FORMAT_OPTION = typer.Option(
+    "--format",
+    help="Output format: table, csv, json, or latex.",
+)
+@
+
+The period grammar has one rule beyond what \cref{sec:metrics-periods}
+defines: [[--period]] and [[--since]]/[[--until]] cannot be combined.
+A report whose header could describe either of two windows is worse
+than a refusal, so the resolver stops before reading anything.
+Each command has its own default window ([[week]] for the four
+single-family reports, [[all]] for [[trends]]), which is why the
+option itself defaults to nothing and the command supplies the
+fallback.
+
+<<imports>>=
+import datetime
+import json
+<<helper functions>>=
+def metrics_inputs(source, period, by, since, until, idle,
+                   default_period=Period.WEEK):
+    """Resolve the source, window, sessions and buckets.
+
+    Returns a `MetricsInputs`; the caller must call its
+    `cleanup()` when done, because the source may be a temporary
+    checkout and a series needs a directory for its snapshots.
+    """
+    if period is not None and (since or until):
+        raise SystemExit(
+            "--period cannot be combined with --since or --until."
+        )
+    repo, tmpdir = resolve_source(source)
+    try:
+        <<resolve the metrics window and buckets>>
+    except BaseException:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+    return MetricsInputs(repo, tmpdir, buckets, idle_delta, header, by)
+@
+
+The header names the choices that move the numbers---window, idle
+threshold, and how many runs never finalised---so that two reports can
+be compared only when they were made the same way.
+
+<<resolve the metrics window and buckets>>=
+records = run_records(repo)
+idle_delta = datetime.timedelta(minutes=idle)
+if since or until:
+    try:
+        window = explicit_window(since, until, records)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+else:
+    window = period_window(period or default_period, records)
+in_window = filter_window(records, *window)
+sessions = segment_sessions(in_window, idle_delta)
+buckets = bucket_sessions(sessions, by, window)
+header = [
+    f"window: {window_label(*window)}, {len(in_window)} runs",
+    f"idle threshold: {idle} min between runs starts a new session",
+]
+incomplete = sum(run.end is None for run in in_window)
+if incomplete:
+    header.append(
+        f"incomplete runs (no end time, counted as 0 s): {incomplete}"
+    )
+<<helper functions>>=
+class MetricsInputs:
+    """What every metrics command needs, plus its cleanup."""
+
+    def __init__(self, repo, tmpdir, buckets, idle, header, by):
+        self.repo = repo
+        self.tmpdir = tmpdir
+        self.buckets = buckets
+        self.idle = idle
+        self.header = header
+        self.by = by
+        self.snapshot_root = None
+
+    def snapshot(self, bucket):
+        """The directory holding the code to measure for `bucket`.
+
+        One window measures the working tree as it is; a series
+        extracts the tree of each bucket's last run.
+        """
+        if self.by is None:
+            return self.repo.workdir
+        if self.snapshot_root is None:
+            self.snapshot_root = tempfile.mkdtemp(prefix="learnlog-")
+        return bucket_snapshot(self.repo, bucket, self.snapshot_root)
+
+    def cleanup(self):
+        """Remove the temporary checkout and snapshots, if any."""
+        for path in (self.tmpdir, self.snapshot_root):
+            if path is not None:
+                shutil.rmtree(path, ignore_errors=True)
+@
+
+The inputs remember whether a granularity was asked for, because that
+is the fact that decides which code to measure; the bucket list alone
+cannot say, since a series of one week and a single window both have
+one bucket.
+
+Each command is the same handful of lines around a different
+[[compute_*]] call, so their signatures are one shared chunk.
+An empty series says so and stops; an empty window still prints its
+one row, because dashes and zeros in a labelled row are the answer to
+\enquote{what did I do this week}.
+
+<<metrics command options>>=
+source: Annotated[str | None, METRICS_SOURCE_OPTION] = None,
+period: Annotated[Period | None, METRICS_PERIOD_OPTION] = None,
+by: Annotated[Granularity | None, METRICS_BY_OPTION] = None,
+since: Annotated[str | None, METRICS_SINCE_OPTION] = None,
+until: Annotated[str | None, METRICS_UNTIL_OPTION] = None,
+idle: Annotated[int, METRICS_IDLE_OPTION] = DEFAULT_IDLE_MINUTES,
+fmt: Annotated[OutputFormat, METRICS_FORMAT_OPTION] = (
+    OutputFormat.TABLE
+),
+<<helper functions>>=
+def emit_metrics(inputs, results, columns, fmt, extra_header=()):
+    """Render and print one report, or say the series is empty."""
+    if not results:
+        typer.echo("No runs in this window.")
+        return
+    header = [*inputs.header, *extra_header]
+    typer.echo(render(results, columns, fmt, header), nl=False)
+<<typer commands>>=
+@metrics_app.command(name="time")
+def metrics_time(
+    <<metrics command options>>
+):
+    """Days, runs, sessions, lines changed, and active time."""
+    inputs = metrics_inputs(source, period, by, since, until, idle)
+    try:
+        results = compute_time(inputs.buckets, inputs.idle)
+        emit_metrics(inputs, results, TIME_COLUMNS, fmt, [
+            "active time is run-to-run: run durations (capped at the "
+            "idle threshold) plus the gaps between runs in a session",
+        ])
+    finally:
+        inputs.cleanup()
+<<constants>>=
+TIME_COLUMNS = (
+    ("active_days", "days"),
+    ("first_run", "first run"),
+    ("runs", "runs"),
+    ("sessions", "sessions"),
+    ("failed_runs", "failed"),
+    ("lines_added", "+lines"),
+    ("lines_removed", "-lines"),
+    ("active_seconds", "active time (run-to-run)"),
+)
+@
+
+The error report prints the variant it computed and the one-line
+caveat the literature earns (\cref{sec:metrics-eq}), once, above the
+table.
+
+<<typer commands>>=
+@metrics_app.command(name="eq")
+def metrics_eq(
+    <<metrics command options>>
+):
+    """Error quotient and repeated error density."""
+    inputs = metrics_inputs(source, period, by, since, until, idle)
+    try:
+        results = compute_errors(inputs.buckets)
+        emit_metrics(inputs, results, ERROR_COLUMNS, fmt, [
+            EQ_VARIANT,
+            "EQ and RED describe how runs that ended in an error "
+            "followed one another; they are not a score of you and "
+            "not a prediction.",
+        ])
+    finally:
+        inputs.cleanup()
+<<constants>>=
+ERROR_COLUMNS = (
+    ("pairs", "pairs"),
+    ("eq_syntax", "EQ (syntax)"),
+    ("eq_any", "EQ (all errors)"),
+    ("red_syntax", "RED (syntax)"),
+    ("red_any", "RED (all errors)"),
+)
+<<typer commands>>=
+@metrics_app.command(name="code")
+def metrics_code(
+    <<metrics command options>>
+):
+    """Size, complexity, and maintainability of the code."""
+    inputs = metrics_inputs(source, period, by, since, until, idle)
+    try:
+        results = compute_code(inputs.buckets, inputs.snapshot)
+        emit_metrics(inputs, results, CODE_COLUMNS, fmt, [
+            SNAPSHOT_NOTE, HALSTEAD_NOTE, MI_CAVEAT,
+        ])
+    finally:
+        inputs.cleanup()
+<<constants>>=
+CODE_COLUMNS = (
+    ("files", "files"),
+    ("unparsable", "unparsable"),
+    ("sloc", "SLOC"),
+    ("lloc", "LLOC"),
+    ("comments", "comments"),
+    ("functions", "functions"),
+    ("max_cc", "max CC"),
+    ("complex_functions", "CC>1"),
+    ("volume", "Halstead volume"),
+    ("mi_min", "MI min"),
+    ("mi_median", "MI median"),
+)
+SNAPSHOT_NOTE = (
+    "code: the working tree for one window; the code as of each "
+    "period's last run for a series"
+)
+@
+
+The linter is looked for once per invocation, in the project's own
+[[.venv]] first (\cref{sec:metrics-lint}); when none is found the
+header says how to install one and the table shows dashes.
+
+<<typer commands>>=
+@metrics_app.command(name="lint")
+def metrics_lint(
+    <<metrics command options>>
+):
+    """Linter findings by rule (ruff or pylint, if installed)."""
+    inputs = metrics_inputs(source, period, by, since, until, idle)
+    try:
+        linter = find_linter(inputs.repo.workdir)
+        results = compute_lint(inputs.buckets, inputs.snapshot, linter)
+        note = (
+            f"linter: {linter[0]} ({linter[1]})" if linter
+            else LINT_INSTALL_HINT
+        )
+        emit_metrics(inputs, results, LINT_COLUMNS, fmt,
+                     [SNAPSHOT_NOTE, note])
+    finally:
+        inputs.cleanup()
+<<constants>>=
+LINT_COLUMNS = (
+    ("lint_tool", "tool"),
+    ("lint_total", "findings"),
+    ("lint_findings", "by rule"),
+)
+@
+
+[[trends]] joins the four families over a series---weekly over the
+whole log by default---and follows the table with one direction line
+per metric (\cref{sec:metrics-trends}).
+The JSON rendering carries the lines under a [[trends]] key so the
+document stays one object; the text renderings print them after the
+table, and CSV as comment lines.
+
+<<typer commands>>=
+@metrics_app.command(name="trends")
+def metrics_trends(
+    <<metrics command options>>
+):
+    """All metrics over time, with a direction per metric."""
+    by = by or Granularity.WEEK
+    inputs = metrics_inputs(
+        source, period, by, since, until, idle,
+        default_period=Period.ALL,
+    )
+    try:
+        <<compute and print the joined trends report>>
+    finally:
+        inputs.cleanup()
+<<compute and print the joined trends report>>=
+linter = find_linter(inputs.repo.workdir)
+results = join_buckets(
+    compute_time(inputs.buckets, inputs.idle),
+    compute_errors(inputs.buckets),
+    compute_code(inputs.buckets, inputs.snapshot),
+    compute_lint(inputs.buckets, inputs.snapshot, linter),
+)
+if not results:
+    typer.echo("No runs in this window.")
+    return
+unit = {
+    Granularity.DAY: "days", Granularity.WEEK: "weeks",
+    Granularity.MONTH: "months",
+}[by]
+lines = trend_lines(results, unit)
+header = [*inputs.header, EQ_VARIANT, MI_CAVEAT, TREND_RULE]
+if fmt is OutputFormat.JSON:
+    document = json.loads(render(results, TREND_COLUMNS, fmt, header))
+    document["trends"] = lines
+    typer.echo(json.dumps(document, indent=2))
+    return
+typer.echo(render(results, TREND_COLUMNS, fmt, header), nl=False)
+prefix = "# " if fmt is OutputFormat.CSV else (
+    "% " if fmt is OutputFormat.LATEX else ""
+)
+typer.echo("")
+for line in lines:
+    typer.echo(prefix + line)
+@
+
+Let's verify the commands end to end on a small history: a
+[[NameError]], the same error after an edit, then a clean run.
+The runs are dated in January so that only [[--period all]] or an
+explicit window reaches them, which is also what makes the
+[[--period]]/[[--since]] refusal testable.
+
+<<test functions>>=
+def _metrics_history(workdir):
+    repo = LearnlogRepo(workdir)
+    trace = (
+        "Traceback (most recent call last):\n"
+        '  File "hello.py", line 1, in <module>\n'
+        "NameError: name 'x' is not defined"
+    )
+    (workdir / "hello.py").write_text("print(x)\n")
+    for minute, source, exc, code in [
+        (0, "print(x)\n", trace, 1),
+        (5, "print(x)  # again\n", trace, 1),
+        (9, "x = 1\nprint(x)\n", None, 0),
+    ]:
+        (workdir / "hello.py").write_text(source)
+        start = datetime.datetime(2026, 1, 5, 10, minute)
+        repo.begin_run("hello.py", [], start)
+        repo.finalize_run(
+            io_log="", exception_info=exc,
+            end_time=start + datetime.timedelta(seconds=2),
+            exit_code=code,
+        )
+    return repo
+
+
+def _metrics(args, workdir, env=None):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    return CliRunner().invoke(
+        app, ["metrics", *args, "--from", str(workdir)], env=env,
+    )
+
+
+def test_metrics_time_and_eq(workdir):
+    """time and eq print headers and the hand-computed values."""
+    _metrics_history(workdir)
+    result = _metrics(["time", "--period", "all"], workdir)
+    assert result.exit_code == 0, result.output
+    assert "idle threshold: 20 min" in result.output
+    assert "active time (run-to-run)" in result.output
+    assert "0h 09m" in result.output
+    result = _metrics(
+        ["eq", "--period", "all", "--format", "json"], workdir,
+    )
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.output)
+    assert any("two-parameter" in p for p in document["parameters"])
+    row = document["rows"][0]
+    assert row["pairs"] == 2
+    assert row["eq_any"] == 0.5 and row["eq_syntax"] == 0.0
+    assert row["red_any"] == 0.5
+
+
+def test_metrics_code_and_lint(workdir, monkeypatch):
+    """code measures the working tree; lint reports a missing linter."""
+    _metrics_history(workdir)
+    result = _metrics(["code", "--period", "all"], workdir)
+    assert result.exit_code == 0, result.output
+    assert "Maintainability index" in result.output
+    result = _metrics(
+        ["code", "--period", "all", "--format", "json"], workdir,
+    )
+    row = json.loads(result.output)["rows"][0]
+    assert row["sloc"] == 2 and row["files"] == 1
+    monkeypatch.setattr(
+        "learnlog.metrics.shutil.which", lambda name: None,
+    )
+    result = _metrics(["lint", "--period", "all"], workdir)
+    assert result.exit_code == 0, result.output
+    assert "pip install ruff" in result.output
+
+
+def test_metrics_trends_and_window_rules(workdir):
+    """trends says when it is too early; conflicting windows refuse."""
+    _metrics_history(workdir)
+    result = _metrics(["trends", "--by", "day"], workdir)
+    assert result.exit_code == 0, result.output
+    assert "2026-01-05" in result.output
+    assert "not enough days yet" in result.output
+    result = _metrics(
+        ["trends", "--by", "day", "--format", "json"], workdir,
+    )
+    assert json.loads(result.output)["trends"]
+    result = _metrics(["time"], workdir)
+    assert result.exit_code == 0
+    assert "0 runs" in result.output
+    result = _metrics(
+        ["time", "--period", "all", "--since", "2026-01-01"], workdir,
+    )
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+    result = _metrics(
+        ["eq", "--since", "2026-01-01", "--until", "2026-01-05"],
+        workdir,
+    )
+    assert result.exit_code == 0, result.output
+    assert "3 runs" in result.output
 @
