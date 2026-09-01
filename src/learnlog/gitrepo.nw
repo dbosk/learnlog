@@ -517,7 +517,7 @@ only chooses what type comes back out of it.
 
 <<repo methods>>=
 def git(self, *args, check=True, timeout=GIT_TIMEOUT,
-        input=None, text=True):
+        input=None, text=True, env=None):
     """Run a Git command with the learnlog environment.
 
     Returns the ``CompletedProcess``.  Raises ``GitError`` when Git
@@ -527,12 +527,52 @@ def git(self, *args, check=True, timeout=GIT_TIMEOUT,
     that way to escape the operating system's argument-size limit.
     With ``text`` false, standard output and standard error come back
     as bytes, for commands whose output is a file rather than a
-    message.
+    message.  ``env`` overlays committer-identity variables onto the
+    learnlog environment; any variable outside that allow-list
+    raises ``ValueError``.
     """
+    <<overlay the committer identity, if asked>>
     <<run Git, turning process failures into [[GitError]]>>
     if check and result.returncode != 0:
         raise GitError(args, result.returncode, result.stderr)
     return result
+@
+
+\subsection{Overlaying a committer identity}
+\label{sec:committer-overlay}
+
+[[git_environment()]] answers \enquote{which variables may Git see}
+by inversion: strip every [[GIT_]] variable, then add back the few
+that cannot redirect a write (\cref{sec:git-environment}).
+A general [[env]] parameter would quietly reopen that question at
+every call site, so the overlay inverts the same way: an allow-list
+names the three committer-identity variables, and anything else is a
+programming error rather than a silent override.
+The list exists for one caller---the ProgSnap2 importer, which must
+reproduce a tagger its dataset records (\cref{sec:tag-table})---and
+the identity variables qualify because they change what a commit or
+tag \emph{says}, never where it goes.
+
+The chunk leaves [[environment]] behind for
+[[<<run Git, turning process failures into [[GitError]]>>]] to pass
+to [[subprocess]]; the two chunks only ever appear together in the
+wrapper above.
+
+<<overlay the committer identity, if asked>>=
+environment = self.env
+if env:
+    unknown = set(env) - OVERRIDABLE_GIT_VARS
+    if unknown:
+        raise ValueError(
+            f"not an overridable Git variable: {sorted(unknown)}"
+        )
+    environment = {**self.env, **env}
+<<constants>>=
+OVERRIDABLE_GIT_VARS = frozenset({
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+})
 @
 
 [[subprocess]] reports \enquote{Git could not be run} in two unrelated
@@ -546,7 +586,7 @@ try:
     result = subprocess.run(
         ["git"] + list(args),
         cwd=str(self.workdir),
-        env=self.env,
+        env=environment,
         capture_output=True,
         text=text,
         timeout=timeout,
@@ -630,6 +670,40 @@ def test_git_bytes_mode_reports_failures_as_text(workdir):
     assert isinstance(caught.value.stderr, str)
     assert caught.value.stderr
     assert "b'" not in str(caught.value)
+@
+
+The overlay's two obligations pull in opposite directions---reach
+Git when a variable is allowed, refuse before Git when it is
+not---so each gets its own test.
+The positive test reads the tag back through Git rather than
+trusting the overlay dict, because what matters is that the
+identity arrived in the object, not that the dict was merged:
+
+<<test functions>>=
+def test_git_env_overlay_rejects_redirecting_variables(workdir):
+    """Only the committer identity may be overlaid."""
+    repo = LearnlogRepo(workdir)
+    with pytest.raises(ValueError):
+        repo.git("status", env={"GIT_DIR": "/tmp/elsewhere"})
+
+def test_git_env_overlay_reaches_git(workdir):
+    """An allowed overlay shapes the object Git writes."""
+    repo = LearnlogRepo(workdir)
+    repo.git(
+        "tag", "-a", "-F", "-", "handed-in",
+        input="done\n",
+        env={
+            "GIT_COMMITTER_NAME": "Ada Lovelace",
+            "GIT_COMMITTER_EMAIL": "ada@learnlog.invalid",
+            "GIT_COMMITTER_DATE": "2026-01-02T03:04:05+00:00",
+        },
+    )
+    shown = repo.git(
+        "for-each-ref", "refs/tags/handed-in",
+        "--format=%(taggername) %(taggerdate:iso-strict)",
+    ).stdout
+    assert "Ada Lovelace" in shown
+    assert "2026-01-02" in shown
 @
 
 

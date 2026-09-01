@@ -60,8 +60,9 @@ Nothing here imports Typer, and nothing here writes to the log.
 
 Computes time-on-task and effort counts, the error quotient and
 repeated error density, static code metrics (via radon) and linter
-counts, over a whole history or per day, week, or month.  The
-results are plain dicts; the CLI renders them.
+counts, over a whole history, per day, week, or month, or per
+tagged milestone.  The results are plain dicts; the CLI renders
+them.
 """
 
 from __future__ import annotations
@@ -80,7 +81,7 @@ step & function & result \\ \hline
 read the log & [[run_records]] & [[RunRecord]] list, oldest first \\
 cut to the window & [[filter_window]] & the records in the period \\
 group into sessions & [[segment_sessions]] & lists of records \\
-slice by period & [[bucket_sessions]] & [[Bucket]] list \\
+slice by period & [[bucket_sessions]] / [[tag_buckets]] & [[Bucket]] list \\
 compute & [[compute_time]] etc. & [[BucketResult]] list \\
 render & [[render]] & text, CSV, JSON or \LaTeX{} \\
 \end{tabular}
@@ -278,11 +279,13 @@ churn is attributed to that run and to no other run of the same commit.
 from learnlog.commits import (
     _parse_iso,
     get_commits,
+    get_tag_map,
     is_learnlog_run,
     merge_run_trailers,
     scan_run_commits,
 )
 from learnlog.progsnap2 import (
+    UNTAGGED_LABEL,
     extract_code_state,
     parse_commit_runs,
     parse_exception_line,
@@ -992,11 +995,12 @@ class Period(str, enum.Enum):
 
 
 class Granularity(str, enum.Enum):
-    """The calendar units a series is sliced by."""
+    """The units a series is sliced by."""
 
     DAY = "day"
     WEEK = "week"
     MONTH = "month"
+    TAG = "tag"
 
 
 PERIOD_DAYS = {Period.WEEK: 7, Period.MONTH: 30}
@@ -1006,6 +1010,14 @@ The two enumerations and the day counts are constants of the same
 kind---vocabularies the command line and the reports share---so they
 sit in the constants bucket, which also puts them ahead of the
 functions that read [[PERIOD_DAYS]] when the module loads.
+
+[[Granularity]] also lists [[tag]], though its arithmetic is nothing
+like a calendar's (\cref{sec:metrics-tags}): [[--by]] asks
+\enquote{one row per what}, and a milestone is an answer to that
+question in the student's own vocabulary.
+A separate option would give [[trends]] two ways to be asked the same
+question; the price of one vocabulary is that the calendar helpers
+below must refuse the member that is not theirs, and they do.
 
 <<metrics functions>>=
 def period_window(period, records, now=None):
@@ -1037,14 +1049,61 @@ def parse_boundary(text, *, inclusive_end=False):
     if inclusive_end and len(text) == len("YYYY-MM-DD"):
         moment += datetime.timedelta(days=1)
     return local_naive(moment)
+@
+
+A boundary the student types may also be one of their own tag
+names---[[--since lab1]]---and the tag is tried \emph{first}: a tag
+named like a date would otherwise be silently unreachable, while a
+date is never shadowed by accident, only by a tag the student chose
+to create in their own namespace.
+Where the names come from and what moment a tag denotes is the
+business of \cref{sec:metrics-tags}; here a name is only a key in
+[[starts]].
+The refusal lists the log's tags because the likeliest cause is a
+typo in one of them.
+
 <<metrics functions>>=
-def explicit_window(since, until, records, now=None):
-    """Return the `(start, end)` of a `--since`/`--until` window."""
+def resolve_boundary(text, starts, *, inclusive_end=False):
+    """Resolve a boundary: a tag name, else a date or datetime.
+
+    `starts` maps tag names to datetimes.  A `text` that is
+    neither a known tag nor parseable raises `ValueError`
+    naming the tags that do exist.
+    """
+    if text in starts:
+        return starts[text]
+    try:
+        return parse_boundary(text, inclusive_end=inclusive_end)
+    except ValueError as error:
+        known = ", ".join(sorted(starts)) or "none"
+        raise ValueError(
+            f"not a date, a datetime, or a tag: {text!r} "
+            f"(tags in this log: {known})"
+        ) from error
+@
+
+A tag hits the map before [[inclusive_end]] can matter, so the
+day-extension stays a fact about \emph{dates}: a date [[--until]] is
+inclusive because a day means the whole day, while a tag [[--until]]
+is that tag's exact start, exclusive---both say \enquote{up to the
+next thing}, and for a tag the next thing is its own run.
+
+<<metrics functions>>=
+def explicit_window(since, until, records, now=None, starts=None):
+    """Return the `(start, end)` of a `--since`/`--until` window.
+
+    `starts` maps tag names to the start of their period; a
+    boundary naming one resolves there before being read as a
+    date.
+    """
     now = now or datetime.datetime.now()
-    start = parse_boundary(since) if since else (
+    starts = starts or {}
+    start = resolve_boundary(since, starts) if since else (
         records[0].start if records else now
     )
-    end = parse_boundary(until, inclusive_end=True) if until else now
+    end = resolve_boundary(
+        until, starts, inclusive_end=True,
+    ) if until else now
     return start, end
 <<metrics functions>>=
 def filter_window(records, start, end):
@@ -1071,6 +1130,13 @@ week with [[isocalendar()]], which also starts weeks on Monday---so
 the first days of January can carry the previous year's label
 ([[2026-W53]]), and that is correct.
 
+All three helpers spell out the [[MONTH]] branch and refuse anything
+else.
+Before [[Granularity.TAG]] existed the fall-through \emph{was} the
+month branch; now a stray [[TAG]] falling through would be discovered
+by a wrong answer instead of an error, and calendar arithmetic knows
+nothing about tags.
+
 <<metrics functions>>=
 def bucket_start(moment, by):
     """The start of the calendar unit containing `moment`."""
@@ -1079,7 +1145,9 @@ def bucket_start(moment, by):
         return day
     if by is Granularity.WEEK:
         return day - datetime.timedelta(days=day.weekday())
-    return day.replace(day=1)
+    if by is Granularity.MONTH:
+        return day.replace(day=1)
+    raise ValueError(f"not a calendar unit: {by}")
 <<metrics functions>>=
 def next_bucket(start, by):
     """The start of the calendar unit after the one at `start`."""
@@ -1087,9 +1155,11 @@ def next_bucket(start, by):
         return start + datetime.timedelta(days=1)
     if by is Granularity.WEEK:
         return start + datetime.timedelta(days=7)
-    if start.month == 12:
-        return start.replace(year=start.year + 1, month=1)
-    return start.replace(month=start.month + 1)
+    if by is Granularity.MONTH:
+        if start.month == 12:
+            return start.replace(year=start.year + 1, month=1)
+        return start.replace(month=start.month + 1)
+    raise ValueError(f"not a calendar unit: {by}")
 <<metrics functions>>=
 def bucket_label(start, by):
     """The label of the calendar unit starting at `start`."""
@@ -1098,7 +1168,9 @@ def bucket_label(start, by):
     if by is Granularity.WEEK:
         year, week, _ = start.isocalendar()
         return f"{year}-W{week:02d}"
-    return start.strftime("%Y-%m")
+    if by is Granularity.MONTH:
+        return start.strftime("%Y-%m")
+    raise ValueError(f"not a calendar unit: {by}")
 <<metrics functions>>=
 @dataclasses.dataclass(frozen=True)
 class Bucket:
@@ -1185,8 +1257,355 @@ def test_windows():
   assert start == datetime.datetime(2026, 8, 1)
   assert end == datetime.datetime(2026, 9, 1)
   assert filter_window([_rec(0), _rec(-10)], T0, T0 + IDLE) == [_rec(0)]
+  assert resolve_boundary("2026-03-01", {"2026-03-01": T0}) is T0
+  assert resolve_boundary("2026-03-01", {}) == \
+    datetime.datetime(2026, 3, 1)
+  with pytest.raises(ValueError) as caught:
+    resolve_boundary("nosuchtag", {"lab1": T0})
+  assert "lab1" in str(caught.value)
   with pytest.raises(ValueError):
     parse_boundary("last tuesday")
+@
+
+
+\section{Tag periods}
+\label{sec:metrics-tags}
+
+A student's tags name their milestones---[[learnlog tag lab2]] after
+the first run of lab~2---and every reader treats a tag the way
+[[git describe]] does: as a \emph{start marker}.
+Tag [[T]]'s period covers [[T]]'s run and every run after it, until
+the next tag.
+One rule everywhere is the point: [[--since lab1 --until lab2]] is
+exactly lab~1's period, [[--by tag]] is one row per period, and the
+[[analyse]] report's sections cover the same runs
+(\cref{sec:analyse-tags}).
+The rule costs no new window arithmetic, because [[filter_window]]
+is half-open: a boundary at the tagged run's start includes that run
+under [[--since]] and excludes it under [[--until]], which is
+precisely \enquote{up to the next milestone}.
+
+A boundary needs a moment, and the honest moment is the start of the
+earliest run recorded on the tagged commit---\emph{including}
+learnlog's own runs, which [[run_records]] drops: a student who ran
+[[learnlog list]], looked at their history and then tagged, tagged
+\emph{then}, and the review run's start is that moment even though
+no student program ran.
+So the map below is built from the scans directly rather than from
+[[run_records(include_learnlog=True)]], which would also compute
+trees and churn no boundary needs, and whose churn attribution
+depends on which runs are kept.
+A commit with no readable run start---the repository's initial
+commit, a foreign history---falls back to the commit's own date,
+which is as accurate as anything else known about such a commit.
+
+<<metrics functions>>=
+def commit_run_starts(repo):
+    """Map every commit to the start of its earliest run.
+
+    Commits whose message yields no readable run start fall
+    back to the commit's own date; commits without that are
+    left out.
+    """
+    scan = scan_run_commits(repo)
+    starts = {}
+    for commit in get_commits(repo):
+        message = merge_run_trailers(
+            scan.messages.get(commit["hash"], ""),
+            scan.trailers,
+        )
+        moments = [
+            local_naive(_parse_iso(run["start_time"]))
+            for run in parse_commit_runs(message)
+        ]
+        moments = [m for m in moments if m is not None]
+        if not moments:
+            fallback = local_naive(_parse_iso(commit["date"]))
+            if fallback is None:
+                continue
+            starts[commit["hash"]] = fallback
+        else:
+            starts[commit["hash"]] = min(moments)
+    return starts
+@
+
+Let's verify the two halves of that decision against a real
+repository: a tag created right after a review run starts its period
+at the \emph{review} run's moment, and a tag on the initial commit
+still gets a boundary:
+
+<<metrics test functions>>=
+def test_tag_boundaries_uses_the_tagged_run_start(workdir):
+  repo = LearnlogRepo(workdir)
+  _record_run(repo, "main.py", T0)
+  review_start = T0 + datetime.timedelta(minutes=5)
+  _record_run(repo, "learnlog list", review_start)
+  repo.git("tag", "lab2")
+  boundary, = tag_boundaries(repo)
+  assert boundary.names == ("lab2",)
+  assert boundary.start == review_start
+
+def test_tag_boundaries_falls_back_to_the_commit_date(workdir):
+  repo = LearnlogRepo(workdir)
+  first = repo.git(
+    "rev-list", "--max-parents=0", "HEAD",
+  ).stdout.strip()
+  repo.git("tag", "epoch", first)
+  boundary, = tag_boundaries(repo)
+  assert boundary.names == ("epoch",)
+  assert abs(boundary.start - datetime.datetime.now()) < \
+    datetime.timedelta(days=1)
+@
+
+Several tags can share a commit---[[lab1]] and [[milestone]] on the
+same run.
+A deterministic order with one of them first would hand the
+alphabetically last name the whole period and the other a zero-width
+bucket, and a zero-width bucket is not the kind of emptiness worth
+emitting: an empty week is information, an artefact of the
+representation is not.
+So tags on one commit share a single boundary whose label joins
+their names the way the [[X-Tag]] column already does
+(\cref{progsnap2}), and [[--since]]/[[--until]] still resolve each
+name individually through [[tag_starts]].
+A tag whose commit the recording branch does not reach has no place
+on a timeline of runs; it is dropped here, and a boundary naming it
+then fails through [[resolve_boundary]]'s listing of the tags that
+do exist.
+
+<<metrics functions>>=
+TagBoundary = collections.namedtuple(
+    "TagBoundary", ["names", "commit", "start"],
+)
+
+def tag_boundaries(repo):
+    """Return the ordered tag boundaries, oldest first.
+
+    Tags on one commit share one boundary, their names
+    sorted; tags whose commit the recording branch does not
+    reach are left out.
+    """
+    starts = commit_run_starts(repo)
+    boundaries = [
+        TagBoundary(tuple(sorted(names)), commit, starts[commit])
+        for commit, names in get_tag_map(repo).items()
+        if commit in starts
+    ]
+    boundaries.sort(key=lambda b: (b.start, b.names))
+    return boundaries
+<<metrics functions>>=
+def tag_starts(boundaries):
+    """Map each tag name to the start of its period."""
+    return {
+        name: boundary.start
+        for boundary in boundaries
+        for name in boundary.names
+    }
+<<metrics functions>>=
+def boundary_label(boundary):
+    """A boundary's bucket label: its names, semicolon-joined."""
+    return ";".join(boundary.names)
+@
+
+The period windows are cut with a [[<=]]/[[<]] split on the window's
+own start: a boundary at or before it joins the \emph{leading}
+period, one strictly inside opens a new period, and one at or past
+the end is out of the report entirely.
+That split does the edge work by itself.
+A tag exactly on the window start labels the lead and produces no
+zero-width bucket; and when the window starts mid-history, the most
+recent tag \emph{before} it owns the leading period---the work at
+the window's start belongs to that milestone whether or not the
+window shows the run that started it.
+Only with no tag at or before the start is the lead labelled
+[[UNTAGGED_LABEL]], imported from the exporter so that every command
+spells the one idea one way.
+Periods with no runs are emitted for the reason empty weeks are
+(\cref{sec:metrics-periods}): a milestone with no work in the
+window is information.
+
+<<metrics functions>>=
+def tag_bucket_windows(boundaries, window):
+    """The `(label, start, end)` triples of tag periods.
+
+    Covers `window` completely: the lead is labelled by the
+    most recent boundary at or before the window start, or
+    `UNTAGGED_LABEL` when there is none.
+    """
+    start, end = window
+    before = [b for b in boundaries if b.start <= start]
+    inside = [b for b in boundaries if start < b.start < end]
+    labels = [
+        boundary_label(before[-1]) if before else UNTAGGED_LABEL,
+        *[boundary_label(b) for b in inside],
+    ]
+    cuts = [start, *[b.start for b in inside], end]
+    return [
+        (label, cuts[i], cuts[i + 1])
+        for i, label in enumerate(labels)
+    ]
+@
+
+Calendar buckets assign a whole session to the bucket of its first
+run (\cref{sec:metrics-periods}); tag periods cut it at the
+boundary instead.
+The two kinds of boundary are not the same kind of fact.
+Midnight is arbitrary with respect to the work, so a session
+straddling it is one piece of work the calendar happens to cut; a
+tag is a boundary the student declared, so a session straddling it
+is two pieces of work with no break between them.
+Cutting is also what makes [[--by tag]] agree with
+[[--since lab1 --until lab2]], which already cuts at the window
+edges via [[filter_window]], and what keeps the error quotient
+honest: EQ scores consecutive run pairs \emph{within} a session, so
+not cutting would score the step from lab~1's last run into lab~2's
+first as a repeated error.
+The price is that the [[sessions]] count stops being additive
+across buckets---a session cut in two counts once on each
+side---where the first-run rule kept it additive by construction.
+
+<<metrics functions>>=
+def tag_buckets(records, boundaries, window, idle):
+    """Slice `records` into `Bucket`s cut at tag boundaries.
+
+    Sessions are segmented within each period, so a session
+    straddling a tag is cut there.
+    """
+    return [
+        Bucket(label, start, end, segment_sessions(
+            filter_window(records, start, end), idle,
+        ))
+        for label, start, end in tag_bucket_windows(
+            boundaries, window,
+        )
+    ]
+@
+
+The header names the window; when a tag chose an edge, the name is
+what the student typed and the dates are derivative, so the names
+come first and the dates follow in parentheses.
+The dates carry minutes because a tag boundary is a run start, not
+a midnight.
+[[window_label]] stays as it is---it doubles as the single-window
+bucket label, and a row label is no place for a sentence.
+
+<<metrics functions>>=
+def window_header(window, since=None, until=None, starts=None):
+    """The header's window text, tag names first when tags chose it."""
+    start, end = window
+    dates = f"{start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M}"
+    starts = starts or {}
+    if since in starts or until in starts:
+        return f"{since or 'start'} .. {until or 'now'} ({dates})"
+    return dates
+@
+
+Two header lines are constants because the command layer prints them
+wherever tag periods appear: the note that decodes a tag-period
+table, and the caveat that a direction over unequal periods compares
+milestones rather than equal stretches of time.
+
+<<metrics constants>>=
+TAG_BUCKET_NOTE = (
+    "tag periods: each tag starts a period that runs to the "
+    "next tag; runs before the first tag are (untagged), and "
+    "periods are not equal in length"
+)
+TAG_TREND_CAVEAT = (
+    "a direction over tag periods compares milestones, not "
+    "equal stretches of time"
+)
+@
+
+Let's verify the window cutting where the edges are easiest to get
+wrong---the lead with and without an earlier tag, a tag exactly on
+the window start, and a merged boundary:
+
+<<metrics test functions>>=
+HOUR = datetime.timedelta(hours=1)
+
+def test_tag_bucket_windows_leading_and_trailing():
+  window = (T0, T0 + 4 * HOUR)
+  boundaries = [
+    TagBoundary(("lab1",), "c1", T0 + HOUR),
+    TagBoundary(("lab2",), "c2", T0 + 3 * HOUR),
+  ]
+  assert tag_bucket_windows(boundaries, window) == [
+    (UNTAGGED_LABEL, T0, T0 + HOUR),
+    ("lab1", T0 + HOUR, T0 + 3 * HOUR),
+    ("lab2", T0 + 3 * HOUR, T0 + 4 * HOUR),
+  ]
+
+def test_tag_bucket_windows_earlier_tag_labels_the_lead():
+  window = (T0, T0 + 2 * HOUR)
+  boundaries = [
+    TagBoundary(("lab1",), "c1", T0 - HOUR),
+    TagBoundary(("lab2",), "c2", T0 + HOUR),
+  ]
+  assert tag_bucket_windows(boundaries, window) == [
+    ("lab1", T0, T0 + HOUR),
+    ("lab2", T0 + HOUR, T0 + 2 * HOUR),
+  ]
+
+def test_tag_bucket_windows_tag_at_window_start():
+  window = (T0, T0 + HOUR)
+  boundaries = [TagBoundary(("lab1",), "c1", T0)]
+  assert tag_bucket_windows(boundaries, window) == [
+    ("lab1", T0, T0 + HOUR),
+  ]
+
+def test_tag_bucket_windows_merges_tags_on_one_commit():
+  window = (T0, T0 + 2 * HOUR)
+  boundaries = [TagBoundary(("lab1", "milestone"), "c1", T0 + HOUR)]
+  labels = [b[0] for b in tag_bucket_windows(boundaries, window)]
+  assert labels == [UNTAGGED_LABEL, "lab1;milestone"]
+@
+
+And the session cut: two runs two minutes apart are one session to
+the calendar and two to a tag boundary between them, and the pair
+that straddles the boundary is scored by neither period:
+
+<<metrics test functions>>=
+def test_tag_buckets_cut_sessions_at_the_boundary():
+  runs = [_name(0), _name(2)]
+  boundary = TagBoundary(("lab1",), "c1", runs[1].start)
+  window = (T0, T0 + IDLE)
+  buckets = tag_buckets(runs, [boundary], window, IDLE)
+  assert [len(b.sessions) for b in buckets] == [1, 1]
+  assert segment_sessions(runs, IDLE) == [runs]
+  assert [r.values["pairs"] for r in compute_errors(buckets)] == \
+    [0, 0]
+
+def test_tag_buckets_emit_empty_periods():
+  runs = [_rec(0)]
+  boundaries = [
+    TagBoundary(("lab1",), "c1", T0 + HOUR),
+    TagBoundary(("lab2",), "c2", T0 + 2 * HOUR),
+  ]
+  buckets = tag_buckets(runs, boundaries, (T0, T0 + 3 * HOUR), IDLE)
+  assert [b.label for b in buckets] == \
+    [UNTAGGED_LABEL, "lab1", "lab2"]
+  assert [len(b.runs) for b in buckets] == [1, 0, 0]
+@
+
+The refusal in the calendar helpers and the header's two shapes are
+each one assertion:
+
+<<metrics test functions>>=
+def test_calendar_helpers_refuse_a_tag():
+  for helper in (bucket_start, next_bucket, bucket_label):
+    with pytest.raises(ValueError):
+      helper(T0, Granularity.TAG)
+  with pytest.raises(ValueError):
+    bucket_sessions([[_rec(0)]], Granularity.TAG, (T0, T0 + IDLE))
+
+def test_window_header_names_the_tags():
+  window = (T0, T0 + datetime.timedelta(days=7))
+  starts = {"lab1": T0}
+  assert window_header(window, "lab1", None, starts) == \
+    "lab1 .. now (2026-08-31 10:00 to 2026-09-07 10:00)"
+  assert window_header(window, None, None, starts) == \
+    "2026-08-31 10:00 to 2026-09-07 10:00"
 @
 
 
@@ -1222,6 +1641,18 @@ def snapshot_files(root):
         if not set(path.relative_to(root).parts[:-1])
         & SNAPSHOT_EXCLUDED_DIRS
     )
+@
+
+A bucket label is student text---a tag name may contain [[/]] and a
+merged label contains [[;]]---while the snapshot directory name is
+an implementation detail nobody reads, so it is flattened to a safe
+alphabet instead of escaping this class of problem one character at
+a time.
+
+<<metrics functions>>=
+def snapshot_dir_name(label):
+    """Flatten a bucket label into a safe directory name."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", label)
 <<metrics functions>>=
 def bucket_snapshot(repo, bucket, root):
     """Extract the tree of the bucket's last run under `root`.
@@ -1231,7 +1662,7 @@ def bucket_snapshot(repo, bucket, root):
     runs = bucket.runs
     if not runs:
         return None
-    state_dir = pathlib.Path(root) / bucket.label
+    state_dir = pathlib.Path(root) / snapshot_dir_name(bucket.label)
     extract_code_state(repo, runs[-1].commit, state_dir)
     return state_dir
 <<metrics test functions>>=

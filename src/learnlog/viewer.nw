@@ -79,6 +79,7 @@ from learnlog.commits import (
     format_elapsed,
     get_commit_detail,
     get_run_trailers,
+    get_tag_map,
 )
 @
 
@@ -112,13 +113,15 @@ class PlaybackViewer:
     """
 
     def __init__(self, repo, commits, start_index=0,
-                 filter_internal=True, trailers=None):
+                 filter_internal=True, trailers=None,
+                 tag_map=None):
         self.repo = repo
         self.commits = commits
         self.index = start_index
         self.scroll = 0
         self.filter_internal = filter_internal
         self.trailers = trailers
+        self.tag_map = tag_map
         self._detail_cache = {}
 
     <<player methods>>
@@ -317,16 +320,26 @@ def _draw(self, stdscr):
 @
 
 The header shows the position in the commit list, the short
-hash, and the commit subject.
+hash, any tags on the run, and the commit subject.
+The text is a method of its own so a test can read it without a
+terminal, and the tag map is read once, on first use, for the
+reason the trailer map is.
 We truncate to the terminal width to avoid curses errors.
 
+<<player methods>>=
+def _header_text(self, commit):
+    """The header line for `commit`, untruncated."""
+    if self.tag_map is None:
+        self.tag_map = get_tag_map(self.repo)
+    names = self.tag_map.get(commit["hash"], [])
+    tags = f" (tag: {', '.join(names)})" if names else ""
+    return (
+        f"[{self.index + 1}/{len(self.commits)}] "
+        f"{commit['hash'][:SHORT_HASH_LEN]}{tags} "
+        f"\u2014 {commit['subject']}"
+    )
 <<draw header>>=
-header = (
-    f"[{self.index + 1}/{len(self.commits)}] "
-    f"{commit['hash'][:SHORT_HASH_LEN]} "
-    f"\u2014 {commit['subject']}"
-)
-header = header[:width - 1]
+header = self._header_text(commit)[:width - 1]
 try:
     import curses
     stdscr.addstr(HEADER_ROW, 0, header, curses.A_REVERSE)
@@ -620,22 +633,33 @@ That an internal run stays out of the record of the review that
 skipped it is the same consistency the reader sees---what the trailer
 says was looked at is what standard output showed.
 
+A tagged run announces its names on a [[Tags:]] line before its
+detail, and the interactive header shows the same names in
+parentheses: a tag is a boundary every report reads
+(\cref{sec:metrics-tags}), so the two places a student actually
+looks at their history must show where the milestones sit.
+
 <<viewer functions>>=
 def play_batch(repo, commits, start_index=0,
-               filter_internal=True, trailers=None):
+               filter_internal=True, trailers=None,
+               tag_map=None):
     """Print commit details sequentially to stdout.
 
     When ``filter_internal`` is ``True``, learnlog's internal
     run blocks are stripped and commits that hold nothing else
     are skipped.  Review runs are printed like any other run.
-    ``trailers`` is the map from ``get_run_trailers``; it is
-    read from ``repo`` when not supplied.
+    ``trailers`` is the map from ``get_run_trailers`` and
+    ``tag_map`` the one from ``get_tag_map``; both are read
+    from ``repo`` when not supplied.  A tagged commit is
+    announced with a ``Tags:`` line.
 
     Every commit that is printed is reported to
     :func:`learnlog.record_view` with the action ``batch``.
     """
     if trailers is None:
         trailers = get_run_trailers(repo)
+    if tag_map is None:
+        tag_map = get_tag_map(repo)
     for index in range(start_index, len(commits)):
         commit = commits[index]
         detail = get_commit_detail(
@@ -644,6 +668,11 @@ def play_batch(repo, commits, start_index=0,
         if detail is None:
             continue
         learnlog.record_view(commit["hash"], "batch")
+        names = tag_map.get(commit["hash"], [])
+        if names:
+            sys.stdout.write(
+                f"Tags: {', '.join(names)}\n"
+            )
         elapsed = format_elapsed(
             elapsed_since_previous_run(commits, index)
         )
@@ -700,6 +729,48 @@ def test_play_batch_shows_one_record_per_run(workdir, capsys):
     assert "Exit-Code: 0" in captured
     assert "stdout: hello" in captured
     assert "Run-End:" not in captured
+@
+
+Let's verify the tag display in both media: the [[Tags:]] line in
+batch output, and the parenthesised names in the interactive
+header---with an untagged commit staying unadorned:
+
+<<viewer test functions>>=
+def test_play_batch_announces_tags(workdir, capsys):
+    """A tagged run's names appear on a Tags: line."""
+    import datetime
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.git("tag", "lab1")
+    repo.git("tag", "milestone")
+    commits = get_commits(repo)
+    play_batch(repo, commits)
+    out = capsys.readouterr().out
+    assert "Tags: lab1, milestone" in out
+
+def test_viewer_header_shows_tags(workdir):
+    """The interactive header names the run's tags."""
+    import datetime
+    from learnlog.viewer import PlaybackViewer
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.git("tag", "lab1")
+    commits = get_commits(repo)
+    viewer = PlaybackViewer(repo, commits)
+    viewer.index = len(commits) - 1
+    assert "(tag: lab1)" in viewer._header_text(commits[-1])
+    assert "(tag:" not in viewer._header_text(commits[0])
 @
 
 A review run needs no special case to be readable: it is a run block

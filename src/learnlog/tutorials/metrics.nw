@@ -92,6 +92,8 @@ summary: Summarise your time, errors, and code, and watch them over time.
 
 <<novice step: look for trends>>
 
+<<novice step: group by milestone>>
+
 <<novice step: see the reflection in the log>>
 <<[[metrics-expert.md]]>>=
 ---
@@ -111,6 +113,8 @@ summary: The same summaries, with the definition behind each number.
 <<expert step: ask a linter>>
 
 <<expert step: look for trends>>
+
+<<expert step: group by milestone>>
 
 <<expert step: see the reflection in the log>>
 @
@@ -546,6 +550,52 @@ Self-comparison is the frame learners receive best (Jivet et al.,
 2018), and no study has managed to predict outcomes from these
 numbers (Tabanao et al., 2011), which is why the words stop at
 rising, falling and steady.
+@
+
+\subsection{Group by milestone}
+
+The step changes the bucket, not the metric: the same summary the
+learner has read per day now comes one row per tag, so what varies
+is only the slicing, and the learner's own milestone vocabulary
+becomes a report axis (\cref{sec:metrics-tags}).
+The prediction asks where the first runs land, because the
+[[(untagged)]] row is the one part of the table the learner has not
+named themselves.
+
+<<shared step: group by milestone>>=
+# Group by milestone
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+\w+[^\n]*--by\s+tag'
+hint: Run `learnlog metrics time --by tag`.
+```
+
+A tag you created (`learnlog tag lab1`) is also a bucket: each tag
+starts a period that runs until the next tag.
+Before you run it: which row do you expect your very first runs to
+land in?
+Run `learnlog metrics time --by tag`.
+
+## How to read it
+
+The `(untagged)` row is everything before your first tag; with no
+tags at all it is the only row.
+Each named row starts at its tag's run and ends just before the next
+tag, so the last row is your current, still-open milestone.
+<<novice step: group by milestone>>=
+<<shared step: group by milestone>>
+<<expert step: group by milestone>>=
+<<shared step: group by milestone>>
+
+Unlike `--by week`, which assigns a whole work session to the week
+of its first run, `--by tag` cuts a session at the tag: the tag is a
+boundary you declared, so work on either side belongs to different
+milestones---and the error quotient never pairs runs across one.
+Tag periods are also unequal in length, which is why
+`learnlog metrics trends --by tag` compares milestones rather than
+equal stretches of time, and says so in its header.
 @
 
 \subsection{See the reflection in the log}

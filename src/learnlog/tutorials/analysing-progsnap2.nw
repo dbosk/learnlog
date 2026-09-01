@@ -10,14 +10,21 @@ This contrast between whole-dataset and range-restricted analysis makes
 the critical aspect discernible: [[learnlog analyse]] filters by event
 ranges, not isolated matching events, which is why the boundary syntax
 is introduced only after the learner has seen the unfiltered report.
+A final step then filters the same dataset with
+[[--since]]/[[--until]], the tag window [[metrics]] also speaks, so
+the learner meets both vocabularies against one dataset: the
+[[Column=Regex]] pair is a generic, inclusive event range, while the
+tag window is half-open and starts at the tag
+(\cref{sec:analyse-tags}).
 
 The report also surfaces a \enquote{Time since last run} line before
 the second and later runs within a tag.
 This gives the teacher a visible think-time signal without requiring
 them to infer it from raw timestamps.
-Resetting the timer at tag boundaries keeps the cue aligned with
-tagged sessions rather than counting overnight or between-lab gaps as
-a deliberate pause inside one session.
+The timer resets at the start of each milestone---a tag is a start
+marker, so the first run under a new tag opens a fresh count---rather
+than counting overnight or between-lab gaps as a deliberate pause
+inside one milestone.
 
 <<[[analysing-progsnap2.md]]>>=
 ---
@@ -96,4 +103,23 @@ Add an end boundary as well, for example:
 
 This keeps the analysis focused on the sessions between the two tagged
 regions.
+
+# Analyse one milestone with the tag window
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+analyse\b[^\n]*--since\s+\S+'
+hint: Try `learnlog analyse --since lab1 --until lab2 -f course.progsnap2`.
+```
+
+The same range can be asked for in the vocabulary `learnlog metrics`
+uses:
+
+`learnlog analyse --since lab1 --until lab2 -f course.progsnap2 -o lab1.tex`
+
+Compare with the previous step: the `Column=Regex` pair keeps both
+boundary tags' events (inclusive at both ends), while the tag window
+starts at `lab1` and stops just before `lab2`---one milestone,
+exactly.
 @
