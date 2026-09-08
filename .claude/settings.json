@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "dbosk-skills": {
+      "source": {
+        "source": "github",
+        "repo": "dbosk/claude-skills"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "dbosk-skills@dbosk-skills": true
+  }
+}

@@ -43,14 +43,18 @@ Tutorials follow the same rule: the sources live in
 - `noweave` extracts LaTeX documentation
 - Code chunks: `<<[[filename.py]]>>=`
 - Test chunks: `<<test [[filename.py]]>>=` (auto-discovered by `tests/Makefile`)
-- **Always activate the `literate-programming` skill before editing `.nw` files**
-- Use the `review-literate-programming` skill to review literate quality of changes
+- **Always activate the `dbosk-skills:literate-programming` skill before editing `.nw` files**
+- Use the `dbosk-skills:review` skill to review literate quality of changes
+
+These skills come from the `dbosk-skills` plugin (github.com/dbosk/claude-skills),
+declared in `.claude/settings.json` so they install automatically, including in
+remote (web) sessions.
 
 ### Related skills
 
-- `latex-writing` — for LaTeX conventions in `.nw` documentation sections
-- `variation-theory` — for structuring educational content in documentation
-- `try-first-tell-later` — for pedagogical exercise design
+- `dbosk-skills:latex-writing` — for LaTeX conventions in `.nw` documentation sections
+- `dbosk-skills:variation-theory` — for structuring educational content in documentation
+- `dbosk-skills:try-first-tell-later` — for pedagogical exercise design
 
 ## Architecture
 
