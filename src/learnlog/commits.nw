@@ -821,12 +821,13 @@ the recorder narrowed to review runs---records of the remaining
 subcommands, which used to log themselves as well.
 That kind is noise in every view, so it is what [[--all]] now reveals.
 
-Three predicates therefore share one text-matching core, and each view
+Four predicates therefore share one text-matching core, and each view
 picks the one that matches its question.
 [[is_learnlog_command]] asks \enquote{is this learnlog at all}, which
 is what the elapsed indicator needs; [[is_review_command]] picks out
-the reflection runs; [[is_internal_command]] is the remainder, and is
-the one the display filters use.
+the reflection runs and [[is_checkout_command]] the one learnlog run
+that changes the files (\cref{sec:checkout}); [[is_internal_command]]
+is the remainder, and is the one the display filters use.
 
 All three read the command line rather than the commit, so the same
 test serves a commit subject (\cref{sec:filter-learnlog}) and a parsed
@@ -928,8 +929,36 @@ def is_review_command(command):
     )
 @
 
-The internal test is the difference between the two: learnlog's own
-activity minus the part of it that belongs to the student.
+A checkout is the student's too, and it is the one learnlog run that
+the recorder does not write.
+[[learnlog checkout]] restores the files of an earlier run and
+records itself first, so that the files it replaces are in the log
+before they go (\cref{sec:checkout}).
+It is not a review---it changes the code rather than reads it, and
+the exporter gives it an event type of its own for that reason
+(\cref{sec:checkout-events})---so it gets a predicate of its own
+rather than a place on the review list.
+The subcommand's name is defined here rather than in \cref{gitrepo}
+because the recorder never reads it: the two parties that have to
+agree are the command that writes the record and the readers below,
+and the command imports the name from here.
+
+<<commits functions>>=
+def is_checkout_command(command):
+    """Return true if ``command`` is a ``learnlog checkout`` run."""
+    parts = command.split()
+    return (
+        len(parts) > 1
+        and parts[0] == "learnlog"
+        and parts[1] == CHECKOUT_SUBCOMMAND
+    )
+<<commits constants>>=
+CHECKOUT_SUBCOMMAND = "checkout"
+@
+
+The internal test is the difference: learnlog's own activity minus
+the part of it that belongs to the student, the reviews and the
+checkouts.
 Writing it as a difference rather than as a second list of subcommands
 means a subcommand can never be both, and that a repository recorded by
 an older version---which logged subcommands this list has never heard
@@ -939,19 +968,22 @@ of---still classifies every one of them as plumbing.
 def is_internal_command(command):
     """Return true if ``command`` is learnlog's own plumbing.
 
-    Learnlog activity that is not a review run: the ``pip``
-    install performed by ``learnlog init``, and records of
-    other subcommands left by versions that logged them.
+    Learnlog activity that is neither a review run nor a
+    checkout: the ``pip`` install performed by ``learnlog
+    init``, and records of other subcommands left by versions
+    that logged them.
     """
     return (
         is_learnlog_command(command)
         and not is_review_command(command)
+        and not is_checkout_command(command)
     )
 @
 
 <<commits test functions>>=
 def test_is_review_command():
     from learnlog.commits import (
+        is_checkout_command,
         is_internal_command,
         is_review_command,
     )
@@ -962,8 +994,13 @@ def test_is_review_command():
     assert not is_review_command("learnlog export out.bundle")
     assert not is_review_command("pip install learnlog")
     assert not is_review_command("play.py list")
+    assert not is_review_command("learnlog checkout abc1234")
+    assert is_checkout_command("learnlog checkout abc1234")
+    assert not is_checkout_command("checkout abc1234")
+    assert not is_checkout_command("learnlog play")
     assert not is_internal_command("learnlog play")
     assert not is_internal_command("learnlog metrics time")
+    assert not is_internal_command("learnlog checkout abc1234")
     assert is_internal_command("learnlog export out.bundle")
     assert is_internal_command("pip install learnlog")
     assert not is_internal_command("hello.py")
@@ -1480,9 +1517,10 @@ def filter_internal_runs(message):
 
     Splits on the ``---`` block separator and removes blocks
     whose header records learnlog's own plumbing.  Review runs
-    (``learnlog play``, ``list`` and ``metrics``) are kept, as are
-    the student's own programs.  Returns the filtered message,
-    which may be empty if every block was internal.
+    (``learnlog play``, ``list`` and ``metrics``) and checkouts
+    are kept, as are the student's own programs.  Returns the
+    filtered message, which may be empty if every block was
+    internal.
     """
     blocks = message.split(BLOCK_SEP)
     filtered = [
@@ -1511,7 +1549,7 @@ The exporter (\cref{progsnap2}) asks the same questions about a run it
 has already parsed into fields, where the command is split in two.
 Rebuilding the command line from those fields is the only part that
 differs from the block-level and commit-level tests, so it is the only
-part written once and shared by all three run-level predicates:
+part written once and shared by all four run-level predicates:
 
 <<commits functions>>=
 def _run_command(run):
@@ -1531,6 +1569,12 @@ def is_learnlog_run(run):
 def is_review_run(run):
     """True if a parsed run block records a review run."""
     return is_review_command(_run_command(run))
+@
+
+<<commits functions>>=
+def is_checkout_run(run):
+    """True if a parsed run block records a checkout."""
+    return is_checkout_command(_run_command(run))
 @
 
 <<commits functions>>=
@@ -1561,6 +1605,7 @@ def test_is_learnlog_run_parsed_block():
 
 def test_is_internal_run():
     from learnlog.commits import (
+        is_checkout_run,
         is_internal_run,
         is_review_run,
     )
@@ -1571,6 +1616,15 @@ def test_is_internal_run():
         {"script": "learnlog", "arguments": "export out.bundle"}
     )
     assert not is_internal_run(
+        {"script": "learnlog", "arguments": "play"}
+    )
+    assert not is_internal_run(
+        {"script": "learnlog", "arguments": "checkout abc1234"}
+    )
+    assert is_checkout_run(
+        {"script": "learnlog", "arguments": "checkout abc1234"}
+    )
+    assert not is_checkout_run(
         {"script": "learnlog", "arguments": "play"}
     )
     assert not is_internal_run(
@@ -1604,6 +1658,17 @@ def test_filter_internal_runs_removes_block():
     assert "hello.py" in result
     assert "Run: learnlog play" in result
     assert "install learnlog" not in result
+
+def test_filter_internal_runs_keeps_checkout():
+    from learnlog.commits import filter_internal_runs
+    msg = (
+        "Run: learnlog checkout abc1234\n\nScript: learnlog\n"
+        "\n\n---\n\n"
+        "Run: pip install learnlog\n\nScript: pip\n"
+    )
+    result = filter_internal_runs(msg)
+    assert "learnlog checkout" in result
+    assert "pip install" not in result
 
 def test_filter_internal_runs_preserves_student():
     from learnlog.commits import filter_internal_runs

@@ -80,9 +80,10 @@ module's job (\cref{sec:run-join}): [[get_run_trailers]] and
 single-commit log would have contained, so everything below parses
 one format.
 Deciding what a run \emph{is} comes from there too: [[is_internal_run]]
-names the plumbing this export drops, and [[is_review_run]] the
+names the plumbing this export drops, [[is_review_run]] the
 reflection it exports under an event type of its own
-(\cref{sec:review-events}).
+(\cref{sec:review-events}), and [[is_checkout_run]] the restore it
+exports under a third (\cref{sec:checkout-events}).
 Importing both rather than testing the command string here is what
 keeps the dataset agreeing with what [[list]] and [[play]] show---the
 three views classify a run by asking the same function
@@ -114,6 +115,7 @@ from learnlog.commits import (
     get_tag_details,
     get_tag_map,
     filter_internal_runs,
+    is_checkout_run,
     is_internal_run,
     is_review_run,
     merge_run_trailers,
@@ -1129,7 +1131,9 @@ For each commit we determine the code state and generate events:
 a [[File.Edit]] event when the tree hash changes from the
 previous commit, and one event per run block---[[Run.Program]] for
 the student's own programs, [[X-Review]] for the [[play]] and
-[[list]] invocations with which they looked back at them.
+[[list]] invocations with which they looked back at them, and
+[[X-Checkout]] for a [[learnlog checkout]] that brought an earlier
+version back (\cref{sec:checkout-events}).
 
 The [[Order]] column provides a global sequence number across
 all events, scoped per subject (the [[EventOrderScope]] metadata
@@ -1248,6 +1252,9 @@ dispatches on [[EventType]] and has no branch for anything else: an
 event type it does not know passes through it untouched.
 An analysis tool that has never heard of [[X-Review]] behaves the same
 way, which is the property the [[X-]] prefix exists to promise.
+A checkout is neither a program run nor a review, and
+\cref{sec:checkout-events} says what it is instead; here it only
+needs its own name.
 
 <<emit run events>>=
 body = repo.git(
@@ -1263,6 +1270,12 @@ for run in runs:
     order += 1
     run_event_id = order
     review = is_review_run(run)
+    if review:
+        event_type = "X-Review"
+    elif is_checkout_run(run):
+        event_type = "X-Checkout"
+    else:
+        event_type = "Run.Program"
     program_result = classify_run_result(run)
     exc_type, exc_msg = parse_exception_line(
         run["exception_info"]
@@ -1271,7 +1284,7 @@ for run in runs:
     timestamp = run["start_time"] or commit["date"]
 
     events.append({
-        "EventType": "X-Review" if review else "Run.Program",
+        "EventType": event_type,
         "EventID": order,
         "Order": order,
         "SubjectID": subject_id,
@@ -1436,6 +1449,36 @@ it would put every earlier run's output into [[Resources/]] a second
 time, attached to an event that did not produce it.
 Keeping the I/O branch for program runs only is what keeps
 [[Resources/]] a record of what programs printed.
+
+\subsection{What a checkout restored}
+\label{sec:checkout-events}
+
+The third kind of run reverses the argument that made the review a
+kind of its own.
+[[learnlog checkout]] (\cref{sec:checkout}) is the one learnlog run
+that changes the code, so it cannot be an [[X-Review]], whose whole
+meaning is that the code stood still while the student read; and it
+is not a [[Run.Program]] either, because nothing was executed.
+It goes out as [[X-Checkout]], with the same columns as the other
+two.
+Its children are the I/O events of a program run rather than the view
+trace of a review, since what the command wrote to the terminal---
+which run it restored, and where it recorded the files it
+replaced---is the whole of what it did; the [[else]] branch above
+already emits them, and the review branch is the only one that
+needed a name.
+
+Which code state the event sits on is worth being precise about.
+The command records the files it is about to replace \emph{before}
+it replaces them (\cref{sec:checkout}), so the [[X-Checkout]]
+event's [[CodeStateID]] is that snapshot, the last state the student
+had, and the restored files are the code state of whatever event
+comes next.
+A [[File.Edit]] that follows an [[X-Checkout]] therefore spans the
+restore as well as any editing the student did afterwards.
+An analysis that wants the two apart has the event's [[X-Arguments]]
+to say which commit was restored; one that does not know the type
+passes it through untouched, for the reason given for [[X-Review]].
 
 \subsection{Writing the zip file}
 
@@ -1945,6 +1988,7 @@ def test_progsnap2_filters_internal_runs(workdir):
     repo.begin_run("hello.py", [], t1)
     repo.begin_run("learnlog", ["play"], t1)
     repo.begin_run("pip", ["install", "learnlog"], t1)
+    repo.begin_run("learnlog", ["checkout", "abc1234"], t1)
     output = workdir / "test.progsnap2"
     do_export_progsnap2(repo, output)
     with zipfile.ZipFile(str(output)) as zf:
@@ -1964,6 +2008,7 @@ def test_progsnap2_filters_internal_runs(workdir):
     assert not any("learnlog" in c for c in program_runs)
     assert not any("pip" in c for c in program_runs)
     assert commands_of("X-Review") == ["learnlog play"]
+    assert commands_of("X-Checkout") == ["learnlog checkout abc1234"]
 
 def test_progsnap2_file_edit_event(workdir):
     import csv as csv_mod
@@ -3299,14 +3344,17 @@ Older datasets remain readable because a missing [[X-EndTime]] simply
 means the rebuilt block omits the [[End-Time:]] line.
 
 The message is rebuilt from the events that \emph{are} runs, and there
-are two kinds: the student's programs and their reviews.
-Both become the same kind of block---a review run is written to the log
+are three kinds: the student's programs, their reviews, and their
+checkouts.
+All become the same kind of block---a review run is written to the log
 by the same [[begin_run]] and [[finalize_run]] as any other
-(\cref{sec:review-runs}), so reconstructing it is not a second code
-path but the same one applied to a second event type.
+(\cref{sec:review-runs}), and a checkout by the same two calls made
+from the command itself (\cref{sec:checkout})---so reconstructing them
+is not a second code path but the same one applied to more event
+types.
 What differs is only which children the block draws on: a
-[[Run.Program]] has I/O chunks and no view trace, an [[X-Review]] the
-reverse.
+[[Run.Program]] and an [[X-Checkout]] have I/O chunks and no view
+trace, an [[X-Review]] the reverse.
 Asking for both and letting the empty one come back empty is what makes
 that possible: a branch on the event type would have to be right about
 which kind of child each type has, and a dataset that disagreed---a
@@ -3348,7 +3396,7 @@ def build_reconstructed_commit_message(group, resources):
 
     return BLOCK_SEP.join(blocks)
 <<progsnap2 constants>>=
-RECONSTRUCTED_RUN_EVENTS = ("Run.Program", "X-Review")
+RECONSTRUCTED_RUN_EVENTS = ("Run.Program", "X-Review", "X-Checkout")
 @
 
 We reuse [[format_run_header]] so the first half of each block is
@@ -4386,6 +4434,66 @@ def test_reconstruction_keeps_review_events(workdir):
         shutil.rmtree(tmpdir, ignore_errors=True)
 @
 
+A checkout has to survive the same trip as its own kind: a run block
+of [[learnlog checkout]], carrying the output the command printed---
+which is where the student's way back is written---and no view
+trace.
+
+<<progsnap2 test functions>>=
+def test_reconstruction_keeps_checkout_events(workdir):
+    """A checkout and its I/O survive the round trip."""
+    import shutil
+    from learnlog.commits import (
+        filter_internal_runs, get_commits,
+    )
+    from learnlog.progsnap2 import (
+        do_export_progsnap2,
+        parse_commit_runs,
+        read_progsnap2_as_repo,
+    )
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("learnlog", ["checkout", "abc1234"], t2)
+    repo.finalize_run(
+        io_log="stdout: abc1234 -> Run: hello.py (none)\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+
+    output = workdir / "checkout.progsnap2"
+    do_export_progsnap2(repo, output)
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        blocks = []
+        for commit in get_commits(reconstructed):
+            message = reconstructed.git(
+                "log", "-1", "--format=%B", commit["hash"],
+            ).stdout
+            blocks.extend(parse_commit_runs(
+                filter_internal_runs(message)
+            ))
+        assert [block["script"] for block in blocks] == [
+            "hello.py", "learnlog",
+        ]
+        checkout = blocks[1]
+        assert checkout["arguments"] == "checkout abc1234"
+        assert "abc1234 -> Run: hello.py" in (
+            checkout["io_log"] or ""
+        )
+        assert not checkout["viewed"]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
 The child events of the two kinds must also stay out of each other's
 way, which is a property of the two rebuilders rather than of the
 round trip, and is worth asking about directly.
@@ -4598,7 +4706,8 @@ than incidental: it is what places the review events
 A student who edits, pages back through the log, and then runs still
 produces one pair joining that edit to that run, because the
 [[X-Review]] and [[X-Review.View]] events between them match no branch
-here.
+here; an [[X-Checkout]] (\cref{sec:checkout-events}) passes through
+the same way.
 Were they matched by the [[Run.Program]] branch instead, the review
 would consume the pending edit and the real run would be recorded as a
 re-run of code nobody had touched.
