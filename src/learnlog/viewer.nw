@@ -6,9 +6,13 @@ time with vi-style navigation.
 We chose [[curses]] over a prompt-based loop because single-keypress
 navigation feels natural for browsing a log---the user never needs
 to press Enter.
-Since [[curses]] is a standard library module on Unix systems and
-learnlog targets university lab machines (Linux), this is a
-pragmatic choice.
+[[curses]] is a standard library module on Unix systems, which
+covers university lab machines and most students' Macs; on Windows
+the standard library lacks it, so the package depends on
+[[windows-curses]] there (a [[sys_platform]] marker in
+[[pyproject.toml]]), which provides the same module on top of
+PDCurses.  The viewer therefore uses only the portable subset:
+[[curses.wrapper]], default colours, and the arrow-key constants.
 
 The viewer state is simple: the current commit index and a vertical
 scroll offset within the commit's content.
