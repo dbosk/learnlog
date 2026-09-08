@@ -39,6 +39,7 @@ exclude = [
   "src/learnlog/*.nw",
   "src/learnlog/*.tex",
   "src/learnlog/students.md",
+  "src/learnlog/tutorials/Makefile",
   "src/learnlog/tutorials/*.nw",
   "src/learnlog/tutorials/*.tex",
   "src/learnlog/ltxobj",
