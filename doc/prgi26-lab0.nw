@@ -1,0 +1,685 @@
+\chapter{A course lab adapted for learnlog: prgi26, Laboration 0}
+\label{prgi26-lab0}
+
+This appendix is a worked example of adapting an existing course lab
+to [[learnlog]].
+The lab is the first, optional lab of the KTH course DD1317
+(\foreignlanguage{swedish}{Programmeringsteknik}, course instance
+prgi26): install Python, install an editor, write a Hello World
+program, and remix two small programs before handing one in for peer
+review.
+The adaptation makes three changes.
+It keeps one editor, VSCodium, instead of offering a choice of three;
+it installs and wires [[learnlog]] \emph{before} the first program is
+run; and it ends with the student looking back at their own recorded
+runs.
+The student-facing text stays in Swedish, the language of the course,
+and this chapter documents in English why the lab is shaped as it is.
+
+The lab is tangled from this chapter into [[prgi26-lab0.md]] for the
+same reason the onboarding page in \cref{sec:students-page} is
+tangled from that chapter: the commands a student types must match
+what the program actually does, and tangling from the manual is the
+only way to keep the two from drifting apart.
+The Markdown carries the frontmatter that the [[canvaslms]] tool
+uses to find the assignment, so a teacher with a source checkout
+publishes it from the tangled file:
+\begin{minted}{bash}
+make -C doc prgi26-lab0.html
+canvaslms --no-cache assignments edit --html -c prgi26 \
+  -f doc/prgi26-lab0.html
+\end{minted}
+The assignment in the course is a FeedbackFruits assignment, an
+external tool reached through LTI, and the two details of this
+command exist to leave that wiring alone.
+[[assignments edit]] sends only the name and the description, plus
+whichever optional fields the frontmatter lists, so a frontmatter
+with nothing but [[name]] and [[regex]] cannot touch the submission
+type or the tool link; and the [[.html]] target converts the Markdown
+with [[pandoc]] beforehand, which is the route that was verified on a
+sandbox copy of such an assignment before the first publish.
+[[--no-cache]] matters after a rename: the tool's object cache can
+hold the old and the new name of one assignment and then refuse an
+ambiguous match.
+Both tangled files are build artefacts and, like [[students.md]],
+are not tracked in the repository.
+
+This lab and the onboarding page now describe two different ways of
+installing [[learnlog]], and the difference is deliberate.
+The onboarding page installs [[learnlog]] with [[pipx]], which puts
+the command on the [[PATH]] of every shell, and lets
+[[learnlog init python]] create the project environment.
+This lab creates the project environment first and installs
+[[learnlog]] inside it.
+The whole lab takes place in VSCodium's integrated terminal, which
+the editor keeps inside the project environment, so a beginner meets
+exactly one environment and one Python; the price is that the
+[[learnlog]] command exists only in terminals that use that
+environment, which the lab states twice.
+
+\section{The object of learning and the shape of the lab}
+
+The object of learning is to write, run and change a Python program in
+an environment of one's own, with the work recorded.
+The critical aspects a beginner has to discern are that a program is
+a file, that running it produces output in a terminal, and that the
+same word [[python]] can name different interpreters, of which only
+one is wired to record.
+Everything else in the lab---download pages, installer dialogs,
+platform differences---is scaffolding that should stay in the
+background.
+
+The lab therefore keeps the course folder invariant from the moment it
+is created and rotates one tool at a time into focus: Python, the
+editor, Git, [[learnlog]], and finally the program itself.
+This is the same separation pattern that orders the tutorial catalog
+in \cref{tut:tutorials}, where the recorded project is the invariant
+and each tutorial varies one part of the CLI.
+The order is not the order of the original lab, which installed
+Python, then let the student choose an editor, then wrote the program.
+Moving [[learnlog]] ahead of the first program is what makes the
+first run and the first record simultaneous, and that simultaneity is
+what the closing step depends on: there is a history to look back at
+only if recording started before the history did.
+
+Each section below pairs the analysis of one step with the Markdown
+that implements it, so the two can be read side by side.
+The root chunk assembles the sections in the order the student meets
+them.
+
+<<[[prgi26-lab0.md]]>>=
+<<lab0: frontmatter>>
+<<lab0: intro>>
+<<lab0: python>>
+<<lab0: vscodium>>
+<<lab0: git>>
+<<lab0: course folder>>
+<<lab0: learnlog>>
+<<lab0: hello world>>
+<<lab0: remix>>
+<<lab0: looking back>>
+<<lab0: submission>>
+<<lab0: troubleshooting>>
+@
+
+\section{Identification for Canvas}
+
+The frontmatter carries only what [[canvaslms]] needs to find the
+assignment: its name and a regular expression that matches the name
+as it appears in the course.
+The regular expression is the stable identifier; the name can be
+edited in Canvas without breaking the match, as it was when the
+assignment became a FeedbackFruits one.
+Should the name ever stop containing the pattern, the assignment's
+numeric Canvas id works in its place, since the pattern is matched
+against both.
+Due dates, module placement and publication state are left to the
+Canvas interface, for the reason the onboarding page gives: those
+fields belong to the course instance, not to the text, and a file
+that carried a date would overwrite whatever the teacher set in the
+course the next time it was published.
+
+<<lab0: frontmatter>>=
+---
+name: "Laboration (0): Hello, world och remix! (kamratgranskning)"
+regex: Laboration \(0\)
+---
+@
+
+\section{Introduction: a voluntary lab that is still handed in}
+
+The original introduction said both that nothing needs to be handed
+in and, at the end, that the remixed program should be handed in for
+peer review.
+The adapted introduction resolves this: the lab is voluntary, but
+handing in is what makes the peer-review practice possible, so the
+student is asked to do so.
+
+The list of goals is the student's map of the lab, and it now names
+[[learnlog]] and the closing look back as goals of their own, so
+neither reads as an aside when it arrives.
+The paragraph on [[learnlog]] tells the student what is recorded,
+where it is kept, and that it stays on their machine unless they
+share it.
+It deliberately does not explain how recording works; a mechanism the
+student has no model of yet would add load without adding
+discernment, the same reasoning that keeps mechanism out of the
+novice tutorial variants in \cref{tut:tutorials}.
+What the paragraph does promise is that the student will see the
+record themselves, which is the first contrast the closing step
+delivers on.
+
+<<lab0: intro>>=
+# Laboration: Kom igång med Hello World
+
+Det här är en frivillig laboration som hjälper dig att komma igång med
+kodandet. Lämna gärna in ändå: då får du öva på att lämna in och
+kamratgranska i Canvas, precis som på de kommande laborationerna.
+
+Målet med laborationen är att:
+
+1. Installera Python.
+2. Installera textredigeraren VSCodium.
+3. Sätta upp learnlog, som sparar dina programkörningar.
+4. Skriva ett enkelt program, "Hello World".
+5. Remixa ett par färdiga program.
+6. Titta tillbaka på vad du gjorde.
+
+Under kursen använder vi verktyget learnlog. Det sparar varje gång du
+kör ett Python-program: koden som den såg ut, vad programmet skrev ut
+och eventuella felmeddelanden. Allt sparas i en dold mapp `.learnlog/`
+i din kursmapp och lämnar inte din dator om du inte själv väljer att
+dela det. I slutet av laborationen tittar du själv på det som sparats.
+
+@
+
+\section{Python: check before you install}
+
+The step opens with a check rather than a download link.
+Running [[python3]] (or [[python]]) before installing anything is a
+try-first move: the student produces the contrast between
+\emph{not having} Python---the shell's \enquote{command not found}, or
+on Windows the Microsoft Store opening---and \emph{having} it, the
+version banner and the [[>>>]] prompt.
+A student who installs without first seeing the absence has no
+discerned effect to attribute the installation to.
+The check uses the bare command rather than [[--version]] because the
+prompt is the effect the lab wants noticed: the same interpreter that
+will later run their program answers by hand here, and leaving it
+with [[exit()]] is the student's first act inside it.
+
+The aspect the check must make discernible is the \emph{version}, not
+mere presence, because [[learnlog]] needs Python~3.10 or newer and a
+Mac that has only the command-line tools' Python has an older one.
+The text states the criterion once, above the platform split, so
+success is recognisable without comparing three narratives.
+
+The platform variation is subordinated to that invariant: the
+checkable end state comes first, and only the command beneath it
+varies by operating system.
+Linux gets one sentence, since the check succeeds there.
+What the student carries out of the step is \enquote{the command that
+worked}, which the environment step reuses; a fact the student
+discovered about their own machine becomes the invariant that
+generalises the later steps across platforms.
+
+<<lab0: python>>=
+## Ladda ner Python
+
+Kolla först om du redan har Python. Öppna en terminal (på Windows:
+Terminal eller PowerShell, på Mac: Terminal, på Linux: din vanliga
+terminal) och skriv
+
+```
+python3
+```
+
+Om terminalen svarar att kommandot inte finns, prova i stället
+
+```
+python
+```
+
+Om Python finns startar det och skriver ut sin version och en prompt
+`>>>`, ungefär så här:
+
+```
+Python 3.13.2 (main, ...)
+Type "help", "copyright", "credits" or "license" for more information.
+>>>
+```
+
+Versionen måste vara 3.10 eller nyare. Skriv `exit()` och tryck Enter
+för att komma tillbaka till terminalen. Kom ihåg vilket av kommandona
+som fungerade, `python3` eller `python`: du använder samma kommando
+senare i laborationen.
+
+Om inget av kommandona fungerar, eller om versionen är för gammal,
+installerar du Python så här:
+
+- **Windows:** Om Microsoft Store öppnades när du skrev `python` har du
+  inte Python: installera det därifrån (välj den senaste versionen).
+  Annars går du till [Pythons
+  nedladdningssida](https://www.python.org/downloads/), laddar ner
+  och kör installationsprogrammet. Missa inte att kryssa i rutan som
+  musen pekar på i bilden nedan. Stäng terminalen, öppna en ny och gör
+  kollen ovan igen.
+
+  ![download_python](https://user-images.githubusercontent.com/105818197/186904393-23505d95-c172-4c9e-a949-952a4b8ded18.PNG)
+
+- **Mac:** Om macOS frågar om du vill installera "kommandoradsverktyg"
+  när du skriver `python3` kan du svara ja; de behövs i steget
+  "Installera Git" nedan. Den Python som följer med dem är dock ofta
+  för gammal. Gå då till [Pythons
+  nedladdningssida](https://www.python.org/downloads/), ladda ner och
+  kör installationsprogrammet för macOS. Öppna en ny terminal och gör
+  kollen ovan igen med `python3`.
+
+- **Linux:** Du har redan Python, som `python3`.
+
+@
+
+\section{One editor: VSCodium}
+
+The original lab offered PyCharm, IDLE and VS Code and let the
+student choose.
+Read as a pattern of variation, that varied the editor while holding
+the program invariant, which makes the editor the dimension the
+student attends to---and the editor is not part of the object of
+learning.
+It also split the cohort three ways, so that staff at a lab session
+could not point at a shared screen.
+Holding the editor invariant frees the student's attention for the
+aspects that matter: a file, a run button, a terminal.
+
+VSCodium is VS Code without Microsoft's telemetry and branding, and
+the text says so in one sentence, because most help a student will
+find online is written for VS Code and transfers unchanged.
+The Python extension is installed from within the editor; VSCodium's
+extension registry carries the same extension under the same name, so
+the instruction is the same one a VS Code tutorial would give.
+The screenshots and the video of the original are dropped: the video
+shows VS Code's own marketplace, which differs, and the screenshots
+were of the editors that are no longer offered.
+
+<<lab0: vscodium>>=
+## Installera VSCodium
+
+I den här kursen använder vi textredigeraren VSCodium. VSCodium är
+Visual Studio Code (VS Code) utan Microsofts tillägg och spårning. Den
+ser ut och fungerar likadant, så hjälp och videor som handlar om VS
+Code gäller även för VSCodium.
+
+Installera VSCodium från [VSCodiums
+nedladdningssida](https://vscodium.com/#install):
+
+- **Windows:** Ladda ner installationsprogrammet (filen som heter
+  `VSCodiumUserSetup-x64-...exe`) och kör det. Om du hellre använder
+  terminalen: `winget install vscodium`.
+- **Mac:** Ladda ner `.dmg`-filen för din dator (Apple Silicon för
+  nyare Macar, Intel för äldre) och dra VSCodium till Program. Med
+  Homebrew: `brew install --cask vscodium`.
+- **Linux:** Använd `snap install codium --classic`, Flatpak eller
+  paketförrådet för din distribution; alla beskrivs på
+  nedladdningssidan.
+
+Starta VSCodium. Installera sedan tillägget för Python: öppna
+tilläggsvyn (Ctrl+Shift+X, på Mac Cmd+Shift+X), sök efter "Python" och
+installera tillägget **Python** från **ms-python**. Det ger VSCodium
+en knapp för att köra Python-program och hjälper till med färgning och
+felmarkeringar i koden.
+
+@
+
+\section{Git: a checked prerequisite}
+
+[[learnlog]] keeps its record in a Git repository, so Git must be
+installed, and on Windows and a fresh Mac it usually is not.
+The step follows the same shape as the Python step: one check with a
+platform-independent success criterion, then the platform-specific
+command beneath it.
+What the step does not do is explain Git.
+The student will not use Git themselves in this lab, and the version
+control that [[learnlog]] performs on their behalf is exactly the
+kind of mechanism the introduction chose to leave in the background.
+On a Mac the check itself triggers the installation offer, which is
+why the Python step told the student to accept that offer if it
+appeared early.
+
+<<lab0: git>>=
+## Installera Git
+
+learnlog använder programmet Git för att spara dina körningar. Kolla
+om du har det genom att skriva i terminalen:
+
+```
+git --version
+```
+
+Om du får ett versionsnummer tillbaka är allt klart. Annars:
+
+- **Windows:** Ladda ner och kör installationsprogrammet från [Gits
+  nedladdningssida](https://git-scm.com/download/win). Du kan behålla
+  alla förvalda inställningar. Med terminalen: `winget install Git.Git`.
+- **Mac:** När du skriver `git --version` erbjuder sig macOS att
+  installera "kommandoradsverktyg för utvecklare". Klicka på Installera
+  och vänta tills det är klart.
+- **Linux:** Installera med din pakethanterare, till exempel
+  `sudo apt install git`.
+
+Stäng terminalen, öppna en ny och kör `git --version` igen.
+
+@
+
+\section{The course folder}
+
+From here on the course folder is the invariant of the lab.
+It is created before any tool is set up in it, and the student is
+told to open it in VSCodium and to use the editor's terminal for
+everything that follows.
+That last instruction is what makes the venv-first route safe: the
+integrated terminal is the one place where the editor's choice of
+interpreter and the shell agree, so a student who never leaves it
+never meets the second Python that the troubleshooting list has to
+account for.
+
+The warning against using the home folder is stated as an expectation
+about \emph{where}, not demonstrated: [[learnlog init]] refuses the
+home directory, and the tutorial in \cref{tut:getting-started} makes
+the same choice of telling rather than tripping the guard, because a
+student who trips it learns [[--force]] as a step in the workflow
+when it is the exception to it.
+
+<<lab0: course folder>>=
+## Skapa en kursmapp och öppna den i VSCodium
+
+Skapa en mapp för kursen, till exempel `prgi26` i din Dokument-mapp.
+Använd inte din hemmapp direkt som kursmapp: learnlog vägrar att sätta
+upp sig i hemmappen, eftersom den då skulle spara allt du har där.
+
+Öppna mappen i VSCodium: välj **Open Folder** i menyn **File** (på Mac
+**Open...**) och välj mappen. Om VSCodium frågar om du litar på mappens
+upphovsmän svarar du ja: det är din egen mapp.
+
+Öppna sedan terminalen inuti VSCodium: välj **Terminal** i menyn
+**View**. Terminalen startar i kursmappen. Alla kommandon i resten av
+laborationen skriver du i den här terminalen.
+
+@
+
+\section{learnlog before the first program}
+
+This is the step where the venv-first route lives, and it is
+sequenced so that each of its parts has a visible effect before the
+next begins.
+The environment is created with the Python command the student found
+in the Python step, so the platform variation that was resolved there
+does not reappear here.
+Selecting the interpreter is the fusion point of the lab: editor,
+interpreter and folder must be held together at once, and this is
+placed after both Python and the folder exist so all three are
+present to be fused.
+The [[(.venv)]] prefix in a fresh terminal is the discernible effect
+of that selection, and the fallback commands cover the two ways it
+fails to appear---an unselected interpreter, and a Windows execution
+policy that blocks the activation script.
+
+Only then is [[learnlog]] installed and wired.
+[[learnlog init python]] installs into the active environment when
+one is active (\cref{sec:init}), which is the property the whole
+route rests on: because the student is in the editor's terminal, the
+environment the editor selected is the one [[init]] wires.
+[[learnlog doctor]] closes the step as a check-before-use, for the
+same reason the Python step opened with a check: the student sees the
+wiring reported before any run depends on it.
+It is used instead of [[learnlog list]], which on an empty log says
+\enquote{No commits found} and reads as an error to a beginner.
+
+The closing paragraph states the cost of the route: the [[learnlog]]
+command exists only inside the environment.
+This is said here, at the point where the student can see the
+[[(.venv)]] prefix that marks such a terminal, and again in the
+troubleshooting list.
+
+<<lab0: learnlog>>=
+## Installera learnlog
+
+Nu ska du installera learnlog i kursmappen. Det sker i tre delar:
+först skapar du en egen Python-miljö för kursmappen (en så kallad
+virtuell miljö, som bor i den dolda mappen `.venv/`), sedan
+installerar du learnlog i den, och till sist kopplar learnlog in sig
+så att varje körning sparas.
+
+1. Skapa miljön. Skriv i terminalen, med det kommando som fungerade i
+   steget "Ladda ner Python":
+
+   ```
+   python3 -m venv .venv
+   ```
+
+   (eller `python -m venv .venv`). Det tar en liten stund och skriver
+   inte ut något när det lyckas.
+
+2. VSCodium upptäcker den nya miljön och frågar om du vill använda den
+   för mappen: svara **Yes**. Om frågan inte dyker upp öppnar du
+   kommandopaletten (Ctrl+Shift+P, på Mac Cmd+Shift+P), skriver
+   **Python: Select Interpreter** och väljer raden som innehåller
+   `.venv`.
+
+3. Öppna en ny terminal (plustecknet i terminalpanelen, eller
+   **Terminal** i menyn **View** en gång till). Prompten i den nya
+   terminalen ska nu börja med `(.venv)`. Det betyder att terminalen
+   använder kursmappens egen Python.
+
+   Om `(.venv)` inte syns: skriv `.venv\Scripts\activate` (Windows)
+   eller `source .venv/bin/activate` (Mac och Linux). Om Windows svarar
+   att det inte går att köra skript ("running scripts is disabled")
+   skriver du först
+   `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+   och försöker igen.
+
+4. Installera learnlog i miljön:
+
+   ```
+   pip install learnlog
+   ```
+
+5. Koppla in learnlog i kursmappen:
+
+   ```
+   learnlog init python
+   ```
+
+   Det skapar den dolda mappen `.learnlog/` där körningarna sparas.
+
+6. Kontrollera att allt är kopplat:
+
+   ```
+   learnlog doctor
+   ```
+
+   Svaret ska innehålla raden "Runs of this interpreter are recorded
+   in" följt av sökvägen till din kursmapp.
+
+Kommandot `learnlog` finns bara i terminaler som använder kursmappens
+miljö, alltså där prompten börjar med `(.venv)`. I en annan terminal
+svarar datorn att kommandot inte finns.
+
+@
+
+\section{Hello World and the first visible record}
+
+The program is the original's two lines, unchanged.
+What the step adds is the run button, which is the reason the Python
+extension was installed, and then [[learnlog list]] immediately after
+the run.
+[[learnlog]] is transparent by design: the program prints exactly what
+it would print without it, so nothing in the run itself can be
+attributed to the tool.
+A mechanism with no perceptible effect cannot be learned, and
+[[learnlog list]] is the contrast that gives it one: the terminal
+that just showed \enquote{Hello World!} now shows a line naming the
+file that produced it.
+Because [[learnlog]] was wired before this first run, the first run
+and the first record coincide, and recording cannot be mistaken for a
+separate act performed afterwards.
+
+The list also shows a line for the [[learnlog list]] command itself,
+since [[learnlog]] records its own review commands
+(\cref{sec:review-runs} explains why those, and only those, leave
+a record).
+Rather than hide this, the text names it, because a beginner who
+notices an unexplained extra line will otherwise wonder whether
+something went wrong.
+
+<<lab0: hello world>>=
+## Skriv ett enkelt program
+
+Dags att skriva ditt första egna program! Skapa en ny fil i VSCodium
+(**New File** i menyn **File**), spara den i kursmappen som
+`helloworld.py` (eller något annat skoj som slutar på `.py`) och skriv
+in:
+
+```python
+message = "Hello World!"
+
+print(message)
+```
+
+Spara filen. Kör programmet genom att klicka på uppspelningsknappen
+(triangeln, **Run Python File**) uppe till höger i VSCodium, eller
+skriv `python helloworld.py` i terminalen. Utskriften i terminalen ska
+se ut så här:
+
+```
+Hello World!
+```
+
+Det du inte såg: learnlog sparade körningen. Skriv i terminalen
+
+```
+learnlog list
+```
+
+så får du en rad per körning, med tidpunkt och programmets namn. Du
+ska se en rad som nämner `helloworld.py` (texten `(none)` efter namnet
+betyder bara att programmet kördes utan argument). Du ser också en
+rad för `learnlog list` självt: även när du tittar på det som sparats
+sparas det.
+
+@
+
+\section{Remixing: the cycle over someone else's program}
+
+Hello World is one instance of the edit--run--observe cycle.
+The remix generalises it: the cycle is held invariant while the
+program and its author vary, since the two downloaded programs were
+written by someone else and do something the student did not choose.
+That second variation is also what the peer review at the end depends
+on, reading code one did not write.
+The programs are saved into the course folder so their runs are
+recorded like the student's own; the suggestions of what to change
+are concrete enough to try and open enough that the student decides
+what the change is, which is what the closing step will ask them to
+find.
+
+The download links are the original's, pointing at the course
+material's own repository.
+
+<<lab0: remix>>=
+## Remixa program
+
+Ladda hem programmen
+
+- [rövarspråket.py](https://github.com/dbosk/intropy/raw/v2024/modules/helloworld/r%C3%B6varspr%C3%A5ket.py)
+- [frågesport.py](https://github.com/dbosk/intropy/raw/v2024/modules/helloworld/fr%C3%A5gesport.py)
+
+och spara dem i kursmappen (samma mapp som `helloworld.py`).
+
+Provkör programmen. Prova sedan att ändra på dem: byt ut frågorna i
+frågesporten, eller lägg till en bokstav bland vokalerna i
+rövarspråket. Kör om programmet efter varje ändring och se vad som
+händer.
+
+@
+
+\section{Looking back}
+
+The last step turns the lab's own history into its final exercise.
+[[learnlog play]] fuses what the earlier steps separated: the file,
+the run, the output and the change since the previous run appear in
+one record, and the student can move between records.
+This is the step the whole sequencing was for, and it is the reason
+[[learnlog]] records review commands at all: looking back is part of
+the work, not an audit of it.
+
+The prompt before the student starts browsing is a try-first prompt.
+It asks which change made the biggest difference, which the student
+must answer from memory before the record answers it for them; the
+question does not say what to look at in the record, only what to
+compare, so the aspects that matter---which run, what it printed
+before and after---are the student's to discern.
+The comparison of expectation with record is the contrast that makes
+the record worth having.
+
+<<lab0: looking back>>=
+## Titta tillbaka
+
+Nu har du kört och ändrat program ett antal gånger, och learnlog har
+sparat varje körning. Innan du tittar: vilken av dina ändringar tror
+du gjorde störst skillnad i vad programmet skrev ut? Bestäm dig för
+ett svar.
+
+Skriv sedan i terminalen
+
+```
+learnlog play
+```
+
+Du får upp en visare som visar en körning i taget: när den gjordes,
+vilket program som kördes, vad det skrev ut och hur koden ändrats
+sedan körningen innan. Bläddra mellan körningarna med piltangenterna
+vänster och höger, rulla i en lång körning med upp och ner, och
+avsluta med `q`.
+
+Leta upp körningen där din ändring dök upp och jämför vad programmet
+skrev ut före och efter. Stämde det med vad du trodde?
+
+@
+
+\section{Handing in}
+
+The submission paragraph is the original's, unchanged: the remixed
+program is handed in on Canvas and reviewed by two classmates, which
+practises the mechanics the graded labs will use.
+The lab does not ask the student to share their [[learnlog]] record;
+the record stays on their machine, as the introduction promised, and
+sharing is a later lab's step.
+
+<<lab0: submission>>=
+## Lämna in
+
+När du är nöjd med dina ändringar kan du lämna in programmet här. Efter
+deadline kommer du att få två program som dina klasskamrater har
+skrivit. Ge dem återkoppling. Detta låter dig öva på att använda Canvas
+såsom vi kommer att använda det på kommande labbar. Se Canvas sida
+[How do I submit a peer review to an
+assignment?](https://community.canvaslms.com/t5/Student-Guide/How-do-I-submit-a-peer-review-to-an-assignment/ta-p/293)
+om hur du går tillväga.
+
+@
+
+\section{When something goes wrong}
+
+The troubleshooting list covers the failures the venv-first route is
+known to have, each stated as the symptom the student will see and
+the check that resolves it.
+Three of the four are the same failure seen from different places:
+the terminal, the editor or the program using a Python other than the
+course folder's.
+The list therefore points back to the same two checks each time, the
+[[(.venv)]] prefix and [[learnlog doctor]], rather than introducing
+new commands to remember.
+The Debian entry is the one platform-specific gap of the route: the
+[[venv]] module ships in a separate package there.
+The last entry protects a student who already uses Git from
+committing the record into their own repository; [[.learnlog/]]
+manages itself.
+
+<<lab0: troubleshooting>>=
+## Om något strular
+
+- **Terminalen säger att `learnlog` inte finns:** terminalen använder
+  inte kursmappens miljö. Kontrollera att prompten börjar med
+  `(.venv)`; annars gör du om steg 2 och 3 under "Installera learnlog".
+- **`learnlog list` visar inte din körning:** programmet kördes med en
+  annan Python än kursmappens. Kör `learnlog doctor` i terminalen och
+  kontrollera att VSCodium har valt tolken under `.venv` (**Python:
+  Select Interpreter**).
+- **`python3 -m venv .venv` misslyckas på Linux:** på Debian och Ubuntu
+  behöver du först `sudo apt install python3-venv`.
+- **Du använder redan Git i kursmappen:** mappen `.learnlog/` sköter
+  sig själv. Lägg aldrig till den i ditt eget Git-förråd.
+
+Kom till ett laborationstillfälle om du kör fast: där finns hjälp!
+@

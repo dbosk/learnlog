@@ -1,9 +1,18 @@
 LATEXFLAGS += -shell-escape
 
 .PHONY: all weave clean distclean
-all: learnlog.pdf
+all: learnlog.pdf prgi26-lab0.md
 
-weave: learnlog.tex
+weave: learnlog.tex prgi26-lab0.tex
+
+prgi26-lab0.md: prgi26-lab0.nw
+	${NOTANGLE}
+
+# The Canvas push file: the frontmatter verbatim, then the body
+# converted by pandoc (canvaslms assignments edit --html -f ...).
+prgi26-lab0.html: prgi26-lab0.md
+	awk '{print} NR>1 && /^---$$/ {exit}' $< > $@
+	pandoc -f gfm+yaml_metadata_block -t html --mathjax $< >> $@
 
 ../src/learnlog/learnlog.tex: ../src/learnlog/learnlog.nw
 ../src/learnlog/capture.tex: ../src/learnlog/capture.nw
@@ -34,6 +43,7 @@ learnlog.pdf: ../src/learnlog/commits.tex
 learnlog.pdf: ../src/learnlog/progsnap2.tex
 learnlog.pdf: ../src/learnlog/metrics.tex
 learnlog.pdf: metrics-protocol.tex
+learnlog.pdf: prgi26-lab0.tex
 learnlog.pdf: ../src/learnlog/viewer.tex
 learnlog.pdf: ../src/learnlog/cli.tex
 learnlog.pdf: ../src/learnlog/tutorials/tutorials.tex
@@ -45,7 +55,7 @@ learnlog.pdf: ../src/learnlog/tutorials/analysing-progsnap2.tex
 learnlog.pdf: bibliography.bib preamble.tex
 
 clean:
-	${RM} learnlog.tex learnlog.pdf
+	${RM} learnlog.tex learnlog.pdf prgi26-lab0.md prgi26-lab0.tex prgi26-lab0.html
 
 distclean:
 
