@@ -913,7 +913,17 @@ So the allow-list is inverted.
 same list); everything
 else---[[init]], [[tutorial]], [[tag]], [[clone]], [[pull]],
 [[push]], [[set-remote]], [[export]], [[git]], [[activate]],
-[[deactivate]], [[doctor]], [[analyse]]---leaves no trace whatsoever.
+[[deactivate]], [[doctor]], [[analyse]], [[config]],
+[[checkout]]---leaves no trace whatsoever.
+[[checkout]] is vetoed here and still ends up in the log, because it
+writes its record by hand (\cref{sec:checkout}): the snapshot it
+takes of the files it is about to replace has to exist before it
+touches them, and only the command knows when that is.
+So the decision is not \emph{whether} a checkout is recorded but
+\emph{who} records it, and the four defects above say why the answer
+is not this hook: a record written at import time would land before
+the command had checked its argument, and a mistyped hash would leave
+a record of a checkout that never happened.
 \enquote{No trace} is stronger than \enquote{no run record}: the veto
 is answered before [[_resolve_workdir]] is consulted, so a vetoed
 command does not even create the repository it would have committed
@@ -1094,7 +1104,7 @@ class TestIsOptedOut:
     @pytest.mark.parametrize("subcommand", [
         "init", "tutorial", "tag", "clone", "pull", "push",
         "set-remote", "export", "git", "activate", "deactivate",
-        "doctor", "analyse",
+        "doctor", "analyse", "config", "checkout",
     ])
     def test_administrative_subcommands_are_vetoed(self, subcommand):
         assert _is_opted_out(
@@ -2324,9 +2334,10 @@ vetoed command must not do---resolving a project, creating a
 repository, committing a header---is written below the [[return]].
 
 An invocation that survives the veto and \emph{is} the learnlog CLI
-can only be [[play]] or [[list]], so the same classifier answers the
-second question this chunk needs: is this a review run
-(\cref{sec:review-runs})?
+can only be [[play]], [[list]] or [[metrics]]---[[checkout]] records
+itself from the command instead (\cref{sec:checkout})---so the same
+classifier answers the second question this chunk needs: is this a
+review run (\cref{sec:review-runs})?
 Asking it twice rather than threading a value out of [[_is_opted_out]]
 keeps that predicate a predicate; the classifier is a few string
 comparisons on a list that is never long.
@@ -6973,6 +6984,48 @@ def test_tag_names_the_newest_student_run(cli_project):
 
     assert "quick.py" in subject
     assert "learnlog" not in subject
+@
+
+The checkout is the one administrative command that leaves a trace,
+and the trace has to be exactly one record: the command's own, not a
+second one from this hook (\cref{sec:checkout}).
+That is a claim about the veto and the CLI together, which is why it
+is tested here with recording on rather than under [[CliRunner]],
+where the suite's [[LEARNLOG_SKIP_AUTOSTART]] hides the hook's half.
+The test also holds the promise the command makes to the student: the
+files come back, [[HEAD]] stays on the branch, and the next program
+run lands in the same history.
+
+<<autostart test functions>>=
+def test_checkout_records_once_and_the_next_run_follows(cli_project):
+    project, venv_dir, learnlog = cli_project
+    _run_student_program(venv_dir, project, "print('keep me')\n")
+    listing = _run_cli(learnlog, ["list"], cwd=project).stdout
+    kept = [
+        line.split()[0] for line in listing.splitlines()
+        if "quick.py" in line
+    ][-1]
+    _run_student_program(venv_dir, project, "print('regret')\n")
+
+    result = _run_cli(learnlog, ["checkout", kept], cwd=project)
+
+    assert "next run continues" in result.stdout
+    assert (project / "quick.py").read_text() == "print('keep me')\n"
+    history = _git_history(project)
+    assert history.count(f"Run: learnlog checkout {kept}") == 1
+    assert history.count(f"Run-End: learnlog checkout {kept}") == 1
+    attached = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "symbolic-ref", "--quiet", "HEAD"],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert attached.returncode == 0
+
+    _run_student_program(venv_dir, project, "print('after')\n")
+    assert "stdout: after" in _git_history(project)
 @
 
 The last test is the positive half of the policy, and it has to hold

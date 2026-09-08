@@ -124,6 +124,7 @@ class LearnlogRepo:
         self.run_id = None
         self.run_script = None
         self.run_args = []
+        self.run_commit = None
         self.init_repo()
 
     <<repo methods>>
@@ -2067,6 +2068,11 @@ an older commit, and a recorder that undoes an explicit checkout is
 interfering with the very work it exists to observe.
 A run made from a detached head is recorded on the branch, [[HEAD]]
 stays where the student put it, and the two facts are independent.
+The one thing that does re-attach [[HEAD]] is not the recorder but a
+request: [[learnlog checkout]] asks, through learnlog, for an older
+version to be the next one on the log, and
+\cref{sec:restore-code-state} explains why honouring that request
+means putting [[HEAD]] back on the branch.
 
 \subsection{Which branch that is}
 
@@ -2417,7 +2423,8 @@ def begin_run(self, script, args, start_time):
 
     Snapshots the current code state and commits it with the run
     header, which carries the run id that :meth:`finalize_run`
-    will refer back to.
+    will refer back to.  The header commit's hash is kept in
+    `run_commit`.
 
     Returns the run header string.
     """
@@ -2442,6 +2449,13 @@ The tree is the work tree as it looks now, which is the state the
 program is about to execute, and [[git write-tree]] turns the staged
 index into the object [[commit_on_branch]] needs
 (\cref{sec:commit-on-branch}).
+The commit's hash is kept on the instance as well, because for one
+caller the header is not only the start of a record but the thing the
+student may want back: [[learnlog checkout]] (\cref{sec:checkout})
+snapshots the files it is about to replace and has to name that
+snapshot afterwards, and reading the branch tip at that point is not a
+safe answer while another run may have landed on top of it
+(\cref{sec:two-commit-protocol}).
 
 <<commit the code state with the run header>>=
 branch, tip = self.branch_and_expected_tip()
@@ -2455,7 +2469,9 @@ with self.run_index(f"{self.run_id}-begin") as index_path:
     tree = self.git(
         "write-tree", timeout=GIT_TREE_TIMEOUT,
     ).stdout.strip()
-    self.commit_on_branch(branch, tree, header, parent=tip)
+    self.run_commit = self.commit_on_branch(
+        branch, tree, header, parent=tip,
+    )
     if not unfinished:
         <<publish the private index as the shared one>>
 @
@@ -3154,6 +3170,14 @@ behaviour worth recording.
 So those three are logged as ordinary runs and every other subcommand
 leaves no trace at all, not even a repository
 (\cref{sec:veto}).
+One more subcommand leaves a record without being on this list.
+[[learnlog checkout]] (\cref{sec:checkout}) writes a run record of its
+own, calling [[begin_run]] and [[finalize_run]] itself, because its
+header has to land before it changes any file and the command has to
+know that it did.
+The recorder has no part in that, so the list it reads does not name
+it; the readers learn the name from \cref{sec:filter-learnlog}, where
+the command that writes the record also gets it.
 A metrics run is recorded without a view trace: it displays no
 commit, and a [[Viewed:]] line for every commit it aggregated would
 turn into review events (\cref{progsnap2}) for commits nobody looked
@@ -3438,13 +3462,15 @@ it wrote before.
 
 <<repo methods>>=
 def finalize_run(self, io_log, exception_info,
-                 end_time, exit_code, view_trace=None):
+                 end_time, exit_code, view_trace=None,
+                 tree=None):
     """Complete the current run with a trailer commit.
 
     Commits the I/O log, exception information, end time, and
     exit code under the run id from :meth:`begin_run`.  Nothing
-    already in the repository is modified, and the commit records
-    no code change.
+    already in the repository is modified.  The commit carries
+    ``tree`` when given, the tree the run left behind; otherwise
+    the branch tip's tree, so that it records no code change.
 
     ``view_trace`` is an optional sequence of
     ``(time, commit, action)`` triples naming the commits a
@@ -3479,7 +3505,7 @@ so the fresh answer costs no extra process.
 <<commit the trailer without touching the tree>>=
 branch, tip = self.branch_and_expected_tip()
 self.commit_on_branch(
-    branch, f"{branch}^{{tree}}", message, parent=tip,
+    branch, tree or f"{branch}^{{tree}}", message, parent=tip,
 )
 @
 
@@ -3495,6 +3521,59 @@ Naming the branch means the trailer copies whatever stands at the end
 of the log at the moment it lands, and names it again if the ref moved
 between reading the tip and moving it
 (\cref{sec:commit-on-branch}).
+
+One run is the exception to \enquote{records no code change}.
+[[learnlog checkout]] (\cref{sec:checkout}) exists to change the
+files, and the tree it leaves behind is its result in the same sense
+that an exit code is a program's, so the caller may name the tree and
+the checkout names the one it restored
+(\cref{sec:restore-code-state}).
+That choice is what keeps the log honest afterwards.
+The branch tip then matches the work tree, so [[git status]] shows
+nothing staged, and the next run's diff against its parent---which is
+what the churn of \cref{metrics} measures---is the student's own
+editing.
+Left to the default, the trailer would copy the snapshot, and the
+first run after a checkout would be charged with undoing everything
+the student had done since the restored version.
+
+<<test functions>>=
+def test_finalize_run_can_record_the_tree_a_run_left(workdir):
+    """A trailer given a tree carries that tree, not the tip's."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    old = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    header_tree = repo.git(
+        "rev-parse", "HEAD^{tree}",
+    ).stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+        tree=f"{old}^{{tree}}",
+    )
+    trailer_tree = repo.git(
+        "rev-parse", "HEAD^{tree}",
+    ).stdout.strip()
+    old_tree = repo.git(
+        "rev-parse", f"{old}^{{tree}}",
+    ).stdout.strip()
+    assert trailer_tree == old_tree
+    assert trailer_tree != header_tree
+@
 
 That this is now one line is worth dwelling on, because it used to be
 the expensive half of a run.
@@ -4157,6 +4236,284 @@ def test_trailer_keeps_the_io_log_verbatim(workdir):
     )
     msg = repo.git("log", "-1", "--format=%B").stdout
     assert io_log in msg
+@
+
+
+\section{Restoring an earlier code state}
+\label{sec:restore-code-state}
+
+Everything above adds to the log; this section is the one operation
+that takes something out of it and puts it back in the work tree.
+[[learnlog checkout]] (\cref{sec:checkout}) lets a student return to
+the files of an earlier run, and the repository's part of that is to
+make the index and the work tree match a commit's tree without moving
+any ref.
+
+The obvious tool is [[git checkout <commit>]], and it is the wrong
+one for the reason [[git commit]] was (\cref{sec:awkward-state}): it
+moves [[HEAD]].
+Checking out a commit detaches [[HEAD]] onto it, and the student ends
+up where the escape hatch leaves them---off the branch, with a
+[[git status]] that says so.
+What we want is the second half of a checkout without the first:
+files and index updated, refs untouched.
+That is [[git read-tree -u --reset]], the plumbing that
+[[git reset --hard]] is built on, minus the ref move.
+It reads the commit's tree into the index and, with [[-u]], makes the
+work tree match: files the tree has are written, files the index had
+and the tree does not are removed, and files the index never knew
+about---the excluded ones---are left alone.
+[[--reset]] is what makes it unconditional.
+Without it Git refuses to overwrite a modified file, which is the
+right default for a person at a keyboard and the wrong one here,
+because the caller has just recorded every file it is about to
+overwrite (\cref{sec:checkout}), and a refusal would only stop the
+student from getting what they asked for.
+
+The restore runs under the commit lock, and the reason is the other
+half of the protocol.
+[[begin_run]] stages the work tree with [[git add .]] while holding
+that lock (\cref{sec:beginning-a-run}), so a restore running beside
+it could hand a concurrent run a tree with some files from before the
+restore and some from after---a code state that never existed on
+disk.
+Taking the lock makes the two exclusive: a run in flight finishes its
+snapshot before the files change, and a run started afterwards sees
+them changed.
+A program already \emph{executing} while its sources are rewritten is
+outside what a lock can settle, and it is the student's own doing.
+
+The last step is [[HEAD]].
+\cref{sec:recording-branch} makes a point of never re-attaching a
+[[HEAD]] the student detached, because a recorder that undoes a
+checkout is interfering with the work it observes.
+This is not the recorder: it is the student asking, through learnlog,
+for the restored version to be the next one on the log, and a
+[[HEAD]] parked at some older commit contradicts that request.
+So a detached [[HEAD]] is pointed back at the recording branch with
+[[git symbolic-ref]], which changes what [[HEAD]] names and touches
+neither the index nor the files just restored.
+An attached [[HEAD]] is left alone, and a repository with no branch at
+all---one the student deleted, since [[init]] always makes one---has
+nothing to re-attach to, which is what the [[refs/heads/]] guard
+checks.
+
+<<repo methods>>=
+def restore_code_state(self, commit):
+    """Make the index and work tree match `commit`'s tree.
+
+    No ref moves.  A detached `HEAD` is re-attached to the
+    recording branch so the next run continues there.
+    """
+    with self.commit_lock():
+        branch = self.recording_branch()
+        self.git(
+            "read-tree", "-u", "--reset", commit,
+            timeout=GIT_TREE_TIMEOUT,
+        )
+        <<re-attach a detached [[HEAD]] to the recording branch>>
+@
+
+<<re-attach a detached [[HEAD]] to the recording branch>>=
+_, attached = self.head_state()
+if attached is None and branch.startswith("refs/heads/"):
+    self.git("symbolic-ref", "HEAD", branch)
+@
+
+Two limits are worth stating, because \cref{sec:checkout} promises
+the student that nothing is lost, and the promise holds for
+everything the log records.
+A file the student excluded from the log ([[.learnlogignore]]) is
+outside the snapshot, and if the restored commit tracks a file of
+that name from before it was excluded, the restore writes the old
+content over the unrecorded new one.
+And a project root that is also an ordinary Git checkout
+(\cref{sec:find-learnlog-dir}) sees the restore as what it is to that
+repository: modified files, to be committed or discarded there like
+any other edit.
+
+Let's verify the restore against a real history: the tree comes back
+exactly---content restored, a newer file removed---without a commit
+and without moving [[HEAD]] off the branch.
+The index is checked as well as the files, since a restore that left
+the index behind would have the next [[git add .]] undo it.
+
+<<test functions>>=
+def test_restore_code_state_matches_the_commit(workdir):
+    """Index and work tree become the commit's tree; refs stay."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    (workdir / "hello.py").write_text('print("v1")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    old = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    (workdir / "extra.py").write_text("pass\n")
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+    tip = repo.git("rev-parse", branch).stdout.strip()
+
+    repo.restore_code_state(old)
+
+    assert (workdir / "hello.py").read_text() == 'print("v1")\n'
+    assert not (workdir / "extra.py").exists()
+    assert repo.git(
+        "diff-index", "--quiet", "--cached", old, check=False,
+    ).returncode == 0
+    assert repo.git(
+        "diff-index", "--quiet", old, check=False,
+    ).returncode == 0
+    assert repo.git("rev-parse", branch).stdout.strip() == tip
+    assert repo.git(
+        "symbolic-ref", "--quiet", "HEAD",
+    ).stdout.strip() == branch
+@
+
+A [[HEAD]] the student detached beforehand comes back to the branch,
+and to the branch's tip rather than the restored commit, since the
+branch is where the next run goes:
+
+<<test functions>>=
+def test_restore_code_state_reattaches_a_detached_head(workdir):
+    """A detached HEAD is put back on the recording branch."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    old = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    tip = repo.git("rev-parse", branch).stdout.strip()
+    repo.git("checkout", "--detach", old)
+
+    repo.restore_code_state(old)
+
+    assert repo.git(
+        "symbolic-ref", "--quiet", "HEAD",
+    ).stdout.strip() == branch
+    assert repo.git("rev-parse", "HEAD").stdout.strip() == tip
+    assert repo.git("rev-parse", branch).stdout.strip() == tip
+@
+
+The point of all this is the run that follows, so the last test is
+the one the command is for: after a restore, the next run's header
+carries the restored tree, sits on top of the previous tip, and the
+branch has grown by the usual two commits.
+
+<<test functions>>=
+def test_next_run_after_a_restore_continues_the_branch(workdir):
+    """The restored tree is what the next run records, in line."""
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    (workdir / "hello.py").write_text('print("v1")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    old = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+    tip = repo.git("rev-parse", branch).stdout.strip()
+    before = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+
+    repo.restore_code_state(old)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 10),
+    )
+    header = repo.run_commit
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 10, 1),
+        exit_code=0,
+    )
+
+    assert repo.git(
+        "rev-parse", f"{header}^{{tree}}",
+    ).stdout.strip() == repo.git(
+        "rev-parse", f"{old}^{{tree}}",
+    ).stdout.strip()
+    assert repo.git(
+        "rev-parse", f"{header}^",
+    ).stdout.strip() == tip
+    after = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+    assert after == before + 2
+    assert repo.git(
+        "symbolic-ref", "--quiet", "HEAD",
+    ).stdout.strip() == branch
+@
+
+An excluded file is outside the log, so it is outside the restore
+too; the test writes the exclusion before constructing the repository,
+which is when the exclude file is derived:
+
+<<test functions>>=
+def test_restore_code_state_leaves_excluded_files(workdir):
+    """A file the log excludes is not the restore's to touch."""
+    (workdir / ".learnlogignore").write_text("notes.txt\n")
+    (workdir / "notes.txt").write_text("mine\n")
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    old = repo.git("rev-parse", "HEAD").stdout.strip()
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 5, 1),
+        exit_code=0,
+    )
+
+    repo.restore_code_state(old)
+
+    assert (workdir / "notes.txt").read_text() == "mine\n"
+    assert (workdir / "hello.py").read_text() == 'print("hello")\n'
 @
 
 
