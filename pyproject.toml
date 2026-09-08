@@ -29,9 +29,13 @@ repository = "https://github.com/dbosk/learnlog"
 
 [tool.poetry]
 packages = [{include = "learnlog", from = "src"}]
+# The tutorial catalog is tangled (gitignored), so it must be included
+# explicitly; the glob starts with a lowercase letter because include
+# beats exclude, and a stray CLAUDE.md in that directory would otherwise
+# ship in the wheel.
 include = [
   {path = "src/**/*.py", format = "wheel"},
-  {path = "src/learnlog/tutorials/*.md", format = "wheel"},
+  {path = "src/learnlog/tutorials/[a-z]*.md", format = "wheel"},
 ]
 exclude = [
   "src/learnlog/.gitignore",
