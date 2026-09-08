@@ -4,7 +4,7 @@
 The [[learnlog]] command lets students prepare projects for
 logging and lets both students and teachers manage and review
 the development logs that are produced.
-It provides sixteen subcommands: [[init]] prepares a project
+It provides seventeen subcommands: [[init]] prepares a project
 directory (creating [[.learnlog/]] and installing [[learnlog]]
 for the student's chosen language), [[doctor]] reports whether
 the running interpreter still records runs and can repair the
@@ -18,8 +18,9 @@ education analysis), [[set-remote]], [[push]], [[clone]], and
 [[pull]] manage synchronisation with a remote Git repository,
 [[git]] forwards Git commands to the log repository, [[tag]]
 manages named markers in the log (such as [[lab1]] or
-[[lab2]]), [[play]] gives an interactive viewer for browsing
-the commit history, [[analyse]] generates \LaTeX{} reports
+[[lab2]]), [[checkout]] brings the files of an earlier run
+back as the next version, [[play]] gives an interactive viewer
+for browsing the commit history, [[analyse]] generates \LaTeX{} reports
 of edit--run cycles from a ProgSnap2 dataset, optionally
 filtered by a [[Column=Regex]] range, and [[metrics]] summarises
 the student's own time, errors and code per day, week or month
@@ -130,10 +131,12 @@ from learnlog._autostart import (
 )
 from learnlog.gitrepo import (
     GIT_TREE_TIMEOUT,
+    GitError,
     LearnlogRepo,
     git_environment,
 )
 from learnlog.commits import (
+    CHECKOUT_SUBCOMMAND,
     get_commits,
     get_tag_map,
     scan_run_commits,
@@ -2227,7 +2230,7 @@ def test_marker_contents_reports_unreadable_marker(tmp_path):
 
 \section{Typer application}
 
-We define the Typer app at module level with fifteen
+We define the Typer app at module level with sixteen
 commands and one command group, [[metrics]].
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
@@ -3430,8 +3433,9 @@ The [[--success]] and [[--failure]] flags narrow the listing to
 commits that contain at least one run of the requested outcome.
 A teacher chasing down where a student got stuck passes
 [[--failure]]; a student searching for a working version to
-revert to passes [[--success]] and uses the last line as the
-hash to check out.  Because a commit's outcomes form a set
+revert to passes [[--success]] and hands the last line's hash
+to [[learnlog checkout]] (\cref{sec:checkout}).  Because a
+commit's outcomes form a set
 (\cref{sec:commit-outcomes}), a commit with both a successful
 and a failed run appears under both flags---this matters for the
 recovery workflow, where the student's most recent known-good
@@ -5828,8 +5832,13 @@ were a normal [[.git/]] directory.
 The command itself is hidden from [[learnlog --help]], and the
 audience is why.
 Every ordinary need this command once served has an ordinary command
-of its own---[[list]], [[play]], [[tag]], [[export]]---and each of
-those knows the two-commit protocol it is reading; raw Git does not.
+of its own---[[list]], [[play]], [[tag]], [[export]],
+[[checkout]]---and each of those knows the two-commit protocol it is
+reading; raw Git does not.
+Going back to an older version is the newest of them:
+[[learnlog git checkout <hash>]] still works and still detaches
+[[HEAD]], but [[learnlog checkout]] (\cref{sec:checkout}) is the
+supported way, and the one that keeps the student on the branch.
 A student who discovers a general Git passthrough in the help output
 will sooner or later drive the log with advice written for a source
 repository, and \cref{sec:git-guards} is the catalogue of how that
@@ -6516,6 +6525,444 @@ def test_tag_command_no_learnlog_dir(
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
     result = runner.invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 1
+@
+
+
+\subsection{The [[checkout]] command}
+\label{sec:checkout}
+
+[[learnlog list --success]] ends with the hash of the last version
+that worked, and the question a student asks next is how to get it
+back.
+The answer used to be the escape hatch,
+[[learnlog git checkout <hash>]], and it has two problems that are
+really one.
+Git's checkout moves [[HEAD]] onto the commit, so the student ends up
+detached: the runs they record afterwards still reach the branch
+(\cref{sec:recording-branch}), but [[git status]] says
+[[HEAD detached]], the log they see from there is the old one, and
+nothing tells them how to get back.
+And it refuses when a modified file would be overwritten, which is
+the right instinct---those edits are in no commit---and the wrong
+outcome, since the student has no way to commit them except to run
+the program they are trying to abandon.
+
+[[learnlog checkout <run>]] answers both by doing one thing first: it
+records the files as they are, as an ordinary run record whose header
+is a snapshot of the work tree, and only then restores the earlier
+tree (\cref{sec:restore-code-state}) and closes the record with a
+trailer that carries the restored tree.
+The snapshot is what makes the overwrite safe---every file about to
+be replaced is in the log before it goes---and it is why this command
+may overwrite without asking where the passthrough refuses.
+[[HEAD]] never leaves the branch, so the restored files are simply
+the next version the log commits: the branch tip's tree \emph{is} the
+restored tree, [[git status]] is clean, and the next run's diff is
+the student's own editing rather than the reversion.
+The record is written by the command, not by the autostart that
+records [[play]] and [[list]] (\cref{sec:veto}), because the command
+has to know the snapshot exists before it touches a file, and because
+a mistyped hash must not leave a record of a checkout that never
+happened.
+Two same-named commands with different manners are a trap, so the
+difference is stated once, plainly: the passthrough is safe by
+refusal and leaves the student detached; this command is safe by
+snapshot and keeps them on the branch.
+
+<<typer commands>>=
+@app.command()
+def checkout(
+    run: Annotated[str, typer.Argument(
+        help="A run's hash from `learnlog list`, or a tag.",
+    )],
+):
+    """Bring back the files of an earlier run as your next version.
+
+    The files you have now are recorded first, so nothing is
+    lost, and your next run continues the log from the
+    restored version.
+    """
+    workdir = find_learnlog_dir()
+    if workdir is None:
+        raise SystemExit("No .learnlog/ directory found.")
+    repo = LearnlogRepo(workdir)
+    <<resolve the run to restore>>
+    <<refuse while a Git operation is unfinished>>
+    <<record the files about to be replaced>>
+    <<restore the run and close its record>>
+    <<confirm the restore and the way back>>
+@
+
+The argument is whatever the student has to hand: the seven-character
+hash that [[list]] and the viewer print, a tag, or any revision Git
+understands.
+It is peeled with [[git rev-parse]] before [[resolve_record_commit]]
+sees it, in that order for the reason [[play --from]] gives
+(\cref{sec:play}): the record map is keyed by full hashes, so a tag or
+an abbreviated hash handed over directly would miss it and fall to
+the topological guess that \cref{sec:trailer-refs} explains is wrong
+whenever two runs overlapped.
+Resolving matters because a tag lands on the trailer of the last run,
+and a trailer's tree is not that run's own; the header is the state
+the run executed.
+The commit then has to be on the recording branch: a hash from
+elsewhere in the object database is not \enquote{a run in this log},
+and refusing it is what keeps the restore inside the history the
+student can see.
+A typo therefore fails before anything is recorded.
+
+<<resolve the run to restore>>=
+peeled = repo.git(
+    "rev-parse", "--verify", "--quiet", f"{run}^{{commit}}",
+    check=False,
+)
+target = None
+if peeled.returncode == 0:
+    target = resolve_record_commit(repo, peeled.stdout.strip())
+    on_branch = repo.git(
+        "merge-base", "--is-ancestor",
+        target, repo.recording_branch(), check=False,
+    )
+    if on_branch.returncode != 0:
+        target = None
+if target is None:
+    raise SystemExit(
+        f"{run} is not a run in this log; "
+        "pick a hash or tag from learnlog list."
+    )
+subject = repo.git(
+    "log", "-1", "--format=%s", target, check=False,
+).stdout.strip()
+@
+
+A merge or rebase the student left half-finished in the log is the one
+state the restore cannot be made safe in.
+[[begin_run]] does not publish its index while one is in progress
+(\cref{sec:beginning-a-run}), so the shared index the restore would
+rewrite is stale, and [[read-tree --reset]] discards the unmerged
+entries that are the operation's whole state.
+Refusing costs the student one [[learnlog git merge --abort]]; going
+ahead would cost them the merge.
+
+<<refuse while a Git operation is unfinished>>=
+unfinished = repo.unfinished_operation()
+if unfinished:
+    raise SystemExit(
+        f"A Git operation is unfinished in the log ({unfinished}); "
+        "finish or abort it, for example with "
+        "learnlog git merge --abort, before checking out."
+    )
+@
+
+The snapshot is the same [[begin_run]] every program run starts with,
+named as a [[learnlog]] run so the readers classify it
+(\cref{sec:filter-learnlog}), and its header hash is what the
+confirmation will hand the student as the way back.
+A snapshot that cannot be made ends the command before any file is
+touched, because an unrecorded overwrite is the one outcome this
+command exists to rule out.
+
+<<record the files about to be replaced>>=
+try:
+    repo.begin_run(
+        "learnlog", [CHECKOUT_SUBCOMMAND, run],
+        datetime.datetime.now(),
+    )
+except GitError as error:
+    raise SystemExit(
+        "Could not record your current files, so nothing was "
+        f"restored: {error}"
+    )
+snapshot = repo.run_commit
+@
+
+The trailer closes the record whether the restore succeeded or not,
+so that a failed checkout reads as one in the log rather than as a
+run that never ended.
+What it carries differs: a success records the confirmation as the
+run's output and names the restored tree
+(\cref{sec:restore-code-state}), a failure records Git's complaint
+and leaves the tree at its default, since how far a failed
+[[read-tree]] got is not something to guess at.
+Only [[GitError]] is caught; anything else is not a failed restore
+but a failed command, and it propagates with the record left open,
+exactly as a killed program run leaves its header.
+
+<<restore the run and close its record>>=
+confirmation = [
+    f"{run} -> {subject}; files restored, "
+    "your next run continues from here",
+    f"Your previous files were recorded as {snapshot[:7]}: "
+    f"learnlog checkout {snapshot[:7]} brings them back",
+]
+failure = None
+try:
+    repo.restore_code_state(target)
+except GitError as error:
+    failure = str(error)
+if failure is None:
+    io_log = "".join(f"stdout: {line}\n" for line in confirmation)
+    tree = f"{target}^{{tree}}"
+else:
+    io_log = f"stderr: {failure}\n"
+    tree = None
+repo.finalize_run(
+    io_log=io_log,
+    exception_info=None,
+    end_time=datetime.datetime.now(),
+    exit_code=0 if failure is None else 1,
+    tree=tree,
+)
+@
+
+<<confirm the restore and the way back>>=
+if failure is not None:
+    raise SystemExit(f"Restoring {run} failed: {failure}")
+for line in confirmation:
+    typer.echo(line)
+@
+
+Let's verify the whole promise on one history: two runs, then an
+edit that was never run.
+The checkout brings the first run's files back and removes the file
+the second run added; the branch grows by exactly one record, whose
+header holds the unrun edit; the trailer's tree is the restored one,
+so the work tree is clean against the tip; and [[HEAD]] is still on
+the branch.
+
+<<test functions>>=
+def _record_run(repo, source, moment):
+    """Write ``source`` to hello.py and record one run of it."""
+    (repo.workdir / "hello.py").write_text(source)
+    repo.begin_run("hello.py", [], moment)
+    header = repo.run_commit
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=moment + datetime.timedelta(seconds=1),
+        exit_code=0,
+    )
+    return header
+
+def test_checkout_restores_and_records(workdir, monkeypatch):
+    """Files come back; the replaced ones go into the log first."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    old = _record_run(
+        repo, 'print("v1")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "extra.py").write_text("pass\n")
+    _record_run(
+        repo, 'print("v2")\n', datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    (workdir / "hello.py").write_text('print("v3, never run")\n')
+    before = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+
+    result = runner.invoke(app, ["checkout", old[:7]])
+    assert result.exit_code == 0, result.output
+
+    assert (workdir / "hello.py").read_text() == 'print("v1")\n'
+    assert not (workdir / "extra.py").exists()
+    after = int(repo.git(
+        "rev-list", "--count", branch,
+    ).stdout.strip())
+    assert after == before + 2
+    header = repo.git("rev-parse", f"{branch}~1").stdout.strip()
+    subject = repo.git(
+        "log", "-1", "--format=%s", header,
+    ).stdout.strip()
+    assert subject == f"Run: learnlog checkout {old[:7]}"
+    assert repo.git(
+        "show", f"{header}:hello.py",
+    ).stdout == 'print("v3, never run")\n'
+    assert repo.git(
+        "rev-parse", f"{branch}^{{tree}}",
+    ).stdout.strip() == repo.git(
+        "rev-parse", f"{old}^{{tree}}",
+    ).stdout.strip()
+    assert repo.git("status", "--porcelain").stdout == ""
+    assert repo.git(
+        "symbolic-ref", "--quiet", "HEAD",
+    ).stdout.strip() == branch
+    assert f"recorded as {header[:7]}" in result.output
+    assert "next run continues" in result.output
+@
+
+The confirmation's second line is the way back, and it has to work as
+printed: checking out the snapshot restores the edit that was never
+run.
+
+<<test functions>>=
+def test_checkout_can_be_undone_with_the_snapshot(
+    workdir, monkeypatch,
+):
+    """The printed snapshot hash checks out to the replaced files."""
+    import re
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    old = _record_run(
+        repo, 'print("v1")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "hello.py").write_text('print("v2, never run")\n')
+
+    result = runner.invoke(app, ["checkout", old[:7]])
+    assert result.exit_code == 0, result.output
+    assert (workdir / "hello.py").read_text() == 'print("v1")\n'
+    snapshot = re.search(
+        r"recorded as ([0-9a-f]{7})", result.output,
+    ).group(1)
+
+    result = runner.invoke(app, ["checkout", snapshot])
+    assert result.exit_code == 0, result.output
+    assert (workdir / "hello.py").read_text() == \
+        'print("v2, never run")\n'
+@
+
+A tag is the argument the tutorial teaches, and it is the case that
+proves the peel-then-resolve order: the tag sits on the first run's
+trailer, and the files that come back must be that run's.
+
+<<test functions>>=
+def test_checkout_accepts_a_tag(workdir, monkeypatch):
+    """A tag on a trailer restores the run the tag names."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    _record_run(
+        repo, 'print("v1")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.git("tag", "lab1")
+    _record_run(
+        repo, 'print("v2")\n', datetime.datetime(2026, 1, 1, 10, 5),
+    )
+
+    result = runner.invoke(app, ["checkout", "lab1"])
+    assert result.exit_code == 0, result.output
+    assert (workdir / "hello.py").read_text() == 'print("v1")\n'
+    assert "lab1 -> Run: hello.py" in result.output
+@
+
+Refusals must come before the record: a name that is not in the log,
+a commit that exists but not on the branch, and an unfinished merge
+all leave the history and the files exactly as they were.
+
+<<test functions>>=
+def test_checkout_refuses_what_is_not_in_the_log(
+    workdir, monkeypatch,
+):
+    """Unknown refs and off-branch commits change nothing."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    _record_run(
+        repo, 'print("v1")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "hello.py").write_text('print("v2, never run")\n')
+    stray = repo.git(
+        "commit-tree", f"{branch}^{{tree}}", input="stray\n",
+    ).stdout.strip()
+    before = repo.git("rev-parse", branch).stdout.strip()
+
+    for ref in ("nonesuch", stray):
+        result = runner.invoke(app, ["checkout", ref])
+        assert result.exit_code == 1, result.output
+        assert "not a run in this log" in result.output
+    assert repo.git("rev-parse", branch).stdout.strip() == before
+    assert (workdir / "hello.py").read_text() == \
+        'print("v2, never run")\n'
+
+def test_checkout_refuses_during_an_unfinished_merge(
+    workdir, monkeypatch,
+):
+    """A half-finished merge in the log stops the checkout."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    old = _record_run(
+        repo, 'print("v1")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / ".learnlog" / "MERGE_HEAD").write_text(old + "\n")
+    before = repo.git("rev-parse", branch).stdout.strip()
+
+    result = runner.invoke(app, ["checkout", old[:7]])
+    assert result.exit_code == 1, result.output
+    assert "MERGE_HEAD" in result.output
+    assert repo.git("rev-parse", branch).stdout.strip() == before
+@
+
+The point of restoring onto the branch is the run that follows, so
+the last test records one: its header sits on the checkout's trailer,
+[[list]] shows the checkout between the two, and the churn that
+\cref{metrics} charges the new run is the one line the student added
+after the restore, not the reversion.
+
+<<test functions>>=
+def test_next_run_after_checkout_is_charged_only_its_edit(
+    workdir, monkeypatch,
+):
+    """The run after a checkout continues in line, with clean churn."""
+    from learnlog.cli import app
+    from learnlog.metrics import run_records
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    old = _record_run(
+        repo, 'print("v1")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    _record_run(
+        repo, 'print("v2")\nprint("v2")\nprint("v2")\n',
+        datetime.datetime(2026, 1, 1, 10, 5),
+    )
+
+    result = runner.invoke(app, ["checkout", old[:7]])
+    assert result.exit_code == 0, result.output
+    trailer = repo.git("rev-parse", branch).stdout.strip()
+
+    header = _record_run(
+        repo, 'print("v1")\nprint("one more")\n',
+        datetime.datetime(2026, 1, 1, 10, 10),
+    )
+    assert repo.git(
+        "rev-parse", f"{header}^",
+    ).stdout.strip() == trailer
+    record = run_records(repo)[-1]
+    assert (record.lines_added, record.lines_removed) == (1, 0)
+
+    listing = runner.invoke(app, ["list"])
+    assert listing.exit_code == 0, listing.output
+    lines = listing.output.splitlines()
+    assert any(f"learnlog checkout {old[:7]}" in l for l in lines)
+    assert lines.index(
+        next(l for l in lines if "learnlog checkout" in l)
+    ) == len(lines) - 2
+
+def test_checkout_no_learnlog_dir(tmp_path, monkeypatch):
+    """Error when no .learnlog/ directory exists."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(app, ["checkout", "abc1234"])
     assert result.exit_code == 1
 @
 
@@ -8019,8 +8466,9 @@ The setting is read and written with [[learnlog config]], which knows
 its keys---only [[linter]] so far---and validates the value before
 Git stores it, so that what is stored is always something
 [[configured_linter]] accepts.
-Like every subcommand outside [[REVIEW_SUBCOMMANDS]] it leaves no run
-record.
+Like every subcommand outside [[REVIEW_SUBCOMMANDS]]---[[checkout]]
+excepted, which records itself (\cref{sec:checkout})---it leaves no
+run record.
 
 <<helper functions>>=
 class ConfigKey(str, enum.Enum):
