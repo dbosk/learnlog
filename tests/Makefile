@@ -4,6 +4,16 @@
 # chunks named "<<test [[modulename.py]]>>". This Makefile automatically
 # discovers those chunks and tangles them to tests/unit/test_*.py files.
 
+# The suite imports learnlog into the pytest process itself, which
+# would otherwise start a run and commit the checkout into whatever
+# repository the upward search finds.  The opt-out is honoured by
+# initialize() on every import path (see learnlog.nw), so exporting it
+# here keeps the test run out of anybody's log.  Subprocess tests that
+# need logging strip it again from the environment they pass on (the
+# test_env fixture and _autostart_env do exactly that), so this does
+# not weaken what the suite checks.
+export LEARNLOG_SKIP_AUTOSTART = 1
+
 # Auto-discover test chunks in .nw files
 # A single .nw file may define several "<<test [[X.py]]>>" chunks, one per
 # module it tests; emit one target per distinct chunk.
@@ -47,10 +57,15 @@ all: unit/conftest.py $(TEST_MODULES)
 # Generate rules for each test
 $(foreach entry,$(TESTS),$(eval $(call def_target,$(entry))))
 
-# Target to run tests after tangling
+# Target to run tests after tangling.  The runner is overridable so
+# the suite works where `poetry run` does not resolve the project's
+# venv -- a git worktree mints a fresh empty venv instead.  E.g.:
+#   make test PYTEST="env PYTHONPATH=$$PWD/../src python -m pytest"
+PYTEST ?= poetry run pytest
+
 .PHONY: test
 test: all compile
-	poetry run pytest -v
+	$(PYTEST) -v
 
 .PHONY: compile
 compile:

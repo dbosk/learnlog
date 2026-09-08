@@ -45,6 +45,7 @@ from learnlog.capture import *
 
 
 \section{The shared I/O log}
+\label{sec:iolog-cap}
 
 The central piece is [[IOLog]]---a thread-safe buffer that collects
 lines from all three streams in the order they arrive.
@@ -56,6 +57,19 @@ prevent a long-running program from consuming unbounded memory.
 Once the cap is reached, we stop recording but continue passing data
 through to the original streams---the student's program still works
 normally.
+
+The cap bounds memory, and nothing else.
+It is worth saying so explicitly, because for a while it also had to
+absorb a limit it was never designed for: the captured log ends up in a
+commit message, and while messages travelled in [[argv]] anything past
+128\,KiB destroyed the whole trailer
+(\cref{sec:commit-message-stdin}).
+Shrinking the cap below that would have hidden the symptom by throwing
+away student output instead---a poor trade for a log whose purpose is to
+keep that output.
+Now that message text reaches Git on standard input, the only question
+the cap has to answer is how much of a runaway program's output we are
+willing to hold in memory, and one megabyte remains a reasonable answer.
 
 <<constants>>=
 MAX_IOLOG_BYTES = 1_000_000
@@ -69,24 +83,132 @@ using ANSI escape codes (CSI sequences such as \verb|\x1b[31m| for red
 text).
 These sequences are meaningful to a terminal emulator but are
 unreadable noise when stored as plain text in a Git commit message.
-We therefore strip all CSI sequences from captured text before
+We therefore strip escape sequences from captured text before
 buffering it, while still passing the raw (coloured) text through to
 the student's terminal unchanged.
 
-The regex matches the standard CSI pattern: an escape character
-(\verb|\x1b|), a left bracket, optional numeric parameters separated
-by semicolons, and a single letter command.
-This covers colours, bold/underline, cursor movement, and line
-clearing---everything Python's traceback colouring produces.
-We precompile the pattern into a module-level constant because
+Colour codes are only the easiest family to recognise, and matching
+just them is not enough.
+As soon as a student uses [[curses]], [[rich]], [[tqdm]], or any
+library that repaints the terminal, the captured text also contains
+window titles, cursor visibility toggles, alternate-screen switches,
+and character-set designations.
+Those all sit outside the \enquote{digits and a letter} shape, so a
+pattern written for colours leaves them behind and the commit message
+still reads as garbage.
+Rather than enumerating the sequences we happen to have seen, we
+implement the grammar that ECMA-48 (equivalently, ISO/IEC~6429)
+actually defines, because that grammar tells us where each sequence
+\emph{ends}---which is the only information stripping needs.
+
+The grammar splits escape sequences into four families, and we write
+one alternative per family:
+
+\begin{description}
+\item[Control sequences (CSI)] \verb|\x1b[| followed by parameter
+  bytes, then intermediate bytes, then one final byte that terminates
+  the sequence.
+\item[Command strings] \verb|\x1b]| (OSC) and \verb|\x1bP|,
+  \verb|\x1bX|, \verb|\x1b^|, \verb|\x1b_| (DCS, SOS, PM, APC), which
+  carry a free-form payload and are terminated by an explicit string
+  terminator instead of by a final byte.
+\item[Escape sequences with intermediates] \verb|\x1b| followed by
+  intermediate bytes and a final byte, e.g.\ the character-set
+  designation \verb|\x1b(B|.
+\item[Two-character escapes] \verb|\x1b| followed directly by a final
+  byte, e.g.\ \verb|\x1bM| (reverse index) or \verb|\x1b7| (save
+  cursor).
+\end{description}
+
+The families overlap---\verb|\x1b[| and \verb|\x1b]| are also valid
+two-character escapes---so the order of the alternatives is
+load-bearing: Python's [[re]] prefers the leftmost alternative that
+matches, so the string and control families must be written before the
+generic escape catch-all.
+We precompile the joined pattern into a module-level constant because
 [[strip_ansi]] is called on every single write.
+Transparency puts a budget on this: the alternation costs more than
+the single colour pattern did---measured at roughly 8~ms per megabyte
+of output against 0.5~ms before---which stays far below what a student
+could notice at the output volumes the 1~MB buffer cap allows.
 
 <<helper functions>>=
-_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+_ANSI_ESCAPE_RE = re.compile("|".join([
+    <<ANSI escape sequence patterns>>
+]))
 
 def strip_ansi(text):
     """Remove ANSI escape sequences from ``text``."""
     return _ANSI_ESCAPE_RE.sub('', text)
+@
+
+An operating system command carries a payload---a window title, a
+hyperlink, a clipboard blob---and is closed either by a [[BEL]]
+(\verb|\x07|, what \texttt{xterm} historically accepted) or by the
+string terminator \verb|\x1b\\|.
+Excluding both introducer bytes from the payload class is what keeps
+the match linear: the payload class and the terminators are disjoint,
+so the engine never has to try alternative splits of the same input.
+An unterminated OSC simply fails to match here and falls through to
+the two-character escape alternative, which removes the introducer and
+leaves the payload as readable text---strictly better than dropping
+the remainder of the log.
+
+<<ANSI escape sequence patterns>>=
+r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)",
+@
+
+The other string families (DCS for terminal queries, SOS, PM, and APC
+for application data such as \texttt{kitty} graphics) accept only the
+string terminator, so their payload class need exclude only
+\verb|\x1b|.
+
+<<ANSI escape sequence patterns>>=
+r"\x1b[PX^_][^\x1b]*\x1b\\",
+@
+
+The control sequence introducer takes parameter bytes
+(\verb|0x30|--\verb|0x3f|, which is where the private-use marker
+\verb|?| of \verb|\x1b[?25l| lives), then intermediate bytes
+(\verb|0x20|--\verb|0x2f|, used by e.g.\ the soft reset
+\verb|\x1b[!p|), then a final byte (\verb|0x40|--\verb|0x7e|).
+Writing the ranges rather than \verb|[0-9;]| and \verb|[A-Za-z]| is
+precisely what fixes the private and intermediate forms.
+
+<<ANSI escape sequence patterns>>=
+r"\x1b\[[0-?]*[ -/]*[@-~]",
+@
+
+The last escape alternative covers both remaining families at once,
+because they differ only in whether intermediate bytes are present:
+zero or more intermediates (\verb|0x20|--\verb|0x2f|) followed by one
+final byte (\verb|0x30|--\verb|0x7e|).
+The two ranges are disjoint, so this alternative cannot backtrack
+either.
+
+<<ANSI escape sequence patterns>>=
+r"\x1b[ -/]*[0-~]",
+@
+
+Terminals may also send the C1 controls as single bytes instead of as
+two-byte escapes.
+We match the 8-bit control sequence introducer \verb|\x9b|, and
+deliberately \emph{not} the 8-bit string introducers.
+The reason is that [[strip_ansi]] works on [[str]], where \verb|\x9b|
+is the code point U+009B and nothing else; had we matched the byte
+\verb|0x9b| in a [[bytes]] object it would also occur inside the UTF-8
+encoding of ordinary characters (U+061B encodes as \verb|0xd8 0x9b|),
+and stripping it would corrupt the text.
+Working on decoded text removes that hazard, but not the risk that a
+\verb|\x9b| in a [[str]] is the debris of a mis-decode rather than a
+real control.
+A C1 control sequence is self-delimiting and short, so a false match
+costs a few characters; a C1 \emph{string} introducer would run to its
+terminator and could swallow the rest of the log.
+We therefore take the bounded case only.
+
+<<ANSI escape sequence patterns>>=
+r"\x9b[0-?]*[ -/]*[@-~]",
 @
 
 We need to verify two directions: that escape codes are actually
@@ -109,7 +231,87 @@ def test_strip_ansi_handles_multiple_codes():
 
 def test_strip_ansi_empty_string():
     assert strip_ansi("") == ""
+@
 
+Each of the remaining families needs its own case, because each one
+was silently left in the log by the colours-only pattern.
+We use [[pytest.mark.parametrize]] so that a family which regresses
+names itself in the failure report instead of hiding behind an
+assertion further up a shared test body.
+The samples are the ones a real full-screen program emits: the
+alternate screen and cursor toggles from [[curses]], the window title
+that a shell or a progress bar sets, a terminal capability query, a
+[[kitty]] graphics payload, and the character-set and cursor-save
+escapes that [[less]] and [[vim]] leave behind on exit.
+
+<<test functions>>=
+@pytest.mark.parametrize("family,text", [
+    ("private CSI", "\x1b[?1049hbody\x1b[?1049l"),
+    ("cursor hiding", "\x1b[?25lbody\x1b[?25h"),
+    ("CSI intermediates", "\x1b[!pbody"),
+    ("OSC with BEL", "\x1b]0;window title\x07body"),
+    ("OSC with ST", "\x1b]8;;http://x/\x1b\\body"),
+    ("DCS", "\x1bP+q544e\x1b\\body"),
+    ("APC", "\x1b_Ga=T,f=100;payload\x1b\\body"),
+    ("PM", "\x1b^private\x1b\\body"),
+    ("SOS", "\x1bXstring\x1b\\body"),
+    ("charset designation", "\x1b(B\x1b)0body\x1b%G"),
+    ("two-character escape", "\x1bMbody\x1b7\x1b8"),
+    ("keypad mode", "\x1b=body\x1b>"),
+    ("full reset", "\x1bcbody"),
+    ("8-bit CSI", "\x9b31mbody\x9b0m"),
+])
+def test_strip_ansi_removes_escape_family(family, text):
+    assert strip_ansi(text) == "body"
+@
+
+The opposite direction matters just as much.
+Extending the grammar widens what we delete, so we pin down that text
+which merely \emph{looks} like an escape sequence---brackets, a regular
+expression, a shell prompt---survives untouched.
+The last sample is written with numeric escapes so that the literate
+source stays ASCII; it is the Arabic semicolon U+061B, chosen because
+its UTF-8 encoding contains the byte \verb|0x9b| that the 8-bit
+alternative matches.
+As a decoded [[str]] it is a single code point that the pattern cannot
+see, which is exactly the property that makes the 8-bit alternative
+safe.
+
+<<test functions>>=
+@pytest.mark.parametrize("text", [
+    "matches [0-9;]+ in a[1] and b[?25l\n",
+    "$ ls ]0;title (B M P _ ^ X\n",
+    "a[[b]] and c]]d and e[?]f\n",
+    "caf\xe9 \u061b \u2014 done\n",
+])
+def test_strip_ansi_leaves_escape_free_text_alone(text):
+    assert strip_ansi(text) == text
+@
+
+A stray escape character with nothing that completes a sequence has no
+valid interpretation, and guessing one would delete real output.
+Such input is left alone:
+
+<<test functions>>=
+def test_strip_ansi_keeps_incomplete_escape():
+    assert strip_ansi("tail\x1b") == "tail\x1b"
+@
+
+An unterminated command string is the interesting boundary case: the
+string alternatives cannot match, so only the introducer is removed
+and the payload stays readable rather than the rest of the capture
+disappearing with it.
+
+<<test functions>>=
+def test_strip_ansi_unterminated_osc_keeps_payload():
+    assert strip_ansi("\x1b]0;title") == "0;title"
+@
+
+Stripping is only useful if it happens on the path the captured text
+actually takes, so one test goes through [[IOLog]] rather than calling
+[[strip_ansi]] directly:
+
+<<test functions>>=
 def test_iolog_strips_ansi_from_logged_text():
     log = IOLog()
     log.log("stderr", "\x1b[31mTraceback\x1b[0m\n")

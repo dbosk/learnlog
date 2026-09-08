@@ -58,32 +58,128 @@ remote (web) sessions.
 
 ## Architecture
 
-Five modules, all defined as `.nw` literate source in `src/learnlog/`:
+The core modules, all defined as `.nw` literate source in `src/learnlog/`
+(`commits.nw` and `progsnap2.nw` hold the read and export sides):
 
 | Module | File | Purpose |
 |--------|------|---------|
-| `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup |
-| `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the project root, skips `learnlog init`, and activates `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs |
+| `__init__.py` | `learnlog.nw` | Auto-initializes on import; wraps stdout/stderr/stdin for transparent I/O capture; atexit cleanup; `find_learnlog_dir()`/`_resolve_workdir()` decide which project a run belongs to. `_is_opted_out()`/`_learnlog_cli_subcommand()` implement the recording veto: `LEARNLOG_SKIP_AUTOSTART`, plus **every CLI subcommand except `play`/`list`/`metrics`** (`REVIEW_SUBCOMMANDS`) — the veto returns *before* `_resolve_workdir()`, so a vetoed command creates no repository at all (`checkout` is vetoed like the rest and records itself from the CLI instead). Review runs skip both capture chunks and instead accumulate `view_trace` via the public `record_view(commit_hash, action)`. A run is owned by the pid that started it: `initialize()` records `run_pid` and registers `on_exit` immediately after `begin_run()` (before any stream wiring, which fails into "run recorded, I/O not captured"), and `on_exit`/`_release_c_invocation` return early in any other process, so a forked child cannot finalise its parent's run. `on_exit` restores the streams last, in a `finally`, so capture stays live until the trailer is composed. `_resolve_workdir()` exports `LEARNLOG_ANCHOR_PREFIX = sys.prefix` beside `LEARNLOG_PROJECT_ROOT` and obeys an inherited anchor only when the prefix matches (or is absent), so a child wired to a different project logs into its own |
+| `_autostart.py` | `learnlog.nw` | Venv startup hook installed via `.pth`; resolves the venv's project root (marker file + `sys.prefix`) for `initialize()`, and imports `learnlog` early enough to capture `SyntaxError`, `python -c`, REPL, `pip`, and other venv-scoped runs. Must never import `learnlog` at module scope: `import learnlog._autostart` already runs `__init__.py`, so the recording veto (`LEARNLOG_SKIP_AUTOSTART`, and every subcommand outside `REVIEW_SUBCOMMANDS`) lives in `initialize()`, not here |
 | `capture.py` | `capture.nw` | `IOLog` (thread-safe shared buffer), `StreamCapture`/`InputCapture` (transparent tee wrappers); strips ANSI escapes |
-| `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; crash-resilient commit strategy (commit header before run, amend with results after) |
-| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone`, `pull`, `set-remote`, `push`, `export` (git bundle), `play` (curses viewer + batch mode), `tag`, `git` (passthrough), and `analyse` |
+| `gitrepo.py` | `gitrepo.nw` | `LearnlogRepo` manages `.learnlog/` hidden Git repo with `--git-dir=.learnlog --work-tree=.`; append-only two-commit protocol (header commit with the code state before the run, trailer commit with the results after, linked by `Run-Id`). Run commits go in via `commit-tree` + guarded `update-ref` on `recording_branch()` (`commit_on_branch()`), so they never consummate a half-finished merge/cherry-pick/rebase (`unfinished_operation()`) and land on the recording branch even when HEAD is detached; the header uses a per-run `GIT_INDEX_FILE` (seeded with `copy2`, published back under git's own `index.lock` protocol), the trailer uses no index at all — `finalize_run(tree=)` lets a caller name the trailer's tree instead of the branch tip's, and `begin_run` keeps its header hash in `run_commit`, both for `learnlog checkout`; `restore_code_state(commit)` makes index and work tree match a commit's tree with `read-tree -u --reset` under the commit lock (a concurrent `begin_run` scans the work tree under that lock), never moves HEAD, and re-attaches a detached HEAD to `recording_branch()`; `run_index` cleanup removes the private index **and** its `.lock`, and `reclaim_run_indexes(lock)` sweeps killed runs' leftovers — only under a held commit lock (which now yields its handle), the proof that no `run_index` block is live. `_acquire_lock` re-checks the inode after `flock` so a deleted-and-recreated lock file cannot void mutual exclusion. `git_environment()` strips every ambient `GIT_*` variable except a transport/config allow-list. `ensure_configured()` runs on every construction (under the commit lock only when writing) and keeps `info/exclude` (incl. `.learnlogignore` and `*.learnlog`/`*.progsnap2`), `commit.gpgsign=false`, and the fallback identity current — this is what makes clones work. `git()` raises `GitError` on failure and `report_error()` records swallowed failures. Owns `REVIEW_SUBCOMMANDS` (the run-record vocabulary both `__init__` and `commits` import; `checkout` is deliberately absent, since it is not autostart-recorded) and writes a review run's `Viewed: <hash> <ISO-8601> <action>` trailer lines. `git()` takes an `env` overlay restricted to `OVERRIDABLE_GIT_VARS` (committer identity only; anything else raises) — used by ProgSnap2 import to reproduce a tagger |
+| `cli.py` | `cli.nw` | Typer CLI with setup, synchronisation, export/import, tutorials, tag, playback, and analysis commands — `init` (project + venv + autostart; honors active `$VIRTUAL_ENV`; refuses `$HOME`-or-above unless `--force`), `activate`/`deactivate` (emit shell code for the project `.venv/`), `tutorial` (embedded pytorial catalog under `learnlog tutorial`), `list`, `clone` (atomic staging + checkout into an empty target; the cloned repo is configured by `ensure_configured()`), `pull` (fetch + merge in the object database via `merge-tree`/private-index fallback; never touches the student's work tree or shared index, advances the ref with a guarded `update-ref` under the commit lock, aborts clean on conflict), `set-remote`, `config` (show/set project settings kept as `learnlog.*` keys in the `.learnlog` git config; only `linter` so far), `push` (explicit `refs/heads/*` + `refs/tags/*` refspecs so lightweight milestone tags ship, matching `export`), `export` (git bundle; written via staging file + `os.replace`), `play` (curses viewer + batch mode), `tag`, `checkout <run>` (restore an earlier run's files as the next version on the recording branch: peels the ref with `rev-parse --verify` *before* `resolve_record_commit`, refuses refs off the branch and unfinished merges, then records itself explicitly — `begin_run` snapshot header of the files about to be replaced, `restore_code_state`, `finalize_run(tree=<restored tree>)` so `git status` is clean and the next run's churn excludes the reversion — and prints the snapshot hash as the way back; a detached HEAD is re-attached; unlike the hidden `learnlog git checkout`, which is safe by refusal and detaches), `git` (**hidden** escape-hatch passthrough — absent from `--help` so students don't drive the log with raw git, still invocable by name for repair; injects `-e .learnlog`/`-e '!.learnlog'` into `clean`, refuses `reset --hard` without `--allow-destructive`, and builds its env with `git_environment()` — as does `tag`), `doctor` (reports/repairs the interpreter's autostart wiring; dead wiring exits 1), `analyse`, and the **`metrics` group** (`time`, `eq`, `code`, `lint`, `trends`; shared `--period today|week|month|all`, `--by day|week|month|tag`, `--since/--until` (a tag name, date, or ISO datetime; tag tried first), `--idle`, `--format table|csv|json|latex`; `lint`/`trends` take `--linter ruff|pylint`; `--by tag` defaults to `--period all` and cuts sessions at each tag; a review run, recorded without a view trace). `analyse` also takes `--since/--until` (tag or date, half-open, refuses combination with the positional inclusive `Column=Regex` pair; an `X-Tag=` boundary matches whole tag names via `re.fullmatch`, never substrings), a bare `learnlog tag name` confirms which run the tag landed on, and `list` appends `(tag: lab1)` to tagged runs' lines. Only `play`, `list` and `metrics` are autostart-recorded runs, and `checkout` records itself explicitly; every other subcommand leaves no trace, which is what makes `clone` into an empty directory, a fast-forwarding `pull`, and a `tag` on the student's own run possible |
+| `metrics.py` | `metrics.nw` | Pure computation behind `learnlog metrics`: `run_records()` (one `RunRecord` per student run, learnlog's own runs dropped via `is_learnlog_run` — `learnlog checkout` included, whose trailer carries the restored tree so the following run's churn is the student's edits alone), traceback-based error classification (never exit status; syntax vs runtime vs interrupt), 20-minute sessions (end-of-run → next start), run-to-run active time, two-parameter EQ (13/3/÷16, syntax-only and all-error series; Jadud's 4-term form beside it), RED, rolling `--period` windows vs calendar `--by` buckets (a session belongs to its first run's bucket) vs tag periods (`tag_boundaries`/`tag_buckets`: each tag starts a period that runs to the next tag, sessions are cut at the boundary, several tags on one commit merge into one `lab1;milestone` boundary, and a tag on a learnlog review run still marks that moment via `commit_run_starts`), radon-based CC/LOC/Halstead/MI per snapshot (working tree for one window, each bucket's last-run tree via `extract_code_state` for a series), ruff/pylint lint counts (both bundled; ruff by default, `--linter` or the `learnlog.linter` git-config setting overrides), `trends` join + least-squares direction rule, and table/csv/json/latex rendering. Every metric is nullable; headers print the parameters. Citations live in `doc/bibliography.bib` (provenance blocks) and the search-protocol appendix `doc/metrics-protocol.tex` |
+| `viewer.py` | `viewer.nw` | `PlaybackViewer` (curses) and `play_batch`; both report each commit they display to `learnlog.record_view` — actions `open`/`next`/`prev`/`jump-first`/`jump-last` interactively, `batch` in batch mode. A keypress that does not change the displayed commit records nothing. Both show tags: a `Tags:` line in batch output, `(tag: ...)` in the interactive header (`_header_text`) |
 
-Tutorial sources in `src/learnlog/tutorials/`:
+Tutorial sources in `src/learnlog/tutorials/` (woven into one `Tutorials`
+chapter via `tutorials.nw`, which also carries the catalog-level design
+prose and the `\input`s of the per-tutorial sections):
 - `getting-started.nw` — first-run setup, activation, running code, and batch playback
-- `playback-and-tagging.nw` — batch and interactive playback plus tagging workflows
+- `playback-and-tagging.nw` — batch and interactive playback, tagging, measuring one milestone, and going back to a tagged version with `learnlog checkout` (two closing steps: back to the tag, then forward again via the snapshot hash the command prints)
 - `export-and-share.nw` — bundle export, ProgSnap2 export, and remote sharing workflows
+- `metrics.nw` — the `learnlog metrics` family: produce runs, `time`, `eq`, `code`, `lint`, `trends`, then `list`
 - `analysing-progsnap2.nw` — `learnlog analyse` reports and `Column=Regex` range filtering
+
+The first four each tangle **two** catalog entries from one `.nw`: a
+novice `.md` (unsuffixed id, the default) and an `-expert.md` variant that
+adds mechanism explanations. The step contract (`pre_command`,
+`required_patterns`) lives in shared chunks referenced by both roots, so
+the variants can differ only in prose and hints; `cli.nw`'s
+`test_expert_variants_share_their_novice_contract` locks that in, and the
+catalog tuple in `cli.nw` lists each expert twin right after its novice.
+The tutorial build rules live in `src/learnlog/tutorials/Makefile` (the
+catalog ids, the `%.md`/`%-expert.md` tangle rules, the weaves);
+`src/learnlog/Makefile` recurses into it via `subdir.mk`, and `doc/Makefile`
+recurses into it directly for a missing tutorial `.tex`. `analysing-progsnap2` has no novice
+variant (its audience is the teacher/researcher end of the progression).
+
+Course material lives in `doc/` beside the manual: `doc/prgi26-lab0.nw`
+tangles `doc/prgi26-lab0.md` (the Swedish Canvas assignment *Laboration
+(0)* for prgi26, a FeedbackFruits/LTI assignment; publish with
+`make -C doc prgi26-lab0.html` then `canvaslms --no-cache assignments edit
+--html -c prgi26 -f doc/prgi26-lab0.html`, which sends only name +
+description so the tool wiring survives; frontmatter carries only `name` +
+`regex`, never dates) and weaves an appendix chapter whose English prose is the lab's
+variation-theory analysis. Like `students.md`, the tangled `.md` is an
+ignored build artefact (`doc/Makefile` rule `prgi26-lab0.md: prgi26-lab0.nw`
+with `${NOTANGLE}`, listed under `all`). The lab uses the venv-first route
+(create `.venv` in VSCodium's terminal, `pip install learnlog`,
+`learnlog init python`), deliberately different from `students.md`'s pipx
+route; the chapter says why. `learnlog play` there relies on the
+`windows-curses` dependency (`sys_platform == 'win32'` marker).
 
 ### Key design constraints
 
 - **Transparency**: student programs must behave identically with/without learnlog
-- **Crash resilience**: `begin_run()` commits before execution, `finalize_run()` amends after
+- **Crash resilience**: `begin_run()` commits a header before execution, `finalize_run()` commits a trailer after; nothing is ever rewritten (no `--amend`), so overlapping runs, pushes, and tags stay correct
+- **Reading**: `commits.nw` joins each run's two commits by `Run-Id` (`get_run_trailers`/`merge_run_trailers`; tag/ref resolution joins the same way via `scan_run_commits`/`resolve_record_commit`, with the topological parent only as legacy fallback); readers walk `recording_branch()`, not HEAD; `get_commits()` hides trailer commits, so `list`/`play`/ProgSnap2 show one record per run. Review runs (`learnlog play`/`list`/`metrics`) and `learnlog checkout` records are shown **by default** — reflection and going back are part of the story; `filter_internal_runs()` hides only learnlog's plumbing (the `pip install learnlog` from `init`, and records of other subcommands left by older versions), which `--all` restores. Predicates: `is_learnlog_*` (all of learnlog's own activity), `is_review_*` (play/list/metrics), `is_checkout_*` (`learnlog checkout`; `CHECKOUT_SUBCOMMAND` lives in `commits.nw`, its only reader, and `cli.nw` imports it to record with), `is_internal_*` (learnlog activity that is neither review nor checkout)
+- **Tags are start markers**: a tag names its own run and every run after it, until the next tag (like `git describe`). `--since T` includes T's run, `--until T` excludes it, so `[since, until)` windows are exact; `metrics --by tag`, `metrics/analyse --since/--until`, and `analyse`'s per-tag sections all read it that way (tags carry *forward* in `group_edit_run_pairs`). Tutorials tell students to tag when *starting* a milestone. `get_tag_details()` (commits.nw) is the single tag reader — one NUL-framed `for-each-ref` call guarding `%(contents)` against the lightweight-tag commit-message trap; `get_tag_map()` is its projection, so the export's `X-Tag` column and the tag table cannot disagree
 - `.learnlog/` in the working directory is the *product's* data (student log repo), not project config
+- **Bounded discovery**: `find_learnlog_dir()` never returns `$HOME` or
+  anything above it, and stops at a `.git` boundary (checked after
+  `.learnlog/`, so a project root that is also a checkout still wins). An
+  autostart-wired interpreter (marker file present, `site.py` enabled) whose
+  project no longer resolves logs *nothing* rather than guessing; so does a
+  run whose only candidate root is `$HOME`. Both raise `UnanchoredRun`, which
+  `initialize()`'s handler turns into a `LEARNLOG_DEBUG` diagnostic;
+  `learnlog doctor` makes that silent state visible and `--repair`
+  re-wires it. An empty marker file reads as no marker
+- `tests/Makefile` exports `LEARNLOG_SKIP_AUTOSTART=1` so the suite never logs
+  its own pytest process; `test_env`/`_autostart_env` strip it for the
+  subprocess tests that must be logged
 - Git operations use `subprocess.run` (no GitPython dependency)
+- `LearnlogRepo.git()` raises `GitError` by default; pass `check=False` only
+  where the exit status is the answer (`git diff --cached --quiet`, probes),
+  and `text=False` where the output is a file rather than a message
+  (`git archive`) — the `GitError`/timeout semantics are identical.  The
+  commands that keep inherited stdio on purpose (`push`, `clone`, `pull`'s
+  fetch, the `learnlog git` passthrough) stay outside the wrapper: capturing
+  would hide progress and credential prompts.  Pull's merge and ref advance
+  go through the wrapper — they talk to no remote
+- `extract_code_state()` accepts a genuinely empty tree (the initial commit
+  of a repo begun in an empty directory) as an empty code state — verified
+  via `git ls-tree` — while an unreadable archive for a non-empty tree
+  still aborts the export
+- ProgSnap2 code-state names are untrusted input: `safe_snapshot_path()`
+  in `progsnap2.nw` rejects absolute names, `..`, drive/UNC prefixes,
+  `.learnlog/` and anything resolving outside the work tree; unsafe
+  entries are skipped with a warning on stderr rather than aborting the
+  import
+- ProgSnap2 tag metadata travels in `LinkTables/X-Tag.csv` (v8 link table
+  keyed on `X-Tag`; columns `X-CommitHash`, `X-TagType` annotated|lightweight,
+  `X-TagMessage`, `X-Tagger`, `X-TagDate`; written only when tags exist).
+  The tagger *name* is always exported — a dataset may name a teacher/TA
+  who tagged in a clone — the email never is. Import recreates annotated
+  tags via `git tag -a -F -` (message on stdin) with the committer-ident
+  `env` overlay, degrading to a lightweight tag on failure (reported via
+  `report_error`); old archives without the table still read (`dataset["tags"] == {}`)
+- ProgSnap2 exports a `learnlog checkout` record as an `X-Checkout` event
+  (I/O child events like `Run.Program`; its `CodeStateID` is the snapshot
+  taken before the restore, the restored state is the next event's), and
+  import reconstructs it (`RECONSTRUCTED_RUN_EVENTS`); `X-Review` stays
+  play/list/metrics only, and the edit–run pairing passes both through
+- Commit messages always go in on stdin (`--file=-`/`commit-tree` with
+  `input=`), never `-m` (Linux caps a single `argv` string at 128 KiB);
+  `commit-tree` also keeps I/O logs verbatim where porcelain would strip them
+- Citations: `\autocite{key}` against `doc/bibliography.bib`, whose
+  entries carry provenance blocks (`backing-claims` skill; validate with its
+  `check_provenance.py`). The document renders citations as *margin*
+  footnotes (didactic + marginfix) and uses biblatex's `verbose` style so
+  the margin note carries the full reference (short form on repeats) —
+  keep `style=verbose` while the memoir+didactic pairing stands: never put
+  `\autocite` inside an `\item[...]` label ("Not in outer par mode"), and if
+  `latexmk` stops with "needed too many passes" after adding citations, thin
+  the repeated citations on the offending page rather than adding packages
+- Failures learnlog must swallow are appended to `.learnlog/errors.log` and,
+  with `LEARNLOG_DEBUG` set, mirrored to stderr — never `except: pass`
 - Runtime dependencies: `typer>=0.9.0` (CLI), `virtualenv>=20` (used by
   `learnlog init` to create project venvs reliably on PEP 668 / split-
-  `python3-venv` systems), and `pytorial>=0.2` (embedded interactive
-  tutorials)
+  `python3-venv` systems), `pytorial>=0.2` (embedded interactive
+  tutorials), and `radon>=6.0` (CC/LOC/Halstead/MI for `learnlog metrics
+  code`), and `ruff`/`pylint` (both bundled for `learnlog metrics lint`;
+  ruff is the default, `--linter pylint` or `learnlog config linter pylint`
+  — a `learnlog.linter` key in the `.learnlog` git config — overrides it;
+  a copy in the project `.venv` wins over the bundled one)
 
 ## Testing
 
@@ -93,6 +189,7 @@ Key test patterns:
 - Temporary directories with `tmp_path` fixture for Git operations
 - Subprocess-based integration tests for full import-capture-commit pipeline
 - `CliRunner` from Typer for CLI command testing (note: CliRunner doesn't connect a real TTY)
+- Anything that depends on **whether a command records itself** is invisible to `CliRunner` tests, because the suite exports `LEARNLOG_SKIP_AUTOSTART=1`. Those belong in the share-cycle end-to-end suite in `learnlog.nw` (`cli_project` fixture), which runs the real CLI from a wired scratch venv in subprocesses that are genuinely logged
 
 ## CI
 

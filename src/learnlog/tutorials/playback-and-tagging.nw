@@ -1,4 +1,4 @@
-\chapter{Tutorial: Playback and Tagging}
+\section{Playback and tagging}
 \label{tut:playback-and-tagging}
 
 This tutorial focuses on two related reading tools: playback for
@@ -6,22 +6,97 @@ reviewing the log and tags for naming important commits.
 The learner already has a recorded project, so the new contrast is not
 between \enquote{before and after learnlog}, but between browsing the
 entire history and jumping directly to a named checkpoint.
+The tutorial varies only the starting point of playback---first the
+whole log, then playback from a tag---while the recorded project stays
+invariant, so the learner discerns that tags are not extra metadata on
+the side; they are navigation anchors into the existing commit history.
+The steps separate the two tools before fusing them: batch playback
+alone, then tagging alone, then playback that starts from the tag,
+first in batch mode and then in the interactive viewer.
+Those two playback steps form their own small generalisation: the
+medium varies (batch print against interactive viewer) while the
+tag-anchored starting point stays invariant, so the learner sees that
+the anchor belongs to the log, not to one viewing tool.
+A measuring step then reads the same tag as the boundary of a report.
+The closing pair turns reading into acting: the anchor stays invariant
+once more while the operation varies from \emph{looking at} a version
+with [[play]] to \emph{getting it back} with [[checkout]], and the
+final step varies only the direction---forward again, by the same
+command---so the learner discerns that a checkout replaces files but
+never history.
 
-\ltnote{%
-  We use contrast on the starting point of playback: first the whole
-  log, then playback from a tag.
-  The invariant is the same recorded project.
-  This helps the learner discern that tags are not extra metadata on the
-  side; they are navigation anchors into the existing commit history.
-}
+\subsection{Two variants, one contract}
+
+As in \cref{tut:getting-started}, the tutorial tangles into a novice
+entry, [[playback-and-tagging]], and an expert entry,
+[[playback-and-tagging-expert]], that share every step's checks
+through common chunks.
+Here the mechanism the expert variant makes visible is the log
+itself: that reviewing is recorded, that a tag is a lightweight Git
+tag in the hidden repository, and that playback resolves a tag to the
+run it names.
+The novice variant keeps to the reading workflow and never mentions
+Git.
 
 <<[[playback-and-tagging.md]]>>=
 ---
 id: playback-and-tagging
 title: Playback and tagging
-summary: Review a log in batch and interactive mode, then jump to tags.
+summary: Review a log in batch and interactive mode, jump to tags, and go back.
 ---
 
+<<novice step: review the whole log in batch mode>>
+
+<<novice step: add a memorable tag>>
+
+<<novice step: list the available tags>>
+
+<<novice step: start playback from the tag in batch mode>>
+
+<<novice step: open the interactive viewer from the tag>>
+
+<<novice step: measure one milestone>>
+
+<<novice step: go back to the tagged version>>
+
+<<novice step: come forward again>>
+<<[[playback-and-tagging-expert.md]]>>=
+---
+id: playback-and-tagging-expert
+title: Playback and tagging, mechanics included
+summary: The same review and restore workflow, with the Git record explained.
+---
+
+<<expert step: review the whole log in batch mode>>
+
+<<expert step: add a memorable tag>>
+
+<<expert step: list the available tags>>
+
+<<expert step: start playback from the tag in batch mode>>
+
+<<expert step: open the interactive viewer from the tag>>
+
+<<expert step: measure one milestone>>
+
+<<expert step: go back to the tagged version>>
+
+<<expert step: come forward again>>
+@
+
+\subsection{Review the whole log in batch mode}
+
+The opening step establishes the whole before the parts: the entire
+history as plain terminal output, which the later tag steps will then
+subdivide.
+Its object of learning is that the log is readable at all, including
+the pacing cue: [[Time since last run]] makes quick retries and long
+pauses visible.
+The expert extra is that this review run records itself---reflection
+is part of the story the log tells---which reframes [[play]] from a
+passive reader to a participant.
+
+<<shared step: review the whole log in batch mode>>=
 # Review the whole log in batch mode
 
 ```tutorial-step
@@ -36,7 +111,31 @@ Begin with `learnlog play -b` to see the full history as plain terminal
 output.
 Each run after the first also shows `Time since last run`, which makes quick
 retries and longer pauses visible during playback.
+<<novice step: review the whole log in batch mode>>=
+<<shared step: review the whole log in batch mode>>
+<<expert step: review the whole log in batch mode>>=
+<<shared step: review the whole log in batch mode>>
 
+This review run is itself part of the story: `play`, `list` and
+`metrics` record themselves, so your log also shows when you went back
+and read it.
+(`checkout`, which you meet at the end of this tutorial, records itself
+too, before it changes anything.)
+Batch playback records a view of each commit it prints.
+@
+
+\subsection{Add a memorable tag}
+
+The step's object of learning is that a milestone can carry a name
+the learner chooses, and that the name marks a \emph{start}: it
+covers the tagged run and everything after it, until the next tag
+(\cref{sec:metrics-tags}).
+The expert extra says what the name is---a lightweight Git tag on the
+run's commit---and why tagging leaves no trace of its own: [[tag]] is
+not a recorded command, so the learner can tag their most recent run
+without creating new history behind it.
+
+<<shared step: add a memorable tag>>=
 # Add a memorable tag
 
 ```tutorial-step
@@ -46,20 +145,70 @@ required_patterns:
 hint: Tag the current commit with a short name such as `lab1`.
 ```
 
-Pick the current commit as a checkpoint and create a tag for it, for
-example with `learnlog tag lab1`.
+Start a new piece of work, run it once, and name that starting
+point, for example with `learnlog tag lab1`.
+The tag covers this run and everything you run after it, until your
+next tag.
+<<novice step: add a memorable tag>>=
+<<shared step: add a memorable tag>>
+<<expert step: add a memorable tag>>=
+<<shared step: add a memorable tag>>
 
-# List the available tags
+The tag is a lightweight Git tag in the hidden `.learnlog/` repository,
+pointing at the run's commit.
+Unlike `play`, `tag` does not record itself, which is what makes it
+possible to name your own most recent run without creating new history
+behind it.
 
-```tutorial-step
+`learnlog metrics --since`, `--by tag` and `learnlog analyse` all
+read the tag as a start marker, the way `git describe` does---which
+is why you tag when you start a milestone, not when you finish one.
+@
+
+\subsection{List the available tags}
+
+A small confirmation step: tags are enumerable, so the learner can
+verify the marker exists before relying on it.
+Only the hint diverges---the expert's names the hidden repository the
+tags live in, the novice's does not---so the checks and prose are one
+shared chunk.
+
+<<checks: list the available tags>>=
 required_patterns:
   - mode: regex
     pattern: 'learnlog\s+tag\b[^\n]*(?:-l\b|--list\b)'
+<<novice step: list the available tags>>=
+# List the available tags
+
+```tutorial-step
+<<checks: list the available tags>>
+hint: Run `learnlog tag -l` to list your tags.
+```
+
+<<instruction: list the available tags>>
+<<expert step: list the available tags>>=
+# List the available tags
+
+```tutorial-step
+<<checks: list the available tags>>
 hint: Run `learnlog tag -l` to list the tags in the `.learnlog/` repository.
 ```
 
+<<instruction: list the available tags>>
+<<instruction: list the available tags>>=
 List the tags so you can confirm that your new marker exists.
+@
 
+\subsection{Start playback from the tag in batch mode}
+
+This step realises the tutorial's central contrast: the same batch
+playback as the first step, with only the starting point varied.
+Its object of learning is that a tag changes where playback begins.
+The expert extra resolves an apparent mismatch the novice never sees:
+the tag names one commit while a run is stored as a pair, and playback
+resolves the tag to the run record it belongs to.
+
+<<shared step: start playback from the tag in batch mode>>=
 # Start playback from the tag in batch mode
 
 ```tutorial-step
@@ -71,7 +220,27 @@ hint: Pass the tag name after `learnlog play -b`.
 
 Use `learnlog play -b lab1` to start playback from the tagged commit
 instead of from the beginning of the history.
+<<novice step: start playback from the tag in batch mode>>=
+<<shared step: start playback from the tag in batch mode>>
+<<expert step: start playback from the tag in batch mode>>=
+<<shared step: start playback from the tag in batch mode>>
 
+The tag names one commit, but a run is stored as a pair of commits;
+playback resolves the tag to the run record it belongs to and starts
+there.
+@
+
+\subsection{Open the interactive viewer from the tag}
+
+The closing step varies the medium while the anchor stays invariant:
+the same tag now opens the interactive viewer.
+The prose diverges only in register---the novice variant avoids the
+word \emph{curses}---and the expert extra completes the
+reviewing-is-recorded thread from the first step: the viewer reports
+what the learner looks at, and a keypress that does not change the
+displayed commit records nothing.
+
+<<shared step: open the interactive viewer from the tag>>=
 # Open the interactive viewer from the tag
 
 ```tutorial-step
@@ -80,7 +249,147 @@ required_patterns:
     pattern: 'learnlog\s+play\s+(?!-)\S+'
 hint: Launch the interactive viewer and quit with `q` when you are done.
 ```
+<<novice step: open the interactive viewer from the tag>>=
+<<shared step: open the interactive viewer from the tag>>
+
+Run `learnlog play lab1` to open the interactive viewer at the tagged
+commit.
+Move around a little, then quit with `q`.
+<<expert step: open the interactive viewer from the tag>>=
+<<shared step: open the interactive viewer from the tag>>
 
 Run `learnlog play lab1` to open the curses viewer at the tagged commit.
 Move around a little, then quit with `q`.
+
+The viewer also reports what you look at: opening a commit and
+stepping or jumping between commits go into the review trace, while a
+keypress that does not change the displayed commit records nothing.
+@
+
+\subsection{Measure one milestone}
+
+The added step closes the loop the tag opened: the name the learner
+chose is now an argument a report accepts, which is the payoff that
+makes tagging worth the habit.
+It sits here rather than in \cref{tut:metrics} to stay
+next to the tag it reads; the grouped series belongs to the metrics
+tutorial.
+
+<<shared step: measure one milestone>>=
+# Measure one milestone
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+metrics\s+\w+[^\n]*--since\s+\S+'
+hint: Try `learnlog metrics time --since lab1`.
+```
+
+Your tag is also a boundary for the metrics: run
+`learnlog metrics time --since lab1` to summarise only the work from
+that starting point on.
+<<novice step: measure one milestone>>=
+<<shared step: measure one milestone>>
+<<expert step: measure one milestone>>=
+<<shared step: measure one milestone>>
+
+`--since lab1` starts the window at the tagged run, inclusive, and
+`--until` another tag would end it just before that tag's run: the
+half-open window is exactly what start marker means.
+@
+
+\subsection{Go back to the tagged version}
+
+The closing pair turns the tag from something the learner reads into
+something they act on.
+This step's object of learning is that an earlier version is not
+merely viewable but recoverable, and that recovering it is safe.
+The learner first makes a change and runs it, so that there is
+something to lose, and only then asks for the tagged version back:
+without that preparation the checkout would change nothing visible
+and the step would teach a command without its consequence.
+The tag is the anchor of the earlier steps, kept invariant so that the
+only thing that varies is the operation---[[play lab1]] showed the
+version, [[checkout lab1]] restores it.
+The instruction sends the learner to the file and to [[learnlog list]]
+afterwards, because the two observations together carry the point:
+the change is gone from the file but not from the log, which lists
+both the run that made it and the checkout that replaced it.
+The expert extra names the mechanism that makes this safe: the
+checkout records the files it is about to replace before it touches
+them, and the restored files become the tip of the same branch, so
+[[HEAD]] is never left detached the way a raw [[git checkout]] would
+leave it.
+
+<<shared step: go back to the tagged version>>=
+# Go back to the tagged version
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+checkout\s+(?!-)\S+'
+  - next run continues
+hint: Run `learnlog checkout lab1` to get the tagged files back.
+```
+
+Change something in your program and run it once more.
+Then run `learnlog checkout lab1` to get the tagged version of your
+files back.
+Open the file: your change is gone.
+Run `learnlog list`: the log shows both the run that made the change
+and the checkout that replaced it.
+<<novice step: go back to the tagged version>>=
+<<shared step: go back to the tagged version>>
+<<expert step: go back to the tagged version>>=
+<<shared step: go back to the tagged version>>
+
+The checkout records itself before it touches a file: the edit you
+just discarded is a commit in the hidden repository, so nothing is
+lost.
+The restored files then become the tip of the same branch, and `HEAD`
+is never left detached; your next run simply continues the log from
+the restored version.
+@
+
+\subsection{Come forward again}
+
+The final step varies only the direction.
+The command is the same, the argument is now the hash the previous
+step printed on its \enquote{recorded as} line, and the discarded
+files come back.
+That is the tutorial's last contrast: a checkout is undone by another
+checkout, because the log never rewrites anything, and both states
+stay in it.
+The step also returns the learner's project to the state it was in
+before the previous step, so the tutorial leaves no surprise behind.
+Requiring a hash rather than a name is what distinguishes this step
+from the previous one in the transcript, and it is also the habit the
+step teaches: the confirmation line names the way back, and the way
+back is a run's hash.
+
+<<shared step: come forward again>>=
+# Come forward again
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+checkout\s+[0-9a-f]{7,40}\b'
+  - next run continues
+hint: Pass the hash from the `recorded as` line to `learnlog checkout`.
+```
+
+The previous step printed where your discarded files were recorded,
+on the line starting `Your previous files were recorded as`.
+Check out that hash to get them back.
+Your project is now as it was before you went back, and the log holds
+both versions.
+<<novice step: come forward again>>=
+<<shared step: come forward again>>
+<<expert step: come forward again>>=
+<<shared step: come forward again>>
+
+A checkout is undone by another checkout because nothing is ever
+rewritten: the snapshot the first checkout made is an ordinary run
+record on the branch, and checking it out records the restored
+version in turn.
 @

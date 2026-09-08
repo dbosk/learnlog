@@ -1,6 +1,12 @@
 # Learnlog's own development log
 .learnlog/
 
+# Per-directory CLAUDE.md files are claude-mem context, not project
+# instructions; only the root one is tracked.  Without this rule the
+# untracked ones also end up in the wheel.
+**/CLAUDE.md
+!/CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

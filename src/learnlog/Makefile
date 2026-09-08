@@ -5,14 +5,14 @@ MODULES+=	capture.py capture.tex
 MODULES+=	gitrepo.py gitrepo.tex
 MODULES+=	commits.py commits.tex
 MODULES+=	progsnap2.py progsnap2.tex
+MODULES+=	metrics.py metrics.tex
 MODULES+=	viewer.py viewer.tex
 MODULES+=	cli.py cli.tex
-TUTORIAL_IDS=	getting-started playback-and-tagging \
-		export-and-share analysing-progsnap2
-TUTORIAL_MD=	$(TUTORIAL_IDS:%=tutorials/%.md)
-TUTORIAL_TEX=	$(TUTORIAL_IDS:%=tutorials/%.tex)
-
-MODULES+=	$(TUTORIAL_MD) $(TUTORIAL_TEX)
+# The tutorial catalog has its own Makefile in tutorials/, so that the
+# doc build can recurse into that directory for a missing weave; all,
+# clean and distclean recurse into it from here.
+SUBDIR+=	tutorials
+SUBDIR_GOALS=	all clean distclean
 
 .PHONY: all
 all: ${MODULES}
@@ -30,12 +30,9 @@ capture.py: capture.nw
 gitrepo.py: gitrepo.nw
 commits.py: commits.nw
 progsnap2.py: progsnap2.nw
+metrics.py: metrics.nw
 viewer.py: viewer.nw
 cli.py: cli.nw
-
-tutorials/%.md: tutorials/%.nw
-	@mkdir -p $(dir $@)
-	notangle -R"[[$(notdir $@)]]" $< | ${CPIF} $@ && noroots $<
 
 
 .PHONY: clean
@@ -50,3 +47,4 @@ distclean:
 INCLUDE_MAKEFILES=../../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
 include ${INCLUDE_MAKEFILES}/noweb.mk
+include ${INCLUDE_MAKEFILES}/subdir.mk
