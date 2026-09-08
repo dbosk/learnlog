@@ -83,9 +83,26 @@ adds mechanism explanations. The step contract (`pre_command`,
 the variants can differ only in prose and hints; `cli.nw`'s
 `test_expert_variants_share_their_novice_contract` locks that in, and the
 catalog tuple in `cli.nw` lists each expert twin right after its novice.
-The expert `.md`s tangle via the `tutorials/%-expert.md: tutorials/%.nw`
-rule in `src/learnlog/Makefile`. `analysing-progsnap2` has no novice
+The tutorial build rules live in `src/learnlog/tutorials/Makefile` (the
+catalog ids, the `%.md`/`%-expert.md` tangle rules, the weaves);
+`src/learnlog/Makefile` recurses into it via `subdir.mk`, and `doc/Makefile`
+recurses into it directly for a missing tutorial `.tex`. `analysing-progsnap2` has no novice
 variant (its audience is the teacher/researcher end of the progression).
+
+Course material lives in `doc/` beside the manual: `doc/prgi26-lab0.nw`
+tangles `doc/prgi26-lab0.md` (the Swedish Canvas assignment *Laboration
+(0)* for prgi26, a FeedbackFruits/LTI assignment; publish with
+`make -C doc prgi26-lab0.html` then `canvaslms --no-cache assignments edit
+--html -c prgi26 -f doc/prgi26-lab0.html`, which sends only name +
+description so the tool wiring survives; frontmatter carries only `name` +
+`regex`, never dates) and weaves an appendix chapter whose English prose is the lab's
+variation-theory analysis. Like `students.md`, the tangled `.md` is an
+ignored build artefact (`doc/Makefile` rule `prgi26-lab0.md: prgi26-lab0.nw`
+with `${NOTANGLE}`, listed under `all`). The lab uses the venv-first route
+(create `.venv` in VSCodium's terminal, `pip install learnlog`,
+`learnlog init python`), deliberately different from `students.md`'s pipx
+route; the chapter says why. `learnlog play` there relies on the
+`windows-curses` dependency (`sys_platform == 'win32'` marker).
 
 ### Key design constraints
 

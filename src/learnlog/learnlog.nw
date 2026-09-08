@@ -244,6 +244,7 @@ reproducible bug reports, and authorship review when a final submission
 appears inconsistent with the recorded development path.
 
 \subsection{A student-facing onboarding page}
+\label{sec:students-page}
 
 Both use cases above assume students have already installed
 [[learnlog]] with \mintinline{bash}{pipx} and run

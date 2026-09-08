@@ -48,6 +48,7 @@
 
 \appendix
 \input{metrics-protocol.tex}
+\input{prgi26-lab0.tex}
 
 \backmatter
 \printbibliography
