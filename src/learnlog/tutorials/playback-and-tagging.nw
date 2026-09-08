@@ -12,11 +12,18 @@ invariant, so the learner discerns that tags are not extra metadata on
 the side; they are navigation anchors into the existing commit history.
 The steps separate the two tools before fusing them: batch playback
 alone, then tagging alone, then playback that starts from the tag,
-first in batch mode and finally in the interactive viewer.
-The last two steps form their own small generalisation: the medium
-varies (batch print against interactive viewer) while the tag-anchored
-starting point stays invariant, so the learner sees that the anchor
-belongs to the log, not to one viewing tool.
+first in batch mode and then in the interactive viewer.
+Those two playback steps form their own small generalisation: the
+medium varies (batch print against interactive viewer) while the
+tag-anchored starting point stays invariant, so the learner sees that
+the anchor belongs to the log, not to one viewing tool.
+A measuring step then reads the same tag as the boundary of a report.
+The closing pair turns reading into acting: the anchor stays invariant
+once more while the operation varies from \emph{looking at} a version
+with [[play]] to \emph{getting it back} with [[checkout]], and the
+final step varies only the direction---forward again, by the same
+command---so the learner discerns that a checkout replaces files but
+never history.
 
 \subsection{Two variants, one contract}
 
@@ -35,7 +42,7 @@ Git.
 ---
 id: playback-and-tagging
 title: Playback and tagging
-summary: Review a log in batch and interactive mode, then jump to tags.
+summary: Review a log in batch and interactive mode, jump to tags, and go back.
 ---
 
 <<novice step: review the whole log in batch mode>>
@@ -49,11 +56,15 @@ summary: Review a log in batch and interactive mode, then jump to tags.
 <<novice step: open the interactive viewer from the tag>>
 
 <<novice step: measure one milestone>>
+
+<<novice step: go back to the tagged version>>
+
+<<novice step: come forward again>>
 <<[[playback-and-tagging-expert.md]]>>=
 ---
 id: playback-and-tagging-expert
 title: Playback and tagging, mechanics included
-summary: The same review workflow, with the Git record explained.
+summary: The same review and restore workflow, with the Git record explained.
 ---
 
 <<expert step: review the whole log in batch mode>>
@@ -67,6 +78,10 @@ summary: The same review workflow, with the Git record explained.
 <<expert step: open the interactive viewer from the tag>>
 
 <<expert step: measure one milestone>>
+
+<<expert step: go back to the tagged version>>
+
+<<expert step: come forward again>>
 @
 
 \subsection{Review the whole log in batch mode}
@@ -101,9 +116,11 @@ retries and longer pauses visible during playback.
 <<expert step: review the whole log in batch mode>>=
 <<shared step: review the whole log in batch mode>>
 
-This review run is itself part of the story: `play` and `list` are the
-only learnlog commands that record themselves, so your log also shows
-when you went back and read it.
+This review run is itself part of the story: `play`, `list` and
+`metrics` record themselves, so your log also shows when you went back
+and read it.
+(`checkout`, which you meet at the end of this tutorial, records itself
+too, before it changes anything.)
 Batch playback records a view of each commit it prints.
 @
 
@@ -279,4 +296,100 @@ that starting point on.
 `--since lab1` starts the window at the tagged run, inclusive, and
 `--until` another tag would end it just before that tag's run: the
 half-open window is exactly what start marker means.
+@
+
+\subsection{Go back to the tagged version}
+
+The closing pair turns the tag from something the learner reads into
+something they act on.
+This step's object of learning is that an earlier version is not
+merely viewable but recoverable, and that recovering it is safe.
+The learner first makes a change and runs it, so that there is
+something to lose, and only then asks for the tagged version back:
+without that preparation the checkout would change nothing visible
+and the step would teach a command without its consequence.
+The tag is the anchor of the earlier steps, kept invariant so that the
+only thing that varies is the operation---[[play lab1]] showed the
+version, [[checkout lab1]] restores it.
+The instruction sends the learner to the file and to [[learnlog list]]
+afterwards, because the two observations together carry the point:
+the change is gone from the file but not from the log, which lists
+both the run that made it and the checkout that replaced it.
+The expert extra names the mechanism that makes this safe: the
+checkout records the files it is about to replace before it touches
+them, and the restored files become the tip of the same branch, so
+[[HEAD]] is never left detached the way a raw [[git checkout]] would
+leave it.
+
+<<shared step: go back to the tagged version>>=
+# Go back to the tagged version
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+checkout\s+(?!-)\S+'
+  - next run continues
+hint: Run `learnlog checkout lab1` to get the tagged files back.
+```
+
+Change something in your program and run it once more.
+Then run `learnlog checkout lab1` to get the tagged version of your
+files back.
+Open the file: your change is gone.
+Run `learnlog list`: the log shows both the run that made the change
+and the checkout that replaced it.
+<<novice step: go back to the tagged version>>=
+<<shared step: go back to the tagged version>>
+<<expert step: go back to the tagged version>>=
+<<shared step: go back to the tagged version>>
+
+The checkout records itself before it touches a file: the edit you
+just discarded is a commit in the hidden repository, so nothing is
+lost.
+The restored files then become the tip of the same branch, and `HEAD`
+is never left detached; your next run simply continues the log from
+the restored version.
+@
+
+\subsection{Come forward again}
+
+The final step varies only the direction.
+The command is the same, the argument is now the hash the previous
+step printed on its \enquote{recorded as} line, and the discarded
+files come back.
+That is the tutorial's last contrast: a checkout is undone by another
+checkout, because the log never rewrites anything, and both states
+stay in it.
+The step also returns the learner's project to the state it was in
+before the previous step, so the tutorial leaves no surprise behind.
+Requiring a hash rather than a name is what distinguishes this step
+from the previous one in the transcript, and it is also the habit the
+step teaches: the confirmation line names the way back, and the way
+back is a run's hash.
+
+<<shared step: come forward again>>=
+# Come forward again
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+checkout\s+[0-9a-f]{7,40}\b'
+  - next run continues
+hint: Pass the hash from the `recorded as` line to `learnlog checkout`.
+```
+
+The previous step printed where your discarded files were recorded,
+on the line starting `Your previous files were recorded as`.
+Check out that hash to get them back.
+Your project is now as it was before you went back, and the log holds
+both versions.
+<<novice step: come forward again>>=
+<<shared step: come forward again>>
+<<expert step: come forward again>>=
+<<shared step: come forward again>>
+
+A checkout is undone by another checkout because nothing is ever
+rewritten: the snapshot the first checkout made is an ordinary run
+record on the branch, and checking it out records the restored
+version in turn.
 @
