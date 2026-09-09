@@ -12,7 +12,20 @@ the standard library lacks it, so the package depends on
 [[windows-curses]] there (a [[sys_platform]] marker in
 [[pyproject.toml]]), which provides the same module on top of
 PDCurses.  The viewer therefore uses only the portable subset:
-[[curses.wrapper]], default colours, and the arrow-key constants.
+[[curses.wrapper]], the arrow-key constants, and the eight named
+colours on a default background that [[curses_styles]] allocates
+(\cref{sec:curses-styles}).
+
+What the viewer draws it does not decide.  Both the reading view and
+the raw view are lists of [[StyledLine]]s built by [[render]]
+(\cref{render}), and this chapter is only the part that puts them on a
+terminal: it turns each line's kind into a curses attribute, clips the
+line to the window, and moves between records.
+Batch mode (\cref{sec:play-batch}) takes the same lists through
+[[ansi_lines]] instead.
+That is what keeps the two media from drifting apart---a wording or a
+colour changes in one place and both surfaces follow---and it is why
+the viewer needs no knowledge of diffs, run blocks or I/O logs at all.
 
 The viewer state is simple: the current commit index and a vertical
 scroll offset within the commit's content.
@@ -72,6 +85,14 @@ one module whose whole job is to be invisible to the run it reports
 on.
 The cost is an attribute lookup per navigation keystroke.
 
+From [[render]] we take the two line builders, the two ways of
+turning a kind into an attribute, and the three kind names this
+chapter mentions by hand: [[chrome]] for the header and footer bars,
+[[faded]] for an I/O prefix, and [[dim]] for the placeholder that
+stands in for a filtered-away commit.
+Every other kind passes through untouched, which is the point---the
+viewer looks its attributes up by name and never enumerates them.
+
 <<viewer imports>>=
 from __future__ import annotations
 
@@ -80,10 +101,21 @@ import sys
 import learnlog
 from learnlog.commits import (
     elapsed_since_previous_run,
-    format_elapsed,
     get_commit_detail,
     get_run_trailers,
     get_tag_map,
+)
+from learnlog.render import (
+    KIND_CHROME,
+    KIND_DIM,
+    KIND_FADED,
+    SHORT_HASH_LEN,
+    StyledLine,
+    ansi_lines,
+    curses_styles,
+    record_lines,
+    record_title,
+    use_color,
 )
 @
 
@@ -93,19 +125,52 @@ from learnlog.commits import (
 The header occupies row~0 and the footer the last row, leaving the
 content area in between.  We name those offsets so the draw chunks
 read as layout statements rather than arithmetic.
-[[SHORT_HASH_LEN]] follows Git's own default for short hash
-abbreviation, which lets readers recognise hashes at a glance
-without losing uniqueness on lab-sized repositories.
+[[SHORT_HASH_LEN]] is [[render]]'s, not a second copy: the short hash
+in the raw header and the one in a card's \enquote{go back to this
+version} hint have to be the same hash, or the student copies a prefix
+from one place that does not name what the other showed.
 
 <<viewer constants>>=
-SHORT_HASH_LEN = 7
 HEADER_ROW = 0
 CONTENT_START_ROW = 1
 FOOTER_OFFSET_FROM_BOTTOM = 2
 @
 
+Two more constants belong to the drawing rather than the layout.
+[[DEFAULT_PAGE]] is what a page-key press moves before the first draw
+has measured the window---no real keypress can arrive that early,
+since [[_main_loop]] draws before it reads, but a unit test drives
+[[_handle_key]] with no screen at all and must still get a defined
+step.
+[[FILTERED_NOTE]] is the one line a commit gets when
+[[get_commit_detail]] filtered every run block out of it; it names the
+flag that brings the commit back, because a reader who meets the note
+is by definition looking for what is missing.
+
+<<viewer constants>>=
+DEFAULT_PAGE = 20
+FILTERED_NOTE = (
+    "(learnlog's own setup \u2014 hidden; "
+    "use --all to see it)"
+)
+@
+
 
 \section{The [[PlaybackViewer]] class}
+
+[[raw]] and [[color]] arrive as constructor arguments rather than as
+arguments to [[_draw]] because they are properties of the session the
+student asked for, not of a redraw: every keystroke would otherwise
+have to carry them down three call levels to reach the line builder.
+
+[[styles]] and [[page]] start at values that make sense with no
+terminal behind them.
+Curses fills both in---[[styles]] when the loop starts, [[page]] when
+a draw measures the window---but [[_draw]] and [[_handle_key]] have to
+be callable before either has happened, and that is not only a test
+convenience: an empty [[styles]] is exactly the state a monochrome
+terminal ends up in, and \mintinline{python}{styles.get(kind, 0)} then
+draws every line with no attribute rather than raising.
 
 <<viewer classes>>=
 class PlaybackViewer:
@@ -113,12 +178,17 @@ class PlaybackViewer:
 
     Displays commits one at a time with vi-style navigation:
     ``H``/``L`` for previous/next commit, ``j``/``k`` for
-    scrolling within a commit, ``q`` to quit.
+    scrolling within a commit, ``PgUp``/``PgDn`` (or ``b``
+    and space) for paging it, ``q`` to quit.  With ``raw``
+    true the records are shown in the stored log format
+    instead of the reading view.  ``color`` is ``True`` or
+    ``False`` to force colour on or off, ``None`` to use it
+    whenever the terminal has it.
     """
 
     def __init__(self, repo, commits, start_index=0,
                  filter_internal=True, trailers=None,
-                 tag_map=None):
+                 tag_map=None, raw=False, color=None):
         self.repo = repo
         self.commits = commits
         self.index = start_index
@@ -126,6 +196,10 @@ class PlaybackViewer:
         self.filter_internal = filter_internal
         self.trailers = trailers
         self.tag_map = tag_map
+        self.raw = raw
+        self.color = color
+        self.styles = {}
+        self.page = DEFAULT_PAGE
         self._detail_cache = {}
 
     <<player methods>>
@@ -145,6 +219,20 @@ def _get_trailers(self):
     if self.trailers is None:
         self.trailers = get_run_trailers(self.repo)
     return self.trailers
+@
+
+The tag map is read the same way and, since the header and the card
+both want it, through one accessor.
+Two lazy readers of the same map would each be correct and together
+would read it twice, and the second read is the one that happens on a
+keystroke.
+
+<<player methods>>=
+def _tags_for(self, commit):
+    """The tag names on ``commit``, reading the map once."""
+    if self.tag_map is None:
+        self.tag_map = get_tag_map(self.repo)
+    return self.tag_map.get(commit["hash"], [])
 @
 
 
@@ -232,12 +320,30 @@ def run(self):
 Each iteration draws the screen and waits for a keypress.
 We redraw on every key because the state may have changed.
 
-We call [[curses.use_default_colors]] so that the viewer inherits
-the terminal's native background and foreground colours instead
-of forcing white-on-black.
-This respects light themes, transparency, and custom colour
-schemes---details that matter when learnlog runs on diverse
-student and teacher machines.
+Colour is set up once, here, because allocating colour pairs is a
+property of the terminal session and not of a redraw.
+[[curses_styles]] (\cref{sec:curses-styles}) does the allocating and
+owns the guarding: it inherits the terminal's own foreground and
+background through [[curses.use_default_colors]] so that light themes,
+transparency and custom schemes survive, and it falls back to bold and
+reverse where colour is unavailable.
+The call it replaces was a bare [[curses.use_default_colors()]] here,
+which is a latent crash: on a terminal without colour support that
+call raises [[curses.error]], and it was the first thing the loop did,
+so the viewer would have died before drawing anything.
+[[--no-color]] skips the setup entirely rather than asking for a
+monochrome table, which leaves [[styles]] empty and every
+\mintinline{python}{styles.get(kind, 0)} answering \enquote{no
+attribute}---the same state a monochrome terminal produces, reached by
+one path instead of two.
+
+Hiding the cursor is guarded for the same reason, and it is the same
+terminals: [[curs_set]] fails wherever [[use_default_colors]] does
+(a [[vt100]] or a [[dumb]] entry has neither capability), so moving
+the crash off the colour setup and leaving it on the next line would
+have fixed nothing a student could notice.
+A visible cursor parked in a corner is a blemish; refusing to open the
+viewer is not being able to read your own log.
 
 The [[open]] event is recorded here rather than in [[_draw]], because
 [[_draw]] runs again on every scroll keystroke and would turn one
@@ -250,8 +356,12 @@ commit was on screen, so it belongs in the record.
 def _main_loop(self, stdscr):
     """Main event loop inside curses."""
     import curses
-    curses.use_default_colors()
-    curses.curs_set(0)
+    if self.color is not False:
+        self.styles = curses_styles(curses)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
     stdscr.clear()
     self._record_view("open")
 
@@ -266,10 +376,10 @@ def _main_loop(self, stdscr):
 \subsection{Drawing the screen}
 
 The screen has three regions: a header showing position and
-commit subject, the scrollable content area with the commit
-message and diff, and a footer with key bindings.
+commit subject, the scrollable content area with the record itself,
+and a footer with key bindings.
 
-We build the content as a list of lines, then display the
+We build the content as a list of styled lines, then display the
 portion that fits in the terminal window starting from the
 scroll offset.
 This approach avoids the complexity of [[curses]] pads while
@@ -280,6 +390,13 @@ Git.
 Without caching, every scroll keystroke would re-run the command,
 making the viewer sluggish on large repositories.
 
+We ask for git's own order rather than the reordered text.
+Both views want it: the card lays the parts out itself from
+[[split_commit_detail]] (\cref{sec:record-lines}), and raw mode is
+supposed to show what the log stores, which is the order git prints.
+Reordering here would mean undoing it in one view and printing a
+rearrangement in the other.
+
 <<player methods>>=
 def _get_detail(self, commit_hash):
     """Fetch and cache the ``git show`` output."""
@@ -289,6 +406,7 @@ def _get_detail(self, commit_hash):
                 self.repo, commit_hash,
                 self.filter_internal,
                 self._get_trailers(),
+                reorder=False,
             )
     return self._detail_cache[commit_hash]
 @
@@ -304,16 +422,26 @@ reserved for genuine plumbing---the [[pip]] install from
 [[learnlog init]], and records of other subcommands left by older
 versions.
 
+[[curses]] is imported once at the top of the method rather than
+inside the header and footer chunks.
+Before, [[<<draw content area>>]] caught [[curses.error]] while
+relying on [[<<draw header>>]] having bound the name a few lines
+earlier---correct only for as long as nobody reorders the regions or
+reuses the content chunk elsewhere, and it would fail as a
+[[NameError]] raised from an [[except]] clause, which is about the
+least legible way for a display bug to present itself.
+
 <<player methods>>=
 def _draw(self, stdscr):
     """Render the current commit to the screen."""
+    import curses
+    chrome = self.styles.get(KIND_CHROME, 0)
+
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
     commit = self.commits[self.index]
     detail = self._get_detail(commit["hash"])
-    if detail is None:
-        detail = "(learnlog internal run)"
 
     <<draw header>>
     <<build content lines>>
@@ -323,67 +451,149 @@ def _draw(self, stdscr):
     stdscr.refresh()
 @
 
-The header shows the position in the commit list, the short
-hash, any tags on the run, and the commit subject.
+The header says where the reader is and what they are looking at, and
+which of those two it can say depends on the view.
+The reading view names the record the way the card does, through
+[[record_title]] (\cref{sec:record-title}), so the fixed bar and the
+scrolling card agree on what the run was called.
+Raw mode keeps the older bracketed form with the short hash, because
+there the hash \emph{is} the thing on screen: the reader who asked for
+the stored format is the reader who wants to hand that hash to
+[[git]].
+Tags are shown in both, spelled the same way in both, and the spelling
+matches the batch card's [[Tags:]] line to the name---a tag is a
+boundary every report reads (\cref{sec:metrics-tags}), so the two
+places a student looks at their history must show where the milestones
+sit.
+
 The text is a method of its own so a test can read it without a
-terminal, and the tag map is read once, on first use, for the
-reason the trailer map is.
+terminal.
 We truncate to the terminal width to avoid curses errors.
 
 <<player methods>>=
 def _header_text(self, commit):
     """The header line for `commit`, untruncated."""
-    if self.tag_map is None:
-        self.tag_map = get_tag_map(self.repo)
-    names = self.tag_map.get(commit["hash"], [])
+    names = self._tags_for(commit)
     tags = f" (tag: {', '.join(names)})" if names else ""
+    if self.raw:
+        return (
+            f"[{self.index + 1}/{len(self.commits)}] "
+            f"{commit['hash'][:SHORT_HASH_LEN]}{tags} "
+            f"\u2014 {commit['subject']}"
+        )
     return (
-        f"[{self.index + 1}/{len(self.commits)}] "
-        f"{commit['hash'][:SHORT_HASH_LEN]}{tags} "
-        f"\u2014 {commit['subject']}"
+        f"{self.index + 1} of {len(self.commits)} \u2014 "
+        f"{record_title(commit['subject'])}{tags}"
     )
+@
+
+The bars are drawn with the [[chrome]] kind rather than a literal
+[[curses.A_REVERSE]].
+The attribute is the same one, but naming it means the header, the
+footer and the batch surface all read the decision out of
+[[render]]'s style table instead of each restating it.
+The lookup sits at the top of [[_draw]], beside the [[curses]]
+import, for the reason the import does: both bars use it, and a name
+bound inside one region's chunk and read in another's is the
+dependency this method just stopped having.
+
 <<draw header>>=
 header = self._header_text(commit)[:width - 1]
 try:
-    import curses
-    stdscr.addstr(HEADER_ROW, 0, header, curses.A_REVERSE)
+    stdscr.addstr(HEADER_ROW, 0, header, chrome)
     stdscr.addstr(
         HEADER_ROW, len(header),
         " " * (width - len(header) - 1),
-        curses.A_REVERSE,
+        chrome,
     )
 except curses.error:
     pass
 @
 
-The content is the reordered [[git show]] output, which places
-the diff before the commit message so that code changes appear
-first.
-When we can compute it, we prepend a compact
-[[Time since last run: ...]] line so the pause becomes part of the
-scrollable commit narrative rather than competing with the fixed header.
+The content is whatever [[render]] makes of this record, and the
+viewer's whole contribution to it is the three facts only a viewer
+knows: where the record sits in the list, how long the student paused
+before it, and which tags name it.
+The [[Time since last run:]] line the viewer used to prepend by hand
+is gone from here---the card carries it among its own meta lines
+(\cref{sec:record-lines}), which is what makes the pause read as part
+of the record instead of a note stuck on top of it, and what keeps
+batch mode from having to prepend the same line a second way.
+
+A commit whose every run block was filtered away has no card to build,
+so it gets the one dim line that says so.
 
 <<build content lines>>=
-content_lines = detail.split("\n")
-elapsed = format_elapsed(
-    elapsed_since_previous_run(self.commits, self.index)
-)
-if elapsed:
-    content_lines = [
-        f"Time since last run: {elapsed}",
-        "",
-        *content_lines,
-    ]
+if detail is None:
+    content_lines = [StyledLine(FILTERED_NOTE, KIND_DIM)]
+else:
+    content_lines = record_lines(
+        commit, detail,
+        index=self.index,
+        total=len(self.commits),
+        elapsed=elapsed_since_previous_run(
+            self.commits, self.index,
+        ),
+        tags=self._tags_for(commit),
+        raw=self.raw,
+    )
+@
+
+A styled line is at most two segments---a faded prefix and the text
+after it (\cref{sec:styled-line})---and drawing it means turning that
+into positions and attributes.
+Doing the arithmetic in a function keeps the draw loop to what it is
+about, and gives the clipping rule somewhere to be tested without a
+terminal.
+
+The rule is that the prefix and the text together stop before the last
+column.
+Curses treats a write into the bottom-right cell as an error, and the
+prefix has already consumed part of the row by the time the text is
+placed, so slicing the text to [[width - 1]] on its own would still
+overflow by exactly the length of the prefix.
+Wide characters still count as one column here, so a line of CJK text
+or emoji overflows as it always has; fixing that needs a width-aware
+measure such as [[wcwidth]] and is out of scope.
+
+<<viewer functions>>=
+def _segments(styled, width):
+    """Split a styled line into ``(column, text, kind)``.
+
+    The prefix is drawn faded from column 0 and the text
+    follows it, both clipped so the pair ends before the
+    window's last column.  Returns an empty list when there is
+    no room at all.
+    """
+    room = width - 1
+    if room <= 0:
+        return []
+    prefix = styled.prefix[:room]
+    text = styled.text[:room - len(prefix)]
+    segments = []
+    if prefix:
+        segments.append((0, prefix, KIND_FADED))
+    if text:
+        segments.append((len(prefix), text, styled.kind))
+    return segments
 @
 
 We display lines starting from the scroll offset, filling
 the area between the header (row~0) and the footer
 (last row).
+The page step is set here because this is where the window's height is
+known; leaving two lines of overlap means the reader keeps a little
+context across a page rather than jumping over the seam.
+
+The [[try]] wraps a whole row, not each segment: a row that curses
+refuses is lost either way, and the loop must go on to the rows below
+it, which is the failure this guard has always been about.
 
 <<draw content area>>=
 content_start = CONTENT_START_ROW
 content_end = height - FOOTER_OFFSET_FROM_BOTTOM
 visible = content_end - content_start
+self.page = max(1, visible - 2)
 
 self.scroll = max(
     0,
@@ -395,37 +605,265 @@ for i in range(visible):
     line_idx = self.scroll + i
     if line_idx >= len(content_lines):
         break
-    line = content_lines[line_idx][:width - 1]
     try:
-        stdscr.addstr(content_start + i, 0, line)
+        for column, text, kind in _segments(
+            content_lines[line_idx], width,
+        ):
+            stdscr.addstr(
+                content_start + i, column, text,
+                self.styles.get(kind, 0),
+            )
     except curses.error:
         pass
 @
 
 The footer shows key bindings.
 It sits on the last row of the terminal.
+It names the arrow keys rather than their vi-style twins, because the
+reader who needs to be told what the keys are is not the reader who
+already knows [[hjkl]]; both sets keep working.
 
 <<draw footer>>=
 footer = (
-    " H/\u2190: prev  L/\u2192: next  "
-    "j/\u2193: down  k/\u2191: up  "
-    "g: first  G: last  q: quit"
+    " \u2190/\u2192 run   \u2191/\u2193 scroll   "
+    "PgUp/PgDn page   g/G first/last   q quit"
 )
 footer = footer[:width - 1]
 try:
-    import curses
-    stdscr.addstr(
-        height - 1, 0, footer, curses.A_REVERSE
-    )
+    stdscr.addstr(height - 1, 0, footer, chrome)
     remaining = width - len(footer) - 1
     if remaining > 0:
         stdscr.addstr(
             height - 1, len(footer),
             " " * remaining,
-            curses.A_REVERSE,
+            chrome,
         )
 except curses.error:
     pass
+@
+
+
+\subsection{Verifying the drawing}
+
+Drawing was the one part of the viewer no test could reach, because
+[[curses]] insists on a real terminal.
+What it does not insist on is that [[stdscr]] be one of \emph{its}
+windows: [[_draw]] calls four methods on the object it is handed, so a
+stand-in that answers those four and writes down what it was asked to
+draw turns every question about the screen into a question about a
+list.
+That is worth having beyond the coverage---the assertions below are
+about which attribute reached which column, which is precisely what a
+human staring at a terminal cannot check.
+
+<<viewer test functions>>=
+class FakeScreen:
+    """A curses window that records what was drawn.
+
+    Each ``addstr`` becomes a ``(row, column, text,
+    attribute)`` tuple in ``calls``.  With ``fail_row`` set,
+    writes to that row raise ``curses.error`` the way a real
+    window does at the edges.
+    """
+
+    def __init__(self, height=10, width=80, fail_row=None):
+        self.height = height
+        self.width = width
+        self.fail_row = fail_row
+        self.calls = []
+
+    def getmaxyx(self):
+        return (self.height, self.width)
+
+    def erase(self):
+        self.calls.clear()
+
+    def refresh(self):
+        pass
+
+    def addstr(self, row, column, text, attribute=0):
+        import curses
+        if row == self.fail_row:
+            raise curses.error("out of bounds")
+        self.calls.append((row, column, text, attribute))
+@
+
+The viewer under test is one finished run: it has a diff, output on
+stdout, and a tag map to consult, so a draw of it exercises every
+chunk above.  We give it a style table of distinct numbers rather than
+real curses attributes, so an assertion names the kind that was meant
+instead of a bit pattern that several kinds share.
+
+<<viewer test functions>>=
+def _drawable_viewer(workdir, **options):
+    """A viewer over one finished run, with numbered styles."""
+    import datetime
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    from learnlog.render import STYLES
+    from learnlog.viewer import PlaybackViewer
+    repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text('print("hi")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    commits = get_commits(repo)
+    viewer = PlaybackViewer(
+        repo, commits, len(commits) - 1, **options,
+    )
+    viewer.styles = {
+        kind: number
+        for number, kind in enumerate(STYLES, start=1)
+    }
+    return viewer
+@
+
+The first thing to check is that a kind survives the trip from
+[[render]] to the screen at all---the card's headline and its section
+heading are different kinds, and each must arrive with its own
+attribute:
+
+<<viewer test functions>>=
+def test_draw_styles_each_line_by_its_kind(workdir):
+    """A line reaches the screen with its kind's attribute."""
+    pytest.importorskip("curses")
+    from learnlog.render import KIND_SECTION, KIND_TITLE
+    viewer = _drawable_viewer(workdir)
+    screen = FakeScreen(height=24)
+
+    viewer._draw(screen)
+
+    drawn = {text: attribute for _, _, text, attribute in screen.calls}
+    assert drawn["You ran hello.py"] == viewer.styles[KIND_TITLE]
+    assert drawn["Terminal session"] == viewer.styles[KIND_SECTION]
+@
+
+A terminal-session line is the only line with two segments, and it is
+the reason [[_segments]] exists.  The prefix must land at column~0 in
+the faded style and the program's own text right after it in the
+stream's style---if either half took the other's attribute the line
+would read as learnlog's rather than the program's:
+
+<<viewer test functions>>=
+def test_draw_writes_an_io_line_as_prefix_then_text(workdir):
+    """The faded prefix and the program's text are separate."""
+    pytest.importorskip("curses")
+    from learnlog.render import KIND_FADED, KIND_OUT
+    viewer = _drawable_viewer(workdir)
+    screen = FakeScreen(height=24)
+
+    viewer._draw(screen)
+
+    prefixes = [c for c in screen.calls if c[2] == "  stdout: "]
+    assert len(prefixes) == 1
+    row, column, _, attribute = prefixes[0]
+    assert (column, attribute) == (0, viewer.styles[KIND_FADED])
+    assert [c for c in screen.calls if c[0] == row] == [
+        (row, 0, "  stdout: ", viewer.styles[KIND_FADED]),
+        (
+            row, len("  stdout: "), "hello",
+            viewer.styles[KIND_OUT],
+        ),
+    ]
+@
+
+The clipping rule is what keeps that pair inside the window, and it is
+cheaper to state against [[_segments]] than against a screen.  A
+narrow window must cut the text short by the length of the prefix, not
+by the width alone, and a window with no room must yield nothing
+rather than an empty write:
+
+<<viewer test functions>>=
+def test_segments_clip_prefix_and_text_together():
+    """Prefix plus text stop before the last column."""
+    from learnlog.render import (
+        KIND_FADED, KIND_OUT, StyledLine,
+    )
+    from learnlog.viewer import _segments
+    line = StyledLine("hello there", KIND_OUT, "  stdout: ")
+
+    assert _segments(line, 80) == [
+        (0, "  stdout: ", KIND_FADED),
+        (10, "hello there", KIND_OUT),
+    ]
+
+    narrow = _segments(line, 14)
+    assert narrow == [
+        (0, "  stdout: ", KIND_FADED),
+        (10, "hel", KIND_OUT),
+    ]
+    assert sum(len(text) for _, text, _ in narrow) == 13
+
+    assert _segments(line, 5) == [(0, "  st", KIND_FADED)]
+    assert _segments(line, 1) == []
+@
+
+A window that refuses one row must not cost the reader the rest of the
+screen.  This is the guard that has always been there; what is new is
+that a test can see it work.  We compare against an undisturbed draw
+rather than naming rows, since a card has blank lines and a blank line
+is written nowhere:
+
+<<viewer test functions>>=
+def test_draw_survives_a_refused_row(workdir):
+    """One failing row does not abort the draw."""
+    pytest.importorskip("curses")
+    viewer = _drawable_viewer(workdir)
+    intact = FakeScreen(height=24)
+    viewer._draw(intact)
+    expected = {row for row, _, _, _ in intact.calls}
+    assert 3 in expected
+
+    screen = FakeScreen(height=24, fail_row=3)
+    viewer._draw(screen)
+
+    assert {
+        row for row, _, _, _ in screen.calls
+    } == expected - {3}
+@
+
+The monochrome case is the empty style table, which is what
+[[--no-color]] leaves behind and what a terminal without colours
+produces.  Every write must then carry no attribute at all rather than
+raising on a missing key:
+
+<<viewer test functions>>=
+def test_draw_without_styles_uses_no_attributes(workdir):
+    """An empty style table draws everything unattributed."""
+    pytest.importorskip("curses")
+    viewer = _drawable_viewer(workdir)
+    viewer.styles = {}
+    screen = FakeScreen(height=24)
+
+    viewer._draw(screen)
+
+    assert screen.calls
+    assert {attribute for _, _, _, attribute in screen.calls} == {0}
+@
+
+The two headers are the one place the views deliberately differ, so
+each has to say what its own reader came for---the record's name in
+the reading view, the hash in the raw one:
+
+<<viewer test functions>>=
+def test_header_names_the_record_and_raw_names_the_hash(workdir):
+    """The header follows the view the reader chose."""
+    viewer = _drawable_viewer(workdir)
+    commit = viewer.commits[viewer.index]
+    short = commit["hash"][:7]
+
+    assert "hello.py" in viewer._header_text(commit)
+    assert short not in viewer._header_text(commit)
+
+    viewer.raw = True
+    assert short in viewer._header_text(commit)
 @
 
 
@@ -447,6 +885,19 @@ it} are genuinely different behaviours and the guard is what
 distinguishes them.
 The scroll keys touch no commit and so pass [[_go_to]] by.
 
+So do the page keys, and for the same reason: a page moves the window
+over one record, never off it.
+That is the rule of \cref{sec:viewer-view-trace} applied to a bigger
+step---what the trace measures is which records the student put on
+screen, and a reader who pages through one long diff has put one
+record on screen.
+Recording a view per page would make a long record look like a
+frequently revisited one, which is exactly the reading the trace is
+supposed to support.
+Space and [[b]] join the [[PgDn]] and [[PgUp]] keys because that is
+what [[less]] and [[man]] do, and this viewer is the first pager many
+of these students meet.
+
 <<player methods>>=
 def _handle_key(self, key):
     """Process a keypress.  Return ``False`` to quit."""
@@ -464,6 +915,10 @@ def _handle_key(self, key):
         self.scroll += 1
     elif key in (ord("k"), curses.KEY_UP):
         self.scroll = max(0, self.scroll - 1)
+    elif key in (curses.KEY_NPAGE, ord(" ")):
+        self.scroll += self.page
+    elif key in (curses.KEY_PPAGE, ord("b")):
+        self.scroll = max(0, self.scroll - self.page)
     elif key == ord("g"):
         self._go_to(0, "jump-first")
     elif key == ord("G"):
@@ -520,6 +975,31 @@ def test_handle_key_jump_endpoints():
     assert viewer.index == 0
 @
 
+A page moves by whatever the last draw measured, and stops at the top
+of the record rather than scrolling past it.  We set [[page]] by hand
+so the test states the step it expects instead of inheriting one from
+a terminal it does not have:
+
+<<viewer test functions>>=
+def test_handle_key_pages_by_a_screenful():
+    """PgDn/space and PgUp/b move by a page, floored at 0."""
+    import curses
+    from learnlog.viewer import PlaybackViewer
+    viewer = PlaybackViewer(None, [{"hash": "a"}], 0)
+    viewer.page = 5
+
+    viewer._handle_key(curses.KEY_NPAGE)
+    assert viewer.scroll == 5
+    viewer._handle_key(ord(" "))
+    assert viewer.scroll == 10
+    viewer._handle_key(curses.KEY_PPAGE)
+    assert viewer.scroll == 5
+    viewer._handle_key(ord("b"))
+    assert viewer.scroll == 0
+    viewer._handle_key(ord("b"))
+    assert viewer.scroll == 0
+@
+
 A live run is what turns [[record_view]] from a no-op into an
 append, so the tests below supply one: a stand-in [[repo]] object
 and an empty trace, both restored afterwards by [[monkeypatch]].
@@ -563,15 +1043,16 @@ def test_navigation_records_view_trace(monkeypatch):
 @
 
 The complement matters just as much, because it is the half that
-decides whether the trace measures reading or typing.  Scrolling
-inside a commit, and a step or a jump that runs into the end of the
-list, all leave the screen showing what it already showed:
+decides whether the trace measures reading or typing.  Scrolling and
+paging inside a commit, and a step or a jump that runs into the end of
+the list, all leave the screen showing what it already showed:
 
 <<viewer test functions>>=
 def test_a_keypress_that_moves_nothing_records_nothing(
     monkeypatch,
 ):
-    """Scrolling and blocked moves are not views."""
+    """Scrolling, paging and blocked moves are not views."""
+    import curses
     import learnlog
     from learnlog.viewer import PlaybackViewer
     monkeypatch.setattr(learnlog, "repo", object())
@@ -579,8 +1060,10 @@ def test_a_keypress_that_moves_nothing_records_nothing(
     commits = [{"hash": "aaa"}, {"hash": "bbb"}]
     viewer = PlaybackViewer(None, commits, 0)
 
-    for key in "hgjk":
+    for key in "hgjk b":
         viewer._handle_key(ord(key))
+    for key in (curses.KEY_NPAGE, curses.KEY_PPAGE):
+        viewer._handle_key(key)
     assert learnlog.view_trace == []
 
     viewer._handle_key(ord("G"))
@@ -637,55 +1120,76 @@ That an internal run stays out of the record of the review that
 skipped it is the same consistency the reader sees---what the trailer
 says was looked at is what standard output showed.
 
-A tagged run announces its names on a [[Tags:]] line before its
-detail, and the interactive header shows the same names in
-parentheses: a tag is a boundary every report reads
+A tagged run announces its names on a [[Tags:]] line, and so does the
+card the interactive viewer scrolls, because both get the line from
+the same builder: a tag is a boundary every report reads
 (\cref{sec:metrics-tags}), so the two places a student actually
 looks at their history must show where the milestones sit.
+The same now goes for the pause between runs.
+Batch mode used to write both lines itself, ahead of the detail, while
+the viewer prepended one of them in its own wording; they agreed only
+because someone kept them agreeing.
+Both are meta lines of the card now (\cref{sec:record-lines}), so the
+two media cannot disagree about a tag or a gap---there is one place
+that decides, and neither surface can reach it separately.
+
+[[stream]] is resolved when the function is called, not when the
+module is imported, because the test suite and the [[CliRunner]] both
+work by replacing [[sys.stdout]] after import; a default argument
+would capture the real one and write past them.
+Colour is decided once per call rather than per line, since the
+question [[use_color]] answers (\cref{sec:use-color}) is about the
+destination and cannot change halfway down the log.
 
 <<viewer functions>>=
 def play_batch(repo, commits, start_index=0,
                filter_internal=True, trailers=None,
-               tag_map=None):
-    """Print commit details sequentially to stdout.
+               tag_map=None, raw=False, color=None,
+               stream=None):
+    """Print commit records sequentially to stdout.
 
     When ``filter_internal`` is ``True``, learnlog's internal
     run blocks are stripped and commits that hold nothing else
     are skipped.  Review runs are printed like any other run.
     ``trailers`` is the map from ``get_run_trailers`` and
     ``tag_map`` the one from ``get_tag_map``; both are read
-    from ``repo`` when not supplied.  A tagged commit is
-    announced with a ``Tags:`` line.
+    from ``repo`` when not supplied.  With ``raw`` true the
+    stored log format is printed instead of the reading view.
+    ``color`` forces colour on or off; ``None`` writes it only
+    to a terminal.  ``stream`` defaults to ``sys.stdout``.
 
     Every commit that is printed is reported to
     :func:`learnlog.record_view` with the action ``batch``.
     """
+    if stream is None:
+        stream = sys.stdout
     if trailers is None:
         trailers = get_run_trailers(repo)
     if tag_map is None:
         tag_map = get_tag_map(repo)
+    colored = use_color(stream, color)
     for index in range(start_index, len(commits)):
         commit = commits[index]
         detail = get_commit_detail(
             repo, commit["hash"], filter_internal, trailers,
+            reorder=False,
         )
         if detail is None:
             continue
         learnlog.record_view(commit["hash"], "batch")
-        names = tag_map.get(commit["hash"], [])
-        if names:
-            sys.stdout.write(
-                f"Tags: {', '.join(names)}\n"
-            )
-        elapsed = format_elapsed(
-            elapsed_since_previous_run(commits, index)
+        lines = record_lines(
+            commit, detail,
+            index=index,
+            total=len(commits),
+            elapsed=elapsed_since_previous_run(
+                commits, index,
+            ),
+            tags=tag_map.get(commit["hash"], []),
+            raw=raw,
         )
-        if elapsed:
-            sys.stdout.write(
-                f"Time since last run: {elapsed}\n"
-            )
-        sys.stdout.write(detail)
-        sys.stdout.write("\n")
+        for text in ansi_lines(lines, colored):
+            stream.write(text)
+        stream.write("\n")
 @
 
 Let's verify that batch playback produces the expected output
@@ -705,8 +1209,9 @@ def test_play_batch_outputs_all_commits(workdir, capsys):
         assert c["hash"][:7] in captured
 @
 
-A finished run must show up as one record: its header, its results, and
-no sign of the trailer commit that carried them:
+A finished run must show up as one record: what ran, how it went, what
+it printed, and no sign of the trailer commit that carried the
+results:
 
 <<viewer test functions>>=
 def test_play_batch_shows_one_record_per_run(workdir, capsys):
@@ -729,10 +1234,37 @@ def test_play_batch_shows_one_record_per_run(workdir, capsys):
     commits = get_commits(repo)
     play_batch(repo, commits)
     captured = capsys.readouterr().out
-    assert captured.count("Run: hello.py") == 1
-    assert "Exit-Code: 0" in captured
+    assert captured.count("You ran hello.py") == 1
+    assert "Result: it worked" in captured
     assert "stdout: hello" in captured
     assert "Run-End:" not in captured
+@
+
+The same run under [[--raw]] is the contrast that says what the flag
+is for: the stored format, complete with the field names and the Git
+diff header that the card spends its effort hiding.
+
+<<viewer test functions>>=
+def test_play_batch_raw_shows_the_stored_format(
+    workdir, capsys,
+):
+    """Raw mode prints the log as it is stored."""
+    import datetime
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text('print("hi")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    commits = get_commits(repo)
+    play_batch(repo, commits, raw=True)
+    captured = capsys.readouterr().out
+    assert "diff --git" in captured
+    assert "Run-Id:" in captured
+    assert "You ran hello.py" not in captured
 @
 
 Let's verify the tag display in both media: the [[Tags:]] line in
@@ -804,9 +1336,9 @@ def test_play_batch_renders_review_run(workdir, capsys):
     commits = get_commits(repo)
     play_batch(repo, commits)
     captured = capsys.readouterr().out
-    assert "Run: learnlog play" in captured
-    assert "Exit-Code: 0" in captured
-    assert "(learnlog internal run)" not in captured
+    assert "You looked back through your log" in captured
+    assert "Looked at 0 runs" in captured
+    assert "learnlog's own setup" not in captured
 @
 
 The batch trace must agree with the page, so we give the log one
@@ -874,6 +1406,6 @@ def test_play_batch_shows_time_since_last_run(workdir, capsys):
     assert "Time since last run:" in captured
     assert captured.count("Time since last run:") == 1
     gap_pos = captured.index("Time since last run:")
-    second_pos = captured.index(commits[-1]["hash"])
+    second_pos = captured.index(commits[-1]["hash"][:7])
     assert gap_pos < second_pos
 @

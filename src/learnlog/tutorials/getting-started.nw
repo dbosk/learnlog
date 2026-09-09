@@ -363,12 +363,29 @@ in one record that [[learnlog play -b]] prints.
 Its object of learning is that the run became an inspectable record
 joining code state, command, and output.
 The checks match the learner's own artefacts (the file name, the
-greeting, a rendered diff) rather than the viewer's output format, so
-the tutorial does not break when the viewer's formatting changes.
+greeting, the section that reports what changed) rather than a
+storage field, so the tutorial does not break when the stored format
+changes.
 The novice variant asks the learner to recognise their own work in the
-record; the expert variant names the viewer's field labels and closes
+record; the expert variant adds the raw view and closes
 with the two-commit protocol, which explains a property the learner
 can only appreciate here: even a crashed run leaves a record.
+
+The fourth pattern is the one that needs an argument, because the
+obvious candidates all fail.
+It has to prove that the record showed the learner what changed, and
+it has to hold for \emph{this} run, whose change is the creation of
+[[hello.py]]: a pattern like [[Changes to]] or [[--- a/]] describes an
+edit to a file that already existed, and a new file has neither.
+[[Code changes]] is the reading view's heading for that section, and
+the reading view emits it for every run record---with the file list
+under it when there is one, and a sentence saying nothing changed when
+there is not---so it is the one phrase that is present whatever the
+learner's first run turns out to look like.
+It is also vocabulary the view owns rather than a field name the log
+stores, which is the same reason the [[Script:]] and [[stdout:]]
+prefixes were dropped from these checks: the tutorial should break when
+the \emph{teaching} changes, not when the storage does.
 
 <<checks: inspect the recorded run>>=
 pre_command: |
@@ -379,7 +396,7 @@ required_patterns:
   - hello.py
   - mode: regex
     pattern: '(?i)hello[,!\s]*world'
-  - diff --git
+  - Code changes
 <<novice step: inspect the recorded run>>=
 # Inspect the recorded run
 
@@ -390,7 +407,8 @@ hint: Use `learnlog play -b` and look for your `hello.py` run.
 
 Use `learnlog play -b` to print the recorded run in the terminal.
 You should recognise what you just did: the name `hello.py`, the
-message it printed, and the line you wrote.
+message it printed under `Terminal session`, and the line you wrote
+under `Code changes`.
 <<expert step: inspect the recorded run>>=
 # Inspect the recorded run
 
@@ -402,8 +420,15 @@ hint: The tutorial already re-activated the project environment; use `learnlog p
 This step also opens in a fresh shell, and the tutorial has already
 re-activated the project environment for you.
 Use `learnlog play -b` to print the recorded commit to the terminal.
-Look for `Script: hello.py`, `stdout: Hello, world!`, and the diff
-showing the file you created.
+What you get is a reading view of the run: a headline saying what you
+ran, when it ran and how it went, then `Code changes` with the line
+you wrote, then `Terminal session` with what the program printed.
+
+That is a rendering, not the log.
+Run `learnlog play -b --raw` to see what is actually stored: the Git
+commit with its hash, an ordinary `diff --git`, and the record's own
+field names, `Script:`, `Exit-Code:` and `stdout:`.
+Both commands read the same commit; only the presentation differs.
 
 Under the hood the run is a pair of Git commits in `.learnlog/`: a
 header committed before your program ran, holding the code state, and

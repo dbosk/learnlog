@@ -443,7 +443,13 @@ To replay your recent runs interactively:
 learnlog play
 ```
 
-Use the arrow keys to step through events and **q** to quit.
+Use the left and right arrow keys to step between runs, the up and
+down keys or **Page Up**/**Page Down** to move within a long one, and
+**q** to quit.
+Each run is shown as a card: what ran, how it went, what changed since
+the run before, and what the program printed.
+Add `--raw` to see the stored record instead, and `-b` to print the
+log to the terminal rather than open the viewer.
 
 ## Submit or share your log
 
@@ -7043,6 +7049,17 @@ And the trailer must carry no captured playback text: a review that
 copied its own output into the log would embed the history inside
 itself, once per review (\cref{sec:review-runs}).
 
+The hashes are only on screen under [[--raw]] now, so that is the
+invocation whose trace we compare (\cref{sec:play}).
+It is also the invocation for which \enquote{the trailer holds none of
+what was printed} still says something, since [[--raw]] is what prints
+[[diff --git]] in the first place.
+The reading view needs the same assertion in its own vocabulary, so a
+second, plain playback follows and its trailer must not contain the
+[[Code changes]] heading it just filled the screen with.
+It runs second because [[_commit_body]] answers with the newest
+matching commit.
+
 <<autostart test functions>>=
 def test_batch_playback_is_recorded_and_traced(cli_project):
     import re
@@ -7052,7 +7069,9 @@ def test_batch_playback_is_recorded_and_traced(cli_project):
         venv_dir, project, "print('review me')\n",
     )
 
-    played = _run_cli(learnlog, ["play", "-b"], cwd=project)
+    played = _run_cli(
+        learnlog, ["play", "-b", "--raw"], cwd=project,
+    )
     shown = set(
         re.findall(
             r"^commit ([0-9a-f]{40})$", played.stdout, re.M,
@@ -7071,6 +7090,12 @@ def test_batch_playback_is_recorded_and_traced(cli_project):
     } == shown
     assert "--- I/O ---\n(no I/O)" in trailer
     assert "diff --git" not in trailer
+
+    reading = _run_cli(learnlog, ["play", "-b"], cwd=project)
+    assert "Code changes" in reading.stdout
+    trailer = _commit_body(project, "^Run-End: learnlog play")
+    assert "--- I/O ---\n(no I/O)" in trailer
+    assert "Code changes" not in trailer
 @
 
 A metrics run is the third kind of review run, and the shape of its
