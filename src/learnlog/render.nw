@@ -1,0 +1,2237 @@
+\chapter{Rendering a Record for Reading}
+\label{render}
+
+A recorded run reaches a reader as [[git show]] output: forty
+hexadecimal digits, an author line, a unified diff, and a message whose
+every line is indented by four spaces because Git indents messages.
+That is a fine format for a program and a poor one for the person the
+log is kept for.
+A first-year student looking at their own afternoon should see what
+they ran, whether it worked, what they had changed since the last time,
+and what the terminal said---and should see the exception message
+before they see the run identifier.
+
+This chapter turns one record into a \emph{card}: a small ordered list
+of lines, each labelled with what kind of thing it is.
+Nothing here decides what the lines look like on a particular screen.
+A line carries a [[kind]]---[[removed]], [[err]], [[section]]---and the
+two surfaces that display records, the curses viewer and the batch
+writer (\cref{viewer}), turn that kind into a curses attribute or an
+ANSI escape at the moment of drawing.
+
+\section{Why the display layer is a module of its own}
+
+Splitting rendering out is what keeps colour out of the log.
+This module imports [[learnlog.commits]] and the standard library and
+nothing else; it takes no repository argument, opens no file, and
+returns values rather than writing them.
+A module with no repository cannot write to one, so no escape sequence
+and no friendly phrase can end up in a commit message by accident:
+what is stored stays the transcript the student's program produced, and
+everything in this chapter happens after it has been read back.
+That is a stronger guarantee than a rule saying \enquote{do not
+colour the log}, because it is enforced by the import list rather than
+by discipline.
+
+The second reason is that one description of a record then serves both
+surfaces.
+The viewer draws with [[addstr]] and the batch writer prints with
+[[print]]; if each built its own card they would drift, and a tutorial
+that tells the student what they will see would be right about only one
+of them.
+
+\ltnote{%
+  The order of this chapter is the order in which the pieces stop
+  depending on each other, not the order a reader meets them on screen.
+  The diff and the terminal session are explained first because they
+  are self-contained line-to-kind rules, and the card is explained last
+  because it is assembled from them.  Presenting the card first would
+  mean forward-referencing two state machines to explain a list of
+  section headings.%
+}
+
+\section{Code overview}
+
+The module is a pipeline with a wide middle: a handful of classifiers
+that each turn one kind of text into styled lines, and two entry points
+that assemble them.
+[[record_lines]] builds the friendly card, [[raw_lines]] builds the
+unchanged [[git show]] text with colour added, and the remaining
+public functions serve the two surfaces: [[use_color]] and
+[[ansi_lines]] for the batch writer, [[curses_styles]] for the viewer.
+
+<<[[render.py]]>>=
+"""Turn one recorded run into styled lines for display.
+
+Reading and writing the log happen elsewhere; this module only
+decides what a record should look like.  It returns ``StyledLine``
+tuples, which ``ansi_lines`` renders for a terminal and
+``curses_styles`` maps to curses attributes.
+"""
+
+<<render imports>>
+
+<<render types>>
+
+<<render constants>>
+
+<<render functions>>
+@
+
+The tests are a root of their own, which is what lets
+[[tests/Makefile]] discover and tangle them.
+
+<<test [[render.py]]>>=
+"""Tests for the render module."""
+import pytest
+
+from learnlog.render import *
+
+<<render test functions>>
+@
+
+
+\section{Imports}
+
+Every reader this module needs already exists in \cref{commits}: the
+block separator (\cref{sec:block-sep}), the run block parser
+(\cref{sec:parse-run-block}, which also delivers the view trace of a
+review run, \cref{sec:view-trace}), the exception line
+(\cref{sec:parse-exception-line}), the stream prefixes
+(\cref{sec:io-stream-prefixes}) and the section splitter
+(\cref{sec:split-commit-detail}).
+Re-deriving any of them here would mean two parsers for one format,
+and the second one would be the one nobody notices is wrong.
+
+[[_parse_iso]] is private to \cref{commits} and imported anyway.
+The alternative is a second [[try]]\slash[[except ValueError]] around
+[[datetime.fromisoformat]] here, and \enquote{a malformed timestamp is
+missing data, not an error} is a decision this package should make once
+rather than twice.
+[[NO_IO_PLACEHOLDER]] reaches us through the same module: it is
+written by \cref{gitrepo} and re-exported by the reader that already
+imports it, so the card recognises the placeholder by the writer's own
+spelling.
+
+<<render imports>>=
+from __future__ import annotations
+
+import collections
+import os
+import unicodedata
+
+from learnlog.commits import (
+    BLOCK_SEP,
+    IO_STREAM_PREFIXES,
+    NO_IO_PLACEHOLDER,
+    RUN_SUBJECT_PREFIX,
+    _parse_iso,
+    format_elapsed,
+    is_checkout_command,
+    is_review_command,
+    is_review_run,
+    parse_exception_line,
+    parse_run_block,
+    parse_show_sections,
+    split_commit_detail,
+)
+@
+
+
+\section{A line and its style}
+\label{sec:styled-line}
+
+A rendered line is at most two pieces of text.
+The terminal-session lines have a stream prefix---[[stdout: ]],
+[[stdin: ]], [[stderr: ]]---and everything after it is what the
+student's program actually said.
+We want the eye to land on the program's own words, so the prefix is
+drawn faded while the text keeps its colour and weight.
+
+Two segments rather than a general list of spans, because nothing in a
+record needs a third: the diff keeps its [[+]] and [[-]] markers inside
+the coloured text exactly as [[git diff]] does, and every other line is
+one piece.  Two segments also keep both consumers trivial---two
+[[addstr]] calls, or two escape-wrapped substrings.
+
+<<render types>>=
+StyledLine = collections.namedtuple(
+    "StyledLine", ["text", "kind", "prefix"], defaults=("",),
+)
+@
+
+\subsection{The vocabulary of kinds}
+
+Each line names a \emph{kind}, and the kinds are a closed vocabulary:
+[[STYLES]] below has a row for every one of them, and a test checks
+that nothing this module emits falls outside the table.
+Naming them as constants rather than writing the strings at each site
+means a mistyped kind raises [[NameError]] the first time that line is
+built, instead of producing a line that silently loses its colour.
+
+<<render constants>>=
+KIND_TITLE = "title"
+KIND_SECTION = "section"
+KIND_META = "meta"
+KIND_OK = "ok"
+KIND_BAD = "bad"
+KIND_WARN = "warn"
+KIND_FILE = "file"
+KIND_HUNK = "hunk"
+KIND_ADDED = "added"
+KIND_REMOVED = "removed"
+KIND_CONTEXT = "context"
+KIND_OUT = "out"
+KIND_INPUT = "input"
+KIND_ERR = "err"
+KIND_FADED = "faded"
+KIND_NOTE = "note"
+KIND_DIM = "dim"
+KIND_PLAIN = "plain"
+KIND_CHROME = "chrome"
+@
+
+\subsection{The style table}
+
+One table describes both surfaces, because the alternative---a curses
+table here and an ANSI table there---is two lists that have to be
+edited together and can therefore disagree.
+
+The curses half is a description rather than an attribute, because
+attributes do not exist until [[initscr]] has run and because
+[[curses]] is unimportable on a Windows machine without
+[[windows-curses]] (\cref{viewer}).
+A module that named [[curses.A_BOLD]] at the top level would fail to
+import for a student who only ever runs [[learnlog play -b]].
+[[curses_styles]] turns these descriptions into attributes later,
+inside curses.
+
+We use only the eight basic colours against the terminal's own
+background.
+That is the portable subset: 256-colour pairs and explicit backgrounds
+are where PDCurses, [[TERM=linux]] consoles and colour-blind-friendly
+terminal themes start to differ from each other.
+PDCurses also ignores [[A_DIM]] on some terminals, so dimming must
+never be the only thing distinguishing two kinds---which is why the
+faded stream prefixes keep their [[stdout: ]] text and the diff keeps
+its [[+]] and [[-]] markers.  Read without any colour at all, a card
+still says everything it meant to.
+
+<<render types>>=
+CursesStyle = collections.namedtuple(
+    "CursesStyle", ["colour", "bold", "dim", "reverse"],
+    defaults=(None, False, False, False),
+)
+Style = collections.namedtuple("Style", ["curses", "sgr"])
+<<render constants>>=
+STYLES = {
+    KIND_TITLE: Style(CursesStyle(bold=True), "1"),
+    KIND_SECTION: Style(CursesStyle("cyan", bold=True), "1;36"),
+    KIND_META: Style(CursesStyle(dim=True), "2"),
+    KIND_OK: Style(CursesStyle("green"), "32"),
+    KIND_BAD: Style(CursesStyle("red"), "31"),
+    KIND_WARN: Style(CursesStyle("yellow"), "33"),
+    KIND_FILE: Style(CursesStyle(bold=True), "1"),
+    KIND_HUNK: Style(CursesStyle("cyan"), "36"),
+    KIND_ADDED: Style(CursesStyle("green"), "32"),
+    KIND_REMOVED: Style(CursesStyle("red"), "31"),
+    KIND_CONTEXT: Style(CursesStyle(), ""),
+    KIND_OUT: Style(CursesStyle(), ""),
+    KIND_INPUT: Style(CursesStyle("blue", bold=True), "1;34"),
+    KIND_ERR: Style(CursesStyle("red"), "31"),
+    KIND_FADED: Style(CursesStyle(dim=True), "2"),
+    KIND_NOTE: Style(CursesStyle(dim=True), "2"),
+    KIND_DIM: Style(CursesStyle(dim=True), "2"),
+    KIND_PLAIN: Style(CursesStyle(), ""),
+    KIND_CHROME: Style(CursesStyle(reverse=True), ""),
+}
+@
+
+Let's verify that the table is complete in both halves---every kind
+has a curses description and an SGR string, and every colour named is
+one of the eight portable ones:
+
+<<render test functions>>=
+def test_styles_cover_every_kind():
+  """Each style row describes both surfaces."""
+  portable = {"black", "red", "green", "yellow",
+              "blue", "magenta", "cyan", "white"}
+  for kind, style in STYLES.items():
+    assert isinstance(kind, str) and kind
+    assert isinstance(style.sgr, str)
+    assert style.curses.colour is None or \
+        style.curses.colour in portable
+@
+
+
+\section{Making text safe to draw}
+\label{sec:sanitise}
+
+A captured transcript is whatever the student's program printed, and a
+program prints things a terminal grid cannot hold.
+A tab is the dangerous one: [[addstr]] expands it against the window's
+own tab stops, and a line that ends past the right edge makes [[addstr]]
+raise [[curses.error]], which costs the \emph{whole} line, not the
+overflowing part.  Expanding tabs ourselves puts the width under our
+control before curses sees it.
+
+A carriage return is the common one.  The capture layer splits its
+buffer on [[\r]] as well as [[\n]] (\cref{capture}), because progress
+bars redraw a line by returning to its start; a stray [[\r]] still
+reaching us here would make a terminal overwrite the line it just drew.
+We drop it rather than replace it, because a carriage return carries no
+text---it is a cursor movement.
+
+Everything else in the control range becomes a question mark, so it
+occupies one visible cell and says that something was there.
+[[unicodedata]] answers \enquote{is this a control character} for the
+C1 range as well as C0, which matters because escape sequences whose
+introducer survived a truncation can start there.
+
+<<render constants>>=
+TAB_WIDTH = 4
+CONTROL_REPLACEMENT = "?"
+<<render functions>>=
+def sanitise(text):
+    """Return ``text`` with tabs expanded and controls removed.
+
+    Tabs become spaces, carriage returns are dropped, and every
+    other control character becomes ``?``.
+    """
+    expanded = text.expandtabs(TAB_WIDTH)
+    return "".join(
+        CONTROL_REPLACEMENT
+        if unicodedata.category(character) == "Cc"
+        else character
+        for character in expanded
+        if character != "\r"
+    )
+@
+
+Let's verify each of the three treatments, including that ordinary
+text and non-ASCII letters pass through untouched:
+
+<<render test functions>>=
+def test_sanitise_expands_tabs():
+  assert sanitise("a\tb") == "a   b"
+  assert sanitise("\tx") == "    x"
+
+def test_sanitise_drops_carriage_returns():
+  assert sanitise("50%\r100%") == "50%100%"
+
+def test_sanitise_replaces_other_controls():
+  assert sanitise("a\x00b\x1bc") == "a?b?c"
+  assert sanitise("a\x7fb") == "a?b"
+
+def test_sanitise_keeps_ordinary_text():
+  text = "k\u00f6r igen! \u2014 ja"
+  assert sanitise(text) == text
+@
+
+
+\section{Reading the parts of a record}
+\label{sec:record-parts}
+
+[[split_commit_detail]] (\cref{sec:split-commit-detail}) hands back the
+three parts of a [[git show]]: the header lines, the message with
+Git's four-space indent already removed, and the diff lines.
+That is everything the card needs, and it is the only splitting this
+module does.
+
+It reads the order Git produces---header, message, diff---and
+[[get_commit_detail]] can hand back a different one, with the diff
+moved in front of the message so that a reader meeting the raw text
+sees the code changes first (\cref{commits}).
+Both views here ask for Git's own order, with [[reorder=False]], for
+two different reasons.
+The card composes its own layout out of the parts and would have to
+undo the move before it could tell message from diff.
+The raw view (\cref{sec:raw-lines}) wants Git's order because that is
+what a record \emph{is}: the diff-first arrangement was a convenience
+for reading the text as text (\cref{commits}), and a view whose promise
+is to show what was recorded should not show a rearrangement of it.
+
+The default stays [[reorder=True]], because the callers that predate
+this chapter are the ones the convenience was written for.  Keeping the
+choice in the reader is also what lets this module take one layout and
+know it: nothing below has to recognise a rearranged [[git show]] or
+guess where a moved message begins.
+
+\subsection{The run blocks of a message}
+
+A commit message holds zero or more run blocks separated by
+[[BLOCK_SEP]] (\cref{sec:block-sep}).
+Zero is not an error: the initial commit's message is
+[[learnlog: initial commit]], and a merge written by [[learnlog pull]]
+records no run either.
+We recognise a run block by the same [[Run: ]] prefix the rest of the
+package uses, so a message that is not a run record simply yields an
+empty list and the card falls back to describing the commit itself.
+
+<<render functions>>=
+def run_blocks(message):
+    """Return the run blocks of a commit message, in order.
+
+    A message that records no run---the initial commit, a
+    merge---yields an empty list.
+    """
+    blocks = []
+    for block in message.split(BLOCK_SEP):
+        first_line = block.split("\n", 1)[0]
+        if first_line.startswith(RUN_SUBJECT_PREFIX):
+            blocks.append(block)
+    return blocks
+@
+
+Let's verify both halves of that: a message with two runs, and one
+that records none.
+
+<<render test functions>>=
+def test_run_blocks_splits_and_ignores_non_runs():
+  message = (
+    "Run: hello.py (none)\nExit-Code: 0"
+    + BLOCK_SEP +
+    "Run: hello.py (none)\nExit-Code: 1"
+  )
+  assert len(run_blocks(message)) == 2
+  assert run_blocks("learnlog: initial commit") == []
+@
+
+
+\subsection{The command a subject names}
+
+Several decisions depend on \emph{what} was run: whether to call the
+record a program run, a look back through the log, or a restore.
+The subject line carries it, and one function pulls it out so the
+predicates in \cref{commits} can be applied to it rather than to a
+string match on the subject.
+That matters because \enquote{is this a review run} is defined by a
+list of subcommands the recorder also consults (\cref{sec:run-visibility});
+matching [[Run: learnlog play]] here instead would be a second,
+private copy of that list.
+
+<<render functions>>=
+def run_command(subject):
+    """Return the command a ``Run:`` subject names, else None."""
+    if not subject.startswith(RUN_SUBJECT_PREFIX):
+        return None
+    return subject[len(RUN_SUBJECT_PREFIX):]
+@
+
+Let's verify that a run subject yields its command and the initial
+commit's subject yields nothing:
+
+<<render test functions>>=
+def test_run_command_reads_the_subject():
+  assert run_command("Run: hello.py (none)") == "hello.py (none)"
+  assert run_command("learnlog: initial commit") is None
+@
+
+
+\section{The diff}
+\label{sec:classify-diff}
+
+A unified diff cannot be classified one line at a time, because the
+same characters mean different things depending on where in the diff
+they appear.
+[[--- a/hello.py]] near the top of a file's diff is the name of the old
+file; the identical text inside a hunk is a \emph{deleted line} whose
+content happened to be [[-- a/hello.py]].
+A renderer that matched on [[--- ]] alone would paint a student's
+deleted line as plumbing and hide it.
+
+So the classifier is a small state machine with three states.
+Outside any file we have not met a [[diff --git]] line yet.  Inside a
+file's \emph{preamble}---from [[diff --git]] up to the first
+[[@@]]---the metadata spellings are meaningful.  Inside a \emph{hunk}
+they are not, and every line is body text whose first character is its
+marker.
+
+\subsection{One headline per file}
+
+Git spends up to seven lines saying which file a diff is about, in a
+vocabulary aimed at another Git.
+A student needs one line: the name, plus a word if the file is new,
+gone, or renamed.  The catch is that the word arrives \emph{after} the
+name---[[new file mode]] and [[rename from]] come below the
+[[diff --git]] line---so the headline cannot be emitted when the name
+is read.  We keep the file pending and flush it at the first line that
+leaves the preamble: a hunk, a \enquote{binary files differ}, the next
+file, or the end of the diff.
+
+<<render constants>>=
+DIFF_FILE_PREFIX = "diff --git "
+HUNK_PREFIX = "@@"
+BINARY_PREFIX = "Binary files "
+NO_NEWLINE_PREFIX = "\\ "
+NEW_FILE_MODE = "new file mode"
+DELETED_FILE_MODE = "deleted file mode"
+RENAME_FROM = "rename from "
+NEW_FILE_SUFFIX = " (new file)"
+DELETED_SUFFIX = " (deleted)"
+RENAMED_SUFFIX = " (renamed from {})"
+BINARY_NOTE = "(binary file)"
+PREAMBLE_PREFIXES = (
+    "index ",
+    "old mode ",
+    "new mode ",
+    "similarity index ",
+    "rename to ",
+    "--- ",
+    "+++ ",
+)
+@
+
+Returning [[False]] for a line the preamble does not recognise is what
+keeps a malformed or future diff readable: the line falls through to
+the body rules and is shown, rather than being swallowed as metadata.
+
+<<render functions>>=
+def _consume_preamble(pending, line):
+    """Fold one preamble line into the pending file headline.
+
+    Returns false for a line that is not preamble metadata.
+    """
+    if line.startswith(NEW_FILE_MODE):
+        pending["suffix"] = NEW_FILE_SUFFIX
+    elif line.startswith(DELETED_FILE_MODE):
+        pending["suffix"] = DELETED_SUFFIX
+    elif line.startswith(RENAME_FROM):
+        pending["suffix"] = RENAMED_SUFFIX.format(
+            line[len(RENAME_FROM):],
+        )
+    elif not line.startswith(PREAMBLE_PREFIXES):
+        return False
+    return True
+@
+
+The two paths on a [[diff --git]] line are the same name twice, once
+under [[a/]] and once under [[b/]], and that repetition is the only
+reliable way to read a name containing a space---which
+[[my program.py]] is, on plenty of student machines.
+Splitting on the first [[ b/]] is right for that name and wrong for a
+name that itself contains one, so we first test whether the line is two
+equal halves and cut it exactly in the middle.
+A rename breaks the symmetry on purpose---the halves are different
+names---so there we fall back to splitting at the first [[ b/]], which
+is what Git's own porcelain does and is wrong only for a name that
+contains that sequence itself.
+
+<<render functions>>=
+def _begin_file(paths):
+    """Start a pending file headline from ``diff --git`` paths."""
+    return {"name": _diff_file_name(paths), "suffix": ""}
+<<render functions>>=
+def _diff_file_name(paths):
+    """The displayed name of the file ``paths`` describes."""
+    half = (len(paths) - len("a/ b/")) // 2
+    if half > 0 and paths.startswith("a/") and \
+            paths[2:2 + half] == paths[-half:]:
+        return paths[2:2 + half]
+    if " b/" in paths:
+        return paths.split(" b/", 1)[1]
+    return paths
+@
+
+Flushing a pending file does nothing in raw mode, where the original
+[[diff --git]] line was emitted when it was read.  That is what lets
+the flush be called unconditionally at each of the four places the
+preamble can end, instead of each of them asking which view it is in.
+
+<<render functions>>=
+def _file_headline(pending, raw):
+    """The headline lines for a pending file, if any."""
+    if raw or pending is None:
+        return []
+    text = pending["name"] + pending["suffix"]
+    return [StyledLine(FILE_INDENT + sanitise(text), KIND_FILE)]
+@
+
+\subsection{Lines inside a hunk}
+
+Inside a hunk the marker character decides, and it stays part of the
+coloured text rather than being stripped.
+That is what [[git diff]] does, and it is what makes a diff readable
+where colour is unavailable---a printout, a pipe into [[less]] without
+[[-R]], a terminal with [[NO_COLOR]] set.  Colour becomes the fast
+path, never the only one.
+
+<<render functions>>=
+def _diff_body_kind(line):
+    """The kind of one line inside a hunk."""
+    if line.startswith(HUNK_PREFIX):
+        return KIND_HUNK
+    if line.startswith(NO_NEWLINE_PREFIX):
+        return KIND_NOTE
+    if line.startswith("+"):
+        return KIND_ADDED
+    if line.startswith("-"):
+        return KIND_REMOVED
+    return KIND_CONTEXT
+@
+
+\subsection{Putting the diff together}
+
+The [[raw]] parameter is what lets one classifier serve both views.
+The friendly view drops the preamble, indents the body under its file
+headline, and sanitises the text; the raw view keeps every line exactly
+as Git wrote it and only attaches a kind.
+Keeping them in one function rather than two is what stops the two
+views from disagreeing about which lines are additions.
+
+<<render constants>>=
+FILE_INDENT = "  "
+DIFF_INDENT = "    "
+<<render functions>>=
+def classify_diff(lines, *, raw=False):
+    """Classify unified diff lines into styled lines.
+
+    With ``raw`` false the metadata around each file becomes a
+    single headline and the body is indented beneath it; with
+    ``raw`` true every line is kept verbatim and only labelled.
+    """
+    result = []
+    pending = None
+    in_hunk = False
+    for line in lines:
+        <<start a file when the diff names one>>
+        <<fold the preamble into one headline>>
+        <<classify a line of the diff body>>
+    result.extend(_file_headline(pending, raw))
+    return result
+@
+
+A [[diff --git]] line both ends the previous file and begins the next,
+so it flushes before it starts.
+
+<<start a file when the diff names one>>=
+if line.startswith(DIFF_FILE_PREFIX):
+    result.extend(_file_headline(pending, raw))
+    pending = _begin_file(line[len(DIFF_FILE_PREFIX):])
+    in_hunk = False
+    if raw:
+        result.append(StyledLine(line, KIND_DIM))
+    continue
+@
+
+A hunk header leaves the preamble without being consumed by it: it
+flushes the headline, switches state, and then falls through to the
+body rules, which know that [[@@]] is a hunk header.  Writing it that
+way means the second and later hunks of a file---which arrive in the
+hunk state and never reach this branch---are classified by the same
+line of code as the first.
+
+A binary file has no hunks at all, so it would otherwise leave a name
+with nothing under it.  We say so in one dim line instead.
+
+<<fold the preamble into one headline>>=
+if pending is not None and not in_hunk:
+    if line.startswith(HUNK_PREFIX):
+        result.extend(_file_headline(pending, raw))
+        pending = None
+        in_hunk = True
+    elif line.startswith(BINARY_PREFIX):
+        result.extend(_file_headline(pending, raw))
+        pending = None
+        result.append(
+            StyledLine(line, KIND_DIM) if raw
+            else StyledLine(
+                DIFF_INDENT + BINARY_NOTE, KIND_NOTE,
+            )
+        )
+        continue
+    elif _consume_preamble(pending, line):
+        if raw:
+            result.append(StyledLine(line, KIND_DIM))
+        continue
+@
+
+An empty line is dropped in the friendly view because a unified diff
+has no empty content lines---every line inside a hunk carries a marker,
+so an empty one is the blank that separates the diff from whatever
+[[git show]] put next to it, rather than anything the student wrote.
+
+<<classify a line of the diff body>>=
+if raw:
+    result.append(StyledLine(line, _diff_body_kind(line)))
+elif line:
+    result.append(StyledLine(
+        DIFF_INDENT + sanitise(line), _diff_body_kind(line),
+    ))
+@
+
+Let's verify the state machine on the case that motivates it: a deleted
+line that looks exactly like a file header.
+
+<<render test functions>>=
+def test_classify_diff_file_headers_only_in_preamble():
+  """A --- line inside a hunk is a deleted line."""
+  lines = [
+    "diff --git a/notes.md b/notes.md",
+    "index 1111111..2222222 100644",
+    "--- a/notes.md",
+    "+++ b/notes.md",
+    "@@ -1,2 +1,2 @@",
+    "--- a/notes.md",
+    "+++ b/notes.md",
+  ]
+  styled = classify_diff(lines)
+  kinds = [line.kind for line in styled]
+  assert kinds == ["file", "hunk", "removed", "added"]
+  assert styled[0].text == "  notes.md"
+  assert styled[2].text == "    --- a/notes.md"
+@
+
+Every preamble spelling must be recognised, and each must yield exactly
+one headline with the right word after the name:
+
+<<render test functions>>=
+def test_classify_diff_one_headline_per_file():
+  lines = [
+    "diff --git a/new.py b/new.py",
+    "new file mode 100644",
+    "index 0000000..e69de29",
+    "--- /dev/null",
+    "+++ b/new.py",
+    "@@ -0,0 +1 @@",
+    "+print(1)",
+    "diff --git a/gone.py b/gone.py",
+    "deleted file mode 100644",
+    "index e69de29..0000000",
+    "@@ -1 +0,0 @@",
+    "-print(2)",
+    "diff --git a/old.py b/renamed.py",
+    "similarity index 100%",
+    "rename from old.py",
+    "rename to renamed.py",
+    "diff --git a/mode.py b/mode.py",
+    "old mode 100644",
+    "new mode 100755",
+    "diff --git a/logo.png b/logo.png",
+    "index 3333333..4444444 100644",
+    "Binary files a/logo.png and b/logo.png differ",
+  ]
+  styled = classify_diff(lines)
+  headlines = [
+    line.text for line in styled if line.kind == "file"
+  ]
+  assert headlines == [
+    "  new.py (new file)",
+    "  gone.py (deleted)",
+    "  renamed.py (renamed from old.py)",
+    "  mode.py",
+    "  logo.png",
+  ]
+  assert "    (binary file)" in [line.text for line in styled]
+  assert not any(
+    "index " in line.text for line in styled
+  )
+@
+
+A file whose name contains a space still comes back whole, because the
+two halves of the [[diff --git]] line agree:
+
+<<render test functions>>=
+def test_classify_diff_reads_names_with_spaces():
+  styled = classify_diff([
+    "diff --git a/my program.py b/my program.py",
+    "@@ -1 +1 @@",
+    "-x",
+    "+y",
+  ])
+  assert styled[0].text == "  my program.py"
+@
+
+A file whose last line has no trailing newline gets a marker of Git's
+own, which is a note about the file rather than a line of it:
+
+<<render test functions>>=
+def test_classify_diff_marks_missing_newline():
+  styled = classify_diff([
+    "diff --git a/a.txt b/a.txt",
+    "@@ -1 +1 @@",
+    "-old",
+    "\\ No newline at end of file",
+    "+new",
+  ])
+  kinds = [line.kind for line in styled]
+  assert kinds == ["file", "hunk", "removed", "note", "added"]
+@
+
+Raw mode keeps every line, in order, with nothing added or indented:
+
+<<render test functions>>=
+def test_classify_diff_raw_keeps_every_line():
+  lines = [
+    "diff --git a/a.py b/a.py",
+    "index 1111111..2222222 100644",
+    "--- a/a.py",
+    "+++ b/a.py",
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+    "",
+  ]
+  styled = classify_diff(lines, raw=True)
+  assert [line.prefix + line.text for line in styled] == lines
+  assert styled[0].kind == "dim"
+  assert styled[2].kind == "dim"
+  assert styled[4].kind == "hunk"
+  assert styled[5].kind == "removed"
+@
+
+
+\section{The terminal session}
+\label{sec:classify-io}
+
+A captured log is a transcript in which every line says which stream it
+came from (\cref{capture}).
+The prefixes are learnlog's words, not the program's, and on screen
+they should read as a margin: present, so the student can tell an
+answer they typed from output they read, but never competing with the
+text beside them.
+That is what the two-segment line in \cref{sec:styled-line} is for---
+the prefix goes in the faded segment and the program's own text keeps
+the colour of its stream.
+
+The indent goes into the prefix rather than the text, so that the
+segment boundary falls exactly where learnlog stops speaking and the
+program starts.
+A line that names no stream has no such boundary to mark, so its indent
+is part of its text.
+
+<<render constants>>=
+IO_INDENT = "  "
+IO_KINDS = {
+    "stdout": KIND_OUT,
+    "stderr": KIND_ERR,
+    "stdin": KIND_INPUT,
+}
+@
+
+Only a prefix at the very start of the line is learnlog's.
+A program that prints the string [[stdin: ]] has that recorded as
+[[stdout: stdin: ]]\ldots, and splitting off more than the first prefix
+would rewrite the program's output into a stream it never used.
+
+<<render functions>>=
+def _io_prefix(line):
+    """Split one log line at its stream prefix.
+
+    Returns ``(prefix, text, kind)``, where ``prefix`` keeps any
+    leading indent, or None when the line names no stream.
+    """
+    body = line.lstrip(" ")
+    indent = line[:len(line) - len(body)]
+    for prefix, stream in IO_STREAM_PREFIXES:
+        if body.startswith(prefix):
+            return (indent + prefix,
+                    body[len(prefix):],
+                    IO_KINDS[stream])
+    return None
+@
+
+An unprefixed line is not a malformed one.
+When a run overruns the log's size cap, the capture layer appends a
+bracketed note of its own with no prefix, and that is the one line a
+reader must not lose: it is the log saying that it is incomplete
+(\cref{sec:io-notes}).
+It is shown whole and dim---learnlog talking about the run, rather than
+either stream of it.
+
+<<render functions>>=
+def classify_io(io_log):
+    """Classify a captured I/O log into styled lines."""
+    if not io_log:
+        return []
+    result = []
+    for line in io_log.split("\n"):
+        split = _io_prefix(line)
+        if split is None:
+            result.append(StyledLine(
+                IO_INDENT + sanitise(line), KIND_NOTE,
+            ))
+            continue
+        prefix, text, kind = split
+        result.append(StyledLine(
+            sanitise(text), kind, IO_INDENT + prefix,
+        ))
+    return result
+@
+
+Let's verify the three streams, the split point, and that a program
+which prints something that looks like a prefix keeps it:
+
+<<render test functions>>=
+def test_classify_io_splits_each_stream():
+  styled = classify_io(
+    "stdout: Name? \n"
+    "stdin: Daniel\n"
+    "stderr: NameError: name 'nme' is not defined"
+  )
+  assert [line.kind for line in styled] == ["out", "input", "err"]
+  assert styled[0].prefix == "  stdout: "
+  assert styled[0].text == "Name? "
+  assert styled[1].prefix == "  stdin: "
+  assert styled[2].text == \
+      "NameError: name 'nme' is not defined"
+
+def test_classify_io_keeps_an_inner_prefix():
+  styled = classify_io("stdout: stdin: type your name")
+  assert styled[0].prefix == "  stdout: "
+  assert styled[0].text == "stdin: type your name"
+@
+
+The truncation marker has no prefix and must survive whole:
+
+<<render test functions>>=
+def test_classify_io_keeps_an_unprefixed_line():
+  marker = "[learnlog: I/O log truncated at 1000000 bytes]"
+  styled = classify_io("stdout: hi\n" + marker)
+  assert styled[1].kind == "note"
+  assert styled[1].prefix == ""
+  assert styled[1].text == "  " + marker
+
+def test_classify_io_without_a_log():
+  assert classify_io(None) == []
+  assert classify_io("") == []
+@
+
+
+\section{What the record is called}
+\label{sec:record-title}
+
+The headline answers \enquote{what is this?} in the student's own
+terms.
+Three records need saying differently from the rest: the commit that
+started the project, a look back through the log, and a restore of an
+earlier version.
+Those last two are decided by the predicates in \cref{commits} applied
+to the command, not by matching the subject text, so this module cannot
+drift from the list of subcommands the recorder itself consults
+(\cref{sec:run-visibility}).
+
+The arguments placeholder disappears here.  [[Run: hello.py (none)]]
+spells \enquote{no arguments} as [[(none)]] because the trailer format
+needs a token where arguments would be; a headline does not, and
+[[hello.py (none)]] would read to a beginner as if [[(none)]] were part
+of what they ran.
+
+<<render constants>>=
+NO_ARGUMENTS_SUFFIX = " (none)"
+INITIAL_SUBJECT = "learnlog: initial commit"
+INITIAL_TITLE = "Project created"
+REVIEW_TITLE = "You looked back through your log"
+CHECKOUT_TITLE = "You restored the files from an earlier run"
+<<render functions>>=
+def record_title(subject):
+    """Return the headline for a record's subject line.
+
+    A program run yields the command it ran; learnlog's own
+    records and the initial commit yield a sentence describing
+    what happened.
+    """
+    command = run_command(subject)
+    if command is None:
+        if subject == INITIAL_SUBJECT:
+            return INITIAL_TITLE
+        return sanitise(subject)
+    if is_review_command(command):
+        return REVIEW_TITLE
+    if is_checkout_command(command):
+        return CHECKOUT_TITLE
+    return sanitise(command.removesuffix(NO_ARGUMENTS_SUFFIX))
+@
+
+Let's verify each of the four answers, including that arguments the
+student really passed are kept while the placeholder is not:
+
+<<render test functions>>=
+def test_record_title_of_a_program_run():
+  assert record_title("Run: hello.py (none)") == "hello.py"
+  assert record_title("Run: hello.py alpha beta") == \
+      "hello.py alpha beta"
+
+def test_record_title_of_learnlogs_own_records():
+  assert record_title("learnlog: initial commit") == \
+      "Project created"
+  assert record_title("Run: learnlog play") == \
+      "You looked back through your log"
+  assert record_title("Run: learnlog list --all") == \
+      "You looked back through your log"
+  assert record_title("Run: learnlog checkout abc1234") == \
+      "You restored the files from an earlier run"
+@
+
+
+\section{The card}
+\label{sec:record-lines}
+
+A card tells the story of one record in the order a student asks about
+it: what did I run, how did it go, what had I changed, and what did the
+terminal say.
+Nothing that only Git needs appears---no run identifier, no author, no
+blob hashes, no section markers from the trailer format.
+Those are still in the log, and \cref{sec:raw-lines} shows them on
+request; what the default view leaves out is what a beginner cannot act
+on.
+
+<<render constants>>=
+BLANK_LINE = StyledLine("", KIND_PLAIN)
+META_SEPARATOR = " \u00b7 "
+SHORT_HASH_LEN = 7
+MERGE_HEADER_PREFIX = "Merge:"
+@
+
+\subsection{When it happened, and for how long}
+
+The date is written out rather than shown as an ISO timestamp.
+A student recognises \enquote{Wed 9 Sep 2026 10:04} as an afternoon
+they remember; \enquote{2026-09-09T10:04:00} has to be decoded first,
+and the decoding is the part that makes a log feel like a machine's
+record rather than their own.
+
+The day-of-month is assembled rather than formatted with [[%-d]].
+That flag is a glibc extension: it strips the leading zero on Linux and
+macOS, and raises [[ValueError]] on Windows, whose C library has never
+had it.  Learnlog ships a Windows dependency precisely because students
+run it there (\cref{viewer}), so a format string that works on the
+teacher's laptop and crashes on half the class is not a saving.
+
+<<render functions>>=
+def _timestamp_text(run, commit):
+    """The record's start time, written out for a reader."""
+    raw = (run or {}).get("start_time") or commit.get("date", "")
+    stamp = _parse_iso(raw)
+    if stamp is None:
+        return sanitise(raw)
+    return (stamp.strftime("%a ") + str(stamp.day)
+            + stamp.strftime(" %b %Y %H:%M"))
+@
+
+A run whose trailer never arrived has no end time, and reporting a
+duration of zero for it would be a claim about a run learnlog did not
+see finish.  We omit the phrase instead; the outcome line says what
+happened.
+
+<<render functions>>=
+def _duration_text(run):
+    """How long the run took, or ``""`` when it never finished."""
+    if run is None:
+        return ""
+    start = _parse_iso(run.get("start_time"))
+    end = _parse_iso(run.get("end_time"))
+    if start is None or end is None:
+        return ""
+    elapsed = (end - start).total_seconds()
+    return "took " + format_elapsed(elapsed)
+@
+
+The position within the log rides on the same line.
+Batch output has no header bar to carry it, and a student scrolling a
+long playback needs to know how far in they are; the viewer's own
+header repeats it, which costs one short phrase and keeps a single
+call producing what both surfaces show.
+
+<<render functions>>=
+def _when_text(run, commit, index, total):
+    """The date, duration and position line of a card."""
+    parts = [_timestamp_text(run, commit)]
+    duration = _duration_text(run)
+    if duration:
+        parts.append(duration)
+    parts.append(f"{index + 1} of {total}")
+    return META_SEPARATOR.join(parts)
+@
+
+\subsection{The gap and the tags}
+
+These two belong to the commit rather than to any run in it, so a
+commit holding several runs shows them once, above the first.
+The wordings are fixed by what already exists: playback has printed
+[[Time since last run:]] and [[Tags:]] since before there were cards
+(\cref{viewer}), the tutorials tell students to look for them, and a
+rendering change is no reason for a student's notes to stop matching
+their screen.
+
+<<render functions>>=
+def _commit_meta(elapsed, tags):
+    """The pause before this record, and its tags."""
+    lines = []
+    if elapsed is not None:
+        lines.append(StyledLine(
+            f"Time since last run: {format_elapsed(elapsed)}",
+            KIND_META,
+        ))
+    if tags:
+        lines.append(StyledLine(
+            "Tags: " + ", ".join(sanitise(tag) for tag in tags),
+            KIND_META,
+        ))
+    return lines
+@
+
+\subsection{How it went}
+
+The outcome repeats the reasoning of [[classify_run_block]]
+(\cref{sec:classify-run-outcomes}) but says more than it does.
+That classifier answers a filter, which needs three verdicts; a reader
+needs to know which of the several ways a run can end actually
+happened, and what the program said on the way out.
+A traceback is the most useful thing on the card, so its last line goes
+straight into the sentence: a beginner who sees
+[[NameError: name 'nme' is not defined]] beside the diff that
+introduced [[nme]] has everything needed to fix it.
+
+[[KeyboardInterrupt]] is separated out because it is not a failure at
+all---it is the student pressing Ctrl-C---and colouring it red would
+teach them to fear their own decision to stop a program.
+A missing exit code is likewise not a failure: the trailer never
+arrived, so nobody knows how the run ended (\cref{sec:classify-run-outcomes}).
+
+<<render constants>>=
+INTERRUPT_EXCEPTION = "KeyboardInterrupt"
+<<render functions>>=
+def _outcome_line(run):
+    """The ``Result:`` line for a parsed run block."""
+    exception, message = parse_exception_line(
+        run.get("exception_info"),
+    )
+    if exception == INTERRUPT_EXCEPTION:
+        return StyledLine("Result: stopped with Ctrl-C", KIND_WARN)
+    if exception:
+        detail = f"{exception}: {message}" if message else exception
+        return StyledLine(
+            f"Result: it crashed \u2014 {sanitise(detail)}",
+            KIND_BAD,
+        )
+    exit_code = run.get("exit_code")
+    if exit_code is None:
+        return StyledLine(
+            "Result: learnlog never saw this run finish", KIND_WARN,
+        )
+    if exit_code == "0":
+        return StyledLine("Result: it worked", KIND_OK)
+    return StyledLine(
+        f"Result: stopped with exit code {sanitise(exit_code)}",
+        KIND_BAD,
+    )
+@
+
+For learnlog's own records the successful outcome is not news.
+\enquote{You looked back through your log} followed by \enquote{it
+worked} says nothing a reader wanted; what is worth knowing is how
+many runs were looked at, or that a restore happened at all.
+A learnlog run that \emph{failed} is worth showing, though, since a
+crash in the tool is exactly the thing a student cannot diagnose
+without seeing it.
+
+<<render functions>>=
+def _outcome_lines(subject, run):
+    """The outcome line, when it tells the reader anything."""
+    line = _outcome_line(run)
+    command = run_command(subject) or ""
+    learnlogs_own = (is_review_command(command)
+                     or is_checkout_command(command))
+    if learnlogs_own and line.kind == KIND_OK:
+        return []
+    return [line]
+@
+
+A review run's card says what the student went and looked at.
+The [[Viewed:]] lines themselves stay out of it: they are forty-digit
+hashes, and the record that matters is that the looking happened and
+how much of it there was.
+
+<<render functions>>=
+def _review_meta(run):
+    """How many records a review run displayed."""
+    if not is_review_run(run):
+        return []
+    count = len(run.get("viewed") or ())
+    return [StyledLine(
+        f"Looked at {count} run{'' if count == 1 else 's'}",
+        KIND_META,
+    )]
+@
+
+\subsection{The head of a card}
+
+The head is the same three things for every record---what it was, when
+it happened, how it went---and the commit-level meta is passed in
+rather than computed here, because a commit holding several runs shows
+the pause and the tags above the first of them only.
+
+<<render functions>>=
+def _head_lines(commit, subject, run, index, total, extra_meta):
+    """Title, timing and outcome of one record."""
+    lines = [
+        StyledLine(_headline(subject), KIND_TITLE),
+        StyledLine(_when_text(run, commit, index, total), KIND_META),
+    ]
+    lines.extend(extra_meta)
+    if run is not None:
+        lines.extend(_review_meta(run))
+        lines.extend(_outcome_lines(subject, run))
+    return lines
+@
+
+[[record_title]] answers what the record \emph{is}, and for a program
+run that answer is the command---which needs a verb in front of it to
+become a sentence.
+learnlog's own records already are sentences, so they are used as they
+stand.  Keeping the split here rather than inside [[record_title]] is
+what lets that function stay usable by anything wanting the plain name
+of what ran.
+
+<<render functions>>=
+def _headline(subject):
+    """The card's first line for ``subject``."""
+    title = record_title(subject)
+    command = run_command(subject)
+    if command is None or is_review_command(command) \
+            or is_checkout_command(command):
+        return title
+    return f"You ran {title}"
+@
+
+\subsection{The two sections}
+
+Every run record gets a code-changes section, including the runs where
+nothing changed.
+Saying \enquote{nothing changed since your last run} is the point:
+a beginner who re-runs a program expecting different output needs to be
+told, in the same place they would have read a diff, that the program
+is the one they ran before.
+A section that appeared only sometimes could not carry that message,
+and the tutorials would have nothing stable to point at.
+
+The initial commit and a merge get the same section under different
+words.  A merge brought files in from another copy of the log, so
+\enquote{nothing changed since your last run} would be false; the
+initial commit predates every run, so it has no \enquote{last run} to
+compare with.
+
+<<render constants>>=
+CHANGES_HEADING = "Code changes since your last run"
+NOTHING_CHANGED = "(nothing changed since your last run)"
+MERGE_HEADING = "Code changes from the copy you merged"
+MERGED_NOTE = "(merged another copy of this log)"
+INITIAL_HEADING = "Files when logging started"
+EMPTY_PROJECT = "(the project was empty)"
+SESSION_HEADING = "Terminal session"
+<<render functions>>=
+def _changes_lines(diff_lines, has_runs, merged):
+    """The code-changes section of a card."""
+    if has_runs:
+        heading, when_empty = CHANGES_HEADING, NOTHING_CHANGED
+    elif merged:
+        heading, when_empty = MERGE_HEADING, MERGED_NOTE
+    else:
+        heading, when_empty = INITIAL_HEADING, EMPTY_PROJECT
+    body = classify_diff(diff_lines)
+    if not body:
+        body = [StyledLine(FILE_INDENT + when_empty, KIND_NOTE)]
+    return [StyledLine(heading, KIND_SECTION)] + body
+@
+
+A run that neither printed nor read anything gets no terminal section
+at all.  The log spells that as the [[(no I/O)]] placeholder rather
+than as an empty section (\cref{gitrepo}), and a heading above nothing
+would be a heading about nothing.
+
+<<render functions>>=
+def _session_lines(run):
+    """The terminal-session section of one run block."""
+    io_log = run.get("io_log")
+    if not io_log or io_log.strip() == NO_IO_PLACEHOLDER:
+        return []
+    return ([StyledLine(SESSION_HEADING, KIND_SECTION)]
+            + classify_io(io_log))
+@
+
+\subsection{The way back}
+
+Each card ends with the command that restores this version.
+[[learnlog checkout]] is the one thing in the tool a student reaches
+for while looking at an old run---\enquote{it worked here}---and a
+reader who has to go and find out how to say it usually does not
+(\cref{sec:checkout}).
+The short hash is Git's own seven digits, which is what the rest of
+learnlog prints and enough to be unique in a lab-sized log.
+
+<<render functions>>=
+def _checkout_hint(commit):
+    """The command that brings this version back."""
+    short = commit.get("hash", "")[:SHORT_HASH_LEN]
+    if not short:
+        return []
+    return [StyledLine(
+        f"To go back to this version: learnlog checkout {short}",
+        KIND_META,
+    )]
+@
+
+\subsection{Assembling the card}
+
+One record, one call.
+The blocks are parsed once here and their parsed forms handed to the
+builders, rather than each builder re-parsing the text it needs, so a
+commit holding several runs costs one parse per run and not one per
+section.
+
+[[raw]] is a parameter of this function rather than a second entry
+point because both views read the same text
+(\cref{sec:record-parts}).  A caller can therefore honour the flag
+without knowing it exists at fetch time: it asks
+[[get_commit_detail]] for Git's order once and passes whichever view
+the reader chose, and a student toggling raw mode mid-playback
+changes no fetch.
+
+<<render functions>>=
+def record_lines(commit, detail, *, index, total, elapsed=None,
+                 tags=(), raw=False):
+    """Render one record as a list of styled lines.
+
+    ``commit`` is an entry from ``get_commits`` and ``detail``
+    the output of ``get_commit_detail(..., reorder=False)``, in
+    git's own order.  ``index`` is the record's zero-based
+    position among ``total`` records, ``elapsed`` the seconds
+    since the previous student run, and ``tags`` the tag names
+    on this commit.  With ``raw`` true the same text comes back
+    unchanged but coloured, instead of a card.
+    """
+    if raw:
+        return raw_lines(detail)
+    header, message, diff_lines = split_commit_detail(detail)
+    <<parse the runs this commit records>>
+    <<lay the card out>>
+    <<close the card with the way back>>
+    return lines
+@
+
+A record's subject line lives inside its own block, not in
+[[commit["subject"]]]: with several blocks in one message the commit
+subject is only the first of them (\cref{sec:block-sep}).
+A commit that records no run has nothing but the commit subject, and
+that is what the card describes.
+
+<<parse the runs this commit records>>=
+records = [
+    (block.split("\n", 1)[0], parse_run_block(block))
+    for block in run_blocks(message)
+]
+merged = any(
+    line.startswith(MERGE_HEADER_PREFIX) for line in header
+)
+commit_meta = _commit_meta(elapsed, tags)
+lines = []
+@
+
+With one run---which is every commit current learnlog writes---the card
+reads as the story of that run, and the changes sit between how it went
+and what it printed.
+Several runs in one message mean the code did not change between them:
+that is precisely why an older learnlog put them in one commit.  The
+changes therefore belong to all of them equally and are shown once,
+above, with a card per run underneath.
+
+<<lay the card out>>=
+if len(records) == 1:
+    subject, run = records[0]
+    lines.extend(_head_lines(
+        commit, subject, run, index, total, commit_meta,
+    ))
+    lines.append(BLANK_LINE)
+    lines.extend(_changes_lines(diff_lines, True, merged))
+    <<append the terminal session, if there was one>>
+elif records:
+    lines.extend(_changes_lines(diff_lines, True, merged))
+    for position, (subject, run) in enumerate(records):
+        lines.append(BLANK_LINE)
+        lines.extend(_head_lines(
+            commit, subject, run, index, total,
+            commit_meta if position == 0 else [],
+        ))
+        <<append the terminal session, if there was one>>
+else:
+    lines.extend(_head_lines(
+        commit, commit.get("subject", ""), None,
+        index, total, commit_meta,
+    ))
+    lines.append(BLANK_LINE)
+    lines.extend(_changes_lines(diff_lines, False, merged))
+@
+
+Both branches that have a run append its session the same way, so the
+step is written once and referenced twice---which is also what keeps
+the blank line above it from being present in one layout and missing
+in the other.
+
+<<append the terminal session, if there was one>>=
+session = _session_lines(run)
+if session:
+    lines.append(BLANK_LINE)
+    lines.extend(session)
+@
+
+Every card ends the same way, whatever it described, so the hint is
+appended after the branches rather than inside each of them.
+
+<<close the card with the way back>>=
+hint = _checkout_hint(commit)
+if hint:
+    lines.append(BLANK_LINE)
+    lines.extend(hint)
+@
+
+\subsection{Verifying the card}
+
+The fixtures below are [[git show]] output in Git's own order, which
+is what a card is given.
+
+<<render test functions>>=
+def styled_text(lines):
+  """The plain text of a rendered card, one line per line."""
+  return "\n".join(line.prefix + line.text for line in lines)
+
+def a_commit(**overrides):
+  commit = {
+    "hash": "309a26b2cad9be26f31b91455c4c3ae1ca48ec3b",
+    "subject": "Run: hello.py (none)",
+    "date": "2026-09-09T10:04:00+02:00",
+  }
+  commit.update(overrides)
+  return commit
+
+def a_detail(message, diff=None, merge=False):
+  """Build git show output in git's order: message, then diff."""
+  header = ["commit " + "3" * 40,
+            "Author: Student <s@example.com>",
+            "Date:   Wed Sep 9 16:43:55 2026 +0200"]
+  if merge:
+    header.insert(1, "Merge: aaaaaaa bbbbbbb")
+  body = ["    " + line if line else ""
+          for line in message.split("\n")]
+  if diff is None:
+    return "\n".join(header + [""] + body + [""])
+  return "\n".join(header + [""] + body + [""] + diff + [""])
+
+CRASHED_RUN = (
+  "Run: hello.py (none)\n"
+  "\n"
+  "Script: hello.py\n"
+  "Arguments: (none)\n"
+  "Start-Time: 2026-09-09T10:04:00\n"
+  "Run-Id: c3da3526b16545cf9697bfb006b50954\n"
+  "End-Time: 2026-09-09T10:04:02\n"
+  "Exit-Code: 1\n"
+  "\n"
+  "--- I/O ---\n"
+  "stdout: Name? \n"
+  "stdin: Daniel\n"
+  "stderr: Traceback (most recent call last):\n"
+  "stderr: NameError: name 'nme' is not defined\n"
+  "\n"
+  "--- exception ---\n"
+  "Traceback (most recent call last):\n"
+  "NameError: name 'nme' is not defined"
+)
+
+A_DIFF = [
+  "diff --git a/hello.py b/hello.py",
+  "index d47ad68..61e56c3 100644",
+  "--- a/hello.py",
+  "+++ b/hello.py",
+  "@@ -1,2 +1,2 @@",
+  " name = input(\"Name? \")",
+  "-print(\"Hello \" + nme)",
+  "+print(\"Hello \" + name)",
+]
+@
+
+The card must say everything a beginner can act on, and none of the
+plumbing that would bury it:
+
+<<render test functions>>=
+def test_record_lines_tells_the_story_of_a_run():
+  lines = record_lines(
+    a_commit(), a_detail(CRASHED_RUN, A_DIFF),
+    index=1, total=2, elapsed=240, tags=("lab1",),
+  )
+  text = styled_text(lines)
+  assert text.startswith("You ran hello.py\n")
+  assert "Wed 9 Sep 2026 10:04" in text
+  assert "took 2 s" in text
+  assert "Time since last run: 4 min" in text
+  assert "Tags: lab1" in text
+  assert "Result: it crashed \u2014 NameError: " \
+      "name 'nme' is not defined" in text
+  assert "Code changes since your last run" in text
+  assert "  hello.py" in text
+  assert "    -print(\"Hello \" + nme)" in text
+  assert "Terminal session" in text
+  assert "  stdout: Name? " in text
+  assert "To go back to this version: learnlog checkout 309a26b" \
+      in text
+
+def test_record_lines_hides_the_plumbing():
+  text = styled_text(record_lines(
+    a_commit(), a_detail(CRASHED_RUN, A_DIFF), index=0, total=1,
+  ))
+  for hidden in ("Run-Id:", "Author:", "index ", "Script:",
+                 "--- exception ---", "Exit-Code:", "commit "):
+    assert hidden not in text
+  assert not any(
+    line.strip() == "None" for line in text.split("\n")
+  )
+  assert "3" * 40 not in text
+@
+
+Every kind a card emits has to be a row of [[STYLES]], or a consumer
+would have nothing to draw it with:
+
+<<render test functions>>=
+def test_record_lines_emits_known_kinds_only():
+  details = [
+    a_detail(CRASHED_RUN, A_DIFF),
+    a_detail(CRASHED_RUN),
+    a_detail("learnlog: initial commit", A_DIFF),
+    a_detail("learnlog: merge", merge=True),
+  ]
+  for detail in details:
+    for line in record_lines(a_commit(), detail,
+                             index=0, total=4, tags=("lab1",)):
+      assert line.kind in STYLES
+    for line in record_lines(a_commit(), detail,
+                             index=0, total=4, raw=True):
+      assert line.kind in STYLES
+@
+
+The five outcomes are the five things that can happen to a run, and
+each has to be said in words a beginner can act on:
+
+<<render test functions>>=
+def a_run(trailer):
+  return (
+    "Run: hello.py (none)\n\nScript: hello.py\n"
+    "Arguments: (none)\n"
+    "Start-Time: 2026-09-09T10:04:00\n" + trailer
+  )
+
+def outcome_of(trailer):
+  lines = record_lines(
+    a_commit(), a_detail(a_run(trailer)), index=0, total=1,
+  )
+  for line in lines:
+    if line.text.startswith("Result:"):
+      return line.text, line.kind
+  return None, None
+
+def test_record_lines_wordings_for_every_outcome():
+  assert outcome_of("Exit-Code: 0\n") == \
+      ("Result: it worked", "ok")
+  assert outcome_of("Exit-Code: 3\n") == \
+      ("Result: stopped with exit code 3", "bad")
+  assert outcome_of("") == \
+      ("Result: learnlog never saw this run finish", "warn")
+  assert outcome_of(
+    "Exit-Code: 1\n\n--- I/O ---\n(no I/O)\n"
+    "\n--- exception ---\nKeyboardInterrupt"
+  ) == ("Result: stopped with Ctrl-C", "warn")
+  assert outcome_of(
+    "Exit-Code: 1\n\n--- I/O ---\n(no I/O)\n"
+    "\n--- exception ---\nValueError: bad input"
+  ) == ("Result: it crashed \u2014 ValueError: bad input", "bad")
+@
+
+A run that changed nothing must say so, in the same place the diff
+would have been:
+
+<<render test functions>>=
+def test_record_lines_says_when_nothing_changed():
+  text = styled_text(record_lines(
+    a_commit(), a_detail(a_run("Exit-Code: 0\n")),
+    index=0, total=1,
+  ))
+  assert "Code changes since your last run" in text
+  assert "  (nothing changed since your last run)" in text
+
+def test_record_lines_omits_an_empty_terminal_session():
+  text = styled_text(record_lines(
+    a_commit(),
+    a_detail(a_run(
+      "Exit-Code: 0\n\n--- I/O ---\n(no I/O)\n"
+      "\n--- exception ---\nNone"
+    )),
+    index=0, total=1,
+  ))
+  assert "Terminal session" not in text
+@
+
+A commit holding several runs shows the changes once and the outcome of
+each:
+
+<<render test functions>>=
+def test_record_lines_of_several_runs_in_one_commit():
+  message = a_run("Exit-Code: 1\n") + BLOCK_SEP + a_run(
+    "Exit-Code: 0\n"
+  )
+  text = styled_text(record_lines(
+    a_commit(), a_detail(message, A_DIFF), index=0, total=1,
+  ))
+  assert text.count("Code changes since your last run") == 1
+  assert text.count("Result:") == 2
+  assert "Result: stopped with exit code 1" in text
+  assert "Result: it worked" in text
+@
+
+The commit that starts a project has no run to report, and the words
+change accordingly---with and without files already in the directory:
+
+<<render test functions>>=
+def test_record_lines_of_the_initial_commit():
+  text = styled_text(record_lines(
+    a_commit(subject="learnlog: initial commit"),
+    a_detail("learnlog: initial commit", A_DIFF),
+    index=0, total=1,
+  ))
+  assert text.startswith("Project created\n")
+  assert "Files when logging started" in text
+  assert "  hello.py" in text
+  assert "Result:" not in text
+
+def test_record_lines_of_an_empty_initial_commit():
+  text = styled_text(record_lines(
+    a_commit(subject="learnlog: initial commit"),
+    a_detail("learnlog: initial commit"),
+    index=0, total=1,
+  ))
+  assert "  (the project was empty)" in text
+@
+
+A merge brought files from elsewhere, so it must not claim that nothing
+changed:
+
+<<render test functions>>=
+def test_record_lines_of_a_merge():
+  text = styled_text(record_lines(
+    a_commit(subject="learnlog: merge"),
+    a_detail("learnlog: merge", merge=True),
+    index=0, total=1,
+  ))
+  assert "(merged another copy of this log)" in text
+  assert "nothing changed" not in text
+@
+
+Learnlog's own records are the student's too, and they say what the
+student did rather than that learnlog exited zero:
+
+<<render test functions>>=
+def test_record_lines_of_a_review_run():
+  first, second = "a" * 40, "b" * 40
+  message = (
+    "Run: learnlog play\n\nScript: learnlog\n"
+    "Arguments: play\n"
+    "Start-Time: 2026-09-09T10:04:00\n"
+    "End-Time: 2026-09-09T10:04:20\n"
+    "Exit-Code: 0\n"
+    f"Viewed: {first} 2026-09-09T10:04:01 open\n"
+    f"Viewed: {second} 2026-09-09T10:04:05 next\n"
+  )
+  text = styled_text(record_lines(
+    a_commit(subject="Run: learnlog play"),
+    a_detail(message), index=0, total=1,
+  ))
+  assert text.startswith("You looked back through your log\n")
+  assert "Looked at 2 runs" in text
+  assert "Viewed:" not in text
+  assert first not in text
+  assert "Result:" not in text
+  assert "Code changes since your last run" in text
+
+def test_record_lines_of_a_checkout():
+  message = (
+    "Run: learnlog checkout 309a26b\n\nScript: learnlog\n"
+    "Arguments: checkout 309a26b\n"
+    "Start-Time: 2026-09-09T10:04:00\n"
+    "End-Time: 2026-09-09T10:04:01\n"
+    "Exit-Code: 0\n"
+  )
+  text = styled_text(record_lines(
+    a_commit(subject="Run: learnlog checkout 309a26b"),
+    a_detail(message, A_DIFF), index=0, total=1,
+  ))
+  assert text.startswith(
+    "You restored the files from an earlier run\n"
+  )
+  assert "Result:" not in text
+  assert "  hello.py" in text
+@
+
+Finally, a card built from a record this test wrote into a real
+repository, so that the fixtures above are checked against the format
+[[begin_run]] and [[finalize_run]] actually produce:
+
+<<render test functions>>=
+def test_record_lines_of_a_real_record(workdir):
+  import datetime
+  from learnlog.commits import get_commit_detail, get_commits, \
+      get_run_trailers
+  from learnlog.gitrepo import LearnlogRepo
+  repo = LearnlogRepo(workdir)
+  repo.begin_run(
+    "hello.py", [], datetime.datetime(2026, 9, 9, 10, 4),
+  )
+  repo.finalize_run(
+    io_log="stdout: hello\n", exception_info=None,
+    end_time=datetime.datetime(2026, 9, 9, 10, 4, 2),
+    exit_code=0,
+  )
+  commits = get_commits(repo)
+  trailers = get_run_trailers(repo)
+  detail = get_commit_detail(
+    repo, commits[-1]["hash"], trailers=trailers, reorder=False,
+  )
+  text = styled_text(record_lines(
+    commits[-1], detail, index=len(commits) - 1,
+    total=len(commits),
+  ))
+  assert text.startswith("You ran hello.py\n")
+  assert "took 2 s" in text
+  assert "Result: it worked" in text
+  assert "Terminal session" in text
+  assert "  stdout: hello" in text
+  assert "Run-Id:" not in text
+@
+
+
+\section{Raw mode}
+\label{sec:raw-lines}
+
+The card is an interpretation, and an interpretation can be wrong.
+A teacher checking what a student's program really printed, or anyone
+debugging learnlog itself, needs the bytes---so raw mode shows exactly
+what [[git show]] said, in exactly its order, and adds only colour.
+
+That constraint is worth stating as an invariant, because it is what a
+test can check: for every line, [[prefix + text]] is the input line,
+and joining them with newlines reproduces the input string.
+Nothing here sanitises, indents, reorders or drops.  One consequence is
+that a tab in a raw line reaches [[addstr]] unexpanded, where it may
+cost that line; the drawer's [[curses.error]] guard is what keeps that
+from being more than a missing line, and it is the price of a view
+whose whole promise is fidelity.
+
+A pleasant consequence of the invariant is that the region boundaries
+need only be approximately right.  Every branch emits its line
+untouched, so a message line mistaken for a diff line is drawn in the
+wrong colour and in the right place---the failure mode is cosmetic, not
+lossy.  It is worth knowing that, because the boundaries below are
+found by the same rule the reading layer uses rather than by anything
+this module reasons out for itself.
+
+<<render constants>>=
+SHOW_HEADER_PREFIXES = (
+    "commit ",
+    "Author:",
+    "AuthorDate:",
+    "Commit:",
+    "CommitDate:",
+    "Date:",
+    "Merge:",
+)
+<<render functions>>=
+def _raw_header_line(line):
+    """Classify one line of the ``git show`` header."""
+    if line.startswith(SHOW_HEADER_PREFIXES):
+        return StyledLine(line, KIND_DIM)
+    return StyledLine(line, KIND_PLAIN)
+@
+
+Inside the message the transcript is still worth colouring, and the
+same split serves: git's four-space indent joins the stream prefix in
+the faded segment, so the program's output is the coloured part of the
+line here too.
+
+<<render functions>>=
+def _raw_message_line(line):
+    """Classify one line of the commit message."""
+    split = _io_prefix(line)
+    if split is None:
+        return StyledLine(line, KIND_PLAIN)
+    prefix, text, kind = split
+    return StyledLine(text, kind, prefix)
+@
+
+The two boundaries come from [[parse_show_sections]]
+(\cref{sec:split-commit-detail}), the same pair of indices the reading
+layer uses, and in Git's order they say everything there is to say:
+the header ends at the first blank line, the diff begins at the first
+[[diff --git]] and runs to the end, and the message is what lies
+between them.
+A commit with no diff---the initial one---has no second boundary, and
+its message simply runs to the end instead.
+
+Taking one layout is what makes that arithmetic honest.  Asked to
+accept the diff-first text as well, this function would have to find
+where a moved message begins, and the only cheap rule for that---the
+first line carrying Git's four-space message indent---is wrong on
+Python.  A context line inside a hunk is a space followed by the file's
+own line, so a statement indented four spaces arrives as five and looks
+exactly like an indented message line; the diff would end at the first
+indented statement of the first hunk.  There is no such question to
+answer here, because there is only one order to read.
+
+<<render functions>>=
+def raw_lines(detail):
+    """Classify ``git show`` output without changing a byte.
+
+    Expects git's own order, as returned by
+    ``get_commit_detail(..., reorder=False)``.  Every line comes
+    back exactly as it went in, labelled with a kind, so raw
+    mode is coloured but never rewritten.
+    """
+    lines = detail.split("\n")
+    header_end, diff_start = parse_show_sections(lines)
+    message_end = len(lines) if diff_start is None else diff_start
+    result = [
+        _raw_header_line(line) for line in lines[:header_end + 1]
+    ]
+    result.extend(
+        _raw_message_line(line)
+        for line in lines[header_end + 1:message_end]
+    )
+    if diff_start is not None:
+        result.extend(classify_diff(lines[diff_start:], raw=True))
+    return result
+@
+
+Let's verify the invariant on a record with a diff and on one without,
+and that the colouring still happened:
+
+<<render test functions>>=
+GIT_ORDER_DETAIL = (
+  "commit " + "a" * 40 + "\n"
+  "Author: Student <s@example.com>\n"
+  "Date:   Wed Sep 9 16:43:55 2026 +0200\n"
+  "\n"
+  "    Run: hello.py (none)\n"
+  "\n"
+  "    stdout: hello\n"
+  "\n"
+  "diff --git a/hello.py b/hello.py\n"
+  "index d47ad68..61e56c3 100644\n"
+  "--- a/hello.py\n"
+  "+++ b/hello.py\n"
+  "@@ -1 +1 @@\n"
+  "-print(1)\n"
+  "+print(2)\n"
+)
+
+NO_DIFF_DETAIL = (
+  "commit " + "c" * 40 + "\n"
+  "Author: Student <s@example.com>\n"
+  "\n"
+  "    learnlog: initial commit\n"
+)
+
+def test_raw_lines_reproduce_the_input_exactly():
+  for detail in (GIT_ORDER_DETAIL, NO_DIFF_DETAIL):
+    assert styled_text(raw_lines(detail)) == detail
+
+def test_raw_lines_colour_without_rewriting():
+  kinds = {line.kind for line in raw_lines(GIT_ORDER_DETAIL)}
+  assert "dim" in kinds
+  assert "added" in kinds and "removed" in kinds
+@
+
+The transcript inside the message keeps its stream colours, with git's
+four-space indent riding along in the faded prefix so the program's
+own words start where they started on screen:
+
+<<render test functions>>=
+def test_raw_lines_colour_the_transcript():
+  styled = raw_lines(GIT_ORDER_DETAIL)
+  spoken = [line for line in styled if line.kind == "out"]
+  assert len(spoken) == 1
+  assert spoken[0].prefix == "    stdout: "
+  assert spoken[0].text == "hello"
+  assert styled[0].kind == "dim"
+@
+
+And a hunk of indented code keeps its own colours: a context line
+five spaces wide is a line of the file, not a line of the message.
+
+<<render test functions>>=
+def test_raw_lines_keep_indented_diff_lines_coloured():
+  detail = (
+    "commit " + "e" * 40 + "\n"
+    "\n"
+    "    Run: deep.py (none)\n"
+    "    stdout: 3\n"
+    "\n"
+    "diff --git a/deep.py b/deep.py\n"
+    "@@ -1,3 +1,3 @@\n"
+    " def f():\n"
+    "     return 1\n"
+    "-    return 2\n"
+    "+    return 3\n"
+  )
+  styled = raw_lines(detail)
+  assert styled_text(styled) == detail
+  kinds = {
+    line.prefix + line.text: line.kind for line in styled
+  }
+  assert kinds["     return 1"] == "context"
+  assert kinds["-    return 2"] == "removed"
+  assert kinds["+    return 3"] == "added"
+  spoken = [line for line in styled if line.kind == "out"]
+  assert len(spoken) == 1 and spoken[0].text == "3"
+@
+
+
+\section{Colour on this terminal}
+\label{sec:use-color}
+
+Whether to colour is a question about the destination, not about the
+content, so it is asked once per stream rather than once per line.
+
+The default answers it the way every well-behaved command-line tool
+does.  [[NO_COLOR]] set to anything non-empty means the user has asked
+for no colour anywhere;\footnote{\url{https://no-color.org/}} an empty
+value is not an opt-in to the convention, so it does not disable
+anything.  [[TERM=dumb]] means the terminal cannot render escapes at
+all---Emacs shell buffers and some editor consoles set it.  Otherwise
+we colour only a real terminal, because escape sequences in a file or a
+pipe are noise in whatever reads them next.
+
+An explicit [[--color]] beats [[NO_COLOR]], because it is the later and
+more specific instruction: a user who typed it on this command line
+means this command line.
+
+Asking a stream whether it is a terminal can fail in two ways that are
+both ordinary here.  A test's captured stream may not have [[isatty]]
+at all, and a stream closed by a broken pipe raises [[ValueError]] on
+the way out.  Neither is a reason to fail, and both mean the same
+thing: nothing is watching, so do not colour.
+
+<<render functions>>=
+def use_color(stream, color):
+    """Decide whether to write colour to ``stream``.
+
+    ``color`` is ``True`` to force colour on, ``False`` to force it
+    off, and ``None`` to decide from ``NO_COLOR``, ``TERM`` and
+    whether ``stream`` is a terminal.
+    """
+    if color is not None:
+        return bool(color)
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+@
+
+Let's verify the whole matrix: forced on, forced off, and each of the
+three things automatic mode consults.
+
+<<render test functions>>=
+class FakeStream:
+  def __init__(self, tty):
+    self._tty = tty
+
+  def isatty(self):
+    return self._tty
+
+def test_use_color_forced_either_way(monkeypatch):
+  monkeypatch.setenv("NO_COLOR", "1")
+  monkeypatch.setenv("TERM", "dumb")
+  assert use_color(FakeStream(False), True) is True
+  monkeypatch.delenv("NO_COLOR")
+  monkeypatch.setenv("TERM", "xterm")
+  assert use_color(FakeStream(True), False) is False
+
+def test_use_color_auto_follows_the_terminal(monkeypatch):
+  monkeypatch.delenv("NO_COLOR", raising=False)
+  monkeypatch.setenv("TERM", "xterm")
+  assert use_color(FakeStream(True), None) is True
+  assert use_color(FakeStream(False), None) is False
+
+def test_use_color_auto_obeys_no_color(monkeypatch):
+  monkeypatch.setenv("TERM", "xterm")
+  monkeypatch.setenv("NO_COLOR", "1")
+  assert use_color(FakeStream(True), None) is False
+  monkeypatch.setenv("NO_COLOR", "")
+  assert use_color(FakeStream(True), None) is True
+
+def test_use_color_auto_obeys_dumb_terminals(monkeypatch):
+  monkeypatch.delenv("NO_COLOR", raising=False)
+  monkeypatch.setenv("TERM", "dumb")
+  assert use_color(FakeStream(True), None) is False
+
+def test_use_color_survives_a_stream_without_isatty(monkeypatch):
+  monkeypatch.delenv("NO_COLOR", raising=False)
+  monkeypatch.setenv("TERM", "xterm")
+
+  class Closed:
+    def isatty(self):
+      raise ValueError("I/O operation on closed file")
+
+  assert use_color(object(), None) is False
+  assert use_color(Closed(), None) is False
+@
+
+\subsection{Writing the escapes}
+
+Each segment is opened and closed on its own line.
+Spanning a colour across a newline is what leaves a terminal stuck in
+red when the reader quits [[less]] halfway, kills a [[head]], or
+watches a pipe close under a long playback; resetting at the end of
+every segment costs a few bytes and makes every prefix of the output a
+valid, self-contained document.
+
+A kind whose SGR string is empty gets no escape at all, and neither
+does an empty segment, so an uncoloured card is byte-for-byte the
+plain text.
+
+<<render constants>>=
+SGR_RESET = "\033[0m"
+<<render functions>>=
+def _segment(text, kind, color):
+    """One segment of a line, wrapped in its escape if any."""
+    if not text or not color:
+        return text
+    style = STYLES.get(kind) or STYLES[KIND_PLAIN]
+    if not style.sgr:
+        return text
+    return f"\033[{style.sgr}m{text}{SGR_RESET}"
+@
+
+An unknown kind falls back to plain rather than raising.  It should be
+impossible---the table is closed and a test checks it---but a display
+layer is the last thing that should stop a student from reading their
+log.
+
+<<render functions>>=
+def ansi_lines(lines, color):
+    """Yield each styled line as a string ending in a newline.
+
+    With ``color`` false the plain text is yielded unchanged.
+    """
+    for line in lines:
+        yield (_segment(line.prefix, KIND_FADED, color)
+               + _segment(line.text, line.kind, color)
+               + "\n")
+@
+
+Let's verify that colour is added only where it was asked for, that
+each segment closes itself, and that no escape crosses a line
+boundary:
+
+<<render test functions>>=
+def test_ansi_lines_without_colour_are_plain():
+  styled = [
+    StyledLine("hello", "err", "  stderr: "),
+    StyledLine("Result: it worked", "ok"),
+  ]
+  out = "".join(ansi_lines(styled, False))
+  assert out == "  stderr: hello\nResult: it worked\n"
+  assert "\033[" not in out
+
+def test_ansi_lines_wrap_and_reset_each_segment():
+  line = StyledLine("boom", "err", "  stderr: ")
+  out = "".join(ansi_lines([line], True))
+  assert out == (
+    "\033[2m  stderr: \033[0m"
+    "\033[31mboom\033[0m\n"
+  )
+
+def test_ansi_lines_skip_empty_segments_and_styles():
+  out = "".join(ansi_lines([
+    StyledLine("plain text", "plain"),
+    StyledLine("", "plain"),
+    StyledLine("body", "context", ""),
+  ], True))
+  assert out == "plain text\n\nbody\n"
+
+def test_ansi_lines_end_every_line_cleanly():
+  styled = record_lines(
+    a_commit(), a_detail(CRASHED_RUN, A_DIFF), index=0, total=1,
+  )
+  for rendered in ansi_lines(styled, True):
+    assert rendered.endswith("\n")
+    assert rendered.count("\033[") == \
+        2 * rendered.count(SGR_RESET)
+@
+
+
+\section{Curses attributes}
+\label{sec:curses-styles}
+
+The viewer needs an integer per kind, and integers do not exist until
+curses is running.
+The [[curses]] module arrives as a parameter rather than as an import
+for two reasons.  It keeps this module importable where [[curses]] is
+not (\cref{viewer}), which is the whole reason \cref{sec:styled-line}
+describes attributes instead of naming them.  And it lets a test pass a
+stub whose colour support is deliberately broken, which is the case
+that matters: the terminal that cannot do what we asked.
+
+[[curses.wrapper]] already calls [[start_color]] inside a bare [[try]],
+so calling it again costs nothing and makes the dependency visible
+here, where the pairs are allocated, rather than implicit in the
+caller.
+
+Each call is guarded separately because they fail independently.
+[[use_default_colors]] is the one that matters: the viewer has called
+it unguarded until now, which is a crash waiting for the first
+monochrome terminal---it raises on a terminal with no default-colour
+support, and it is called before anything is drawn, so the whole viewer
+goes down rather than losing a colour.  Guarding it means the worst
+case is a viewer in bold and dim.
+
+<<render functions>>=
+def _colour_pairs(curses):
+    """Allocate one colour pair per colour the table names.
+
+    Returns a map from colour name to pair number, empty when
+    the terminal has no colours.
+    """
+    try:
+        curses.start_color()
+    except curses.error:
+        return {}
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+    try:
+        if not curses.has_colors():
+            return {}
+    except curses.error:
+        return {}
+    pairs = {}
+    for number, name in enumerate(_named_colours(), start=1):
+        try:
+            curses.init_pair(
+                number, getattr(curses, "COLOR_" + name.upper()), -1,
+            )
+        except (curses.error, AttributeError):
+            continue
+        pairs[name] = number
+    return pairs
+@
+
+The colours come from the style table rather than from a list of their
+own, so a row that names a new colour gets a pair without anybody
+remembering to add one.  Sorting makes the pair numbers deterministic,
+which matters only when reading a debugger, but costs nothing.
+
+<<render functions>>=
+def _named_colours():
+    """The colour names the style table uses, in a fixed order."""
+    return sorted({
+        style.curses.colour for style in STYLES.values()
+        if style.curses.colour
+    })
+@
+
+The map that comes back is complete whatever happened: a kind whose
+colour could not be allocated keeps its bold, dim or reverse attribute
+and loses only the colour.  A caller can therefore index it without
+checking, which is what a draw loop wants.
+
+<<render functions>>=
+def curses_styles(curses):
+    """Map each kind to a curses attribute.
+
+    Takes the ``curses`` module as an argument so that this
+    module stays importable where curses is not.  Colours that
+    cannot be allocated degrade to bold, dim and reverse.
+    """
+    pairs = _colour_pairs(curses)
+    attributes = {}
+    for kind, style in STYLES.items():
+        attribute = 0
+        if style.curses.bold:
+            attribute |= curses.A_BOLD
+        if style.curses.dim:
+            attribute |= curses.A_DIM
+        if style.curses.reverse:
+            attribute |= curses.A_REVERSE
+        number = pairs.get(style.curses.colour)
+        if number is not None:
+            attribute |= curses.color_pair(number)
+        attributes[kind] = attribute
+    return attributes
+@
+
+Let's verify the degraded case, which is the one a student on a
+monochrome terminal meets: colour support absent and every allocation
+failing.  Nothing may raise, and every kind must still have an
+attribute.
+
+<<render test functions>>=
+class StubCurses:
+  """A curses module whose colour support is broken."""
+  error = type("error", (Exception,), {})
+  A_BOLD = 1
+  A_DIM = 2
+  A_REVERSE = 4
+  COLOR_RED = 1
+  COLOR_GREEN = 2
+  COLOR_YELLOW = 3
+  COLOR_BLUE = 4
+  COLOR_CYAN = 6
+
+  def start_color(self):
+    pass
+
+  def use_default_colors(self):
+    raise self.error("no default colours here")
+
+  def has_colors(self):
+    return False
+
+  def init_pair(self, number, foreground, background):
+    raise self.error("no colour pairs here")
+
+  def color_pair(self, number):
+    return number << 8
+
+def test_curses_styles_degrade_without_colour():
+  attributes = curses_styles(StubCurses())
+  assert set(attributes) == set(STYLES)
+  assert attributes["title"] == StubCurses.A_BOLD
+  assert attributes["meta"] == StubCurses.A_DIM
+  assert attributes["chrome"] == StubCurses.A_REVERSE
+  assert attributes["removed"] == 0
+@
+
+With a terminal that does support colour, each colour the table names
+gets a pair of its own and the attributes combine:
+
+<<render test functions>>=
+class ColourCurses(StubCurses):
+  def use_default_colors(self):
+    pass
+
+  def has_colors(self):
+    return True
+
+  def init_pair(self, number, foreground, background):
+    pass
+
+def test_curses_styles_allocate_one_pair_per_colour():
+  attributes = curses_styles(ColourCurses())
+  assert set(attributes) == set(STYLES)
+  assert attributes["removed"] != 0
+  assert attributes["context"] == 0
+  assert attributes["section"] & StubCurses.A_BOLD
+  assert attributes["section"] != attributes["hunk"]
+  assert attributes["removed"] == attributes["err"]
+@

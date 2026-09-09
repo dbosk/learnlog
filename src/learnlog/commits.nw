@@ -2618,10 +2618,22 @@ it, so the whole diff would be read as part of the commit message.
 Asking for no colour is cheaper than teaching every reader below to
 see through it.
 
+Reordering is what a reader wants when it is shown the [[git show]]
+text itself, and only then.
+A caller that builds its own layout out of the three parts---the
+reading view of \cref{render} composes a headline, a changes section
+and a transcript---gains nothing from having them pre-shuffled, and
+would have to undo the shuffle before it could tell the message from
+the diff.
+So [[reorder]] says which of the two the caller is: leave it alone to
+get today's diff-first text, pass [[False]] to get the merged and
+filtered detail in Git's own order.
+
 <<commits functions>>=
 def get_commit_detail(repo, commit_hash,
                       filter_internal=True,
-                      trailers=None):
+                      trailers=None,
+                      reorder=True):
     """Return ``git show`` output for a single commit,
     reordered so the diff appears before the message.
 
@@ -2630,7 +2642,9 @@ def get_commit_detail(repo, commit_hash,
     When ``filter_internal`` is ``True`` (the default),
     learnlog's internal run blocks are stripped from the commit
     message; review runs are kept.  Returns ``None`` if every
-    run in the commit was internal.
+    run in the commit was internal.  With ``reorder`` false the
+    text keeps git's own order, header then message then diff,
+    for a caller that lays the parts out itself.
     """
     result = repo.git("show", "--no-color", commit_hash)
     detail = result.stdout
@@ -2647,7 +2661,7 @@ def get_commit_detail(repo, commit_hash,
     if detail is None:
         return None
 
-    return reorder_commit_detail(detail)
+    return reorder_commit_detail(detail) if reorder else detail
 @
 
 Let's verify that a run's results show up in its header commit once
@@ -2721,6 +2735,35 @@ def test_get_commit_detail_diff_before_message(workdir):
     first_msg_pos = detail.index(msg_lines[0])
     assert diff_pos < first_msg_pos, \
         "diff should appear before the commit message"
+@
+
+And that asking for git's own order gets it, on the same record, so
+that the two orders are pinned against each other rather than each
+against a fixture:
+
+<<commits test functions>>=
+def test_get_commit_detail_can_keep_gits_order(workdir):
+    """With reorder=False the diff stays after the message."""
+    from learnlog.commits import get_commits, \
+        get_commit_detail
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    commits = get_commits(repo)
+    detail = get_commit_detail(
+        repo, commits[-1]["hash"], reorder=False,
+    )
+    message = [
+        line for line in detail.split("\n")
+        if line.startswith("    ")
+    ]
+    assert message, "expected indented message lines"
+    assert detail.index(message[0]) < detail.index("diff --git")
 @
 
 The colour setting is the interesting one to pin down, because

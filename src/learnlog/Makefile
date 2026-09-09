@@ -4,6 +4,7 @@ MODULES+=	__init__.py _autostart.py learnlog.tex students.md
 MODULES+=	capture.py capture.tex
 MODULES+=	gitrepo.py gitrepo.tex
 MODULES+=	commits.py commits.tex
+MODULES+=	render.py render.tex
 MODULES+=	progsnap2.py progsnap2.tex
 MODULES+=	metrics.py metrics.tex
 MODULES+=	viewer.py viewer.tex
@@ -29,6 +30,7 @@ students.md: learnlog.nw
 capture.py: capture.nw
 gitrepo.py: gitrepo.nw
 commits.py: commits.nw
+render.py: render.nw
 progsnap2.py: progsnap2.nw
 metrics.py: metrics.nw
 viewer.py: viewer.nw
