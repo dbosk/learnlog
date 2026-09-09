@@ -122,6 +122,7 @@ from typing import Annotated
 import pytorial
 import typer
 
+import learnlog
 from learnlog import _is_home_or_above, find_learnlog_dir
 from learnlog._autostart import (
     _DEFAULT_MARKER_PATH,
@@ -7034,6 +7035,58 @@ Typer's [[CliRunner]] connects no terminal, so a test that invokes
 branch; the automatic \emph{on} branch is covered where it can be, by
 [[render]]'s unit test of [[use_color]] against a stub stream.
 
+Without a starting ref the viewer opens on the newest record, not the
+oldest.
+A student who types [[learnlog play]] has just run something and wants
+to see how it went; the beginning of the log is where they were weeks
+ago.
+The newest record, though, is usually the [[play]] run itself:
+playback is recorded (\cref{sec:review-runs}), and its header commit is
+in the list before the viewer opens.
+So the default is the record just before the run in progress---the
+one that made the student look---and the run in progress is one
+[[\textrightarrow]] away, which is where a reader expects the present
+to be.
+Reading the log from a bundle or from an unwired interpreter records
+no run, and then the newest record is simply the last one.
+Batch mode keeps starting from the beginning: it prints rather than
+positions, and [[learnlog play -b | less]] is how a reader gets the
+whole log.
+
+<<helper functions>>=
+def current_run_commit():
+    """The header commit of the run being recorded, or ``None``."""
+    return getattr(learnlog.repo, "run_commit", None)
+
+
+def latest_record_index(commits, current=None):
+    """Index of the newest record other than the run in progress.
+
+    ``current`` is that run's header commit; when it is the last
+    entry the one before it is chosen, so that ``learnlog play``
+    opens on what the student just did rather than on itself.
+    """
+    last = len(commits) - 1
+    if last > 0 and commits[last]["hash"] == current:
+        return last - 1
+    return last
+@
+
+Let's verify the choice in the three situations the viewer meets: a
+recorded playback whose own header ends the list, a log read without
+a run in progress, and a run in progress that is not in this list at
+all (playback of a bundle):
+
+<<test functions>>=
+def test_latest_record_index_skips_the_run_in_progress():
+    from learnlog.cli import latest_record_index
+    commits = [{"hash": "aaa"}, {"hash": "bbb"}, {"hash": "ccc"}]
+    assert latest_record_index(commits, "ccc") == 1
+    assert latest_record_index(commits, None) == 2
+    assert latest_record_index(commits, "zzz") == 2
+    assert latest_record_index([{"hash": "ccc"}], "ccc") == 0
+@
+
 <<typer commands>>=
 @app.command()
 def play(
@@ -7110,7 +7163,7 @@ def play(
         if not commits:
             raise SystemExit("No commits found.")
 
-        start_index = 0
+        start_index = None
         if start:
             <<find starting commit index>>
 
@@ -7131,9 +7184,13 @@ use_batch = (
     else not sys.stdout.isatty()
 )
 if use_batch:
-    play_batch(repo, commits, start_index,
+    play_batch(repo, commits, start_index or 0,
                filter_internal, raw=raw, color=color)
 else:
+    if start_index is None:
+        start_index = latest_record_index(
+            commits, current_run_commit(),
+        )
     viewer = PlaybackViewer(
         repo, commits, start_index, filter_internal,
         raw=raw, color=color,
