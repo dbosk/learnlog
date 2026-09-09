@@ -2012,11 +2012,61 @@ We therefore also wrap [[builtins.input]], but only as a supplement:
 when [[sys.stdin]] is already an [[InputCapture]] we must not write a
 second identical [[stdin:]] entry for the same line.
 
+The prompt needs the same supplement, and for the same reason.
+On a terminal CPython does not print the prompt through
+[[sys.stdout]] at all: [[input()]] hands prompt and read together to
+its C-level line reader, which writes the prompt straight to the
+console and takes the reply straight from it.
+Our stream wrapper never sees the prompt, so the record of
+[[antal = int(input("Antal personer: "))]] held the answer and not the
+question---and the question is the half a reader needs to make sense
+of a bare [[stdin: 5]].
+The wrapper is the only code that holds the prompt at that moment, so
+it logs the prompt itself, as the [[stdout]] fragment the program
+meant to write; the stream switch to [[stdin]] then closes it on a
+line of its own (\cref{capture}).
+
+Whether the prompt bypasses [[sys.stdout]] is CPython's decision, so
+we ask exactly the question CPython asks rather than a simpler one:
+the fast path is taken only when [[sys.stdin]] and [[sys.stdout]]
+report the console's own descriptors and both are terminals.
+A simpler test---\enquote{is stdin a tty}---would log the prompt twice
+when a student redirects output to a file, because with stdout
+redirected CPython prints the prompt the ordinary way and the stream
+wrapper records it.
+Our wrappers delegate [[fileno]] to the stream they wrap, which is
+what makes the two tests agree: CPython and we see the same
+descriptors.
+
+<<functions>>=
+def _reports_console(stream, descriptor):
+    """True if ``stream`` is the terminal on ``descriptor``."""
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False
+    return fd == descriptor and os.isatty(fd)
+
+
+def _prompt_bypasses_stdout():
+    """True when ``input()`` will write its prompt to the console.
+
+    Mirrors the test CPython's ``input()`` makes before taking its
+    C-level reader path, which prints the prompt without going
+    through ``sys.stdout``.
+    """
+    return (
+        _reports_console(sys.stdin, 0)
+        and _reports_console(sys.stdout, 1)
+    )
+@
+
 <<functions>>=
 def _wrap_input(original_input, iolog):
-    """Return an ``input`` wrapper that records returned lines."""
+    """Return an ``input`` wrapper that records prompt and reply."""
     def logged_input(prompt=""):
         _flush_pending_repl_capture()
+        _log_console_prompt(iolog, prompt)
         line = original_input(prompt)
         _skip_repl_input_history(line)
         if not isinstance(sys.stdin, InputCapture):
@@ -2024,6 +2074,12 @@ def _wrap_input(original_input, iolog):
         return line
 
     return logged_input
+
+
+def _log_console_prompt(iolog, prompt):
+    """Record ``prompt`` as output if the console will swallow it."""
+    if prompt != "" and _prompt_bypasses_stdout():
+        iolog.log("stdout", str(prompt))
 @
 
 REPL statements need a second supplement.
@@ -2061,11 +2117,15 @@ method as well.
 Without that second hook we would capture [[value = input()]] as a
 statement, but miss the student's reply that the running code reads from
 the terminal.
+The prompt goes the same way as in [[_wrap_input]], and through the
+same test: pyrepl draws it on its own console, never through
+[[sys.stdout]].
 
 <<functions>>=
 def _wrap_pyrepl_input(original_input, iolog):
-    """Return a pyrepl ``input`` wrapper that records returned lines."""
+    """Return a pyrepl ``input`` wrapper that records prompt and reply."""
     def logged_input(self, prompt=""):
+        _log_console_prompt(iolog, prompt)
         line = original_input(self, prompt)
         iolog.log("stdin", line + "\n")
         return line
@@ -3976,6 +4036,53 @@ def test_wrap_input_skips_duplicate_log_when_stdin_is_wrapped():
         learnlog.sys.stdin = original_stdin
 
     assert log.getvalue() == ""
+@
+
+The prompt is logged exactly when CPython would swallow it.
+We stand in for the console with objects that answer [[fileno]] with
+the console's descriptors and an [[isatty]] that says yes, which is
+all CPython's own test looks at; the [[StringIO]] in the test above,
+which has no descriptor at all, is the contrast, and there the prompt
+must stay unlogged because the stream wrapper will record it:
+
+<<test functions>>=
+class _ConsoleStream:
+    def __init__(self, descriptor):
+        self.descriptor = descriptor
+
+    def fileno(self):
+        return self.descriptor
+
+
+def test_wrap_input_logs_the_prompt_the_console_swallows(monkeypatch):
+    import learnlog
+
+    log = learnlog.IOLog()
+    monkeypatch.setattr(learnlog.sys, "stdin", _ConsoleStream(0))
+    monkeypatch.setattr(learnlog.sys, "stdout", _ConsoleStream(1))
+    monkeypatch.setattr(learnlog.os, "isatty", lambda fd: True)
+    wrapped = learnlog._wrap_input(lambda prompt="": "5", log)
+
+    assert wrapped("Antal personer: ") == "5"
+    assert log.getvalue() == (
+        "stdout: Antal personer: \n"
+        "stdin: 5\n"
+    )
+
+
+def test_wrap_input_leaves_the_prompt_to_the_stream_off_console(
+    monkeypatch,
+):
+    import learnlog
+
+    log = learnlog.IOLog()
+    monkeypatch.setattr(learnlog.sys, "stdin", io.StringIO())
+    monkeypatch.setattr(learnlog.sys, "stdout", _ConsoleStream(1))
+    monkeypatch.setattr(learnlog.os, "isatty", lambda fd: True)
+    wrapped = learnlog._wrap_input(lambda prompt="": "5", log)
+
+    assert wrapped("Antal personer: ") == "5"
+    assert log.getvalue() == "stdin: 5\n"
 
 
 def test_log_repl_statement_formats_multiline_input():
@@ -6532,7 +6639,7 @@ def test_autostart_captures_common_invocations(tmp_path):
     ask = tmp_path / "ask.py"
 
     quick.write_text("print('quick')\n")
-    ask.write_text("value = input()\nprint(value)\n")
+    ask.write_text('value = input("Name? ")\nprint(value)\n')
 
     subprocess.run(
         [str(python), "-c", "print(1)"],
@@ -6576,7 +6683,8 @@ def test_autostart_captures_common_invocations(tmp_path):
     assert "Arguments: 'print(1)'" in history
     assert "Script: pip" in history
     assert "Script: quick.py" in history
-    assert "stdin: hello from tty\n" in history
+    assert "stdout: Name? \nstdin: hello from tty\n" in history
+    assert history.count("Name? ") == 1
     assert not (project / "python_c_invocation.py").exists()
     assert _committed_c_source(project) == "print(1)"
 @
