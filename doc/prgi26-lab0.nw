@@ -619,8 +619,8 @@ learnlog play
 Du får upp en visare som visar en körning i taget: när den gjordes,
 vilket program som kördes, vad det skrev ut och hur koden ändrats
 sedan körningen innan. Bläddra mellan körningarna med piltangenterna
-vänster och höger, rulla i en lång körning med upp och ner, och
-avsluta med `q`.
+vänster och höger, rulla i en lång körning med upp och ner (eller en
+skärm i taget med Page Up och Page Down), och avsluta med `q`.
 
 Leta upp körningen där din ändring dök upp och jämför vad programmet
 skrev ut före och efter. Stämde det med vad du trodde?
