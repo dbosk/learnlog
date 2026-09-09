@@ -79,6 +79,11 @@ module's job (\cref{sec:run-join}): [[get_run_trailers]] and
 [[merge_run_trailers]] hand us the same complete run block that a
 single-commit log would have contained, so everything below parses
 one format.
+Parsing that block is from there too---[[parse_run_block]] and
+[[parse_exception_line]] (\cref{sec:parse-run-block})---because
+reading the recorded format is what that module is for, and this
+chapter is one of three consumers of the result rather than its
+owner.
 Deciding what a run \emph{is} comes from there too: [[is_internal_run]]
 names the plumbing this export drops, [[is_review_run]] the
 reflection it exports under an event type of its own
@@ -119,8 +124,10 @@ from learnlog.commits import (
     is_internal_run,
     is_review_run,
     merge_run_trailers,
-    parse_view_trace,
+    parse_exception_line,
+    parse_run_block,
     BLOCK_SEP,
+    IO_STREAM_PREFIXES,
 )
 from learnlog.gitrepo import (
     EXCEPTION_SECTION_MARKER,
@@ -146,286 +153,19 @@ PROGSNAP2_VERSION = 8
 @
 
 
-\section{Parsing individual run blocks}
-\label{sec:parse-run-block}
-
-The existing [[parse_run_summary]] (\cref{commits}) extracts
-just enough for the [[list]] command: command string, start time,
-and run count.
-ProgSnap2 needs every field from every run block---exit code,
-end time, exception type, I/O---so we need a more thorough parser.
-
-A run block has two parts: a \emph{header} written by
-[[begin_run]] (always present) and a \emph{trailer} written by
-[[finalize_run]] (missing if the program was killed by SIGKILL).
-The header contains [[Run:]], [[Script:]], [[Arguments:]], and
-[[Start-Time:]]; the trailer contains [[End-Time:]],
-[[Exit-Code:]], [[--- I/O ---]], and [[--- exception ---]].
-
-We parse each block into a flat dict with string values, keeping
-the raw text for I/O and exception sections.  Missing trailer
-fields are represented as [[None]]---this lets callers distinguish
-\enquote{program crashed} from \enquote{exit code was zero}.
-
-A review run's trailer carries a further section, the [[Viewed:]]
-lines naming the commits the student looked at.
-Reading it is [[parse_view_trace]]'s job (\cref{sec:view-trace}); we
-call it here so that every consumer of a parsed block sees the trace
-as just another field, and so that ordinary runs---which have no such
-lines---come back with an empty list rather than a missing key.
-
-<<progsnap2 functions>>=
-def parse_run_block(block_text):
-    """Parse a single run block into a dict.
-
-    Returns a dict with keys ``script``, ``arguments``,
-    ``start_time``, ``end_time``, ``exit_code``,
-    ``io_log``, ``exception_info``, and ``viewed``.
-    Missing trailer fields are ``None``; ``viewed`` is the
-    view trace, empty for everything but a review run.
-    """
-    result = {
-        "script": None, "arguments": None,
-        "start_time": None, "end_time": None,
-        "exit_code": None, "io_log": None,
-        "exception_info": None,
-        "viewed": parse_view_trace(block_text),
-    }
-
-    <<parse key-value fields>>
-    <<parse trailer fields>>
-
-    return result
-@
-
-Both header and trailer use simple [[Key: value]] lines, so
-we parse them in a single pass.
-We skip the first [[Run:]] line because it duplicates the
-[[Script:]] and [[Arguments:]] fields in a less structured form.
-
-<<parse key-value fields>>=
-for line in block_text.split("\n"):
-    if line.startswith("Script:"):
-        result["script"] = line.split(":", 1)[1].strip()
-    elif line.startswith("Arguments:"):
-        result["arguments"] = (
-            line.split(":", 1)[1].strip()
-        )
-    elif line.startswith("Start-Time:"):
-        result["start_time"] = (
-            line.split(":", 1)[1].strip()
-        )
-    elif line.startswith("End-Time:"):
-        result["end_time"] = (
-            line.split(":", 1)[1].strip()
-        )
-    elif line.startswith("Exit-Code:"):
-        result["exit_code"] = (
-            line.split(":", 1)[1].strip()
-        )
-@
-
-The I/O and exception sections are delimited by the markers
-[[format_run_trailer]] writes (\cref{sec:io-section}), and the I/O
-section is read back by cutting exactly at them.
-The parser this replaced took the text between the markers and
-[[strip]]ped it, which is the natural thing to write and wrong for
-this format: a captured log is a transcript, so spaces at the start of
-its first line and at the end of its last are output the program
-produced, and an export that removed them showed an analysis different
-bytes than the student saw.
-
-Cutting exactly means naming both edges as the writer writes them.
-The log begins on the line after the [[--- I/O ---]] marker, so the
-opening delimiter carries the newline that ends the marker line.
-It ends one blank line above [[--- exception ---]], and that blank
-line belongs to the layout rather than to the log
-(\cref{sec:io-section}), so the closing cut drops exactly one
-newline---[[removesuffix]] rather than [[rstrip]], because a run of
-newlines at the end of the section would be output too, and only the
-last of them is the separator.
-
-Anchoring both delimiters between newlines is what keeps a run's own
-text from being mistaken for one: a program that prints
-[[--- exception ---]] has that line recorded as [[stdout: ]] plus the
-text, which the anchor does not match.
-An \emph{unprefixed} line could still say it (\cref{sec:io-notes}),
-and no anchor can settle that---the format has one way of spelling
-both---so we take the first closing marker, as this has always done.
-
-<<parse trailer fields>>=
-io_start = block_text.find(IO_SECTION_OPEN)
-if io_start >= 0:
-    io_text = block_text[io_start + len(IO_SECTION_OPEN):]
-    exc_start = io_text.find(EXCEPTION_SECTION_OPEN)
-    if exc_start < 0:
-        io_content = io_text.rstrip("\n")
-    else:
-        io_content = io_text[:exc_start].removesuffix("\n")
-        exc_content = io_text[
-            exc_start + len(EXCEPTION_SECTION_OPEN):
-        ].strip()
-        if exc_content and exc_content != "None":
-            result["exception_info"] = exc_content
-    if io_content and io_content != NO_IO_PLACEHOLDER:
-        result["io_log"] = io_content
-<<progsnap2 constants>>=
-IO_SECTION_OPEN = f"\n{IO_SECTION_MARKER}\n"
-EXCEPTION_SECTION_OPEN = f"\n{EXCEPTION_SECTION_MARKER}\n"
-@
-
-The exception section keeps its [[strip]], and the asymmetry is in the
-format rather than in our attention: the I/O section has a marker
-below it to cut at, while the exception text runs to the end of the
-block and therefore ends in whatever the commit message ended
-in---Git's closing newline included.
-There is nothing there to preserve it against, so preserving it would
-be preserving punctuation the recorder never wrote.
-
-A block whose I/O section has no [[--- exception ---]] below it is not
-something [[format_run_trailer]] can produce; it is what a hand-made
-or truncated message looks like.
-We read the section to the end of the block and drop the trailing
-newlines, which is the same cut the writer would have made.
-
-Let's verify the parser handles complete blocks, header-only
-blocks (crash), and blocks with exceptions:
-
-<<progsnap2 test functions>>=
-def test_parse_run_block_complete():
-    from learnlog.progsnap2 import parse_run_block
-    block = (
-        "Run: hello.py arg1\n"
-        "\n"
-        "Script: hello.py\n"
-        "Arguments: arg1\n"
-        "Start-Time: 2026-01-01T10:00:00\n"
-        "End-Time: 2026-01-01T10:00:05\n"
-        "Exit-Code: 0\n"
-        "\n"
-        "--- I/O ---\n"
-        "stdout: hello world\n"
-        "\n"
-        "--- exception ---\n"
-        "None"
-    )
-    result = parse_run_block(block)
-    assert result["script"] == "hello.py"
-    assert result["arguments"] == "arg1"
-    assert result["start_time"] == "2026-01-01T10:00:00"
-    assert result["end_time"] == "2026-01-01T10:00:05"
-    assert result["exit_code"] == "0"
-    assert result["io_log"] == "stdout: hello world"
-    assert result["exception_info"] is None
-
-def test_parse_run_block_crash():
-    """Header-only block indicates SIGKILL crash."""
-    from learnlog.progsnap2 import parse_run_block
-    block = (
-        "Run: hello.py (none)\n"
-        "\n"
-        "Script: hello.py\n"
-        "Arguments: (none)\n"
-        "Start-Time: 2026-01-01T10:00:00"
-    )
-    result = parse_run_block(block)
-    assert result["script"] == "hello.py"
-    assert result["end_time"] is None
-    assert result["exit_code"] is None
-
-def test_parse_run_block_exception():
-    from learnlog.progsnap2 import parse_run_block
-    block = (
-        "Run: hello.py (none)\n"
-        "\n"
-        "Script: hello.py\n"
-        "Arguments: (none)\n"
-        "Start-Time: 2026-01-01T10:00:00\n"
-        "End-Time: 2026-01-01T10:00:01\n"
-        "Exit-Code: 1\n"
-        "\n"
-        "--- I/O ---\n"
-        "(no I/O)\n"
-        "\n"
-        "--- exception ---\n"
-        "Traceback (most recent call last):\n"
-        '  File "hello.py", line 1\n'
-        "SyntaxError: invalid syntax"
-    )
-    result = parse_run_block(block)
-    assert result["exit_code"] == "1"
-    assert result["io_log"] is None
-    assert "SyntaxError" in result["exception_info"]
-@
-
-The parser's real contract is stronger than any of those blocks can
-say, and it is easiest to state by asking the writer for the block:
-whatever [[format_run_trailer]] puts in the section comes back out of
-it unchanged, spaces at both ends included.
-
-<<progsnap2 test functions>>=
-def test_parse_run_block_keeps_io_verbatim():
-    """The I/O section reads back exactly as it was written."""
-    from learnlog.gitrepo import format_run_trailer
-    from learnlog.progsnap2 import parse_run_block
-    io_log = (
-        "   [session start]   \n"
-        "stdout: padded   \n"
-        "stdout: \n"
-        "stdout: "
-    )
-    block = "\n".join([
-        "Run: menu.py (none)",
-        "",
-        "Script: menu.py",
-        "Arguments: (none)",
-        "Start-Time: 2026-01-01T10:00:00",
-        format_run_trailer(
-            io_log, None,
-            datetime.datetime(2026, 1, 1, 10, 0, 5), 0,
-        ),
-    ])
-    assert parse_run_block(block)["io_log"] == io_log
-@
-
-A review run's block reaches the exporter with its navigation intact,
-while an ordinary run reports an empty trace rather than nothing at
-all---so a consumer never has to test for the key's presence:
-
-<<progsnap2 test functions>>=
-def test_parse_run_block_exposes_viewed():
-    from learnlog.progsnap2 import parse_run_block
-    first, second = "a" * 40, "b" * 40
-    block = (
-        "Run: learnlog play\n"
-        "\n"
-        "Script: learnlog\n"
-        "Arguments: play\n"
-        "Start-Time: 2026-01-01T10:00:00\n"
-        "End-Time: 2026-01-01T10:00:20\n"
-        "Exit-Code: 0\n"
-        f"Viewed: {first} 2026-01-01T10:00:01 open\n"
-        f"Viewed: {second} 2026-01-01T10:00:05 next\n"
-        "\n--- I/O ---\n(no I/O)\n"
-        "\n--- exception ---\nNone"
-    )
-    result = parse_run_block(block)
-    assert result["viewed"] == [
-        (first, "2026-01-01T10:00:01", "open"),
-        (second, "2026-01-01T10:00:05", "next"),
-    ]
-
-def test_parse_run_block_without_views():
-    from learnlog.progsnap2 import parse_run_block
-    result = parse_run_block(
-        "Run: hello.py (none)\n\nScript: hello.py\n"
-        "Start-Time: 2026-01-01T10:00:00"
-    )
-    assert result["viewed"] == []
-@
-
-
 \section{Parsing all runs from a commit message}
+
+Turning one run block into a dict of its fields is
+[[parse_run_block]], and it is not defined here.
+It used to be---the export was the first thing that needed every
+field of a block rather than just a summary---but it is a reader of
+the recorded format, and readers live in \cref{commits}
+(\cref{sec:parse-run-block}).
+The metrics module and the display layer want the same fields, and
+neither should have to import a chapter about zip files to get at
+them.
+What this chapter is left with is the part that is genuinely about
+the export: turning the parsed fields into ProgSnap2 events.
 
 A single commit message may contain multiple run blocks separated
 by [[BLOCK_SEP]].
@@ -544,58 +284,6 @@ def test_classify_run_result_nonzero_exit_without_exception():
 @
 
 
-\section{Extracting exception type and message}
-
-The exception section of a run block contains a Python traceback.
-The last line has the exception type and message, formatted as
-[[ExceptionType: message]] or just [[ExceptionType]] when there
-is no message.
-We extract these for the [[X-ExceptionType]] and
-[[X-ExceptionMessage]] custom columns.
-
-<<progsnap2 functions>>=
-def parse_exception_line(exception_info):
-    """Extract type and message from exception info.
-
-    Returns ``(exception_type, exception_message)`` where
-    either may be ``None``.
-    """
-    if not exception_info:
-        return None, None
-
-    last_line = exception_info.rstrip().split("\n")[-1]
-    if ":" in last_line:
-        exc_type, _, exc_msg = last_line.partition(":")
-        return exc_type.strip(), exc_msg.strip()
-    return last_line.strip(), None
-@
-
-<<progsnap2 test functions>>=
-def test_parse_exception_line_with_message():
-    from learnlog.progsnap2 import parse_exception_line
-    info = (
-        "Traceback (most recent call last):\n"
-        '  File "hello.py", line 1\n'
-        "SyntaxError: invalid syntax"
-    )
-    typ, msg = parse_exception_line(info)
-    assert typ == "SyntaxError"
-    assert msg == "invalid syntax"
-
-def test_parse_exception_line_no_message():
-    from learnlog.progsnap2 import parse_exception_line
-    info = "KeyboardInterrupt"
-    typ, msg = parse_exception_line(info)
-    assert typ == "KeyboardInterrupt"
-    assert msg is None
-
-def test_parse_exception_line_none():
-    from learnlog.progsnap2 import parse_exception_line
-    assert parse_exception_line(None) == (None, None)
-    assert parse_exception_line("") == (None, None)
-@
-
-
 \section{Chunking captured I/O into events}
 \label{sec:chunk-io}
 
@@ -668,11 +356,33 @@ def classify_io_line(line):
         if line.startswith(prefix):
             return event_type, line[len(prefix):]
     return "X-Run.Note", line
+@
+
+Which prefix marks which stream is not this chapter's to say---it is
+the transcript's own vocabulary, named once in
+\cref{sec:io-stream-prefixes} where every reader of a run block can
+find it.
+What is this chapter's to say is what ProgSnap2 calls each stream, so
+that is all we write down, and the lookup table the loop above walks
+is derived from the two.
+
+Spelling the prefixes out again here would have worked exactly as
+well, right up until the capture layer gains a fourth stream: the two
+tables would then agree only by somebody remembering they exist.
+Deriving one from the other makes that a compile-time question
+instead---a stream with no entry in the table below raises a
+[[KeyError]] at import, which is the loudest place a packaging
+mistake can be found.
+
 <<progsnap2 constants>>=
-IO_LINE_PREFIXES = (
-    ("stdout: ", "X-Run.Output"),
-    ("stderr: ", "X-Run.Output"),
-    ("stdin: ", "X-Run.Input"),
+STREAM_EVENT_TYPES = {
+    "stdout": "X-Run.Output",
+    "stderr": "X-Run.Output",
+    "stdin": "X-Run.Input",
+}
+IO_LINE_PREFIXES = tuple(
+    (prefix, STREAM_EVENT_TYPES[stream])
+    for prefix, stream in IO_STREAM_PREFIXES
 )
 @
 
