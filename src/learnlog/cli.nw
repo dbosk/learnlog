@@ -124,6 +124,7 @@ import typer
 
 from learnlog import _is_home_or_above, find_learnlog_dir
 from learnlog._autostart import (
+    venv_script_candidates,
     _DEFAULT_MARKER_PATH,
     _is_autostart_wired,
     _replace_file,
@@ -1069,9 +1070,8 @@ def find_in_venv(venv_dir, name):
     ``SystemExit`` if neither is present---which means the
     venv is broken or incomplete.
     """
-    for rel in (f"bin/{name}", f"Scripts/{name}.exe"):
-        candidate = venv_dir / rel
-        if candidate.exists():
+    for candidate in venv_script_candidates(venv_dir, name):
+        if candidate.is_file():
             return candidate
     raise SystemExit(
         f"No {name} found inside venv at {venv_dir}"
@@ -1085,6 +1085,14 @@ def test_find_in_venv_finds_posix_layout(tmp_path, name):
     from learnlog.cli import find_in_venv
     (tmp_path / "bin").mkdir()
     binary = tmp_path / "bin" / name
+    binary.write_text("")
+    assert find_in_venv(tmp_path, name) == binary
+
+@pytest.mark.parametrize("name", ["pip", "python"])
+def test_find_in_venv_finds_windows_layout(tmp_path, name):
+    from learnlog.cli import find_in_venv
+    binary = tmp_path / "Scripts" / f"{name}.exe"
+    binary.parent.mkdir()
     binary.write_text("")
     assert find_in_venv(tmp_path, name) == binary
 

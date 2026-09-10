@@ -5470,12 +5470,51 @@ import sys
 import pathlib
 import sysconfig
 
+<<venv script helpers>>
 <<autostart marker location>>
 <<project root resolution>>
 
 <<autostart entry point>>
 @
 
+
+\subsection{Finding scripts across venv layouts}
+
+A project may contain [[.venv/bin/ruff]] or
+[[.venv/Scripts/ruff.exe]].  The directory layout belongs to the venv,
+so discovering it from existing files works even when the host platform
+differs.  The CLI and metrics module share these stdlib-only candidates
+with the startup module that already knows venv geometry.
+
+<<venv script helpers>>=
+def script_candidates(directory, name):
+    """Yield bare and executable-suffixed paths in ``directory``."""
+    directory = pathlib.Path(directory)
+    yield directory / name
+    yield directory / f"{name}.exe"
+@
+
+Trying [[bin]] before [[Scripts]] preserves the POSIX preference when
+both directories exist.  Callers decide whether a candidate exists and
+how to report a missing tool; discovery itself has no side effects.
+
+<<venv script helpers>>=
+def venv_script_candidates(venv_dir, name):
+    """Yield script candidates in POSIX and Windows venv layouts."""
+    for directory in ("bin", "Scripts"):
+        yield from script_candidates(pathlib.Path(venv_dir) / directory, name)
+@
+
+<<autostart test functions>>=
+def test_venv_script_candidates_cover_both_layouts(tmp_path):
+    from learnlog._autostart import venv_script_candidates
+    assert list(venv_script_candidates(tmp_path, "python")) == [
+        tmp_path / "bin" / "python",
+        tmp_path / "bin" / "python.exe",
+        tmp_path / "Scripts" / "python",
+        tmp_path / "Scripts" / "python.exe",
+    ]
+@
 
 \subsection{Locating the project root}
 
