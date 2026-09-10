@@ -54,6 +54,13 @@ and leave it again with
 \begin{minted}{bash}
 eval "$(learnlog deactivate)"
 \end{minted}
+In Windows PowerShell the equivalent commands are
+\begin{minted}{powershell}
+learnlog activate | Invoke-Expression
+learnlog deactivate | Invoke-Expression
+\end{minted}
+If PowerShell blocks activation scripts, the one-time user setting is
+[[Set-ExecutionPolicy -Scope CurrentUser RemoteSigned]].
 Every subsequent Python run through the wired venv is
 captured automatically.
 When a script runs, an autostart hook triggers a chain of actions: it
@@ -400,6 +407,21 @@ When you are done in that same shell, leave it with:
 ```bash
 eval "$(learnlog deactivate)"
 ```
+
+In Windows PowerShell, use these commands instead:
+
+```powershell
+learnlog activate | Invoke-Expression
+learnlog deactivate | Invoke-Expression
+```
+
+If PowerShell blocks activation scripts, allow them once for your user:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+On Windows, run the interactive `learnlog tutorial` lessons inside WSL.
 
 If VS Code did not already pick the project venv, open the
 Command Palette (**Ctrl+Shift+P** or **Cmd+Shift+P**), run

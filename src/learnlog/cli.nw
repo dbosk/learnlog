@@ -117,7 +117,7 @@ import sys
 import tempfile
 import zipfile
 from importlib import resources
-from typing import Annotated
+from typing import Annotated, Optional
 
 import pytorial
 import typer
@@ -924,10 +924,10 @@ validated [[--shell]] choices automatically, and adding [[zsh]],
 [[fish]], or PowerShell later becomes a local change rather than a
 stringly-typed special case.
 
-For now we keep the surface intentionally small and only support
-[[bash]].  That matches the documented usage pattern
-[[eval "$(learnlog activate)"]], and it keeps the first
-implementation honest about which shell semantics we actually emit.
+The same project can be used from bash, PowerShell, or cmd.
+The shell choice controls quoting and invocation syntax; it does not
+change which project or venv is selected.  PowerShell is the default on
+Windows and bash elsewhere, with an explicit [[--shell]] override.
 
 <<constants>>=
 class Shell(str, enum.Enum):
@@ -940,8 +940,20 @@ class Shell(str, enum.Enum):
     """
 
     bash = "bash"
+    powershell = "powershell"
+    cmd = "cmd"
 @
 
+
+The platform supplies a useful default without guessing from inherited
+shell environment variables, which may describe a parent process rather
+than the shell evaluating the output.  An explicit choice always wins.
+
+<<helper functions>>=
+def default_shell():
+    """Return the default activation syntax for this platform."""
+    return Shell.powershell if sys.platform.startswith("win") else Shell.bash
+@
 
 \subsection{Resolving the target Python}
 \label{sec:setup-target-python}
@@ -1165,13 +1177,22 @@ Because [[activate]] and [[deactivate]] print shell code to be
 evaluated later, every path we interpolate must already be quoted for
 the target shell.  For [[bash]] the right primitive is
 [[shlex.quote()]]: it produces a single shell word regardless of
-spaces or punctuation in the underlying path.
+spaces or punctuation in the underlying path.  PowerShell uses single
+quotes with embedded quotes doubled.  Cmd keeps spaces inside double
+quotes but expands percent expressions even there, so paths containing
+percent signs or double quotes are rejected before emitting code.
 
 <<helper functions>>=
 def shell_quote(text, shell):
     """Return ``text`` quoted as one word for ``shell``."""
     if shell is Shell.bash:
         return shlex.quote(str(text))
+    if shell is Shell.powershell:
+        return "'" + str(text).replace("'", "''") + "'"
+    if shell is Shell.cmd:
+        if '"' in str(text) or "%" in str(text):
+            raise SystemExit('cmd paths cannot contain double quotes or %.')
+        return '"' + str(text) + '"'
     raise AssertionError(f"Unsupported shell: {shell}")
 @
 
@@ -1185,7 +1206,7 @@ def test_shell_quote_bash_handles_spaces():
 @
 
 
-\subsection{Emitting activation code for [[bash]]}
+\subsection{Emitting activation code}
 \label{sec:emit-activation}
 
 The shell commands cannot directly change the caller's environment, so
@@ -1196,30 +1217,47 @@ virtual environment already knows how to install its [[deactivate]]
 function and restore shell state correctly, so sourcing it is both the
 minimal and the most correct option.
 
-The emitted code is intentionally just one command: source the project
-[[activate]] script.  If the script is missing even though [[.venv/]]
+PowerShell invokes [[Activate.ps1]] with [[&]] and cmd invokes
+[[activate.bat]] with [[call]].  Both [[bin/]] and [[Scripts/]] are
+searched, including both spellings of the PowerShell filename because
+[[virtualenv]] and the standard library differ in capitalisation.
+Git Bash can therefore use [[Scripts/activate]] too.
+The emitted code delegates to the project venv's own activation script.
+If the script is missing even though [[.venv/]]
 exists, the venv is incomplete and we fail early rather than emitting
 broken shell code.
 
 <<helper functions>>=
 def activation_script(venv_dir, shell):
     """Return the activation script path for ``venv_dir`` and ``shell``."""
-    if shell is Shell.bash:
-        script = venv_dir / "bin" / "activate"
-    else:
-        raise AssertionError(f"Unsupported shell: {shell}")
-    if not script.is_file():
-        raise SystemExit(
-            f"No activation script found for {shell.value} in {venv_dir}"
-        )
-    return script
+    names = {
+        Shell.bash: ("activate",),
+        Shell.powershell: ("activate.ps1", "Activate.ps1"),
+        Shell.cmd: ("activate.bat",),
+    }[shell]
+    for directory in ("bin", "Scripts"):
+        for name in names:
+            script = venv_dir / directory / name
+            if script.is_file():
+                return script
+    raise SystemExit(
+        f"No activation script found for {shell.value} in {venv_dir}"
+    )
+@
 
+Once the script is found, only the shell's invocation operator differs.
+The venv supplies the environment changes and the matching deactivator.
 
+<<helper functions>>=
 def emit_activate_shell_code(venv_dir, shell):
     """Return shell code that activates ``venv_dir``."""
     script = activation_script(venv_dir, shell)
     if shell is Shell.bash:
         return f"source {shell_quote(script, shell)}"
+    if shell is Shell.powershell:
+        return f"& {shell_quote(script, shell)}"
+    if shell is Shell.cmd:
+        return f"call {shell_quote(script, shell)}"
     raise AssertionError(f"Unsupported shell: {shell}")
 @
 
@@ -1255,7 +1293,7 @@ def test_emit_activate_shell_code_bash_quotes_path(workdir):
 @
 
 
-\subsection{Emitting deactivation code for [[bash]]}
+\subsection{Emitting deactivation code}
 \label{sec:emit-deactivation}
 
 Deactivation is intentionally more conservative than activation.
@@ -1279,6 +1317,18 @@ def emit_deactivate_shell_code(venv_dir, shell):
             f'if [ "${{VIRTUAL_ENV:-}}" = {quoted_venv} ] '
             f'&& declare -F deactivate >/dev/null; then deactivate; fi'
         )
+    if shell is Shell.powershell:
+        return (
+            f"if ($env:VIRTUAL_ENV -eq {quoted_venv} -and "
+            "(Get-Command deactivate -ErrorAction SilentlyContinue)) "
+            "{ deactivate }"
+        )
+    if shell is Shell.cmd:
+        script = venv_dir / "Scripts" / "deactivate.bat"
+        return (
+            f'if "%VIRTUAL_ENV%"=={quoted_venv} '
+            f"call {shell_quote(script, shell)}"
+        )
     raise AssertionError(f"Unsupported shell: {shell}")
 @
 
@@ -1296,6 +1346,83 @@ def test_emit_deactivate_shell_code_bash_guards_venv(workdir):
 @
 
 
+The test project stays fixed while shell syntax and venv layout vary.
+This exercises case-sensitive PowerShell filenames on Linux as well as
+Windows' [[Scripts]] layout, and checks that cmd refuses paths it cannot
+quote without expansion.
+
+<<test functions>>=
+@pytest.mark.parametrize("directory", ["bin", "Scripts"])
+@pytest.mark.parametrize("shell_name, filename, operator", [
+    ("bash", "activate", "source"),
+    ("powershell", "activate.ps1", "&"),
+    ("powershell", "Activate.ps1", "&"),
+    ("cmd", "activate.bat", "call"),
+])
+def test_activation_supports_shells_and_layouts(
+    tmp_path, directory, shell_name, filename, operator,
+):
+    from learnlog.cli import Shell, emit_activate_shell_code, shell_quote
+    venv = tmp_path / "course project" / ".venv"
+    script = venv / directory / filename
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    shell = Shell(shell_name)
+    assert emit_activate_shell_code(venv, shell) == (
+        f"{operator} {shell_quote(script, shell)}"
+    )
+
+
+def test_powershell_quote_preserves_apostrophes():
+    from learnlog.cli import Shell, shell_quote
+    assert shell_quote("C:/student's project/.venv", Shell.powershell) == (
+        "'C:/student''s project/.venv'"
+    )
+
+
+@pytest.mark.parametrize("path", ['C:/a"b/.venv', "C:/%TEMP%/.venv"])
+def test_cmd_quote_rejects_expanding_paths(path):
+    from learnlog.cli import Shell, shell_quote
+    with pytest.raises(SystemExit, match="cmd paths"):
+        shell_quote(path, Shell.cmd)
+
+
+def test_windows_deactivation_guards_the_selected_venv(tmp_path):
+    from learnlog.cli import Shell, emit_deactivate_shell_code
+    venv = tmp_path / "course project" / ".venv"
+    assert emit_deactivate_shell_code(venv, Shell.powershell) == (
+        f"if ($env:VIRTUAL_ENV -eq '{venv}' -and "
+        "(Get-Command deactivate -ErrorAction SilentlyContinue)) "
+        "{ deactivate }"
+    )
+    script = venv / "Scripts" / "deactivate.bat"
+    assert emit_deactivate_shell_code(venv, Shell.cmd) == (
+        f'if "%VIRTUAL_ENV%"=="{venv}" call "{script}"'
+    )
+
+
+@pytest.mark.parametrize("command", ["activate", "deactivate"])
+def test_windows_commands_default_to_powershell(workdir, monkeypatch, command):
+    import learnlog.cli as cli
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    venv = workdir / ".venv"
+    scripts = venv / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "Activate.ps1").write_text("")
+    (scripts / "activate").write_text("")
+    monkeypatch.chdir(workdir)
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    runner = CliRunner()
+    implicit = runner.invoke(cli.app, [command])
+    explicit = runner.invoke(cli.app, [command, "--shell", "powershell"])
+    assert implicit.exit_code == explicit.exit_code == 0
+    assert implicit.output == explicit.output
+    bash = runner.invoke(cli.app, [command, "--shell", "bash"])
+    assert bash.exit_code == 0
+    assert bash.output != implicit.output
+@
+
 \subsection{Activation hint for a fresh venv}
 \label{sec:setup-activation-hint}
 
@@ -1306,17 +1433,11 @@ child process cannot mutate its parent shell's environment.
 A one-line hint printed after creation is therefore the best
 we can do.
 
-The hint differs by platform because the activation scripts
-do: POSIX shells expect [[source .venv/bin/activate]],
-whereas Windows venvs place the scripts in [[Scripts\]] and
-have no [[source]] builtin (the student types the path to the
-activator directly, and both [[cmd.exe]] and PowerShell pick
-up the right extension via [[PATHEXT]]).  This is the same
-POSIX/Windows layout split that [[find_in_venv]] already
-branches on in \cref{sec:setup-pip-in-venv}, so factoring it
-into its own helper keeps the two concerns in sync---if
-Windows ever drops [[Scripts\]], both helpers fail together
-and the fix is localised.
+The hint uses the same platform default as [[activate]].  On Windows,
+PowerShell needs the explicit [[.ps1]] script and an invocation operator;
+relying on [[PATHEXT]] could select a batch file that cannot change the
+parent PowerShell environment.  Quoting the full script path also keeps
+project names containing spaces or apostrophes intact.
 
 We branch on [[sys.platform]] rather than [[os.name]]
 because [[pathlib]] inspects [[os.name]] at [[Path]]
@@ -1334,11 +1455,12 @@ def venv_activation_hint(venv_dir):
 
     Used by :func:`init_python` to nudge the student after a
     fresh venv is created.  POSIX shells need ``source
-    .../bin/activate``; Windows shells run
-    ``...\\Scripts\\activate`` directly.
+    .../bin/activate``; Windows PowerShell invokes
+    ``.../Scripts/Activate.ps1`` with the call operator.
     """
     if sys.platform.startswith("win"):
-        return f"Next step: {venv_dir}\\Scripts\\activate"
+        script = pathlib.Path(venv_dir) / "Scripts" / "Activate.ps1"
+        return f"Next step: & {shell_quote(script, Shell.powershell)}"
     return f"Next step: source {venv_dir}/bin/activate"
 @
 
@@ -1357,12 +1479,13 @@ def test_venv_activation_hint_posix(monkeypatch, tmp_path):
     )
 
 def test_venv_activation_hint_windows(monkeypatch, tmp_path):
-    """Windows hint uses ``...\\Scripts\\activate``."""
+    """Windows hint explicitly invokes the PowerShell script."""
     from learnlog.cli import venv_activation_hint
     monkeypatch.setattr("sys.platform", "win32")
     venv = tmp_path / ".venv"
+    script = venv / "Scripts" / "Activate.ps1"
     assert venv_activation_hint(venv) == (
-        f"Next step: {venv}\\Scripts\\activate"
+        f"Next step: & '{script}'"
     )
 @
 
@@ -3199,9 +3322,9 @@ is therefore to print shell code and let the caller evaluate it:
 We make that usage explicit in the help text because a plain
 [[learnlog activate]] would only print the [[source .../bin/activate]]
 command instead of running it.  The optional [[--shell]] argument is an
-enum, currently with only [[bash]], so the surface is honest about the
-syntax we emit while still leaving a clean extension point for more
-shells later.
+enum covering bash, PowerShell, and cmd.  With no explicit choice,
+[[default_shell]] supplies the platform default.  PowerShell callers use
+[[learnlog activate | Invoke-Expression]] to evaluate the output.
 
 <<typer commands>>=
 @app.command(
@@ -3209,6 +3332,7 @@ shells later.
     help=(
         "Print shell code that activates the project .venv/. "
         "Use it as: eval \"$(learnlog activate)\".  "
+        "PowerShell: learnlog activate | Invoke-Expression. "
         "Running 'learnlog activate' by itself only prints "
         "the command because a subprocess cannot change the "
         "parent shell environment."
@@ -3216,15 +3340,17 @@ shells later.
 )
 def activate(
     shell: Annotated[
-        Shell,
+        Optional[Shell],
         typer.Option(
             "--shell",
             help=(
-                "Shell syntax to emit.  Use with eval, "
+                "Shell syntax (default: PowerShell on Windows, "
+                "bash elsewhere). "
+                "Use with eval or PowerShell Invoke-Expression; "
                 "for example: eval \"$(learnlog activate)\"."
             ),
         ),
-    ] = Shell.bash,
+    ] = None,
 ):
     """Print shell code for `eval "$(learnlog activate)"`.
 
@@ -3234,7 +3360,7 @@ def activate(
     """
     typer.echo(
         emit_activate_shell_code(
-            resolve_project_venv(), shell,
+            resolve_project_venv(), shell or default_shell(),
         )
     )
 @
@@ -3304,7 +3430,9 @@ def test_activate_help_mentions_eval_pattern():
     from typer.testing import CliRunner
     result = CliRunner().invoke(app, ["activate", "--help"])
     assert result.exit_code == 0
-    assert 'eval "$(learnlog activate)"' in result.output
+    help_text = " ".join(result.output.split())
+    assert 'eval "$(learnlog activate)"' in help_text
+    assert "learnlog activate | Invoke-Expression" in help_text
     assert "--shell" in result.output
     assert "bash" in result.output
 @
@@ -3338,15 +3466,17 @@ directly so the intended usage is visible in [[--help]].
 )
 def deactivate(
     shell: Annotated[
-        Shell,
+        Optional[Shell],
         typer.Option(
             "--shell",
             help=(
-                "Shell syntax to emit.  Use with eval, "
+                "Shell syntax (default: PowerShell on Windows, "
+                "bash elsewhere). "
+                "Use with eval or PowerShell Invoke-Expression; "
                 "for example: eval \"$(learnlog deactivate)\"."
             ),
         ),
-    ] = Shell.bash,
+    ] = None,
 ):
     """Print shell code for `eval "$(learnlog deactivate)"`.
 
@@ -3356,7 +3486,7 @@ def deactivate(
     """
     typer.echo(
         emit_deactivate_shell_code(
-            resolve_project_venv(), shell,
+            resolve_project_venv(), shell or default_shell(),
         )
     )
 @
