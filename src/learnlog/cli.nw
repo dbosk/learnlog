@@ -2430,6 +2430,41 @@ pytorial.add_typer_subcommand(
 )
 @
 
+Pytorial 0.8.1 defers POSIX terminal imports, so the dependency floor is
+what makes every CLI command importable on Windows.  An import guard
+here would hide a broken installation by silently removing the tutorial
+command.  A fresh interpreter with all four POSIX modules blocked checks
+both the catalog path and the shell runner's WSL diagnostic.
+
+<<test functions>>=
+@pytest.mark.parametrize("command, status, expected", [
+    (["tutorial", "list"], 0, "getting-started"),
+    (["tutorial", "run", "getting-started"], 1, "WSL"),
+])
+def test_cli_without_posix_terminal_modules(tmp_path, command, status, expected):
+    import learnlog
+    probe = (
+        "import sys\n"
+        "sys.modules.update(dict.fromkeys("
+        "['fcntl', 'pty', 'termios', 'tty']))\n"
+        "from learnlog.cli import app\n"
+        "app()\n"
+    )
+    env = dict(os.environ)
+    env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    env["PYTHONPATH"] = str(pathlib.Path(learnlog.__file__).parent.parent)
+    env["XDG_STATE_HOME"] = str(tmp_path / "state")
+    env["XDG_DATA_HOME"] = str(tmp_path / "data")
+    result = subprocess.run(
+        [sys.executable, "-c", probe, *command], cwd=tmp_path, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == status, output
+    assert expected in output
+@
+
 Like [[play]] in \cref{sec:play}, the interactive execution path
 needs a real terminal, so our CLI regression test stays on the
 TTY-free [[list]] subcommand.
