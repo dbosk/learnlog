@@ -2012,7 +2012,7 @@ def run_linter(tool, executable, files):
 <<run the linter and count its findings>>=
 try:
     result = subprocess.run(
-        command, capture_output=True, text=True, check=False,
+        command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         timeout=LINT_TIMEOUT,
     )
     if result.returncode not in accepted:

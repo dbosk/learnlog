@@ -519,7 +519,7 @@ only chooses what type comes back out of it.
 
 <<repo methods>>=
 def git(self, *args, check=True, timeout=GIT_TIMEOUT,
-        input=None, text=True, env=None):
+        input=None, text=True, encoding="utf-8", errors="replace", env=None):
     """Run a Git command with the learnlog environment.
 
     Returns the ``CompletedProcess``.  Raises ``GitError`` when Git
@@ -577,6 +577,16 @@ OVERRIDABLE_GIT_VARS = frozenset({
 })
 @
 
+A commit containing [[åäö]] must survive both the input pipe and a later
+[[git show]], regardless of the terminal's locale.  Text pipes use UTF-8
+with replacement for undecodable output bytes, so one malformed byte
+cannot end a run.  Binary callers such as [[git archive]] omit the codec:
+passing [[encoding]] itself would force text mode and corrupt an archive.
+
+<<constants>>=
+GIT_TEXT_CODEC = {"encoding": "utf-8", "errors": "replace"}
+@
+
 [[subprocess]] reports \enquote{Git could not be run} in two unrelated
 exception hierarchies---[[OSError]] for a missing binary or an
 oversized argument list, [[SubprocessError]] for a timeout---so we
@@ -591,11 +601,39 @@ try:
         env=environment,
         capture_output=True,
         text=text,
+        **(GIT_TEXT_CODEC if text else {}),
         timeout=timeout,
         input=input,
     )
 except (OSError, subprocess.SubprocessError) as error:
     raise GitError(args, None, str(error)) from error
+@
+
+The same Git pipe must preserve UTF-8 text, replace a malformed byte
+when asked for text, and return that byte verbatim when asked for binary.
+Storing a blob gives the test precise bytes independent of Git's display
+settings or the shell's locale.
+
+<<test functions>>=
+def test_git_text_codec_preserves_unicode_and_binary(workdir):
+    repo = LearnlogRepo(workdir)
+    message = "åäö " + chr(0x1f600) + "\n"
+    oid = repo.git("hash-object", "-w", "--stdin", input=message).stdout.strip()
+    assert repo.git("cat-file", "blob", oid).stdout == message
+    payload = message.encode("utf-8") + b"\xff"
+    oid = repo.git(
+        "hash-object", "-w", "--stdin", input=payload, text=False,
+    ).stdout.decode("ascii").strip()
+    assert repo.git("cat-file", "blob", oid).stdout == message + "\ufffd"
+    assert repo.git("cat-file", "blob", oid, text=False).stdout == payload
+
+
+def test_ignore_file_accepts_utf8_and_invalid_bytes(workdir):
+    (workdir / LEARNLOGIGNORE_NAME).write_bytes("räksmörgås\n".encode() + b"\xff\n")
+    repo = LearnlogRepo(workdir)
+    content = repo.exclude_content()
+    assert "räksmörgås" in content
+    assert "\ufffd" in content
 @
 
 Let's verify the helper runs Git commands in the right context, and
@@ -1035,7 +1073,7 @@ likely to be stale: it changes whenever the student edits
 def is_configured(self):
     """Return whether our settings are already in place."""
     try:
-        current = (self.git_dir / EXCLUDE_PATH).read_text()
+        current = (self.git_dir / EXCLUDE_PATH).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
     if current != self.exclude_content():
@@ -1261,7 +1299,7 @@ def exclude_content(self):
     try:
         extra = (
             self.workdir / LEARNLOGIGNORE_NAME
-        ).read_text()
+        ).read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         extra = ""
     patterns.extend(extra.splitlines())
@@ -1282,7 +1320,7 @@ exclude_file.parent.mkdir(parents=True, exist_ok=True)
 staged = exclude_file.with_name(
     exclude_file.name + STAGED_SUFFIX
 )
-staged.write_text(self.exclude_content())
+staged.write_text(self.exclude_content(), encoding="utf-8")
 os.replace(staged, exclude_file)
 <<constants>>=
 STAGED_SUFFIX = ".new"

@@ -1455,7 +1455,7 @@ right answer---the first run holds that name.
 <<record the claim, or try the next name>>=
 record = _c_invocation_record(repo, name, digest)
 try:
-    lock = open(record, "x")
+    lock = open(record, "x", encoding="utf-8")
 except FileExistsError:
     continue
 _hold_claim(lock)
@@ -1576,7 +1576,7 @@ def _reclaim_c_invocation(repo, record):
     """Act on one claim, if the run that made it is gone."""
     digest, _, name = record.name.partition(".")
     try:
-        lock = open(record)
+        lock = open(record, encoding="utf-8")
     except FileNotFoundError:
         return
     with lock:
@@ -5523,6 +5523,10 @@ So we ask [[sysconfig]] for this interpreter's [[purelib]] path
 and only fall back to a module-relative guess if that lookup
 fails.
 
+Paths in marker files and generated startup files use UTF-8 explicitly.
+A project name containing accented characters must resolve identically
+on Windows and POSIX, independently of the process locale.
+
 <<autostart marker location>>=
 def _default_marker_path(module_file=None, purelib_path=None):
     """Return the marker path for this interpreter.
@@ -5581,7 +5585,7 @@ def _read_marker(marker_path):
     try:
         if not marker_path.exists():
             return None
-        text = marker_path.read_text().strip()
+        text = marker_path.read_text(encoding="utf-8", errors="replace").strip()
         if not text:
             return None
         candidate = pathlib.Path(text)
@@ -5648,7 +5652,7 @@ def _replace_file(path, text):
     path = pathlib.Path(path)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(text)
+        temporary.write_text(text, encoding="utf-8")
         os.replace(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)

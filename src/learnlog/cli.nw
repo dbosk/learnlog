@@ -333,7 +333,7 @@ if not path.is_file():
 
 verify = subprocess.run(
     ["git", "bundle", "list-heads", str(path)],
-    capture_output=True, text=True,
+    capture_output=True, text=True, encoding="utf-8", errors="replace",
 )
 if verify.returncode != 0:
     raise SystemExit(
@@ -381,7 +381,7 @@ tmppath = pathlib.Path(tmpdir)
 
 subprocess.run(
     ["git", "clone", str(path), str(tmppath / "repo")],
-    capture_output=True, text=True, check=True,
+    capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
 )
 
 cloned = tmppath / "repo"
@@ -1425,7 +1425,7 @@ def venv_purelib(venv_dir):
     )
     result = subprocess.run(
         [str(find_in_venv(venv_dir, "python")), "-c", probe],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=True, timeout=10,
     )
     return pathlib.Path(result.stdout.strip())
@@ -1505,7 +1505,7 @@ def write_autostart_files(venv_dir, project_root):
             legacy_path.unlink()
         for name, content in files:
             path = purelib / name
-            if path.exists() and path.read_text() == content:
+            if path.exists() and path.read_text(encoding="utf-8", errors="replace") == content:
                 continue
             _replace_file(path, content)
     except OSError as exc:
@@ -2046,7 +2046,7 @@ error and a half-written file are the same news here.
 def marker_contents(marker_path):
     """Return the marker file's text, or why it cannot be read."""
     try:
-        return pathlib.Path(marker_path).read_text().strip()
+        return pathlib.Path(marker_path).read_text(encoding="utf-8", errors="replace").strip()
     except Exception as exc:
         return f"<unreadable: {exc}>"
 @
