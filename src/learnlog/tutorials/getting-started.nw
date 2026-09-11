@@ -21,6 +21,9 @@ earlier aspect in one recorded run.
 
 \subsection{Two variants, one contract}
 
+Windows students run this interactive tutorial inside WSL: the runner
+uses POSIX shells, so the shared [[pre_command]] remains bash.
+
 The tutorial tangles into two catalog entries.
 [[getting-started]] addresses novices who have never programmed
 before; [[getting-started-expert]] addresses experienced programmers.
@@ -111,6 +114,8 @@ hint: Run `learnlog init python` in an empty project directory.
 <<novice step: create a fresh project>>=
 <<shared step: create a fresh project>>
 
+On Windows, run this tutorial inside WSL.
+
 Start in a new directory made just for this practice project and
 initialise it with `learnlog init python`.
 Use a directory of its own, not your home directory: `learnlog init`
@@ -121,6 +126,8 @@ This creates a hidden folder called `.learnlog/`, where your runs will
 be saved, and a `.venv/` folder with the project's own Python.
 <<expert step: create a fresh project>>=
 <<shared step: create a fresh project>>
+
+On Windows, run this tutorial inside WSL.
 
 Start in a new directory for a throwaway practice project and initialise
 it with `learnlog init python`.

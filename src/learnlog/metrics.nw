@@ -1908,6 +1908,8 @@ the analysis, not the questions asked; only ambiguous one-letter names
 The default is spelled as a member of the enumeration, which is why
 it sits beside the class rather than among the constants: the
 constants are tangled first.
+Both [[bin/]] and [[Scripts/]] layouts, with bare names and [[.exe]]
+suffixes, use the shared startup-module candidates.
 Each tool is looked for in the project's own [[.venv]] first, so that
 a student's own installation wins, then beside the interpreter running
 learnlog, where the bundled copies live, and last on the [[PATH]].
@@ -1925,6 +1927,7 @@ import json
 import shutil
 import subprocess
 import sys
+from learnlog._autostart import script_candidates, venv_script_candidates
 <<metrics constants>>=
 RUFF_RULES = (
     "F", "E501", "E711", "E712", "E722", "E731", "E741", "A001",
@@ -1957,15 +1960,15 @@ def find_linter(workdir, tool=None):
 
     `tool` names the linter to look for (a `Linter` or its value);
     with none, ruff is looked for first and pylint is the fallback.
-    Each is looked for in the project's `.venv/bin`, then beside the
+    Each is looked for in the project's `.venv`, then beside the
     running interpreter, then on the `PATH`, so the student's own
     installation wins over the copy that came with learnlog.
     """
     names = [Linter(tool).value] if tool else [t.value for t in Linter]
     for name in names:
         for candidate in (
-            pathlib.Path(workdir) / ".venv" / "bin" / name,
-            INTERPRETER_BIN / name,
+            *venv_script_candidates(pathlib.Path(workdir) / ".venv", name),
+            *script_candidates(INTERPRETER_BIN, name),
         ):
             if candidate.is_file():
                 return name, str(candidate)
@@ -1973,6 +1976,26 @@ def find_linter(workdir, tool=None):
         if found:
             return name, found
     return None
+@
+
+An executable in [[Scripts]] must win over any bundled or [[PATH]]
+copy; the suffix rule also applies beside the running interpreter.
+These tests construct Windows layouts without changing the host platform.
+
+<<metrics test functions>>=
+@pytest.mark.parametrize("location", ["project", "interpreter"])
+def test_find_linter_finds_windows_executable(tmp_path, monkeypatch, location):
+    import learnlog.metrics as metrics
+    directory = (
+        tmp_path / ".venv" / "Scripts" if location == "project"
+        else tmp_path / "bundled" / "Scripts"
+    )
+    directory.mkdir(parents=True)
+    binary = directory / "ruff.exe"
+    binary.write_text("")
+    if location == "interpreter":
+        monkeypatch.setattr(metrics, "INTERPRETER_BIN", directory)
+    assert metrics.find_linter(tmp_path, "ruff") == ("ruff", str(binary))
 @
 
 Both tools signal findings through their exit status---ruff exits 1
@@ -2012,7 +2035,7 @@ def run_linter(tool, executable, files):
 <<run the linter and count its findings>>=
 try:
     result = subprocess.run(
-        command, capture_output=True, text=True, check=False,
+        command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
         timeout=LINT_TIMEOUT,
     )
     if result.returncode not in accepted:

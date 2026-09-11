@@ -54,6 +54,13 @@ and leave it again with
 \begin{minted}{bash}
 eval "$(learnlog deactivate)"
 \end{minted}
+In Windows PowerShell the equivalent commands are
+\begin{minted}{powershell}
+learnlog activate | Invoke-Expression
+learnlog deactivate | Invoke-Expression
+\end{minted}
+If PowerShell blocks activation scripts, the one-time user setting is
+[[Set-ExecutionPolicy -Scope CurrentUser RemoteSigned]].
 Every subsequent Python run through the wired venv is
 captured automatically.
 When a script runs, an autostart hook triggers a chain of actions: it
@@ -401,6 +408,21 @@ When you are done in that same shell, leave it with:
 eval "$(learnlog deactivate)"
 ```
 
+In Windows PowerShell, use these commands instead:
+
+```powershell
+learnlog activate | Invoke-Expression
+learnlog deactivate | Invoke-Expression
+```
+
+If PowerShell blocks activation scripts, allow them once for your user:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+On Windows, run the interactive `learnlog tutorial` lessons inside WSL.
+
 If VS Code did not already pick the project venv, open the
 Command Palette (**Ctrl+Shift+P** or **Cmd+Shift+P**), run
 **Python: Select Interpreter**, and pick the one under `.venv`.
@@ -547,13 +569,13 @@ from learnlog.gitrepo import (
     REVIEW_SUBCOMMANDS,
     LearnlogRepo,
     report_error,
+    lock_exclusive,
+    unlock,
 )
 from learnlog._autostart import (
     _is_autostart_wired,
     _resolve_project_root,
 )
-
-<<optional claim locking>>
 
 <<constants>>
 <<module state>>
@@ -1307,24 +1329,13 @@ all: is the run that made it still running?
 Nothing written on disk can answer it---a live run's claim and a killed
 run's claim are the same file, which is exactly why the leftover is
 recognisable at all---but a lock can.
-The owner holds an exclusive [[flock]] on its claim file for as long as
-the work-tree file is its own, and the kernel drops that lock when the
-process ends, whichever way it ends.
-A later run that can take the lock is therefore looking at a claim
-whose owner is gone; one that cannot is looking at a run in progress,
-and leaves that run's claim and file alone.
-The instrument is the one the commit lock uses
-(\cref{sec:commit-lock}), and it degrades the same way: with no
-[[fcntl]] there is no telling the two apart, so we decline to remove
-anything rather than guess, and a killed run's file waits for a
-platform that can tell.
-
-<<optional claim locking>>=
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no fcntl
-    fcntl = None
-@
+The owner holds the same exclusive lock as the commit protocol
+(\cref{sec:commit-lock}) for as long as the work-tree file is its own.
+The operating system releases that lock when the process ends, including
+when it is killed.  POSIX uses [[flock]] and Windows a byte-range lock;
+a later run can reclaim only after acquiring that lock nonblockingly.
+If neither backend works, the negative answer preserves the leftover
+rather than guessing whether its owner is still running.
 
 Everything a claim holds fits in its own file name: the digest of the
 source and the name of the file that carries it.
@@ -1381,26 +1392,19 @@ a reason worth reporting, since nothing else can be holding it; it can
 only wait, and only for the moment another run needs to look at a claim
 and put it down again.
 Testing another run's lock is entirely a question, and the answer we
-want is the one [[LOCK_NB]] gives: refused means the owner is still
+want is the one a nonblocking acquisition gives: refused means the owner is still
 there.
 
 <<functions>>=
 def _hold_claim(lock):
     """Mark the run that owns this claim as still running."""
-    if fcntl is not None:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    lock_exclusive(lock)
 @
 
 <<functions>>=
 def _claim_is_abandoned(lock):
     """Say whether the run that made this claim is gone."""
-    if fcntl is None:
-        return False
-    try:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return False
-    return True
+    return lock_exclusive(lock, blocking=False)
 @
 
 The helper hands the claim it took back to its caller, because
@@ -1473,7 +1477,7 @@ right answer---the first run holds that name.
 <<record the claim, or try the next name>>=
 record = _c_invocation_record(repo, name, digest)
 try:
-    lock = open(record, "x")
+    lock = open(record, "x", encoding="utf-8")
 except FileExistsError:
     continue
 _hold_claim(lock)
@@ -1492,6 +1496,7 @@ target = repo.workdir / name
 try:
     handle = open(target, "xb")
 except FileExistsError:
+    unlock(lock, repo.workdir)
     lock.close()
     record.unlink(missing_ok=True)
     continue
@@ -1593,14 +1598,17 @@ def _reclaim_c_invocation(repo, record):
     """Act on one claim, if the run that made it is gone."""
     digest, _, name = record.name.partition(".")
     try:
-        lock = open(record)
+        lock = open(record, encoding="utf-8")
     except FileNotFoundError:
         return
     with lock:
         if not _claim_is_abandoned(lock):
             return
-        <<remove the leftover the claim vouches for>>
-        record.unlink(missing_ok=True)
+        try:
+            <<remove the leftover the claim vouches for>>
+        finally:
+            unlock(lock, repo.workdir)
+    record.unlink(missing_ok=True)
 @
 
 Not every claim has a file to answer for.
@@ -1613,7 +1621,9 @@ either still holds the bytes learnlog wrote or it does not.
 The order is the one releasing uses, for the same reason: the file goes
 first and the claim second, so a failure in between leaves a claim
 without a file---which the next run drops---rather than a file without
-a claim, which no run could ever recognise again.
+a claim, which no run could ever recognise again.  The claim handle must
+be closed before unlinking the record, because Windows refuses deletion
+of an open file.
 
 <<remove the leftover the claim vouches for>>=
 leftover = repo.workdir / name
@@ -1689,21 +1699,28 @@ def _release_c_invocation(claimed):
     if claimed is None or claimed.pid != os.getpid():
         return
     try:
-        claimed.path.unlink(missing_ok=True)
+        try:
+            claimed.path.unlink(missing_ok=True)
+        finally:
+            <<let go of the claim>>
         claimed.record.unlink(missing_ok=True)
     except Exception as error:
         _report_swallowed_failure("release -c source", error)
-    <<let go of the claim>>
 @
 
-The lock is let go last, and outside the part that is allowed to fail.
+The lock is released and closed after attempting to remove the source,
+but before removing the claim record.  The [[finally]] also closes it
+when source deletion fails, leaving the record available for a retry.
 It answers \enquote{is this run still going?}, and this run is over
 whether or not the removal worked---a claim whose file could not be
 deleted has to be lockable again, or no later run could retry it.
 
 <<let go of the claim>>=
 try:
-    claimed.lock.close()
+    try:
+        unlock(claimed.lock, claimed.path.parent)
+    finally:
+        claimed.lock.close()
 except Exception as error:
     _report_swallowed_failure("release -c claim", error)
 @
@@ -1931,6 +1948,47 @@ def test_keeps_the_claim_when_the_file_cannot_be_removed(workdir):
     assert claimed.record.exists()
     with open(claimed.record) as record:
         assert _claim_is_abandoned(record)
+@
+
+The Windows backend must distinguish the same live and abandoned
+claims.  Its fake models process death by explicit unlock.  A guarded
+[[unlink]] also enforces Windows' close-before-delete rule on Linux,
+so reversing the release order fails here without a Windows runner.
+
+<<test functions>>=
+def test_windows_claim_survives_until_abandoned(workdir, fake_windows):
+    repo = LearnlogRepo(workdir)
+    claimed = _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    _reclaim_c_invocations(repo)
+    assert claimed.path.exists()
+    assert claimed.record.exists()
+    from learnlog.gitrepo import unlock
+    unlock(claimed.lock)
+    claimed.lock.close()
+    _reclaim_c_invocations(repo)
+    assert not claimed.path.exists()
+    assert not claimed.record.exists()
+    assert not fake_windows.owners
+
+
+def test_windows_release_closes_before_unlink(
+    workdir, fake_windows, monkeypatch,
+):
+    repo = LearnlogRepo(workdir)
+    claimed = _persist_c_invocation(repo, "<python -c>", ["print(1)"])
+    original_unlink = type(claimed.record).unlink
+
+    def refuse_open_record(path, *args, **kwargs):
+        if path == claimed.record:
+            assert claimed.lock.closed
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(claimed.record), "unlink", refuse_open_record)
+    _release_c_invocation(claimed)
+    assert claimed.lock.closed
+    assert not claimed.path.exists()
+    assert not claimed.record.exists()
+    assert not fake_windows.owners
 @
 
 Finally, the point of writing the file at all: it has to be inside the
@@ -5434,12 +5492,51 @@ import sys
 import pathlib
 import sysconfig
 
+<<venv script helpers>>
 <<autostart marker location>>
 <<project root resolution>>
 
 <<autostart entry point>>
 @
 
+
+\subsection{Finding scripts across venv layouts}
+
+A project may contain [[.venv/bin/ruff]] or
+[[.venv/Scripts/ruff.exe]].  The directory layout belongs to the venv,
+so discovering it from existing files works even when the host platform
+differs.  The CLI and metrics module share these stdlib-only candidates
+with the startup module that already knows venv geometry.
+
+<<venv script helpers>>=
+def script_candidates(directory, name):
+    """Yield bare and executable-suffixed paths in ``directory``."""
+    directory = pathlib.Path(directory)
+    yield directory / name
+    yield directory / f"{name}.exe"
+@
+
+Trying [[bin]] before [[Scripts]] preserves the POSIX preference when
+both directories exist.  Callers decide whether a candidate exists and
+how to report a missing tool; discovery itself has no side effects.
+
+<<venv script helpers>>=
+def venv_script_candidates(venv_dir, name):
+    """Yield script candidates in POSIX and Windows venv layouts."""
+    for directory in ("bin", "Scripts"):
+        yield from script_candidates(pathlib.Path(venv_dir) / directory, name)
+@
+
+<<autostart test functions>>=
+def test_venv_script_candidates_cover_both_layouts(tmp_path):
+    from learnlog._autostart import venv_script_candidates
+    assert list(venv_script_candidates(tmp_path, "python")) == [
+        tmp_path / "bin" / "python",
+        tmp_path / "bin" / "python.exe",
+        tmp_path / "Scripts" / "python",
+        tmp_path / "Scripts" / "python.exe",
+    ]
+@
 
 \subsection{Locating the project root}
 
@@ -5486,6 +5583,10 @@ import [[learnlog._autostart]] from a checkout under [[src/]].
 So we ask [[sysconfig]] for this interpreter's [[purelib]] path
 and only fall back to a module-relative guess if that lookup
 fails.
+
+Paths in marker files and generated startup files use UTF-8 explicitly.
+A project name containing accented characters must resolve identically
+on Windows and POSIX, independently of the process locale.
 
 <<autostart marker location>>=
 def _default_marker_path(module_file=None, purelib_path=None):
@@ -5545,7 +5646,7 @@ def _read_marker(marker_path):
     try:
         if not marker_path.exists():
             return None
-        text = marker_path.read_text().strip()
+        text = marker_path.read_text(encoding="utf-8", errors="replace").strip()
         if not text:
             return None
         candidate = pathlib.Path(text)
@@ -5612,7 +5713,7 @@ def _replace_file(path, text):
     path = pathlib.Path(path)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(text)
+        temporary.write_text(text, encoding="utf-8")
         os.replace(temporary, path)
     except Exception:
         temporary.unlink(missing_ok=True)

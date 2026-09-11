@@ -3277,7 +3277,7 @@ def restore_code_state(workdir, code_state):
         if isinstance(content, bytes):
             target.write_bytes(content)
         else:
-            target.write_text(content)
+            target.write_text(content, encoding="utf-8")
 @
 
 The symbolic-link branch of the deletion pass exists because [[Path]]
