@@ -368,14 +368,14 @@ filelock = ">=3.15.4"
 
 [[package]]
 name = "pytorial"
-version = "0.8"
+version = "0.8.1"
 description = "Interactive command-line tutorials with PTY-backed steps"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "pytorial-0.8-py3-none-any.whl", hash = "sha256:35721c398bf371780ea613544c48674fa856947ab7ed3305217277f18b2a1f11"},
-    {file = "pytorial-0.8.tar.gz", hash = "sha256:8d7cdb3529fc7a376c35e8fd055bec088ad7e4e613da3f0533bbfbb253a55511"},
+    {file = "pytorial-0.8.1-py3-none-any.whl", hash = "sha256:087c6c8fce3f11fe8bb09ff04780abef6ab180babe713138b919e15bac1a373f"},
+    {file = "pytorial-0.8.1.tar.gz", hash = "sha256:4bf2055598660ffe145869387f60ac4ccf234e9f2a8aea03e88b9caf6007057d"},
 ]
 
 [package.dependencies]
@@ -709,4 +709,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<4.0"
-content-hash = "371f6c04c097025cd997613a2369a3e98a50c6db81e9d75c37f6e2cae95abc75"
+content-hash = "fe31c8736d54feedee869706ef2c7a6273ddd29e6fd51031e062a270ff7a02f2"
