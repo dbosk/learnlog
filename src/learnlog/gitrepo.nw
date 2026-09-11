@@ -519,7 +519,7 @@ only chooses what type comes back out of it.
 
 <<repo methods>>=
 def git(self, *args, check=True, timeout=GIT_TIMEOUT,
-        input=None, text=True, encoding="utf-8", errors="replace", env=None):
+        input=None, text=True, env=None):
     """Run a Git command with the learnlog environment.
 
     Returns the ``CompletedProcess``.  Raises ``GitError`` when Git
@@ -527,11 +527,13 @@ def git(self, *args, check=True, timeout=GIT_TIMEOUT,
     ``check`` is false, when Git exits non-zero.  Text passed as
     ``input`` reaches Git on standard input; commit messages travel
     that way to escape the operating system's argument-size limit.
-    With ``text`` false, standard output and standard error come back
-    as bytes, for commands whose output is a file rather than a
-    message.  ``env`` overlays committer-identity variables onto the
-    learnlog environment; any variable outside that allow-list
-    raises ``ValueError``.
+    Text is always UTF-8, whatever the locale says, and undecodable
+    output bytes become U+FFFD rather than an exception.  With
+    ``text`` false, standard output and standard error come back as
+    bytes, for commands whose output is a file rather than a message.
+    ``env`` overlays committer-identity variables onto the learnlog
+    environment; any variable outside that allow-list raises
+    ``ValueError``.
     """
     <<overlay the committer identity, if asked>>
     <<run Git, turning process failures into [[GitError]]>>
@@ -580,7 +582,10 @@ OVERRIDABLE_GIT_VARS = frozenset({
 A commit containing [[åäö]] must survive both the input pipe and a later
 [[git show]], regardless of the terminal's locale.  Text pipes use UTF-8
 with replacement for undecodable output bytes, so one malformed byte
-cannot end a run.  Binary callers such as [[git archive]] omit the codec:
+cannot end a run.  The codec is a constant rather than a parameter of
+[[git]]: Git stores bytes, learnlog writes them as UTF-8, and a caller
+who could ask for another encoding could only make the log lie about
+itself.  Binary callers such as [[git archive]] omit the codec:
 passing [[encoding]] itself would force text mode and corrupt an archive.
 
 <<constants>>=
