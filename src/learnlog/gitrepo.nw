@@ -1831,9 +1831,17 @@ while True:
 Explicit release makes the lifetime visible to both backends and to the
 simulated Windows backend.  The caller still closes the handle, which
 releases the operating system lock even if explicit unlocking fails.
+That fallback is why a failed release must not stop the caller---the
+lock is gone a moment later either way---but it is not a reason to
+lose the failure: a release the kernel refuses is news about the
+filesystem, and it goes to the diagnostics log like every other error
+learnlog swallows.  The caller names the project so the entry lands in
+that project's log; the test fixtures that release a lock by hand may
+leave it out, and [[report_error]] then falls back to the current
+directory.
 
 <<functions>>=
-def unlock(handle):
+def unlock(handle, workdir=None):
     """Release a held lock; closing the handle remains the fallback."""
     try:
         if fcntl is not None:
@@ -1841,8 +1849,8 @@ def unlock(handle):
         elif msvcrt is not None:
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, LOCK_BYTES)
-    except OSError:
-        pass
+    except OSError as error:
+        report_error("release lock", error, workdir)
 @
 
 <<repo methods>>=
@@ -1858,7 +1866,7 @@ def commit_lock(self):
         yield handle
     finally:
         if handle is not None:
-            unlock(handle)
+            unlock(handle, self.workdir)
             handle.close()
 @
 
@@ -1930,7 +1938,7 @@ def _acquire_lock(self):
             return None
         if _is_same_file(handle, lock_path):
             return handle
-        unlock(handle)
+        unlock(handle, self.workdir)
         handle.close()
     return None
 <<constants>>=

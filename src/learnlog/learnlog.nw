@@ -1496,7 +1496,7 @@ target = repo.workdir / name
 try:
     handle = open(target, "xb")
 except FileExistsError:
-    unlock(lock)
+    unlock(lock, repo.workdir)
     lock.close()
     record.unlink(missing_ok=True)
     continue
@@ -1607,7 +1607,7 @@ def _reclaim_c_invocation(repo, record):
         try:
             <<remove the leftover the claim vouches for>>
         finally:
-            unlock(lock)
+            unlock(lock, repo.workdir)
     record.unlink(missing_ok=True)
 @
 
@@ -1718,7 +1718,7 @@ deleted has to be lockable again, or no later run could retry it.
 <<let go of the claim>>=
 try:
     try:
-        unlock(claimed.lock)
+        unlock(claimed.lock, claimed.path.parent)
     finally:
         claimed.lock.close()
 except Exception as error:
