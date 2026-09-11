@@ -1433,11 +1433,19 @@ child process cannot mutate its parent shell's environment.
 A one-line hint printed after creation is therefore the best
 we can do.
 
-The hint uses the same platform default as [[activate]].  On Windows,
-PowerShell needs the explicit [[.ps1]] script and an invocation operator;
-relying on [[PATHEXT]] could select a batch file that cannot change the
-parent PowerShell environment.  Quoting the full script path also keeps
-project names containing spaces or apostrophes intact.
+The hint differs by platform because the activation scripts do:
+POSIX shells expect [[source .venv/bin/activate]], whereas Windows
+venvs place the scripts in [[Scripts\]] and have no [[source]]
+builtin.  On Windows the hint names the script \emph{without} an
+extension, and that is deliberate: [[init]] cannot know which shell
+will read the hint, and the extensionless name is the one spelling
+both Windows shells accept---PowerShell resolves it to
+[[activate.ps1]], [[cmd.exe]] to [[activate.bat]]---so one line serves
+both, and it is the same line the course handouts tell students to
+type.  A shell-specific form such as [[& '...\Activate.ps1']] would
+be right for one shell and a syntax error in the other; students who
+want that form get it from [[learnlog activate]], which takes
+[[--shell]].
 
 We branch on [[sys.platform]] rather than [[os.name]]
 because [[pathlib]] inspects [[os.name]] at [[Path]]
@@ -1455,12 +1463,11 @@ def venv_activation_hint(venv_dir):
 
     Used by :func:`init_python` to nudge the student after a
     fresh venv is created.  POSIX shells need ``source
-    .../bin/activate``; Windows PowerShell invokes
-    ``.../Scripts/Activate.ps1`` with the call operator.
+    .../bin/activate``; Windows shells run ``...\\Scripts\\activate``
+    directly, PowerShell and cmd each picking their own script.
     """
     if sys.platform.startswith("win"):
-        script = pathlib.Path(venv_dir) / "Scripts" / "Activate.ps1"
-        return f"Next step: & {shell_quote(script, Shell.powershell)}"
+        return f"Next step: {venv_dir}\\Scripts\\activate"
     return f"Next step: source {venv_dir}/bin/activate"
 @
 
@@ -1479,13 +1486,12 @@ def test_venv_activation_hint_posix(monkeypatch, tmp_path):
     )
 
 def test_venv_activation_hint_windows(monkeypatch, tmp_path):
-    """Windows hint explicitly invokes the PowerShell script."""
+    """Windows hint is the extensionless ``...\\Scripts\\activate``."""
     from learnlog.cli import venv_activation_hint
     monkeypatch.setattr("sys.platform", "win32")
     venv = tmp_path / ".venv"
-    script = venv / "Scripts" / "Activate.ps1"
     assert venv_activation_hint(venv) == (
-        f"Next step: & '{script}'"
+        f"Next step: {venv}\\Scripts\\activate"
     )
 @
 
