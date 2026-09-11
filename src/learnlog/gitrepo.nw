@@ -1956,8 +1956,9 @@ read/write mode also leaves every handle free to seek to byte zero.
 Inode and device number are what \enquote{the same file} means to the
 kernel, and they are the terms [[flock]] is itself defined in.
 Comparing paths would answer a question we already know the answer to,
-and comparing contents would answer none---the file is empty either
-way.
+and comparing contents would answer none: nothing ever writes to the
+lock file, so whatever bytes it happens to hold say nothing about who
+holds the lock.
 A [[stat]] that fails means there is no file at the path at all just
 now, which is a mismatch like any other.
 
