@@ -117,14 +117,16 @@ import sys
 import tempfile
 import zipfile
 from importlib import resources
-from typing import Annotated
+from typing import Annotated, Optional
 
 import pytorial
 import typer
+from typer.core import TyperGroup
 
 import learnlog
 from learnlog import _is_home_or_above, find_learnlog_dir
 from learnlog._autostart import (
+    venv_script_candidates,
     _DEFAULT_MARKER_PATH,
     _is_autostart_wired,
     _replace_file,
@@ -133,8 +135,10 @@ from learnlog._autostart import (
 from learnlog.gitrepo import (
     GIT_TREE_TIMEOUT,
     GitError,
+    GitNotFoundError,
     LearnlogRepo,
     git_environment,
+    run_git,
 )
 from learnlog.commits import (
     CHECKOUT_SUBCOMMAND,
@@ -327,14 +331,18 @@ We point [[GIT_DIR]] at the cloned repo's [[.git/]] so that
 [[LearnlogRepo.git()]] can query it.
 However, [[LearnlogRepo]] expects the git directory to be named
 [[.learnlog/]], so we rename it after cloning.
+Both Git calls go through [[run_git]] (\cref{sec:starting-git})
+rather than the wrapper, because there is no repository yet to build
+a wrapper on; a machine without Git is then reported the same way as
+everywhere else.
 
 <<resolve bundle file>>=
 if not path.is_file():
     raise SystemExit(f"Not a file or directory: {path}")
 
-verify = subprocess.run(
-    ["git", "bundle", "list-heads", str(path)],
-    capture_output=True, text=True,
+verify = run_git(
+    ["bundle", "list-heads", str(path)],
+    capture_output=True, text=True, encoding="utf-8", errors="replace",
 )
 if verify.returncode != 0:
     raise SystemExit(
@@ -380,9 +388,9 @@ it is precisely the one [[except Exception]] is defined not to see.
 <<clone the bundle into the temporary directory>>=
 tmppath = pathlib.Path(tmpdir)
 
-subprocess.run(
-    ["git", "clone", str(path), str(tmppath / "repo")],
-    capture_output=True, text=True, check=True,
+run_git(
+    ["clone", str(path), str(tmppath / "repo")],
+    capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
 )
 
 cloned = tmppath / "repo"
@@ -924,10 +932,10 @@ validated [[--shell]] choices automatically, and adding [[zsh]],
 [[fish]], or PowerShell later becomes a local change rather than a
 stringly-typed special case.
 
-For now we keep the surface intentionally small and only support
-[[bash]].  That matches the documented usage pattern
-[[eval "$(learnlog activate)"]], and it keeps the first
-implementation honest about which shell semantics we actually emit.
+The same project can be used from bash, PowerShell, or cmd.
+The shell choice controls quoting and invocation syntax; it does not
+change which project or venv is selected.  PowerShell is the default on
+Windows and bash elsewhere, with an explicit [[--shell]] override.
 
 <<constants>>=
 class Shell(str, enum.Enum):
@@ -940,8 +948,20 @@ class Shell(str, enum.Enum):
     """
 
     bash = "bash"
+    powershell = "powershell"
+    cmd = "cmd"
 @
 
+
+The platform supplies a useful default without guessing from inherited
+shell environment variables, which may describe a parent process rather
+than the shell evaluating the output.  An explicit choice always wins.
+
+<<helper functions>>=
+def default_shell():
+    """Return the default activation syntax for this platform."""
+    return Shell.powershell if sys.platform.startswith("win") else Shell.bash
+@
 
 \subsection{Resolving the target Python}
 \label{sec:setup-target-python}
@@ -1070,9 +1090,8 @@ def find_in_venv(venv_dir, name):
     ``SystemExit`` if neither is present---which means the
     venv is broken or incomplete.
     """
-    for rel in (f"bin/{name}", f"Scripts/{name}.exe"):
-        candidate = venv_dir / rel
-        if candidate.exists():
+    for candidate in venv_script_candidates(venv_dir, name):
+        if candidate.is_file():
             return candidate
     raise SystemExit(
         f"No {name} found inside venv at {venv_dir}"
@@ -1086,6 +1105,14 @@ def test_find_in_venv_finds_posix_layout(tmp_path, name):
     from learnlog.cli import find_in_venv
     (tmp_path / "bin").mkdir()
     binary = tmp_path / "bin" / name
+    binary.write_text("")
+    assert find_in_venv(tmp_path, name) == binary
+
+@pytest.mark.parametrize("name", ["pip", "python"])
+def test_find_in_venv_finds_windows_layout(tmp_path, name):
+    from learnlog.cli import find_in_venv
+    binary = tmp_path / "Scripts" / f"{name}.exe"
+    binary.parent.mkdir()
     binary.write_text("")
     assert find_in_venv(tmp_path, name) == binary
 
@@ -1158,13 +1185,22 @@ Because [[activate]] and [[deactivate]] print shell code to be
 evaluated later, every path we interpolate must already be quoted for
 the target shell.  For [[bash]] the right primitive is
 [[shlex.quote()]]: it produces a single shell word regardless of
-spaces or punctuation in the underlying path.
+spaces or punctuation in the underlying path.  PowerShell uses single
+quotes with embedded quotes doubled.  Cmd keeps spaces inside double
+quotes but expands percent expressions even there, so paths containing
+percent signs or double quotes are rejected before emitting code.
 
 <<helper functions>>=
 def shell_quote(text, shell):
     """Return ``text`` quoted as one word for ``shell``."""
     if shell is Shell.bash:
         return shlex.quote(str(text))
+    if shell is Shell.powershell:
+        return "'" + str(text).replace("'", "''") + "'"
+    if shell is Shell.cmd:
+        if '"' in str(text) or "%" in str(text):
+            raise SystemExit('cmd paths cannot contain double quotes or %.')
+        return '"' + str(text) + '"'
     raise AssertionError(f"Unsupported shell: {shell}")
 @
 
@@ -1178,7 +1214,7 @@ def test_shell_quote_bash_handles_spaces():
 @
 
 
-\subsection{Emitting activation code for [[bash]]}
+\subsection{Emitting activation code}
 \label{sec:emit-activation}
 
 The shell commands cannot directly change the caller's environment, so
@@ -1189,30 +1225,47 @@ virtual environment already knows how to install its [[deactivate]]
 function and restore shell state correctly, so sourcing it is both the
 minimal and the most correct option.
 
-The emitted code is intentionally just one command: source the project
-[[activate]] script.  If the script is missing even though [[.venv/]]
+PowerShell invokes [[Activate.ps1]] with [[&]] and cmd invokes
+[[activate.bat]] with [[call]].  Both [[bin/]] and [[Scripts/]] are
+searched, including both spellings of the PowerShell filename because
+[[virtualenv]] and the standard library differ in capitalisation.
+Git Bash can therefore use [[Scripts/activate]] too.
+The emitted code delegates to the project venv's own activation script.
+If the script is missing even though [[.venv/]]
 exists, the venv is incomplete and we fail early rather than emitting
 broken shell code.
 
 <<helper functions>>=
 def activation_script(venv_dir, shell):
     """Return the activation script path for ``venv_dir`` and ``shell``."""
-    if shell is Shell.bash:
-        script = venv_dir / "bin" / "activate"
-    else:
-        raise AssertionError(f"Unsupported shell: {shell}")
-    if not script.is_file():
-        raise SystemExit(
-            f"No activation script found for {shell.value} in {venv_dir}"
-        )
-    return script
+    names = {
+        Shell.bash: ("activate",),
+        Shell.powershell: ("activate.ps1", "Activate.ps1"),
+        Shell.cmd: ("activate.bat",),
+    }[shell]
+    for directory in ("bin", "Scripts"):
+        for name in names:
+            script = venv_dir / directory / name
+            if script.is_file():
+                return script
+    raise SystemExit(
+        f"No activation script found for {shell.value} in {venv_dir}"
+    )
+@
 
+Once the script is found, only the shell's invocation operator differs.
+The venv supplies the environment changes and the matching deactivator.
 
+<<helper functions>>=
 def emit_activate_shell_code(venv_dir, shell):
     """Return shell code that activates ``venv_dir``."""
     script = activation_script(venv_dir, shell)
     if shell is Shell.bash:
         return f"source {shell_quote(script, shell)}"
+    if shell is Shell.powershell:
+        return f"& {shell_quote(script, shell)}"
+    if shell is Shell.cmd:
+        return f"call {shell_quote(script, shell)}"
     raise AssertionError(f"Unsupported shell: {shell}")
 @
 
@@ -1248,7 +1301,7 @@ def test_emit_activate_shell_code_bash_quotes_path(workdir):
 @
 
 
-\subsection{Emitting deactivation code for [[bash]]}
+\subsection{Emitting deactivation code}
 \label{sec:emit-deactivation}
 
 Deactivation is intentionally more conservative than activation.
@@ -1272,6 +1325,18 @@ def emit_deactivate_shell_code(venv_dir, shell):
             f'if [ "${{VIRTUAL_ENV:-}}" = {quoted_venv} ] '
             f'&& declare -F deactivate >/dev/null; then deactivate; fi'
         )
+    if shell is Shell.powershell:
+        return (
+            f"if ($env:VIRTUAL_ENV -eq {quoted_venv} -and "
+            "(Get-Command deactivate -ErrorAction SilentlyContinue)) "
+            "{ deactivate }"
+        )
+    if shell is Shell.cmd:
+        script = venv_dir / "Scripts" / "deactivate.bat"
+        return (
+            f'if "%VIRTUAL_ENV%"=={quoted_venv} '
+            f"call {shell_quote(script, shell)}"
+        )
     raise AssertionError(f"Unsupported shell: {shell}")
 @
 
@@ -1289,6 +1354,83 @@ def test_emit_deactivate_shell_code_bash_guards_venv(workdir):
 @
 
 
+The test project stays fixed while shell syntax and venv layout vary.
+This exercises case-sensitive PowerShell filenames on Linux as well as
+Windows' [[Scripts]] layout, and checks that cmd refuses paths it cannot
+quote without expansion.
+
+<<test functions>>=
+@pytest.mark.parametrize("directory", ["bin", "Scripts"])
+@pytest.mark.parametrize("shell_name, filename, operator", [
+    ("bash", "activate", "source"),
+    ("powershell", "activate.ps1", "&"),
+    ("powershell", "Activate.ps1", "&"),
+    ("cmd", "activate.bat", "call"),
+])
+def test_activation_supports_shells_and_layouts(
+    tmp_path, directory, shell_name, filename, operator,
+):
+    from learnlog.cli import Shell, emit_activate_shell_code, shell_quote
+    venv = tmp_path / "course project" / ".venv"
+    script = venv / directory / filename
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    shell = Shell(shell_name)
+    assert emit_activate_shell_code(venv, shell) == (
+        f"{operator} {shell_quote(script, shell)}"
+    )
+
+
+def test_powershell_quote_preserves_apostrophes():
+    from learnlog.cli import Shell, shell_quote
+    assert shell_quote("C:/student's project/.venv", Shell.powershell) == (
+        "'C:/student''s project/.venv'"
+    )
+
+
+@pytest.mark.parametrize("path", ['C:/a"b/.venv', "C:/%TEMP%/.venv"])
+def test_cmd_quote_rejects_expanding_paths(path):
+    from learnlog.cli import Shell, shell_quote
+    with pytest.raises(SystemExit, match="cmd paths"):
+        shell_quote(path, Shell.cmd)
+
+
+def test_windows_deactivation_guards_the_selected_venv(tmp_path):
+    from learnlog.cli import Shell, emit_deactivate_shell_code
+    venv = tmp_path / "course project" / ".venv"
+    assert emit_deactivate_shell_code(venv, Shell.powershell) == (
+        f"if ($env:VIRTUAL_ENV -eq '{venv}' -and "
+        "(Get-Command deactivate -ErrorAction SilentlyContinue)) "
+        "{ deactivate }"
+    )
+    script = venv / "Scripts" / "deactivate.bat"
+    assert emit_deactivate_shell_code(venv, Shell.cmd) == (
+        f'if "%VIRTUAL_ENV%"=="{venv}" call "{script}"'
+    )
+
+
+@pytest.mark.parametrize("command", ["activate", "deactivate"])
+def test_windows_commands_default_to_powershell(workdir, monkeypatch, command):
+    import learnlog.cli as cli
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    venv = workdir / ".venv"
+    scripts = venv / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "Activate.ps1").write_text("")
+    (scripts / "activate").write_text("")
+    monkeypatch.chdir(workdir)
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    runner = CliRunner()
+    implicit = runner.invoke(cli.app, [command])
+    explicit = runner.invoke(cli.app, [command, "--shell", "powershell"])
+    assert implicit.exit_code == explicit.exit_code == 0
+    assert implicit.output == explicit.output
+    bash = runner.invoke(cli.app, [command, "--shell", "bash"])
+    assert bash.exit_code == 0
+    assert bash.output != implicit.output
+@
+
 \subsection{Activation hint for a fresh venv}
 \label{sec:setup-activation-hint}
 
@@ -1299,17 +1441,19 @@ child process cannot mutate its parent shell's environment.
 A one-line hint printed after creation is therefore the best
 we can do.
 
-The hint differs by platform because the activation scripts
-do: POSIX shells expect [[source .venv/bin/activate]],
-whereas Windows venvs place the scripts in [[Scripts\]] and
-have no [[source]] builtin (the student types the path to the
-activator directly, and both [[cmd.exe]] and PowerShell pick
-up the right extension via [[PATHEXT]]).  This is the same
-POSIX/Windows layout split that [[find_in_venv]] already
-branches on in \cref{sec:setup-pip-in-venv}, so factoring it
-into its own helper keeps the two concerns in sync---if
-Windows ever drops [[Scripts\]], both helpers fail together
-and the fix is localised.
+The hint differs by platform because the activation scripts do:
+POSIX shells expect [[source .venv/bin/activate]], whereas Windows
+venvs place the scripts in [[Scripts\]] and have no [[source]]
+builtin.  On Windows the hint names the script \emph{without} an
+extension, and that is deliberate: [[init]] cannot know which shell
+will read the hint, and the extensionless name is the one spelling
+both Windows shells accept---PowerShell resolves it to
+[[activate.ps1]], [[cmd.exe]] to [[activate.bat]]---so one line serves
+both, and it is the same line the course handouts tell students to
+type.  A shell-specific form such as [[& '...\Activate.ps1']] would
+be right for one shell and a syntax error in the other; students who
+want that form get it from [[learnlog activate]], which takes
+[[--shell]].
 
 We branch on [[sys.platform]] rather than [[os.name]]
 because [[pathlib]] inspects [[os.name]] at [[Path]]
@@ -1327,8 +1471,8 @@ def venv_activation_hint(venv_dir):
 
     Used by :func:`init_python` to nudge the student after a
     fresh venv is created.  POSIX shells need ``source
-    .../bin/activate``; Windows shells run
-    ``...\\Scripts\\activate`` directly.
+    .../bin/activate``; Windows shells run ``...\\Scripts\\activate``
+    directly, PowerShell and cmd each picking their own script.
     """
     if sys.platform.startswith("win"):
         return f"Next step: {venv_dir}\\Scripts\\activate"
@@ -1350,7 +1494,7 @@ def test_venv_activation_hint_posix(monkeypatch, tmp_path):
     )
 
 def test_venv_activation_hint_windows(monkeypatch, tmp_path):
-    """Windows hint uses ``...\\Scripts\\activate``."""
+    """Windows hint is the extensionless ``...\\Scripts\\activate``."""
     from learnlog.cli import venv_activation_hint
     monkeypatch.setattr("sys.platform", "win32")
     venv = tmp_path / ".venv"
@@ -1426,7 +1570,7 @@ def venv_purelib(venv_dir):
     )
     result = subprocess.run(
         [str(find_in_venv(venv_dir, "python")), "-c", probe],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=True, timeout=10,
     )
     return pathlib.Path(result.stdout.strip())
@@ -1506,7 +1650,7 @@ def write_autostart_files(venv_dir, project_root):
             legacy_path.unlink()
         for name, content in files:
             path = purelib / name
-            if path.exists() and path.read_text() == content:
+            if path.exists() and path.read_text(encoding="utf-8", errors="replace") == content:
                 continue
             _replace_file(path, content)
     except OSError as exc:
@@ -2047,7 +2191,7 @@ error and a half-written file are the same news here.
 def marker_contents(marker_path):
     """Return the marker file's text, or why it cannot be read."""
     try:
-        return pathlib.Path(marker_path).read_text().strip()
+        return pathlib.Path(marker_path).read_text(encoding="utf-8", errors="replace").strip()
     except Exception as exc:
         return f"<unreadable: {exc}>"
 @
@@ -2235,10 +2379,86 @@ We define the Typer app at module level with sixteen
 commands and one command group, [[metrics]].
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
+It is built on a group class of our own, which exists for one
+failure every command shares and none should have to handle itself.
+
+\subsection{A missing Git is a sentence, not a traceback}
+\label{sec:learnlog-group}
+
+Nearly every command begins by constructing a [[LearnlogRepo]], and
+the constructor runs Git (\cref{sec:init-repo}).
+On a machine without Git that raises [[GitNotFoundError]]
+(\cref{sec:starting-git}) before the command has done anything, and
+nothing in the command catches it, so Typer prints a traceback.
+The traceback ends in the right sentence, but a student who has not
+installed Git is the reader least equipped to find it there.
+
+The group is the one place every command passes through.
+Typer runs a subcommand inside its group's [[invoke]], including the
+commands of the [[metrics]] and [[tutorial]] sub-groups, so one
+override covers them all, where a [[try]] in each command would be
+forgotten at the next command added.
+A callback cannot do this, because it runs before the subcommand
+rather than around it.
+Nor can the console script: [[pyproject.toml]] points at [[app]] and
+so do the tests, through [[CliRunner]], so a wrapper function would
+be exercised by neither.
+
+Only [[GitNotFoundError]] is converted.
+A [[GitError]] with an exit status means Git ran and refused, which
+is a damaged log or a bug in learnlog; both deserve the traceback,
+or the more specific sentence that the commands expecting such a
+refusal already produce (\cref{sec:export,sec:checkout}).
+[[SystemExit]] with a string is how every other refusal in this
+module is delivered---exit status 1, the message on standard
+error---and, unlike [[typer.Exit]], it carries the message, which
+here is the whole point.
+
+<<constants>>=
+class LearnlogGroup(TyperGroup):
+    """The learnlog command group.
+
+    Adds the one handler every subcommand would otherwise need: a
+    Git that cannot be found is reported as a sentence naming the
+    fix, not as a traceback.
+    """
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except GitNotFoundError as error:
+            raise SystemExit(str(error)) from error
+@
+
+The repository is built before [[PATH]] is scrubbed, because building
+it runs Git; the scrub reaches the command because [[git_environment]]
+copies the process environment (\cref{sec:git-environment}).
+The [[SystemExit]] assertion is the one that matters: [[CliRunner]]
+reports exit status 1 for any uncaught exception, so without it the
+test would pass on the very traceback it exists to forbid.
+
+<<test functions>>=
+def test_a_missing_git_is_a_sentence_not_a_traceback(
+    workdir, monkeypatch,
+):
+    """A student without Git gets the fix, not a stack trace."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("PATH", str(workdir / "no-such-bin"))
+    result = CliRunner().invoke(app, ["list"])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "Install Git" in result.output
+@
+
+\subsection{The app object}
 
 <<typer app>>=
 app = typer.Typer(
     name="learnlog",
+    cls=LearnlogGroup,
     help="Set up and review student development logs.",
     no_args_is_help=True,
 )
@@ -2298,6 +2518,41 @@ pytorial.add_typer_subcommand(
         str(_builtin_tutorials_dir / "analysing-progsnap2.md"),
     ),
 )
+@
+
+Pytorial 0.8.1 defers POSIX terminal imports, so the dependency floor is
+what makes every CLI command importable on Windows.  An import guard
+here would hide a broken installation by silently removing the tutorial
+command.  A fresh interpreter with all four POSIX modules blocked checks
+both the catalog path and the shell runner's WSL diagnostic.
+
+<<test functions>>=
+@pytest.mark.parametrize("command, status, expected", [
+    (["tutorial", "list"], 0, "getting-started"),
+    (["tutorial", "run", "getting-started"], 1, "WSL"),
+])
+def test_cli_without_posix_terminal_modules(tmp_path, command, status, expected):
+    import learnlog
+    probe = (
+        "import sys\n"
+        "sys.modules.update(dict.fromkeys("
+        "['fcntl', 'pty', 'termios', 'tty']))\n"
+        "from learnlog.cli import app\n"
+        "app()\n"
+    )
+    env = dict(os.environ)
+    env["LEARNLOG_SKIP_AUTOSTART"] = "1"
+    env["PYTHONPATH"] = str(pathlib.Path(learnlog.__file__).parent.parent)
+    env["XDG_STATE_HOME"] = str(tmp_path / "state")
+    env["XDG_DATA_HOME"] = str(tmp_path / "data")
+    result = subprocess.run(
+        [sys.executable, "-c", probe, *command], cwd=tmp_path, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == status, output
+    assert expected in output
 @
 
 Like [[play]] in \cref{sec:play}, the interactive execution path
@@ -3197,9 +3452,9 @@ is therefore to print shell code and let the caller evaluate it:
 We make that usage explicit in the help text because a plain
 [[learnlog activate]] would only print the [[source .../bin/activate]]
 command instead of running it.  The optional [[--shell]] argument is an
-enum, currently with only [[bash]], so the surface is honest about the
-syntax we emit while still leaving a clean extension point for more
-shells later.
+enum covering bash, PowerShell, and cmd.  With no explicit choice,
+[[default_shell]] supplies the platform default.  PowerShell callers use
+[[learnlog activate | Invoke-Expression]] to evaluate the output.
 
 <<typer commands>>=
 @app.command(
@@ -3207,6 +3462,7 @@ shells later.
     help=(
         "Print shell code that activates the project .venv/. "
         "Use it as: eval \"$(learnlog activate)\".  "
+        "PowerShell: learnlog activate | Invoke-Expression. "
         "Running 'learnlog activate' by itself only prints "
         "the command because a subprocess cannot change the "
         "parent shell environment."
@@ -3214,15 +3470,17 @@ shells later.
 )
 def activate(
     shell: Annotated[
-        Shell,
+        Optional[Shell],
         typer.Option(
             "--shell",
             help=(
-                "Shell syntax to emit.  Use with eval, "
+                "Shell syntax (default: PowerShell on Windows, "
+                "bash elsewhere). "
+                "Use with eval or PowerShell Invoke-Expression; "
                 "for example: eval \"$(learnlog activate)\"."
             ),
         ),
-    ] = Shell.bash,
+    ] = None,
 ):
     """Print shell code for `eval "$(learnlog activate)"`.
 
@@ -3232,7 +3490,7 @@ def activate(
     """
     typer.echo(
         emit_activate_shell_code(
-            resolve_project_venv(), shell,
+            resolve_project_venv(), shell or default_shell(),
         )
     )
 @
@@ -3302,7 +3560,9 @@ def test_activate_help_mentions_eval_pattern():
     from typer.testing import CliRunner
     result = CliRunner().invoke(app, ["activate", "--help"])
     assert result.exit_code == 0
-    assert 'eval "$(learnlog activate)"' in result.output
+    help_text = " ".join(result.output.split())
+    assert 'eval "$(learnlog activate)"' in help_text
+    assert "learnlog activate | Invoke-Expression" in help_text
     assert "--shell" in result.output
     assert "bash" in result.output
 @
@@ -3336,15 +3596,17 @@ directly so the intended usage is visible in [[--help]].
 )
 def deactivate(
     shell: Annotated[
-        Shell,
+        Optional[Shell],
         typer.Option(
             "--shell",
             help=(
-                "Shell syntax to emit.  Use with eval, "
+                "Shell syntax (default: PowerShell on Windows, "
+                "bash elsewhere). "
+                "Use with eval or PowerShell Invoke-Expression; "
                 "for example: eval \"$(learnlog deactivate)\"."
             ),
         ),
-    ] = Shell.bash,
+    ] = None,
 ):
     """Print shell code for `eval "$(learnlog deactivate)"`.
 
@@ -3354,7 +3616,7 @@ def deactivate(
     """
     typer.echo(
         emit_deactivate_shell_code(
-            resolve_project_venv(), shell,
+            resolve_project_venv(), shell or default_shell(),
         )
     )
 @
@@ -4253,7 +4515,7 @@ which is the same bargain branches have always been on, and
 
 \paragraph{Inherited standard I/O.}
 
-[[push]] uses [[subprocess.run]] with inherited standard I/O---the
+[[push]] uses [[run_git]] with inherited standard I/O---the
 same approach as the [[git]] passthrough command (\cref{sec:git})---so
 that the user sees transfer progress and can answer a credential
 prompt.
@@ -4270,6 +4532,10 @@ from the code-state extraction that also thought it had a reason
 (\cref{sec:extract-code-state}): Git's own diagnosis has already
 reached the terminal, and the exit code below is Git's, so a failed
 push is neither silent nor mistaken for a successful one.
+A Git that is not there at all is the one failure Git cannot diagnose
+for us, and [[run_git]] reports it the same way inside and outside the
+wrapper (\cref{sec:starting-git}), so staying out no longer means
+losing that either.
 
 <<typer commands>>=
 @app.command()
@@ -4297,12 +4563,12 @@ def push(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    cmd = ["git", "push", "-u"]
+    cmd = ["push", "-u"]
     if force:
         cmd.append("--force")
     cmd += ["origin", *PUSH_REFSPECS]
 
-    result = subprocess.run(
+    result = run_git(
         cmd,
         env=repo.env,
         cwd=str(repo.workdir),
@@ -4523,7 +4789,7 @@ a standard clone produces a properly configured repository with remote
 tracking branches---so subsequent [[push]] and [[pull]]
 (\cref{sec:pull}) operations work without additional setup.
 
-Like [[push]], we use [[subprocess.run]] with inherited I/O so the
+Like [[push]], we use [[run_git]] with inherited I/O so the
 user sees clone progress and can respond to credential prompts.
 We deliberately avoid constructing a [[LearnlogRepo]] before the
 clone completes, because its constructor auto-initialises an empty
@@ -4653,8 +4919,8 @@ staging = pathlib.Path(
     )
 )
 try:
-    result = subprocess.run(
-        ["git", "clone", url, str(staging)],
+    result = run_git(
+        ["clone", url, str(staging)],
         cwd=str(workdir),
     )
     if result.returncode != 0:
@@ -5035,8 +5301,8 @@ A missing or unreachable [[origin]] surfaces here, and its exit code
 is the one worth reporting, so we stop on it.
 
 <<fetch the remote branches>>=
-fetched = subprocess.run(
-    ["git", "fetch", "origin"],
+fetched = run_git(
+    ["fetch", "origin"],
     env=repo.env,
     cwd=str(repo.workdir),
 )
@@ -5975,8 +6241,8 @@ def git_command(
     learnlog_dir = workdir / ".learnlog"
     env = git_environment(learnlog_dir, workdir)
 
-    result = subprocess.run(
-        ["git"] + args,
+    result = run_git(
+        args,
         env=env,
         cwd=str(workdir),
     )
@@ -6156,6 +6422,26 @@ def test_git_command_forwards_exit_code(
         app, ["git", "log", "--invalid-option"]
     )
     assert result.exit_code != 0
+@
+
+The passthrough is the one command that reaches Git without a
+[[LearnlogRepo]] in front of it, so it is where the unwrapped
+launch path (\cref{sec:starting-git}) can be checked on its own:
+
+<<test functions>>=
+def test_git_command_without_git_names_the_fix(
+    workdir, monkeypatch,
+):
+    """The passthrough reports a missing Git like any command."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("PATH", str(workdir / "no-such-bin"))
+    result = CliRunner().invoke(app, ["git", "log"])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "Install Git" in result.output
 @
 
 Hidden means absent from the catalogue and nothing more, so the test
@@ -6351,7 +6637,7 @@ implementation detail.
 The implementation mirrors the [[git]] passthrough
 (\cref{sec:git}): we find the [[.learnlog/]] directory,
 set the Git environment, and forward all arguments to
-[[git tag]].
+[[git tag]] through [[run_git]] (\cref{sec:starting-git}).
 
 [[git tag]] with no ref tags HEAD, and which commit that is depends
 on something outside this command: whether [[learnlog tag]] is itself
@@ -6413,8 +6699,8 @@ def tag_command(
     learnlog_dir = workdir / ".learnlog"
     env = git_environment(learnlog_dir, workdir)
 
-    result = subprocess.run(
-        ["git", "tag"] + ctx.args,
+    result = run_git(
+        ["tag", *ctx.args],
         env=env,
         cwd=str(workdir),
     )

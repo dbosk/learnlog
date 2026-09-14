@@ -37,6 +37,7 @@ import re
 import shlex
 import shutil
 import uuid
+import time
 
 <<optional locking support>>
 
@@ -339,6 +340,9 @@ the method.
 A fourth decision---whether Git's output comes back as text or as
 bytes---costs no runs, but it decides who can use the wrapper at all,
 and a caller who cannot use it opts out of the other three as well.
+The first decision has a corner of its own: what to say when there is
+no Git to fail, which is the one Git failure a student can fix
+themselves once told how (\cref{sec:starting-git}).
 
 \subsection{Failure is an exception, not a return code}
 
@@ -362,7 +366,8 @@ Callers that genuinely want the return code---[[git diff]] with
 the old behaviour.
 
 The opt-out covers only the exit status.
-A missing [[git]] binary or an expired timeout still raises even under
+A missing [[git]] binary ([[GitNotFoundError]],
+\cref{sec:starting-git}) or an expired timeout still raises even under
 [[check=False]], because there is no exit status to interpret in those
 cases: treating them as \enquote{Git said no} would let
 [[check=False]] callers read [[returncode]] off a process that never
@@ -423,6 +428,132 @@ command = " ".join(self.command)
 if len(command) > MAX_REPORTED_COMMAND_CHARS:
     command = command[:MAX_REPORTED_COMMAND_CHARS] + "..."
 message = f"{command} {status}{detail}"
+@
+
+\subsection{Starting Git}
+\label{sec:starting-git}
+
+Before Git can refuse, it has to start, and the commonest reason it
+does not is that there is no [[git]] to start: a student who never
+installed it, or a Windows install that never reached [[PATH]].
+[[subprocess]] reports that as a [[FileNotFoundError]] whose text
+names a file, [['git']], and nothing else.
+That is the symptom.
+What the student needs is the fix, so a missing Git raises an exception
+whose message \emph{is} the fix: install Git, or add it to [[PATH]] if
+it is already installed.
+
+The fix gets its own class rather than a longer message on the plain
+[[GitError]] for two readers.
+The command line needs to tell exactly this failure apart from every
+other, because this is the one it answers with a sentence instead of a
+traceback (\cref{sec:learnlog-group}); a Git that ran and said no is
+something else, and telling the student to install Git then would be
+wrong advice.
+The errors log needs the name, because [[report_error]] writes the
+class name before the message (\cref{sec:diagnostics}) and the
+autostart hook can never print to the terminal: a
+[[GitNotFoundError]] line there tells a reader at a glance what was
+wrong on that machine, as [[UnanchoredRun]] does for a project that
+would not resolve.
+Subclassing keeps every existing [[except GitError]] working unchanged.
+
+<<constants>>=
+GIT_NOT_FOUND_HINT = (
+    "Git was not found. Install Git, or add it to PATH "
+    "if it is already installed."
+)
+<<classes>>=
+class GitNotFoundError(GitError):
+    """There is no `git` to run.
+
+    A `GitError` whose message is the fix rather than the symptom:
+    install Git, or put it on `PATH`.  It is its own class so that
+    the command line can turn exactly this failure into one
+    sentence, and so that the errors log names it.
+    """
+@
+
+The launcher that raises it is a module-level function rather than a
+method of [[LearnlogRepo]], because not every Git call can go through
+the wrapper.
+The argument of \cref{sec:git-bytes} still holds---a caller that works
+around the wrapper loses everything the wrapper decides---but some
+callers have no choice: [[push]], [[clone]], [[pull]]'s fetch, the
+[[git]] passthrough and [[tag]] keep inherited standard I/O so the
+student sees transfer progress and can answer a credential prompt, and
+the bundle clone runs before any repository exists to construct a
+wrapper on.
+[[run_git]] is the floor under both.
+The wrapper is built on it, and a caller that has to stay outside the
+wrapper now loses the captured output and the bounded timeout, but not
+the diagnosis that there is no Git.
+
+Only [[FileNotFoundError]] earns the hint.
+A timeout means Git is there and busy; a [[PermissionError]] means Git
+is there and not executable; an oversized argument list means Git was
+never the problem.
+For all of those, \enquote{install Git} would be wrong advice, so they
+stay a plain [[GitError]] carrying the operating system's own words.
+[[FileNotFoundError]] is itself an [[OSError]], which is why its clause
+comes first.
+The timeout is caught as [[TimeoutExpired]] rather than the broader
+[[SubprocessError]] it used to be, because [[run_git]] now also serves
+callers that pass [[check=True]], and their [[CalledProcessError]] is a
+Git that ran---labelling it \enquote{could not be run} would lie.
+Nothing broader is caught either: a [[KeyboardInterrupt]] during a
+slow clone must reach the cleanup that waits for it
+(\cref{sec:resolve-source}), and [[run_git]] never raises
+[[SystemExit]] itself, because the autostart hook swallows
+[[Exception]] and only [[Exception]] to keep the student's program
+running (\cref{sec:initialize}).
+The command reaches [[subprocess.run]] as one positional list, as
+every caller passed it before, which is also what lets a test stand in
+for [[subprocess.run]] and recognise the command it is asked to run.
+
+<<functions>>=
+def run_git(args, **kwargs):
+    """Run `git` with `args`, raising `GitError` if it cannot start.
+
+    Keyword arguments go to `subprocess.run` unchanged, so each
+    caller keeps the standard I/O, environment and timeout it needs.
+    A missing Git raises `GitNotFoundError`; any other failure to
+    start raises `GitError` with no return code.  A Git that ran and
+    exited non-zero is the caller's to judge.
+    """
+    try:
+        return subprocess.run(["git", *args], **kwargs)
+    except FileNotFoundError as error:
+        raise GitNotFoundError(
+            args, None, GIT_NOT_FOUND_HINT,
+        ) from error
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GitError(args, None, str(error)) from error
+@
+
+Let's verify that nothing to run is reported as a fix to name, not a
+return code to read, and that a Git which is there but slow gets no
+installation advice:
+
+<<test functions>>=
+def test_run_git_reports_a_missing_git_with_the_fix(workdir):
+    with pytest.raises(GitNotFoundError) as caught:
+        run_git(
+            ["--version"],
+            env={"PATH": str(workdir / "empty")},
+            capture_output=True,
+        )
+    assert caught.value.returncode is None
+    assert "Install Git" in str(caught.value)
+
+def test_run_git_timeout_is_not_a_missing_git(monkeypatch):
+    def time_out(cmd, *args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 1)
+    monkeypatch.setattr(subprocess, "run", time_out)
+    with pytest.raises(GitError) as caught:
+        run_git(["status"])
+    assert type(caught.value) is GitError
+    assert "Install Git" not in str(caught.value)
 @
 
 \subsection{How long we are willing to wait}
@@ -526,11 +657,13 @@ def git(self, *args, check=True, timeout=GIT_TIMEOUT,
     ``check`` is false, when Git exits non-zero.  Text passed as
     ``input`` reaches Git on standard input; commit messages travel
     that way to escape the operating system's argument-size limit.
-    With ``text`` false, standard output and standard error come back
-    as bytes, for commands whose output is a file rather than a
-    message.  ``env`` overlays committer-identity variables onto the
-    learnlog environment; any variable outside that allow-list
-    raises ``ValueError``.
+    Text is always UTF-8, whatever the locale says, and undecodable
+    output bytes become U+FFFD rather than an exception.  With
+    ``text`` false, standard output and standard error come back as
+    bytes, for commands whose output is a file rather than a message.
+    ``env`` overlays committer-identity variables onto the learnlog
+    environment; any variable outside that allow-list raises
+    ``ValueError``.
     """
     <<overlay the committer identity, if asked>>
     <<run Git, turning process failures into [[GitError]]>>
@@ -556,7 +689,7 @@ tag \emph{says}, never where it goes.
 
 The chunk leaves [[environment]] behind for
 [[<<run Git, turning process failures into [[GitError]]>>]] to pass
-to [[subprocess]]; the two chunks only ever appear together in the
+to [[run_git]]; the two chunks only ever appear together in the
 wrapper above.
 
 <<overlay the committer identity, if asked>>=
@@ -576,25 +709,63 @@ OVERRIDABLE_GIT_VARS = frozenset({
 })
 @
 
-[[subprocess]] reports \enquote{Git could not be run} in two unrelated
-exception hierarchies---[[OSError]] for a missing binary or an
-oversized argument list, [[SubprocessError]] for a timeout---so we
-catch both and re-raise them as the one type callers have to know
-about.
+A commit containing [[åäö]] must survive both the input pipe and a later
+[[git show]], regardless of the terminal's locale.  Text pipes use UTF-8
+with replacement for undecodable output bytes, so one malformed byte
+cannot end a run.  The codec is a constant rather than a parameter of
+[[git]]: Git stores bytes, learnlog writes them as UTF-8, and a caller
+who could ask for another encoding could only make the log lie about
+itself.  Binary callers such as [[git archive]] omit the codec:
+passing [[encoding]] itself would force text mode and corrupt an archive.
+
+<<constants>>=
+GIT_TEXT_CODEC = {"encoding": "utf-8", "errors": "replace"}
+@
+
+Starting Git is [[run_git]]'s job (\cref{sec:starting-git}); what the
+wrapper adds is everything decided in this section---the captured
+output, the codec, the timeout and the standard-input plumbing.
+A missing Git or an expired timeout therefore arrives here already
+as a [[GitError]], and only the exit status is left to judge.
 
 <<run Git, turning process failures into [[GitError]]>>=
-try:
-    result = subprocess.run(
-        ["git"] + list(args),
-        cwd=str(self.workdir),
-        env=environment,
-        capture_output=True,
-        text=text,
-        timeout=timeout,
-        input=input,
-    )
-except (OSError, subprocess.SubprocessError) as error:
-    raise GitError(args, None, str(error)) from error
+result = run_git(
+    args,
+    cwd=str(self.workdir),
+    env=environment,
+    capture_output=True,
+    text=text,
+    **(GIT_TEXT_CODEC if text else {}),
+    timeout=timeout,
+    input=input,
+)
+@
+
+The same Git pipe must preserve UTF-8 text, replace a malformed byte
+when asked for text, and return that byte verbatim when asked for binary.
+Storing a blob gives the test precise bytes independent of Git's display
+settings or the shell's locale.
+
+<<test functions>>=
+def test_git_text_codec_preserves_unicode_and_binary(workdir):
+    repo = LearnlogRepo(workdir)
+    message = "åäö " + chr(0x1f600) + "\n"
+    oid = repo.git("hash-object", "-w", "--stdin", input=message).stdout.strip()
+    assert repo.git("cat-file", "blob", oid).stdout == message
+    payload = message.encode("utf-8") + b"\xff"
+    oid = repo.git(
+        "hash-object", "-w", "--stdin", input=payload, text=False,
+    ).stdout.decode("ascii").strip()
+    assert repo.git("cat-file", "blob", oid).stdout == message + "\ufffd"
+    assert repo.git("cat-file", "blob", oid, text=False).stdout == payload
+
+
+def test_ignore_file_accepts_utf8_and_invalid_bytes(workdir):
+    (workdir / LEARNLOGIGNORE_NAME).write_bytes("räksmörgås\n".encode() + b"\xff\n")
+    repo = LearnlogRepo(workdir)
+    content = repo.exclude_content()
+    assert "räksmörgås" in content
+    assert "\ufffd" in content
 @
 
 Let's verify the helper runs Git commands in the right context, and
@@ -618,6 +789,7 @@ def test_git_error_reports_command_and_stderr(workdir):
     assert caught.value.returncode != 0
     assert "cat-file" in str(caught.value)
     assert caught.value.stderr
+    assert "Install Git" not in str(caught.value)
 
 def test_git_error_truncates_long_command(workdir):
     repo = LearnlogRepo(workdir)
@@ -640,6 +812,8 @@ def test_git_missing_binary_raises_even_unchecked(workdir):
     with pytest.raises(GitError) as caught:
         repo.git("status", check=False)
     assert caught.value.returncode is None
+    assert isinstance(caught.value, GitNotFoundError)
+    assert "Install Git" in str(caught.value)
 
 def test_git_input_reaches_git(workdir):
     repo = LearnlogRepo(workdir)
@@ -971,11 +1145,10 @@ def has_commit(self):
     return tip is not None
 @
 
-Where [[fcntl]] is missing the lock is a no-op
-(\cref{sec:commit-lock}), and check-then-initialise is racy again.
-That is the same trade as for the commit lock itself: a platform
-without [[flock]] gets the protocol without the serialisation, rather
-than no learnlog at all.
+Both POSIX and Windows serialise initialisation with the commit lock
+(\cref{sec:commit-lock}).  If neither backend is available or the
+filesystem refuses locking, initialisation proceeds without that
+guarantee so recording remains available.
 
 \subsection{Keeping the repository configured}
 \label{sec:ensure-configured}
@@ -1035,7 +1208,7 @@ likely to be stale: it changes whenever the student edits
 def is_configured(self):
     """Return whether our settings are already in place."""
     try:
-        current = (self.git_dir / EXCLUDE_PATH).read_text()
+        current = (self.git_dir / EXCLUDE_PATH).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
     if current != self.exclude_content():
@@ -1261,7 +1434,7 @@ def exclude_content(self):
     try:
         extra = (
             self.workdir / LEARNLOGIGNORE_NAME
-        ).read_text()
+        ).read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         extra = ""
     patterns.extend(extra.splitlines())
@@ -1282,7 +1455,7 @@ exclude_file.parent.mkdir(parents=True, exist_ok=True)
 staged = exclude_file.with_name(
     exclude_file.name + STAGED_SUFFIX
 )
-staged.write_text(self.exclude_content())
+staged.write_text(self.exclude_content(), encoding="utf-8")
 os.replace(staged, exclude_file)
 <<constants>>=
 STAGED_SUFFIX = ".new"
@@ -1704,7 +1877,7 @@ Git guards its own data structures with lock files, but a losing
 command \emph{fails} ([[index.lock]] already exists) rather than
 waiting, and a dropped run is data loss.
 We would rather wait a few milliseconds, so we take an exclusive
-[[flock]] on a file in [[.learnlog/]] around each commit.
+lock on a file in [[.learnlog/]] around each commit.
 
 The lock covers one commit operation and nothing more.
 A lock held from [[begin_run]] to [[finalize_run]] would make two
@@ -1722,15 +1895,92 @@ its file has to live somewhere creation can be relied on to have made:
 inside [[.learnlog/]], which [[init_repo]] creates before it takes the
 lock.
 
-[[fcntl]] does not exist on Windows.
-Rather than fail there, we degrade to no locking: the protocol is still
-append-only, and the remaining window is the one Git itself guards.
+POSIX uses [[fcntl.flock]]; Windows uses [[msvcrt.locking]] on the
+first byte of the file, even when the file is empty.  Both backends
+answer the same question: does this handle now own the exclusive lock?
+Selecting once keeps platform detection out of the commit and claim
+protocols, while consulting the selected globals at call time lets tests
+exercise either backend without re-importing the package.
 
 <<optional locking support>>=
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no fcntl
-    fcntl = None
+def _select_lock_backend():
+    """Return the available POSIX or Windows locking module pair."""
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None
+    return (fcntl, None) if fcntl is not None else (None, msvcrt)
+
+
+fcntl, msvcrt = _select_lock_backend()
+@
+
+A commit may wait; a claim probe must answer immediately.  Windows'
+blocking mode retries at one-second intervals, so short nonblocking
+probes let ordinary contention clear promptly.  A monotonic deadline
+bounds the delay when the filesystem refuses locking altogether.
+Neither backend being available is also a negative answer.
+
+<<functions>>=
+def lock_exclusive(handle, blocking=True):
+    """Return whether this handle acquired the exclusive lock."""
+    if fcntl is not None:
+        try:
+            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), flags)
+            return True
+        except OSError:
+            return False
+    if msvcrt is not None:
+        <<poll for the Windows byte lock>>
+    return False
+@
+
+Every probe seeks to the same byte: allowing the caller's current file
+position to choose the region would let two handles lock different
+parts of one file and both claim exclusive ownership.
+
+<<poll for the Windows byte lock>>=
+deadline = time.monotonic() + LOCK_WAIT
+while True:
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, LOCK_BYTES)
+        return True
+    except OSError:
+        remaining = deadline - time.monotonic()
+        if not blocking or remaining <= 0:
+            return False
+        time.sleep(min(LOCK_POLL, remaining))
+@
+
+Explicit release makes the lifetime visible to both backends and to the
+simulated Windows backend.  The caller still closes the handle, which
+releases the operating system lock even if explicit unlocking fails.
+That fallback is why a failed release must not stop the caller---the
+lock is gone a moment later either way---but it is not a reason to
+lose the failure: a release the kernel refuses is news about the
+filesystem, and it goes to the diagnostics log like every other error
+learnlog swallows.  The caller names the project so the entry lands in
+that project's log; the test fixtures that release a lock by hand may
+leave it out, and [[report_error]] then falls back to the current
+directory.
+
+<<functions>>=
+def unlock(handle, workdir=None):
+    """Release a held lock; closing the handle remains the fallback."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, LOCK_BYTES)
+    except OSError as error:
+        report_error("release lock", error, workdir)
 @
 
 <<repo methods>>=
@@ -1746,6 +1996,7 @@ def commit_lock(self):
         yield handle
     finally:
         if handle is not None:
+            unlock(handle, self.workdir)
             handle.close()
 @
 
@@ -1804,29 +2055,40 @@ acquire---[[None]], and the commit proceeds unserialised.
 <<repo methods>>=
 def _acquire_lock(self):
     """Return a locked file handle, or ``None`` if unavailable."""
-    if fcntl is None:
-        return None
     lock_path = self.git_dir / LOCK_FILE_NAME
     for _ in range(LOCK_ATTEMPTS):
         try:
-            handle = open(lock_path, "w")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle = os.fdopen(
+                os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666), "r+b",
+            )
         except OSError:
+            return None
+        if not lock_exclusive(handle):
+            handle.close()
             return None
         if _is_same_file(handle, lock_path):
             return handle
+        unlock(handle, self.workdir)
         handle.close()
     return None
 <<constants>>=
 LOCK_FILE_NAME = "learnlog.lock"
 LOCK_ATTEMPTS = 8
+LOCK_BYTES = 1
+LOCK_WAIT = 5
+LOCK_POLL = 0.01
 @
+
+Opening without truncation matters on Windows: truncation could fail
+before a contender ever reaches the mandatory byte lock.  Binary
+read/write mode also leaves every handle free to seek to byte zero.
 
 Inode and device number are what \enquote{the same file} means to the
 kernel, and they are the terms [[flock]] is itself defined in.
 Comparing paths would answer a question we already know the answer to,
-and comparing contents would answer none---the file is empty either
-way.
+and comparing contents would answer none: nothing ever writes to the
+lock file, so whatever bytes it happens to hold say nothing about who
+holds the lock.
 A [[stat]] that fails means there is no file at the path at all just
 now, which is a mismatch like any other.
 
@@ -1847,16 +2109,15 @@ the next process therefore cannot have it.
 Driving [[_acquire_lock]] directly, with a stand-in for [[flock]] that
 swaps the file just before it locks, turns the race into a sequence
 instead of a coincidence.
-The tests skip where [[fcntl]] does, for the same reason the module
-degrades there.
+These two tests exercise POSIX inode replacement semantics and skip
+where [[fcntl]] is unavailable.  Windows backend tests follow separately.
 
 <<test functions>>=
-fcntl = pytest.importorskip("fcntl")
-
 def test_lock_survives_a_recreated_lock_file(workdir, monkeypatch):
     """A lock file swapped mid-acquisition still excludes rivals."""
     repo = LearnlogRepo(workdir)
     lock_path = repo.git_dir / LOCK_FILE_NAME
+    fcntl = pytest.importorskip("fcntl")
     real_flock = fcntl.flock
     swapped = []
 
@@ -1886,6 +2147,7 @@ def test_lock_gives_up_on_a_file_that_keeps_moving(workdir, monkeypatch):
     """An endlessly recreated lock file ends in no lock, not a hang."""
     repo = LearnlogRepo(workdir)
     lock_path = repo.git_dir / LOCK_FILE_NAME
+    fcntl = pytest.importorskip("fcntl")
     real_flock = fcntl.flock
 
     def swap_the_file_then_lock(fd, operation):
@@ -1894,6 +2156,106 @@ def test_lock_gives_up_on_a_file_that_keeps_moving(workdir, monkeypatch):
         return real_flock(fd, operation)
 
     monkeypatch.setattr(fcntl, "flock", swap_the_file_then_lock)
+    assert repo._acquire_lock() is None
+@
+
+
+The Windows stand-in records ownership per open descriptor and file
+identity, so two handles in one process contend just as two processes
+would.  It deliberately does not infer process death from descriptor
+reuse: tests model death with explicit [[unlock]], and teardown clears
+all ownership.  The fixture is shared with the claim tests.
+
+<<[[conftest.py]]>>=
+import errno
+import os
+import learnlog.gitrepo as gitrepo
+
+
+class FakeMsvcrt:
+    LK_NBLCK, LK_LOCK, LK_UNLCK = range(3)
+
+    def __init__(self):
+        self.owners = {}
+
+    def locking(self, fd, mode, nbytes):
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 0
+        assert nbytes == 1
+        stat = os.fstat(fd)
+        key = (stat.st_dev, stat.st_ino)
+        owner = self.owners.get(key)
+        if mode == self.LK_UNLCK:
+            if owner == fd:
+                del self.owners[key]
+        elif owner is not None:
+            raise OSError(errno.EACCES, "locked")
+        else:
+            self.owners[key] = fd
+
+
+@pytest.fixture
+def fake_windows(monkeypatch):
+    backend = FakeMsvcrt()
+    monkeypatch.setattr(gitrepo, "fcntl", None)
+    monkeypatch.setattr(gitrepo, "msvcrt", backend)
+    monkeypatch.setattr(gitrepo, "LOCK_WAIT", 0.05)
+    yield backend
+    backend.owners.clear()
+@
+
+Backend selection prefers POSIX when both imports happen to work, uses
+Windows when only that import works, and declines locking when neither
+does.  Contention must time out without truncating the lock file; release
+must let another handle in.  A real Windows witness also enables the
+private-index sweep described next.
+
+<<test functions>>=
+def test_selects_fcntl_then_msvcrt_then_nothing(monkeypatch):
+    from learnlog.gitrepo import _select_lock_backend
+    posix, windows = object(), object()
+    monkeypatch.setitem(sys.modules, "fcntl", posix)
+    monkeypatch.setitem(sys.modules, "msvcrt", windows)
+    assert _select_lock_backend() == (posix, None)
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    assert _select_lock_backend() == (None, windows)
+    monkeypatch.setitem(sys.modules, "msvcrt", None)
+    assert _select_lock_backend() == (None, None)
+
+
+def test_windows_lock_contends_and_releases(workdir, fake_windows):
+    repo = LearnlogRepo(workdir)
+    path = repo.git_dir / LOCK_FILE_NAME
+    path.write_bytes(b"keep")
+    first = repo._acquire_lock()
+    assert first is not None
+    try:
+        started = time.monotonic()
+        assert repo._acquire_lock() is None
+        assert time.monotonic() - started >= 0.05
+        assert path.read_bytes() == b"keep"
+    finally:
+        unlock(first)
+        first.close()
+    with repo.commit_lock() as second:
+        assert second is not None
+    assert not fake_windows.owners
+
+
+def test_windows_lock_witness_allows_reclaim(workdir, fake_windows):
+    repo = LearnlogRepo(workdir)
+    leftover = repo.git_dir / (RUN_INDEX_PREFIX + "killed")
+    leftover.write_bytes(b"index")
+    with repo.commit_lock() as held:
+        assert held is not None
+        repo.reclaim_run_indexes(held)
+    assert not leftover.exists()
+
+
+def test_missing_lock_backends_decline(workdir, monkeypatch):
+    import learnlog.gitrepo as gitrepo
+    repo = LearnlogRepo(workdir)
+    monkeypatch.setattr(gitrepo, "fcntl", None)
+    monkeypatch.setattr(gitrepo, "msvcrt", None)
     assert repo._acquire_lock() is None
 @
 
@@ -2525,9 +2887,8 @@ could not tell holding the lock from having given up on it, and giving
 up is precisely when it must not sweep.
 Requiring the handle makes the precondition something the caller has to
 produce.
-Where [[fcntl]] is missing it is [[None]] always, and that platform
-keeps its leftovers rather than gambling with them, which is the trade
-every other user of this lock makes.
+Both supported platforms can produce this witness.  A failed lock
+acquisition still yields [[None]] and leaves leftovers untouched.
 
 One case is left over: a run that could not take the lock and made an
 index anyway.
@@ -2535,7 +2896,7 @@ It is already committing unserialised (\cref{sec:commit-lock}), and it
 now also runs without the cover that holding the lock is what conveys.
 What answers it is how narrow the case is.
 [[_acquire_lock]] comes back empty-handed only where the filesystem
-refuses the lock outright---in which case nothing here sweeps either---
+refuses the lock or the Windows wait expires---
 or where something is recreating [[learnlog.lock]] faster than
 [[LOCK_ATTEMPTS]] tries can catch it, and that is not a repository in
 which any of the guarantees hanging off this lock still hold.

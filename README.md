@@ -7,6 +7,31 @@ program run is recorded transparently: source code changes, command-line
 arguments, standard input/output/error, and unhandled exceptions. The data is
 stored in a hidden local Git repository.
 
+## Activating a project
+
+After `learnlog init python`, activate the project environment in bash:
+
+```bash
+eval "$(learnlog activate)"
+# When finished:
+eval "$(learnlog deactivate)"
+```
+
+In Windows PowerShell:
+
+```powershell
+learnlog activate | Invoke-Expression
+# When finished:
+learnlog deactivate | Invoke-Expression
+```
+
+If PowerShell blocks activation scripts, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once for your user.
+Use `--shell bash`, `--shell powershell`, or `--shell cmd` to choose the
+syntax explicitly. The commands print code for that shell to execute.
+Interactive tutorial shell steps need WSL on Windows; `learnlog tutorial list`
+works natively.
+
 ## Use cases
 
 - **Sharing live-coding sessions.**
