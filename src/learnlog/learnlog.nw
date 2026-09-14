@@ -497,6 +497,12 @@ Upload `mylog.learnlog` through the course platform as instructed.
 
 ## Troubleshooting
 
+- **`Git was not found`** — learnlog keeps your log in a Git
+  repository, so Git must be installed and on your `PATH`. Check
+  with `git --version`. If that works but learnlog still complains,
+  the terminal learnlog runs in has a different `PATH` than the one
+  you tested in; close and reopen it, or reinstall Git with the
+  option to add it to `PATH`.
 - **`learnlog: command not found`** — `pipx`'s bin directory is
   not on your `PATH`. Run `pipx ensurepath` and then close and
   reopen your terminal. Platform-specific `PATH` guidance is at
@@ -2320,6 +2326,10 @@ Once [[repo]] exists we know which project the failure belongs to; a
 failure before that---an unreadable working directory, a Git that will
 not start---has no project yet, and [[report_error]] falls back to the
 current directory, writing only if a [[.learnlog/]] is already there.
+A Git that is not installed at all is the failure most worth finding
+there, and its entry names both the class and the fix
+([[GitNotFoundError]], \cref{sec:starting-git}), since this is the one
+place the autostart hook can say so.
 
 <<functions>>=
 def _report_swallowed_failure(context, error):
@@ -2354,6 +2364,8 @@ class TestSwallowedFailureDiagnostics:
             workdir / ".learnlog" / "errors.log"
         ).read_text()
         assert "initialize" in log
+        assert "GitNotFoundError" in log
+        assert "Install Git" in log
 
     def test_debug_mirrors_failure_to_stderr(
         self, workdir, test_env

@@ -340,6 +340,9 @@ the method.
 A fourth decision---whether Git's output comes back as text or as
 bytes---costs no runs, but it decides who can use the wrapper at all,
 and a caller who cannot use it opts out of the other three as well.
+The first decision has a corner of its own: what to say when there is
+no Git to fail, which is the one Git failure a student can fix
+themselves once told how (\cref{sec:starting-git}).
 
 \subsection{Failure is an exception, not a return code}
 
@@ -363,7 +366,8 @@ Callers that genuinely want the return code---[[git diff]] with
 the old behaviour.
 
 The opt-out covers only the exit status.
-A missing [[git]] binary or an expired timeout still raises even under
+A missing [[git]] binary ([[GitNotFoundError]],
+\cref{sec:starting-git}) or an expired timeout still raises even under
 [[check=False]], because there is no exit status to interpret in those
 cases: treating them as \enquote{Git said no} would let
 [[check=False]] callers read [[returncode]] off a process that never
@@ -424,6 +428,132 @@ command = " ".join(self.command)
 if len(command) > MAX_REPORTED_COMMAND_CHARS:
     command = command[:MAX_REPORTED_COMMAND_CHARS] + "..."
 message = f"{command} {status}{detail}"
+@
+
+\subsection{Starting Git}
+\label{sec:starting-git}
+
+Before Git can refuse, it has to start, and the commonest reason it
+does not is that there is no [[git]] to start: a student who never
+installed it, or a Windows install that never reached [[PATH]].
+[[subprocess]] reports that as a [[FileNotFoundError]] whose text
+names a file, [['git']], and nothing else.
+That is the symptom.
+What the student needs is the fix, so a missing Git raises an exception
+whose message \emph{is} the fix: install Git, or add it to [[PATH]] if
+it is already installed.
+
+The fix gets its own class rather than a longer message on the plain
+[[GitError]] for two readers.
+The command line needs to tell exactly this failure apart from every
+other, because this is the one it answers with a sentence instead of a
+traceback (\cref{sec:learnlog-group}); a Git that ran and said no is
+something else, and telling the student to install Git then would be
+wrong advice.
+The errors log needs the name, because [[report_error]] writes the
+class name before the message (\cref{sec:diagnostics}) and the
+autostart hook can never print to the terminal: a
+[[GitNotFoundError]] line there tells a reader at a glance what was
+wrong on that machine, as [[UnanchoredRun]] does for a project that
+would not resolve.
+Subclassing keeps every existing [[except GitError]] working unchanged.
+
+<<constants>>=
+GIT_NOT_FOUND_HINT = (
+    "Git was not found. Install Git, or add it to PATH "
+    "if it is already installed."
+)
+<<classes>>=
+class GitNotFoundError(GitError):
+    """There is no `git` to run.
+
+    A `GitError` whose message is the fix rather than the symptom:
+    install Git, or put it on `PATH`.  It is its own class so that
+    the command line can turn exactly this failure into one
+    sentence, and so that the errors log names it.
+    """
+@
+
+The launcher that raises it is a module-level function rather than a
+method of [[LearnlogRepo]], because not every Git call can go through
+the wrapper.
+The argument of \cref{sec:git-bytes} still holds---a caller that works
+around the wrapper loses everything the wrapper decides---but some
+callers have no choice: [[push]], [[clone]], [[pull]]'s fetch, the
+[[git]] passthrough and [[tag]] keep inherited standard I/O so the
+student sees transfer progress and can answer a credential prompt, and
+the bundle clone runs before any repository exists to construct a
+wrapper on.
+[[run_git]] is the floor under both.
+The wrapper is built on it, and a caller that has to stay outside the
+wrapper now loses the captured output and the bounded timeout, but not
+the diagnosis that there is no Git.
+
+Only [[FileNotFoundError]] earns the hint.
+A timeout means Git is there and busy; a [[PermissionError]] means Git
+is there and not executable; an oversized argument list means Git was
+never the problem.
+For all of those, \enquote{install Git} would be wrong advice, so they
+stay a plain [[GitError]] carrying the operating system's own words.
+[[FileNotFoundError]] is itself an [[OSError]], which is why its clause
+comes first.
+The timeout is caught as [[TimeoutExpired]] rather than the broader
+[[SubprocessError]] it used to be, because [[run_git]] now also serves
+callers that pass [[check=True]], and their [[CalledProcessError]] is a
+Git that ran---labelling it \enquote{could not be run} would lie.
+Nothing broader is caught either: a [[KeyboardInterrupt]] during a
+slow clone must reach the cleanup that waits for it
+(\cref{sec:resolve-source}), and [[run_git]] never raises
+[[SystemExit]] itself, because the autostart hook swallows
+[[Exception]] and only [[Exception]] to keep the student's program
+running (\cref{sec:initialize}).
+The command reaches [[subprocess.run]] as one positional list, as
+every caller passed it before, which is also what lets a test stand in
+for [[subprocess.run]] and recognise the command it is asked to run.
+
+<<functions>>=
+def run_git(args, **kwargs):
+    """Run `git` with `args`, raising `GitError` if it cannot start.
+
+    Keyword arguments go to `subprocess.run` unchanged, so each
+    caller keeps the standard I/O, environment and timeout it needs.
+    A missing Git raises `GitNotFoundError`; any other failure to
+    start raises `GitError` with no return code.  A Git that ran and
+    exited non-zero is the caller's to judge.
+    """
+    try:
+        return subprocess.run(["git", *args], **kwargs)
+    except FileNotFoundError as error:
+        raise GitNotFoundError(
+            args, None, GIT_NOT_FOUND_HINT,
+        ) from error
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GitError(args, None, str(error)) from error
+@
+
+Let's verify that nothing to run is reported as a fix to name, not a
+return code to read, and that a Git which is there but slow gets no
+installation advice:
+
+<<test functions>>=
+def test_run_git_reports_a_missing_git_with_the_fix(workdir):
+    with pytest.raises(GitNotFoundError) as caught:
+        run_git(
+            ["--version"],
+            env={"PATH": str(workdir / "empty")},
+            capture_output=True,
+        )
+    assert caught.value.returncode is None
+    assert "Install Git" in str(caught.value)
+
+def test_run_git_timeout_is_not_a_missing_git(monkeypatch):
+    def time_out(cmd, *args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 1)
+    monkeypatch.setattr(subprocess, "run", time_out)
+    with pytest.raises(GitError) as caught:
+        run_git(["status"])
+    assert type(caught.value) is GitError
+    assert "Install Git" not in str(caught.value)
 @
 
 \subsection{How long we are willing to wait}
@@ -559,7 +689,7 @@ tag \emph{says}, never where it goes.
 
 The chunk leaves [[environment]] behind for
 [[<<run Git, turning process failures into [[GitError]]>>]] to pass
-to [[subprocess]]; the two chunks only ever appear together in the
+to [[run_git]]; the two chunks only ever appear together in the
 wrapper above.
 
 <<overlay the committer identity, if asked>>=
@@ -592,26 +722,23 @@ passing [[encoding]] itself would force text mode and corrupt an archive.
 GIT_TEXT_CODEC = {"encoding": "utf-8", "errors": "replace"}
 @
 
-[[subprocess]] reports \enquote{Git could not be run} in two unrelated
-exception hierarchies---[[OSError]] for a missing binary or an
-oversized argument list, [[SubprocessError]] for a timeout---so we
-catch both and re-raise them as the one type callers have to know
-about.
+Starting Git is [[run_git]]'s job (\cref{sec:starting-git}); what the
+wrapper adds is everything decided in this section---the captured
+output, the codec, the timeout and the standard-input plumbing.
+A missing Git or an expired timeout therefore arrives here already
+as a [[GitError]], and only the exit status is left to judge.
 
 <<run Git, turning process failures into [[GitError]]>>=
-try:
-    result = subprocess.run(
-        ["git"] + list(args),
-        cwd=str(self.workdir),
-        env=environment,
-        capture_output=True,
-        text=text,
-        **(GIT_TEXT_CODEC if text else {}),
-        timeout=timeout,
-        input=input,
-    )
-except (OSError, subprocess.SubprocessError) as error:
-    raise GitError(args, None, str(error)) from error
+result = run_git(
+    args,
+    cwd=str(self.workdir),
+    env=environment,
+    capture_output=True,
+    text=text,
+    **(GIT_TEXT_CODEC if text else {}),
+    timeout=timeout,
+    input=input,
+)
 @
 
 The same Git pipe must preserve UTF-8 text, replace a malformed byte
@@ -662,6 +789,7 @@ def test_git_error_reports_command_and_stderr(workdir):
     assert caught.value.returncode != 0
     assert "cat-file" in str(caught.value)
     assert caught.value.stderr
+    assert "Install Git" not in str(caught.value)
 
 def test_git_error_truncates_long_command(workdir):
     repo = LearnlogRepo(workdir)
@@ -684,6 +812,8 @@ def test_git_missing_binary_raises_even_unchecked(workdir):
     with pytest.raises(GitError) as caught:
         repo.git("status", check=False)
     assert caught.value.returncode is None
+    assert isinstance(caught.value, GitNotFoundError)
+    assert "Install Git" in str(caught.value)
 
 def test_git_input_reaches_git(workdir):
     repo = LearnlogRepo(workdir)

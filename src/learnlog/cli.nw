@@ -121,6 +121,7 @@ from typing import Annotated, Optional
 
 import pytorial
 import typer
+from typer.core import TyperGroup
 
 from learnlog import _is_home_or_above, find_learnlog_dir
 from learnlog._autostart import (
@@ -133,8 +134,10 @@ from learnlog._autostart import (
 from learnlog.gitrepo import (
     GIT_TREE_TIMEOUT,
     GitError,
+    GitNotFoundError,
     LearnlogRepo,
     git_environment,
+    run_git,
 )
 from learnlog.commits import (
     CHECKOUT_SUBCOMMAND,
@@ -327,13 +330,17 @@ We point [[GIT_DIR]] at the cloned repo's [[.git/]] so that
 [[LearnlogRepo.git()]] can query it.
 However, [[LearnlogRepo]] expects the git directory to be named
 [[.learnlog/]], so we rename it after cloning.
+Both Git calls go through [[run_git]] (\cref{sec:starting-git})
+rather than the wrapper, because there is no repository yet to build
+a wrapper on; a machine without Git is then reported the same way as
+everywhere else.
 
 <<resolve bundle file>>=
 if not path.is_file():
     raise SystemExit(f"Not a file or directory: {path}")
 
-verify = subprocess.run(
-    ["git", "bundle", "list-heads", str(path)],
+verify = run_git(
+    ["bundle", "list-heads", str(path)],
     capture_output=True, text=True, encoding="utf-8", errors="replace",
 )
 if verify.returncode != 0:
@@ -380,8 +387,8 @@ it is precisely the one [[except Exception]] is defined not to see.
 <<clone the bundle into the temporary directory>>=
 tmppath = pathlib.Path(tmpdir)
 
-subprocess.run(
-    ["git", "clone", str(path), str(tmppath / "repo")],
+run_git(
+    ["clone", str(path), str(tmppath / "repo")],
     capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
 )
 
@@ -2371,10 +2378,86 @@ We define the Typer app at module level with sixteen
 commands and one command group, [[metrics]].
 The [[app]] object is the entry point referenced by
 [[pyproject.toml]].
+It is built on a group class of our own, which exists for one
+failure every command shares and none should have to handle itself.
+
+\subsection{A missing Git is a sentence, not a traceback}
+\label{sec:learnlog-group}
+
+Nearly every command begins by constructing a [[LearnlogRepo]], and
+the constructor runs Git (\cref{sec:init-repo}).
+On a machine without Git that raises [[GitNotFoundError]]
+(\cref{sec:starting-git}) before the command has done anything, and
+nothing in the command catches it, so Typer prints a traceback.
+The traceback ends in the right sentence, but a student who has not
+installed Git is the reader least equipped to find it there.
+
+The group is the one place every command passes through.
+Typer runs a subcommand inside its group's [[invoke]], including the
+commands of the [[metrics]] and [[tutorial]] sub-groups, so one
+override covers them all, where a [[try]] in each command would be
+forgotten at the next command added.
+A callback cannot do this, because it runs before the subcommand
+rather than around it.
+Nor can the console script: [[pyproject.toml]] points at [[app]] and
+so do the tests, through [[CliRunner]], so a wrapper function would
+be exercised by neither.
+
+Only [[GitNotFoundError]] is converted.
+A [[GitError]] with an exit status means Git ran and refused, which
+is a damaged log or a bug in learnlog; both deserve the traceback,
+or the more specific sentence that the commands expecting such a
+refusal already produce (\cref{sec:export,sec:checkout}).
+[[SystemExit]] with a string is how every other refusal in this
+module is delivered---exit status 1, the message on standard
+error---and, unlike [[typer.Exit]], it carries the message, which
+here is the whole point.
+
+<<constants>>=
+class LearnlogGroup(TyperGroup):
+    """The learnlog command group.
+
+    Adds the one handler every subcommand would otherwise need: a
+    Git that cannot be found is reported as a sentence naming the
+    fix, not as a traceback.
+    """
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except GitNotFoundError as error:
+            raise SystemExit(str(error)) from error
+@
+
+The repository is built before [[PATH]] is scrubbed, because building
+it runs Git; the scrub reaches the command because [[git_environment]]
+copies the process environment (\cref{sec:git-environment}).
+The [[SystemExit]] assertion is the one that matters: [[CliRunner]]
+reports exit status 1 for any uncaught exception, so without it the
+test would pass on the very traceback it exists to forbid.
+
+<<test functions>>=
+def test_a_missing_git_is_a_sentence_not_a_traceback(
+    workdir, monkeypatch,
+):
+    """A student without Git gets the fix, not a stack trace."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("PATH", str(workdir / "no-such-bin"))
+    result = CliRunner().invoke(app, ["list"])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "Install Git" in result.output
+@
+
+\subsection{The app object}
 
 <<typer app>>=
 app = typer.Typer(
     name="learnlog",
+    cls=LearnlogGroup,
     help="Set up and review student development logs.",
     no_args_is_help=True,
 )
@@ -4426,7 +4509,7 @@ which is the same bargain branches have always been on, and
 
 \paragraph{Inherited standard I/O.}
 
-[[push]] uses [[subprocess.run]] with inherited standard I/O---the
+[[push]] uses [[run_git]] with inherited standard I/O---the
 same approach as the [[git]] passthrough command (\cref{sec:git})---so
 that the user sees transfer progress and can answer a credential
 prompt.
@@ -4443,6 +4526,10 @@ from the code-state extraction that also thought it had a reason
 (\cref{sec:extract-code-state}): Git's own diagnosis has already
 reached the terminal, and the exit code below is Git's, so a failed
 push is neither silent nor mistaken for a successful one.
+A Git that is not there at all is the one failure Git cannot diagnose
+for us, and [[run_git]] reports it the same way inside and outside the
+wrapper (\cref{sec:starting-git}), so staying out no longer means
+losing that either.
 
 <<typer commands>>=
 @app.command()
@@ -4470,12 +4557,12 @@ def push(
     workdir = resolve_workdir(directory)
     repo = LearnlogRepo(workdir)
 
-    cmd = ["git", "push", "-u"]
+    cmd = ["push", "-u"]
     if force:
         cmd.append("--force")
     cmd += ["origin", *PUSH_REFSPECS]
 
-    result = subprocess.run(
+    result = run_git(
         cmd,
         env=repo.env,
         cwd=str(repo.workdir),
@@ -4696,7 +4783,7 @@ a standard clone produces a properly configured repository with remote
 tracking branches---so subsequent [[push]] and [[pull]]
 (\cref{sec:pull}) operations work without additional setup.
 
-Like [[push]], we use [[subprocess.run]] with inherited I/O so the
+Like [[push]], we use [[run_git]] with inherited I/O so the
 user sees clone progress and can respond to credential prompts.
 We deliberately avoid constructing a [[LearnlogRepo]] before the
 clone completes, because its constructor auto-initialises an empty
@@ -4826,8 +4913,8 @@ staging = pathlib.Path(
     )
 )
 try:
-    result = subprocess.run(
-        ["git", "clone", url, str(staging)],
+    result = run_git(
+        ["clone", url, str(staging)],
         cwd=str(workdir),
     )
     if result.returncode != 0:
@@ -5208,8 +5295,8 @@ A missing or unreachable [[origin]] surfaces here, and its exit code
 is the one worth reporting, so we stop on it.
 
 <<fetch the remote branches>>=
-fetched = subprocess.run(
-    ["git", "fetch", "origin"],
+fetched = run_git(
+    ["fetch", "origin"],
     env=repo.env,
     cwd=str(repo.workdir),
 )
@@ -6148,8 +6235,8 @@ def git_command(
     learnlog_dir = workdir / ".learnlog"
     env = git_environment(learnlog_dir, workdir)
 
-    result = subprocess.run(
-        ["git"] + args,
+    result = run_git(
+        args,
         env=env,
         cwd=str(workdir),
     )
@@ -6329,6 +6416,26 @@ def test_git_command_forwards_exit_code(
         app, ["git", "log", "--invalid-option"]
     )
     assert result.exit_code != 0
+@
+
+The passthrough is the one command that reaches Git without a
+[[LearnlogRepo]] in front of it, so it is where the unwrapped
+launch path (\cref{sec:starting-git}) can be checked on its own:
+
+<<test functions>>=
+def test_git_command_without_git_names_the_fix(
+    workdir, monkeypatch,
+):
+    """The passthrough reports a missing Git like any command."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    monkeypatch.setenv("PATH", str(workdir / "no-such-bin"))
+    result = CliRunner().invoke(app, ["git", "log"])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "Install Git" in result.output
 @
 
 Hidden means absent from the catalogue and nothing more, so the test
@@ -6524,7 +6631,7 @@ implementation detail.
 The implementation mirrors the [[git]] passthrough
 (\cref{sec:git}): we find the [[.learnlog/]] directory,
 set the Git environment, and forward all arguments to
-[[git tag]].
+[[git tag]] through [[run_git]] (\cref{sec:starting-git}).
 
 [[git tag]] with no ref tags HEAD, and which commit that is depends
 on something outside this command: whether [[learnlog tag]] is itself
@@ -6586,8 +6693,8 @@ def tag_command(
     learnlog_dir = workdir / ".learnlog"
     env = git_environment(learnlog_dir, workdir)
 
-    result = subprocess.run(
-        ["git", "tag"] + ctx.args,
+    result = run_git(
+        ["tag", *ctx.args],
         env=env,
         cwd=str(workdir),
     )
