@@ -123,6 +123,7 @@ import pytorial
 import typer
 from typer.core import TyperGroup
 
+import learnlog
 from learnlog import _is_home_or_above, find_learnlog_dir
 from learnlog._autostart import (
     venv_script_candidates,
@@ -2577,15 +2578,19 @@ the command tolerates [[python3]] and a leading [[./]], and the greeting
 tolerates case and punctuation variation around [[hello]] and [[world]].
 The final playback step looks for [[learnlog play -b]] (accepting the
 long [[--batch]] alternative through a regex), then verifies the
-recorded run by matching [[hello.py]] and the same lenient greeting,
-plus the stable [[diff --git]] header that proves a real diff was
-rendered.
+recorded run by matching [[hello.py]], the same lenient greeting, and
+the reading view's [[Code changes]] heading, which proves the record
+reported what the run changed.
 We deliberately drop the [[Script: hello.py]] and
 [[stdout: Hello, world!]] line prefixes from the validation: those
-strings are an internal output format of [[learnlog play -b]], not
-anything the student types, and pinning the tutorial to that exact
-format would make it fragile to future viewer changes without
-strengthening the learning signal.
+strings are the log's storage format rather than anything the student
+types, and pinning the tutorial to them would make it fragile to
+changes in how a record is stored without strengthening the learning
+signal.
+[[Code changes]] is on the other side of that line: it is the reading
+view's own vocabulary, emitted for every run record whatever its diff
+looks like (\cref{sec:record-lines}), so it fails when the teaching
+changes rather than when the storage does.
 We lock the resulting mixed-mode pattern list in with regression tests
 against the generated tutorial resource.
 
@@ -2768,7 +2773,7 @@ def test_getting_started_reactivates_and_checks_playback():
         (r"learnlog\s+play\b[^\n]*(?:-b\b|--batch\b)", "regex"),
         ("hello.py", "contains"),
         (r"(?i)hello[,!\s]*world", "regex"),
-        ("diff --git", "contains"),
+        ("Code changes", "contains"),
     )
     assert play_step.check_command is None
     assert "learnlog play -b" in play_step.instructions
@@ -2777,8 +2782,9 @@ def test_getting_started_reactivates_and_checks_playback():
     expert_play = tutorial_step(
         "getting-started-expert.md", "Inspect the recorded run"
     )
-    assert "Script: hello.py" in expert_play.instructions
-    assert "diff" in expert_play.instructions
+    assert "learnlog play -b --raw" in expert_play.instructions
+    assert "Script:" in expert_play.instructions
+    assert "diff --git" in expert_play.instructions
 @
 
 One step is keyed to learnlog's \emph{output} rather than to what the
@@ -7288,6 +7294,85 @@ It is a debugging and archaeology switch rather than a reading one:
 the material it restores is setup noise and history from a policy that
 no longer applies, which is exactly why the default hides it.
 
+[[--raw]] / [[-r]] is the other axis, and the two compose because they
+answer different questions.
+[[--all]] decides \emph{which} runs are shown; [[--raw]] decides
+\emph{how} a run is shown---as the reading card of \cref{render}, or
+as the [[git show]] text the log actually stores.
+A student debugging their own record wants
+[[learnlog play -b --all --raw]] and gets exactly the union, not a
+mode that has to be chosen between.
+The reading view is the default because the audience is a first-year
+student and the stored format is full of vocabulary that has nothing
+to teach them; the raw view stays reachable because the same log is
+also the thing a teacher, a bug report, and a [[git]] command have to
+talk about.
+
+Colour follows the rule every well-behaved command-line tool follows,
+and [[use_color]] (\cref{sec:use-color}) states it: [[--color]] on,
+[[--no-color]] off, and by default on only when standard output is a
+terminal and [[NO_COLOR]] is unset.
+The default is what makes [[learnlog play -b > log.txt]] and
+[[learnlog play -b | grep]] produce plain text without the student
+knowing there was a decision to make, and it is the same detection
+[[--batch]] already does one line below.
+Typer's [[CliRunner]] connects no terminal, so a test that invokes
+[[play]] through it can only ever exercise the automatic \emph{off}
+branch; the automatic \emph{on} branch is covered where it can be, by
+[[render]]'s unit test of [[use_color]] against a stub stream.
+
+Without a starting ref the viewer opens on the newest record, not the
+oldest.
+A student who types [[learnlog play]] has just run something and wants
+to see how it went; the beginning of the log is where they were weeks
+ago.
+The newest record, though, is usually the [[play]] run itself:
+playback is recorded (\cref{sec:review-runs}), and its header commit is
+in the list before the viewer opens.
+So the default is the record just before the run in progress---the
+one that made the student look---and the run in progress is one
+[[\textrightarrow]] away, which is where a reader expects the present
+to be.
+Reading the log from a bundle or from an unwired interpreter records
+no run, and then the newest record is simply the last one.
+Batch mode keeps starting from the beginning: it prints rather than
+positions, and [[learnlog play -b | less]] is how a reader gets the
+whole log.
+
+<<helper functions>>=
+def current_run_commit():
+    """The header commit of the run being recorded, or ``None``."""
+    return getattr(learnlog.repo, "run_commit", None)
+
+
+def latest_record_index(commits, current=None):
+    """Index of the newest record other than the run in progress.
+
+    ``current`` is that run's header commit; when it is the last
+    entry the one before it is chosen, so that ``learnlog play``
+    opens on what the student just did rather than on itself.
+    """
+    last = len(commits) - 1
+    if last > 0 and commits[last]["hash"] == current:
+        return last - 1
+    return last
+@
+
+Let's verify the choice in the three situations the viewer meets: a
+recorded playback whose own header ends the list, a log read without
+a run in progress, and a run in progress that is not in this list at
+all (playback of a bundle):
+
+<<test functions>>=
+def test_latest_record_index_skips_the_run_in_progress():
+    from learnlog.cli import latest_record_index
+    commits = [{"hash": "aaa"}, {"hash": "bbb"}, {"hash": "ccc"}]
+    assert latest_record_index(commits, "ccc") == 1
+    assert latest_record_index(commits, None) == 2
+    assert latest_record_index(commits, "zzz") == 2
+    assert latest_record_index([{"hash": "ccc"}], "ccc") == 0
+@
+
 <<typer commands>>=
 @app.command()
 def play(
@@ -7333,6 +7418,27 @@ def play(
             ),
         ),
     ] = False,
+    raw: Annotated[
+        bool,
+        typer.Option(
+            "--raw", "-r",
+            help=(
+                "Show the recorded log format (git show "
+                "output) instead of the reading view."
+            ),
+        ),
+    ] = False,
+    color: Annotated[
+        bool | None,
+        typer.Option(
+            "--color/--no-color",
+            help=(
+                "Colour the output.  Default: only when "
+                "writing to a terminal and NO_COLOR is "
+                "unset."
+            ),
+        ),
+    ] = None,
 ):
     """Interactively play back the development log."""
     import shutil
@@ -7343,7 +7449,7 @@ def play(
         if not commits:
             raise SystemExit("No commits found.")
 
-        start_index = 0
+        start_index = None
         if start:
             <<find starting commit index>>
 
@@ -7364,11 +7470,16 @@ use_batch = (
     else not sys.stdout.isatty()
 )
 if use_batch:
-    play_batch(repo, commits, start_index,
-               filter_internal)
+    play_batch(repo, commits, start_index or 0,
+               filter_internal, raw=raw, color=color)
 else:
+    if start_index is None:
+        start_index = latest_record_index(
+            commits, current_run_commit(),
+        )
     viewer = PlaybackViewer(
         repo, commits, start_index, filter_internal,
+        raw=raw, color=color,
     )
     viewer.run()
 @
@@ -7376,8 +7487,8 @@ else:
 Typer's [[CliRunner]] does not connect a real terminal, so
 invoking [[play]] through it exercises the batch path
 automatically.
-We verify that the command succeeds and that every commit
-appears in the output:
+We verify that the command succeeds and shows the reading view, and
+that [[--raw]] on the same log shows the stored format instead:
 
 <<test functions>>=
 def test_play_batch_via_cli(workdir):
@@ -7385,12 +7496,86 @@ def test_play_batch_via_cli(workdir):
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
     runner = CliRunner()
     result = runner.invoke(
         app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
+    assert "You ran hello.py" in result.output
+    assert "Code changes" in result.output
+    assert "diff --git" not in result.output
+
+def test_play_raw_via_cli(workdir):
+    """The --raw flag prints the stored log format."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "--raw", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "Run: hello.py" in result.output
     assert "diff --git" in result.output
+    assert "Code changes" not in result.output
+@
+
+Colour is the one behaviour the runner can only half exercise, so the
+three assertions below are chosen for what a TTY-less process
+\emph{can} decide.
+Without a terminal the automatic rule says no colour, so the default
+invocation must be free of escapes; [[--color]] must overrule the
+missing terminal; and [[NO_COLOR]] must not overrule [[--color]], which
+is the half of the [[NO_COLOR]] convention that tools get wrong.
+The escape we look for is the green of an added diff line, which is
+the first colour a student sees.
+
+<<test functions>>=
+def test_play_colour_follows_the_flags(workdir, monkeypatch):
+    """--no-color strips escapes, --color forces them."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    (workdir / "hello.py").write_text('print("hi")\n')
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    runner = CliRunner()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    plain = runner.invoke(
+        app, ["play", "--no-color", "--from", str(workdir)]
+    )
+    assert plain.exit_code == 0
+    assert "\x1b[" not in plain.output
+
+    default = runner.invoke(
+        app, ["play", "--from", str(workdir)]
+    )
+    assert "\x1b[" not in default.output
+
+    coloured = runner.invoke(
+        app, ["play", "--color", "--from", str(workdir)]
+    )
+    assert coloured.exit_code == 0
+    assert "\x1b[32m" in coloured.output
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert "\x1b[" not in runner.invoke(
+        app, ["play", "--from", str(workdir)]
+    ).output
+    assert "\x1b[32m" in runner.invoke(
+        app, ["play", "--color", "--from", str(workdir)]
+    ).output
 @
 
 We verify that review runs reach playback without [[--all]], while
@@ -7412,9 +7597,9 @@ def test_play_shows_review_runs(workdir):
         app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
-    assert "Script: hello.py" in result.output
-    assert "Run: learnlog play" in result.output
-    assert "Run: learnlog export" not in result.output
+    assert "You ran hello.py" in result.output
+    assert "You looked back through your log" in result.output
+    assert "learnlog export" not in result.output
 
 def test_play_keeps_student_run_intact(workdir):
     """A learnlog run overlapping a student run stays separate.
@@ -7448,7 +7633,9 @@ def test_play_keeps_student_run_intact(workdir):
         app, ["play", "--from", str(workdir)]
     )
     assert result.exit_code == 0
-    review_start = result.output.index("Run: learnlog play")
+    review_start = result.output.index(
+        "You looked back through your log",
+    )
     assert result.output.index("stdout: hello") < review_start
     assert result.output.index("CURSES SCREEN") > review_start
 
@@ -7466,8 +7653,8 @@ def test_play_all_shows_internal_runs(workdir):
         ["play", "--all", "--from", str(workdir)],
     )
     assert result.exit_code == 0
-    assert "Script: hello.py" in result.output
-    assert "Run: learnlog export" in result.output
+    assert "You ran hello.py" in result.output
+    assert "learnlog export" in result.output
 @
 
 We resolve the starting ref through [[git rev-parse]], which

@@ -379,13 +379,29 @@ without changing the total logical size, while [[_truncate_locked]]
 appends the truncation notice after flushing any already accepted
 fragment.
 
+A fragment is flushed for one of two reasons, and they want different
+endings.
+The truncation notice and the final snapshot take the fragment as it
+is: it is the last thing in the log, and nothing follows it that could
+be mistaken for its continuation.
+A switch of stream is the other reason, and there the fragment must be
+\emph{terminated}: the entry that follows belongs to another stream
+and gets its own prefix, so if the fragment keeps the line, the log
+reads [[stdout: Name? stdin: Daniel]]---one output line whose text
+happens to contain the input.
+Every reader of the log takes a prefixed line as its unit
+(\cref{sec:io-stream-prefixes}), so the typed answer would be invisible
+as input to all of them.
+[[terminate]] is what says which of the two flushes this is; the
+newline it adds is counted like any other byte.
+
 <<iolog methods>>=
 def _write_entry_locked(self, prefix, text):
     entry = self._entry(prefix, text)
     self.buf.write(entry)
     self.size += len(entry)
 
-def _flush_pending_locked(self):
+def _flush_pending_locked(self, terminate=False):
     if not self.pending_text:
         return
     prefix = self.pending_prefix
@@ -393,6 +409,9 @@ def _flush_pending_locked(self):
     self.pending_prefix = None
     self.pending_text = ""
     self._write_entry_locked(prefix, text)
+    if terminate:
+        self.buf.write("\n")
+        self.size += 1
 
 def _truncate_locked(self, flush_pending=False):
     if flush_pending:
@@ -418,13 +437,26 @@ Once fragmented writes have been reassembled, we still prefix every
 completed line separately so that multi-line output remains readable
 even when stdout, stderr, and stdin interleave mid-block.
 
+A fragment that is still open when another stream writes is closed
+first, on a line of its own.
+The commonest shape of a first-year program is a prompt printed without
+a newline and an answer typed to it, and on the terminal the two share
+a line; the log does not copy that, because the log's unit is the
+prefixed line and its promise is that each line names its stream.
+The prompt therefore ends with the newline the program never wrote,
+and the answer starts on the next line as [[stdin: ]].
+A reader who wants the terminal's picture back can rejoin an
+unterminated prompt with the input that follows it; a reader handed
+the joined line could never tell the input from the output.
+
 <<iolog methods>>=
 def log(self, prefix, text):
     """Log ``text`` with ``prefix`` (e.g. ``'stdout'``).
 
     Each completed line of ``text`` gets its own prefixed entry.
-    Incomplete trailing fragments stay pending until a later write,
-    another stream forces a flush, or :meth:`getvalue` snapshots them.
+    Incomplete trailing fragments stay pending until a later write
+    from the same stream continues them, another stream closes
+    them on a line of their own, or :meth:`getvalue` snapshots them.
     ANSI escape sequences are stripped before buffering.
     If the buffer is full, further writes are silently dropped.
     """
@@ -437,7 +469,7 @@ def log(self, prefix, text):
         if self.truncated:
             return
         if self.pending_text and self.pending_prefix != prefix:
-            self._flush_pending_locked()
+            self._flush_pending_locked(terminate=True)
         if self.pending_text:
             if self._current_size_locked() + len(text) > self.max_bytes:
                 self._truncate_locked(flush_pending=True)
@@ -458,7 +490,11 @@ def log(self, prefix, text):
 @
 
 Let's verify the basic logging behavior---single lines, interleaved
-streams, and multi-line writes:
+streams, and multi-line writes.
+The interleaved case is the prompt-and-answer shape, and the assertion
+is on the whole log rather than on its parts: what matters is that the
+answer is a line of its own, which no [[in]] test on the pieces would
+notice.
 
 <<test functions>>=
 def test_iolog_logs_with_prefix():
@@ -471,10 +507,17 @@ def test_iolog_interleaved_streams():
     log.log("stdout", "prompt: ")
     log.log("stdin", "answer\n")
     log.log("stdout", "ok\n")
-    value = log.getvalue()
-    assert "stdout: prompt: " in value
-    assert "stdin: answer\n" in value
-    assert "stdout: ok\n" in value
+    assert log.getvalue() == (
+        "stdout: prompt: \n"
+        "stdin: answer\n"
+        "stdout: ok\n"
+    )
+
+def test_iolog_stream_switch_counts_its_newline():
+    log = IOLog()
+    log.log("stdout", "prompt: ")
+    log.log("stdin", "answer\n")
+    assert log.size == len(log.getvalue())
 
 def test_iolog_multiline_write():
     log = IOLog()

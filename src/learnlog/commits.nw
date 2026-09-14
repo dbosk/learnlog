@@ -47,9 +47,12 @@ instance but do not construct one.
 [[collections]] provides the named tuple that carries the results
 of the shared log scan (\cref{sec:run-index}).
 
-The recorder owns the commit format, so the field names and the
-trailer keyword come from \cref{gitrepo} rather than being spelled
-out a second time here.
+The recorder owns the commit format, so the field names, the section
+markers and the placeholder that stands in for an empty log all come
+from \cref{gitrepo} rather than being spelled out a second time here.
+Reading a run block (\cref{sec:parse-run-block}) means cutting it at
+the same strings the writer used to join it, so importing them is not
+tidiness but the only way the two halves can be guaranteed to agree.
 
 <<commits imports>>=
 from __future__ import annotations
@@ -59,7 +62,9 @@ import datetime
 
 from learnlog.gitrepo import (
     EXCEPTION_SECTION_MARKER,
+    IO_SECTION_MARKER,
     LearnlogRepo,
+    NO_IO_PLACEHOLDER,
     REVIEW_SUBCOMMANDS,
     RUN_ID_FIELD,
     TRAILER_PREFIX,
@@ -1463,6 +1468,80 @@ def parse_show_sections(lines):
 @
 
 
+\subsection{Splitting the three sections apart}
+\label{sec:split-commit-detail}
+
+Boundaries alone are not what most callers want; they want the three
+pieces, with the message as text rather than as indented lines.
+Git indents the message by four spaces in [[git show]] output, so
+every reader of the message begins by undoing that---and a reader
+that forgets is not obviously broken, it merely reports four spaces
+of leading whitespace on every line of a transcript that is supposed
+to be exact.
+Undoing it in one place is what keeps that mistake from being
+available to make.
+
+The diff comes back as an empty list rather than as [[None]] when
+the commit has none---which is the initial commit, recording a run
+without changing a file---so a caller can concatenate the three
+parts without first asking whether the third exists.
+
+<<commits functions>>=
+def split_commit_detail(detail):
+    """Split ``git show`` output into its three parts.
+
+    Returns `(header_lines, message, diff_lines)`, where
+    `message` is the commit message with git's four-space
+    indent removed, and `diff_lines` is empty when the commit
+    has no diff.
+    """
+    lines = detail.split("\n")
+    header_end, diff_start = parse_show_sections(lines)
+    end = diff_start if diff_start is not None else len(lines)
+
+    message = "\n".join(
+        line[4:] if line.startswith("    ") else line
+        for line in lines[header_end + 1:end]
+    )
+    return lines[:header_end + 1], message, lines[end:]
+@
+
+Let's verify both shapes---a commit whose diff has to be found, and
+one that has none:
+
+<<commits test functions>>=
+def test_split_commit_detail_with_diff():
+    from learnlog.commits import split_commit_detail
+    detail = (
+        "commit abc123\n"
+        "Author: Test <test@test>\n"
+        "\n"
+        "    Run: hello.py\n"
+        "\n"
+        "    Exit-Code: 0\n"
+        "\n"
+        "diff --git a/hello.py b/hello.py\n"
+        '+print("hi")'
+    )
+    header, message, diff = split_commit_detail(detail)
+    assert header[0] == "commit abc123"
+    assert message == "Run: hello.py\n\nExit-Code: 0\n"
+    assert diff[0].startswith("diff --git ")
+
+def test_split_commit_detail_without_diff():
+    from learnlog.commits import split_commit_detail
+    detail = (
+        "commit abc123\n"
+        "\n"
+        "    learnlog: initial commit"
+    )
+    header, message, diff = split_commit_detail(detail)
+    assert header == ["commit abc123", ""]
+    assert message == "learnlog: initial commit"
+    assert diff == []
+@
+
+
 \subsection{Reordering commit detail}
 
 Given the section boundaries, rearranging is a matter of slicing the
@@ -1470,6 +1549,14 @@ lines into header, message, and diff, then reassembling them in the
 order that puts code changes first.
 When no diff is present (the initial commit), we leave the output
 unchanged.
+
+This is the one reader that slices the lines itself instead of
+calling [[split_commit_detail]], and the reason is what that function
+does for everyone else: it un-indents the message.
+Reordering hands the message straight back to a viewer as part of
+[[git show]] output, where it is supposed to be indented, so
+stripping four spaces only to put them back would be work whose only
+possible effect is to get it wrong.
 
 <<commits functions>>=
 def reorder_commit_detail(detail):
@@ -1841,13 +1928,12 @@ run, which they can then check out to recover.
 
 Both workflows reduce to the same underlying question: does a
 given run block represent a successful run or a failed one?
-The [[progsnap2]] module (\cref{progsnap2}) has
-[[parse_run_block]] that extracts every field of a block, but
-filtering only needs the verdict, not the details---and reaching
-into the exporter from the CLI would invert the module layering
-established in \cref{commits}.  So we define a narrower
-classifier here that the CLI can import without pulling in the
-exporter.
+\Cref{sec:parse-run-block} below has [[parse_run_block]], which
+extracts every field of a block, but filtering only needs the
+verdict, not the details, and the two answers rest on different
+amounts of trust in the block---that section returns to why this
+narrower classifier is worth keeping beside the full parser
+rather than being expressed in terms of it.
 
 A run is a success only when the exit code is zero \emph{and} no
 exception was recorded.  The recorder in \cref{learnlog} currently
@@ -2032,21 +2118,416 @@ def test_commit_outcomes_no_runs():
 @
 
 
+\section{Parsing a run block in full}
+\label{sec:parse-run-block}
+
+[[classify_run_block]] above reads a block for a single bit of
+information.  Everything else that meets a run block wants all of
+it: the ProgSnap2 exporter turns each field into a column of the
+event table (\cref{progsnap2}), the metrics module reads exit codes
+and tracebacks to tell a syntax error from a runtime one
+(\cref{metrics}), and showing a student their own run means
+rendering the same fields a third time.
+
+The full parser began life in the exporter, back when the exporter
+was the only reader that needed it.  That placement contradicts the
+separation this chapter opens with: reading a recorded run is this
+module's job, and a reader that has to import the exporter to do it
+drags the whole ProgSnap2 chapter---zip files, temporary Git
+repositories, \LaTeX{} generation---behind a question about one
+commit message.  So the parser lives here, beside the classifier
+that answers the narrower question, and the exporter imports it like
+every other reader.
+
+Keeping both is not duplication, because the two disagree, usefully,
+about what a block has to look like.  The classifier treats any
+line below an [[--- exception ---]] marker as exception text, so a
+truncated or hand-assembled block still yields a verdict; the parser
+below cuts the two sections exactly where [[format_run_trailer]]
+joined them, because its promise is that what the recorder wrote
+comes back out unchanged.  Neither tolerance would serve both jobs:
+loosening the parser would break that promise, and tightening the
+classifier would withhold a verdict from blocks a teacher can still
+read perfectly well.
+
+[[parse_run_summary]] above extracts just enough for the [[list]]
+command: command string, start time, and run count.
+The readers named above need every field of every run block---exit
+code, end time, exception type, I/O---which is what this parser
+supplies.
+
+A run block has two parts: a \emph{header} written by
+[[begin_run]] (always present) and a \emph{trailer} written by
+[[finalize_run]] (missing if the program was killed by SIGKILL).
+The header contains [[Run:]], [[Script:]], [[Arguments:]], and
+[[Start-Time:]]; the trailer contains [[End-Time:]],
+[[Exit-Code:]], [[--- I/O ---]], and [[--- exception ---]].
+
+We parse each block into a flat dict with string values, keeping
+the raw text for I/O and exception sections.  Missing trailer
+fields are represented as [[None]]---this lets callers distinguish
+\enquote{program crashed} from \enquote{exit code was zero}.
+
+A review run's trailer carries a further section, the [[Viewed:]]
+lines naming the commits the student looked at.
+Reading it is [[parse_view_trace]]'s job (\cref{sec:view-trace}); we
+call it here so that every consumer of a parsed block sees the trace
+as just another field, and so that ordinary runs---which have no such
+lines---come back with an empty list rather than a missing key.
+
+<<commits functions>>=
+def parse_run_block(block_text):
+    """Parse a single run block into a dict.
+
+    Returns a dict with keys ``script``, ``arguments``,
+    ``start_time``, ``end_time``, ``exit_code``,
+    ``io_log``, ``exception_info``, and ``viewed``.
+    Missing trailer fields are ``None``; ``viewed`` is the
+    view trace, empty for everything but a review run.
+    """
+    result = {
+        "script": None, "arguments": None,
+        "start_time": None, "end_time": None,
+        "exit_code": None, "io_log": None,
+        "exception_info": None,
+        "viewed": parse_view_trace(block_text),
+    }
+
+    <<parse key-value fields>>
+    <<parse trailer fields>>
+
+    return result
+@
+
+Both header and trailer use simple [[Key: value]] lines, so
+we parse them in a single pass.
+We skip the first [[Run:]] line because it duplicates the
+[[Script:]] and [[Arguments:]] fields in a less structured form.
+
+<<parse key-value fields>>=
+for line in block_text.split("\n"):
+    if line.startswith("Script:"):
+        result["script"] = line.split(":", 1)[1].strip()
+    elif line.startswith("Arguments:"):
+        result["arguments"] = (
+            line.split(":", 1)[1].strip()
+        )
+    elif line.startswith("Start-Time:"):
+        result["start_time"] = (
+            line.split(":", 1)[1].strip()
+        )
+    elif line.startswith("End-Time:"):
+        result["end_time"] = (
+            line.split(":", 1)[1].strip()
+        )
+    elif line.startswith("Exit-Code:"):
+        result["exit_code"] = (
+            line.split(":", 1)[1].strip()
+        )
+@
+
+The I/O and exception sections are delimited by the markers
+[[format_run_trailer]] writes (\cref{sec:io-section}), and the I/O
+section is read back by cutting exactly at them.
+The parser this replaced took the text between the markers and
+[[strip]]ped it, which is the natural thing to write and wrong for
+this format: a captured log is a transcript, so spaces at the start of
+its first line and at the end of its last are output the program
+produced, and a reader that removed them showed a different set of
+bytes than the student saw.
+
+Cutting exactly means naming both edges as the writer writes them.
+The log begins on the line after the [[--- I/O ---]] marker, so the
+opening delimiter carries the newline that ends the marker line.
+It ends one blank line above [[--- exception ---]], and that blank
+line belongs to the layout rather than to the log
+(\cref{sec:io-section}), so the closing cut drops exactly one
+newline---[[removesuffix]] rather than [[rstrip]], because a run of
+newlines at the end of the section would be output too, and only the
+last of them is the separator.
+
+Anchoring both delimiters between newlines is what keeps a run's own
+text from being mistaken for one: a program that prints
+[[--- exception ---]] has that line recorded as [[stdout: ]] plus the
+text, which the anchor does not match.
+An \emph{unprefixed} line could still say it (\cref{sec:io-notes}),
+and no anchor can settle that---the format has one way of spelling
+both---so we take the first closing marker, as this has always done.
+
+<<parse trailer fields>>=
+io_start = block_text.find(IO_SECTION_OPEN)
+if io_start >= 0:
+    io_text = block_text[io_start + len(IO_SECTION_OPEN):]
+    exc_start = io_text.find(EXCEPTION_SECTION_OPEN)
+    if exc_start < 0:
+        io_content = io_text.rstrip("\n")
+    else:
+        io_content = io_text[:exc_start].removesuffix("\n")
+        exc_content = io_text[
+            exc_start + len(EXCEPTION_SECTION_OPEN):
+        ].strip()
+        if exc_content and exc_content != "None":
+            result["exception_info"] = exc_content
+    if io_content and io_content != NO_IO_PLACEHOLDER:
+        result["io_log"] = io_content
+<<commits constants>>=
+IO_SECTION_OPEN = f"\n{IO_SECTION_MARKER}\n"
+EXCEPTION_SECTION_OPEN = f"\n{EXCEPTION_SECTION_MARKER}\n"
+@
+
+The exception section keeps its [[strip]], and the asymmetry is in the
+format rather than in our attention: the I/O section has a marker
+below it to cut at, while the exception text runs to the end of the
+block and therefore ends in whatever the commit message ended
+in---Git's closing newline included.
+There is nothing there to preserve it against, so preserving it would
+be preserving punctuation the recorder never wrote.
+
+A block whose I/O section has no [[--- exception ---]] below it is not
+something [[format_run_trailer]] can produce; it is what a hand-made
+or truncated message looks like.
+We read the section to the end of the block and drop the trailing
+newlines, which is the same cut the writer would have made.
+
+Let's verify the parser handles complete blocks, header-only
+blocks (crash), and blocks with exceptions:
+
+<<commits test functions>>=
+def test_parse_run_block_complete():
+    from learnlog.commits import parse_run_block
+    block = (
+        "Run: hello.py arg1\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: arg1\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "End-Time: 2026-01-01T10:00:05\n"
+        "Exit-Code: 0\n"
+        "\n"
+        "--- I/O ---\n"
+        "stdout: hello world\n"
+        "\n"
+        "--- exception ---\n"
+        "None"
+    )
+    result = parse_run_block(block)
+    assert result["script"] == "hello.py"
+    assert result["arguments"] == "arg1"
+    assert result["start_time"] == "2026-01-01T10:00:00"
+    assert result["end_time"] == "2026-01-01T10:00:05"
+    assert result["exit_code"] == "0"
+    assert result["io_log"] == "stdout: hello world"
+    assert result["exception_info"] is None
+
+def test_parse_run_block_crash():
+    """Header-only block indicates SIGKILL crash."""
+    from learnlog.commits import parse_run_block
+    block = (
+        "Run: hello.py (none)\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:00:00"
+    )
+    result = parse_run_block(block)
+    assert result["script"] == "hello.py"
+    assert result["end_time"] is None
+    assert result["exit_code"] is None
+
+def test_parse_run_block_exception():
+    from learnlog.commits import parse_run_block
+    block = (
+        "Run: hello.py (none)\n"
+        "\n"
+        "Script: hello.py\n"
+        "Arguments: (none)\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "End-Time: 2026-01-01T10:00:01\n"
+        "Exit-Code: 1\n"
+        "\n"
+        "--- I/O ---\n"
+        "(no I/O)\n"
+        "\n"
+        "--- exception ---\n"
+        "Traceback (most recent call last):\n"
+        '  File "hello.py", line 1\n'
+        "SyntaxError: invalid syntax"
+    )
+    result = parse_run_block(block)
+    assert result["exit_code"] == "1"
+    assert result["io_log"] is None
+    assert "SyntaxError" in result["exception_info"]
+@
+
+The parser's real contract is stronger than any of those blocks can
+say, and it is easiest to state by asking the writer for the block:
+whatever [[format_run_trailer]] puts in the section comes back out of
+it unchanged, spaces at both ends included.
+
+<<commits test functions>>=
+def test_parse_run_block_keeps_io_verbatim():
+    """The I/O section reads back exactly as it was written."""
+    from learnlog.gitrepo import format_run_trailer
+    from learnlog.commits import parse_run_block
+    io_log = (
+        "   [session start]   \n"
+        "stdout: padded   \n"
+        "stdout: \n"
+        "stdout: "
+    )
+    block = "\n".join([
+        "Run: menu.py (none)",
+        "",
+        "Script: menu.py",
+        "Arguments: (none)",
+        "Start-Time: 2026-01-01T10:00:00",
+        format_run_trailer(
+            io_log, None,
+            datetime.datetime(2026, 1, 1, 10, 0, 5), 0,
+        ),
+    ])
+    assert parse_run_block(block)["io_log"] == io_log
+@
+
+A review run's block reaches its readers with its navigation intact,
+while an ordinary run reports an empty trace rather than nothing at
+all---so a consumer never has to test for the key's presence:
+
+<<commits test functions>>=
+def test_parse_run_block_exposes_viewed():
+    from learnlog.commits import parse_run_block
+    first, second = "a" * 40, "b" * 40
+    block = (
+        "Run: learnlog play\n"
+        "\n"
+        "Script: learnlog\n"
+        "Arguments: play\n"
+        "Start-Time: 2026-01-01T10:00:00\n"
+        "End-Time: 2026-01-01T10:00:20\n"
+        "Exit-Code: 0\n"
+        f"Viewed: {first} 2026-01-01T10:00:01 open\n"
+        f"Viewed: {second} 2026-01-01T10:00:05 next\n"
+        "\n--- I/O ---\n(no I/O)\n"
+        "\n--- exception ---\nNone"
+    )
+    result = parse_run_block(block)
+    assert result["viewed"] == [
+        (first, "2026-01-01T10:00:01", "open"),
+        (second, "2026-01-01T10:00:05", "next"),
+    ]
+
+def test_parse_run_block_without_views():
+    from learnlog.commits import parse_run_block
+    result = parse_run_block(
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "Start-Time: 2026-01-01T10:00:00"
+    )
+    assert result["viewed"] == []
+@
+
+
+\subsection{The line vocabulary of a captured transcript}
+\label{sec:io-stream-prefixes}
+
+The [[io_log]] field the parser hands back is a transcript, and every
+line in it names the stream it came from: the capture layer writes
+[[stdout: ]], [[stderr: ]] or [[stdin: ]] in front of each completed
+line (\cref{capture}).
+Any reader that does more than print the transcript verbatim has to
+undo that---to colour input differently from output, to count the
+prompts a program wrote, or to file each line as an event of its own.
+
+We name the correspondence once, here, rather than letting each such
+reader spell the three prefixes out again.
+Naming it as \emph{pairs} is what makes it worth more than three bare
+strings: a reader needs the stream a line belongs to as well as the
+text to cut off the front of it, and taking both from one entry means
+the two can never be mismatched at a call site.
+The exporter's own event table is built on top of this one
+(\cref{sec:chunk-io}), so the two cannot drift apart.
+
+<<commits constants>>=
+IO_STREAM_PREFIXES = (
+    ("stdout: ", "stdout"),
+    ("stderr: ", "stderr"),
+    ("stdin: ", "stdin"),
+)
+@
+
+
+\subsection{Extracting exception type and message}
+\label{sec:parse-exception-line}
+
+The exception section of a run block contains a Python traceback.
+The last line has the exception type and message, formatted as
+[[ExceptionType: message]] or just [[ExceptionType]] when there
+is no message.
+Splitting them apart is what lets a reader group runs by what went
+wrong: the exporter fills the [[X-ExceptionType]] and
+[[X-ExceptionMessage]] columns from it (\cref{progsnap2}), and the
+metrics module counts syntax errors separately from runtime ones
+(\cref{metrics}).
+
+<<commits functions>>=
+def parse_exception_line(exception_info):
+    """Extract type and message from exception info.
+
+    Returns ``(exception_type, exception_message)`` where
+    either may be ``None``.
+    """
+    if not exception_info:
+        return None, None
+
+    last_line = exception_info.rstrip().split("\n")[-1]
+    if ":" in last_line:
+        exc_type, _, exc_msg = last_line.partition(":")
+        return exc_type.strip(), exc_msg.strip()
+    return last_line.strip(), None
+@
+
+Let's verify the three shapes a last line can take---a type with a
+message, a type alone, and no exception section at all:
+
+<<commits test functions>>=
+def test_parse_exception_line_with_message():
+    from learnlog.commits import parse_exception_line
+    info = (
+        "Traceback (most recent call last):\n"
+        '  File "hello.py", line 1\n'
+        "SyntaxError: invalid syntax"
+    )
+    typ, msg = parse_exception_line(info)
+    assert typ == "SyntaxError"
+    assert msg == "invalid syntax"
+
+def test_parse_exception_line_no_message():
+    from learnlog.commits import parse_exception_line
+    info = "KeyboardInterrupt"
+    typ, msg = parse_exception_line(info)
+    assert typ == "KeyboardInterrupt"
+    assert msg is None
+
+def test_parse_exception_line_none():
+    from learnlog.commits import parse_exception_line
+    assert parse_exception_line(None) == (None, None)
+    assert parse_exception_line("") == (None, None)
+@
+
+
 \section{Filtering [[git show]] output}
 
 We could fetch the raw commit message separately
 ([[git log --format=%B]]), but that would require an extra subprocess
 call per commit.
-Instead, we extract the message directly from the [[git show]]
-output---it is indented with four spaces---rewrite it, and reconstruct
-the output in place, reusing [[parse_show_sections]] to locate the
-boundaries.
+Instead, we take the message out of the [[git show]] output with
+[[split_commit_detail]] (\cref{sec:split-commit-detail}), rewrite it,
+and put the output back together around the result.
 
 Two different rewrites need this: merging a run's trailer back into its
 header (\cref{sec:run-join}) and dropping learnlog's internal runs
 (review runs stay---\cref{sec:filter-learnlog}).
-Taking the rewrite as a parameter keeps the fiddly
-un-indent/re-indent surgery in one place instead of two.
+Taking the rewrite as a parameter keeps the re-indent surgery in one
+place instead of two.
 
 <<commits functions>>=
 def rewrite_show_message(show_output, rewrite):
@@ -2056,25 +2537,29 @@ def rewrite_show_message(show_output, rewrite):
     Returns the reconstructed output, or ``None`` when the
     rewritten message is empty.
     """
-    lines = show_output.split("\n")
-    header_end, diff_start = parse_show_sections(lines)
+    header, raw_msg, diff = split_commit_detail(show_output)
 
-    <<extract and rewrite raw message>>
+    <<rewrite the commit message>>
     <<reconstruct show output>>
 @
 
-<<extract and rewrite raw message>>=
-end = diff_start if diff_start is not None else len(lines)
-msg_lines = lines[header_end + 1:end]
-raw_msg = "\n".join(
-    line[4:] if line.startswith("    ") else line
-    for line in msg_lines
-)
+A rewrite that empties the message is a signal rather than a result:
+it means every run in the commit was filtered out, so there is no
+commit left to show.
+Returning [[None]] lets the caller drop it entirely instead of
+printing a header with nothing under it.
+
+<<rewrite the commit message>>=
 new_msg = rewrite(raw_msg)
 
 if not new_msg.strip():
     return None
 @
+
+Re-indenting skips empty lines rather than indenting them, because
+trailing whitespace on a blank line is not what [[git show]] writes,
+and a reader comparing our output against git's own would see the
+difference.
 
 <<reconstruct show output>>=
 reindented = []
@@ -2084,8 +2569,6 @@ for line in new_msg.split("\n"):
     else:
         reindented.append("")
 
-header = lines[:header_end + 1]
-diff = lines[end:] if diff_start is not None else []
 return "\n".join(header + reindented + diff)
 @
 
@@ -2119,10 +2602,38 @@ Callers that have no map---tests, and anyone who only wants the commit
 as it was recorded---see the header alone, with no end time or captured
 I/O.
 
+We ask for [[--no-color]] explicitly because the student's own Git
+configuration reaches this command.
+[[git_environment]] (\cref{gitrepo}) strips the [[GIT_*]] variables
+that could redirect a write, but it deliberately keeps the config
+files: that is how a clone finds its credentials.
+A [[color.ui = always]] in [[~/.gitconfig]]---not a strange setting,
+it is what someone puts there after being annoyed by colour
+disappearing down a pipe---therefore makes Git wrap this output in
+ANSI escapes even though nothing here is a terminal.
+That would not merely look wrong: the diff boundary is found by
+matching [[diff --git ]] at the start of a line
+(\cref{sec:split-commit-detail}), and a colour code sits in front of
+it, so the whole diff would be read as part of the commit message.
+Asking for no colour is cheaper than teaching every reader below to
+see through it.
+
+Reordering is what a reader wants when it is shown the [[git show]]
+text itself, and only then.
+A caller that builds its own layout out of the three parts---the
+reading view of \cref{render} composes a headline, a changes section
+and a transcript---gains nothing from having them pre-shuffled, and
+would have to undo the shuffle before it could tell the message from
+the diff.
+So [[reorder]] says which of the two the caller is: leave it alone to
+get today's diff-first text, pass [[False]] to get the merged and
+filtered detail in Git's own order.
+
 <<commits functions>>=
 def get_commit_detail(repo, commit_hash,
                       filter_internal=True,
-                      trailers=None):
+                      trailers=None,
+                      reorder=True):
     """Return ``git show`` output for a single commit,
     reordered so the diff appears before the message.
 
@@ -2131,9 +2642,11 @@ def get_commit_detail(repo, commit_hash,
     When ``filter_internal`` is ``True`` (the default),
     learnlog's internal run blocks are stripped from the commit
     message; review runs are kept.  Returns ``None`` if every
-    run in the commit was internal.
+    run in the commit was internal.  With ``reorder`` false the
+    text keeps git's own order, header then message then diff,
+    for a caller that lays the parts out itself.
     """
-    result = repo.git("show", commit_hash)
+    result = repo.git("show", "--no-color", commit_hash)
     detail = result.stdout
 
     if trailers:
@@ -2148,7 +2661,7 @@ def get_commit_detail(repo, commit_hash,
     if detail is None:
         return None
 
-    return reorder_commit_detail(detail)
+    return reorder_commit_detail(detail) if reorder else detail
 @
 
 Let's verify that a run's results show up in its header commit once
@@ -2222,6 +2735,59 @@ def test_get_commit_detail_diff_before_message(workdir):
     first_msg_pos = detail.index(msg_lines[0])
     assert diff_pos < first_msg_pos, \
         "diff should appear before the commit message"
+@
+
+And that asking for git's own order gets it, on the same record, so
+that the two orders are pinned against each other rather than each
+against a fixture:
+
+<<commits test functions>>=
+def test_get_commit_detail_can_keep_gits_order(workdir):
+    """With reorder=False the diff stays after the message."""
+    from learnlog.commits import get_commits, \
+        get_commit_detail
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    (workdir / "hello.py").write_text('print("v2")\n')
+    repo.begin_run(
+        "hello.py", [], datetime.datetime(2026, 1, 1, 10, 5),
+    )
+    commits = get_commits(repo)
+    detail = get_commit_detail(
+        repo, commits[-1]["hash"], reorder=False,
+    )
+    message = [
+        line for line in detail.split("\n")
+        if line.startswith("    ")
+    ]
+    assert message, "expected indented message lines"
+    assert detail.index(message[0]) < detail.index("diff --git")
+@
+
+The colour setting is the interesting one to pin down, because
+nothing about it is visible from inside this function: it lives in a
+config file we never read, and the failure it causes is a diff that
+silently reads as message text.  Setting it on the log repository
+itself reproduces what an inherited [[~/.gitconfig]] would do:
+
+<<commits test functions>>=
+def test_get_commit_detail_ignores_colour_config(workdir):
+    """A colour-happy Git config must not reach the reader."""
+    from learnlog.commits import get_commits, \
+        get_commit_detail
+    repo = LearnlogRepo(workdir)
+    repo.git("config", "color.ui", "always")
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    (workdir / "hello.py").write_text('print("v2")\n')
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t2)
+    commits = get_commits(repo)
+    detail = get_commit_detail(repo, commits[-1]["hash"])
+    assert "\x1b" not in detail
+    assert "diff --git " in detail
 @
 
 

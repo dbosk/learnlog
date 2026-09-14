@@ -282,13 +282,13 @@ from learnlog.commits import (
     get_tag_map,
     is_learnlog_run,
     merge_run_trailers,
+    parse_exception_line,
     scan_run_commits,
 )
 from learnlog.progsnap2 import (
     UNTAGGED_LABEL,
     extract_code_state,
     parse_commit_runs,
-    parse_exception_line,
 )
 <<metrics functions>>=
 def run_records(repo, *, include_learnlog=False):

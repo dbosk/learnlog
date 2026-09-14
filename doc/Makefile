@@ -18,6 +18,7 @@ prgi26-lab0.html: prgi26-lab0.md
 ../src/learnlog/capture.tex: ../src/learnlog/capture.nw
 ../src/learnlog/gitrepo.tex: ../src/learnlog/gitrepo.nw
 ../src/learnlog/commits.tex: ../src/learnlog/commits.nw
+../src/learnlog/render.tex: ../src/learnlog/render.nw
 ../src/learnlog/progsnap2.tex: ../src/learnlog/progsnap2.nw
 ../src/learnlog/metrics.tex: ../src/learnlog/metrics.nw
 ../src/learnlog/viewer.tex: ../src/learnlog/viewer.nw
@@ -40,6 +41,7 @@ learnlog.pdf: ../src/learnlog/learnlog.tex
 learnlog.pdf: ../src/learnlog/capture.tex
 learnlog.pdf: ../src/learnlog/gitrepo.tex
 learnlog.pdf: ../src/learnlog/commits.tex
+learnlog.pdf: ../src/learnlog/render.tex
 learnlog.pdf: ../src/learnlog/progsnap2.tex
 learnlog.pdf: ../src/learnlog/metrics.tex
 learnlog.pdf: metrics-protocol.tex
