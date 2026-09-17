@@ -22,8 +22,8 @@ decidable yet---because a number the learner has guessed at first is
 one they read, and a number that merely appears is one they skim.
 The order runs from the metric with the most obvious meaning (days and
 runs) to the one that needs the most caveats (trends), and ends where
-the playback tutorial ended: in [[learnlog list]], seeing that the
-reflection itself was recorded.
+the playback tutorial ended: in [[learnlog list --all]], seeing that
+the reflection itself was recorded.
 
 Every metric step closes with a \emph{How to read it} part, because a
 number the learner cannot interpret is worse than none: an error
@@ -606,6 +606,10 @@ Its object of learning is that reading the summaries is part of the
 history the summaries describe, and---a contrast the expert variant
 makes explicit---that the metrics nevertheless leave their own runs
 out of the counts.
+The step asks for [[learnlog list --all]] because the plain listing
+keeps the reading out of the way of the writing
+(\cref{sec:filter-learnlog}); the three-way split the expert variant
+names---recorded, displayed, counted---is the whole lesson.
 
 <<shared step: see the reflection in the log>>=
 # See the reflection in the log
@@ -613,18 +617,21 @@ out of the counts.
 ```tutorial-step
 required_patterns:
   - mode: regex
-    pattern: 'learnlog\s+list\b'
-hint: Run `learnlog list`.
+    pattern: 'learnlog\s+list\b[^\n]*(?:-a\b|--all\b)'
+hint: Run `learnlog list --all`.
 ```
 
-Run `learnlog list`.
+Run `learnlog list --all`.
 The `learnlog metrics` commands you just ran appear as runs of their
-own, next to your program's runs.
+own, next to your program's runs---`--all` is what shows them, because
+a plain `learnlog list` keeps the reading out of the way of the
+writing.
 <<novice step: see the reflection in the log>>=
 <<shared step: see the reflection in the log>>
 
 Looking back at your work is part of your work, so learnlog records
-it; the metrics themselves do not count these runs, only your
+it---out of the way by default, and there under `--all` when you want
+to see it; the metrics themselves never count these runs, only your
 program's.
 <<expert step: see the reflection in the log>>=
 <<shared step: see the reflection in the log>>
@@ -633,7 +640,10 @@ program's.
 a header and a trailer like any run, but capture no output (the output
 *is* the log) and, for `metrics`, no view trace (it showed no
 commit).
-When the metrics read the log they drop learnlog's own runs first,
-including the header commit of the very invocation that is running,
-so a report never counts itself.
+Recorded, displayed and counted are three different things here: the
+record is always written and always exported, `list` and `play`
+display it only under `--all` (or when you tagged it), and when the
+metrics read the log they drop learnlog's own runs first, including
+the header commit of the very invocation that is running, so a report
+never counts itself.
 @

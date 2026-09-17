@@ -68,6 +68,7 @@ import tempfile
 import os
 import io
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -147,7 +148,11 @@ from learnlog.commits import (
     scan_run_commits,
     merge_run_trailers,
     parse_run_summary,
-    filter_internal_runs,
+    filter_runs,
+    hidden_runs,
+    is_hidden_command,
+    local_naive,
+    visible_commits,
     resolve_record_commit,
     commit_outcomes,
 )
@@ -188,10 +193,10 @@ from learnlog.metrics import (
     filter_window,
     find_linter,
     join_buckets,
-    local_naive,
     parse_boundary,
     period_window,
     render,
+    resolve_boundary,
     run_records,
     segment_sessions,
     tag_boundaries,
@@ -3682,6 +3687,30 @@ the start time and command instead of the commit message subject.
 This is useful for quickly finding a session to inspect with
 [[play]], or for checking what a student has been working on.
 
+The lines are grouped under one heading per day.
+A listing that is one flat column of timestamps makes the reader do
+the grouping in their head, and the grouping is the thing they came
+for: a student looking for \enquote{the evening I got the loop
+working} navigates by day, not by hash.
+A heading per day and a time per entry say the same thing in less
+ink, because the date stops being repeated on every line.
+The heading spells the weekday out, since [[2026-09-16]] does not
+tell a student whether that was a lab day.
+It is spelled in English because the rest of this command is:
+[[%A]] names the day in the C locale, which is where Python leaves
+[[LC_TIME]] unless something calls [[setlocale]], and nothing here
+does.
+Should the viewer ever need a [[setlocale]] for wide characters, it
+has to be scoped to [[LC_CTYPE]], or this listing quietly changes
+language.
+
+The same vocabulary that narrows a report (\cref{sec:metrics-command})
+narrows the listing: [[--period]] for a rolling window, [[--since]]
+and [[--until]] for an explicit one, with a tag name, a date or a
+datetime as the boundary.
+The default is [[all]], because a listing that silently showed only
+this week would be read as a log that had lost the rest.
+
 For symmetry with [[play]] and [[analyse]], the source is passed
 with [[--from]] / [[-f]].  This keeps the positional interface free
 for command-specific arguments and makes the source selection rule the
@@ -3729,12 +3758,16 @@ def list_commits(
         typer.Option(
             "--all", "-a",
             help=(
-                "Include learnlog's internal runs "
-                "(e.g. the pip install from "
-                "learnlog init)."
+                "Include learnlog's own runs: the "
+                "play/list/metrics runs in which you read "
+                "your log back, and the pip install from "
+                "learnlog init."
             ),
         ),
     ] = False,
+    period: Annotated[Period | None, LIST_PERIOD_OPTION] = None,
+    since: Annotated[str | None, METRICS_SINCE_OPTION] = None,
+    until: Annotated[str | None, METRICS_UNTIL_OPTION] = None,
     success: Annotated[
         bool,
         typer.Option(
@@ -3756,24 +3789,142 @@ def list_commits(
         ),
     ] = False,
 ):
-    """List commits with start time and command."""
+    """List your runs by day, with start time and command."""
     import shutil
 
+    refuse_two_windows(period, since, until)
     repo, tmpdir = resolve_source(source)
     try:
         commits = get_commits(repo)
         if not commits:
             raise SystemExit("No commits found.")
 
-        filter_internal = not show_all
+        starts = (
+            tag_starts(tag_boundaries(repo))
+            if since or until else {}
+        )
+        window = list_window(period, since, until, starts)
         scan = scan_run_commits(repo)
         tag_map = get_tag_map(repo)
+        records = visible_commits(
+            commits, scan.messages, tag_map, show_all=show_all,
+        )
         <<build wanted outcome set>>
-        for commit in commits:
-            <<get and summarise commit>>
+        <<list the records by day>>
     finally:
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+The tag boundaries are read only when a boundary was given, exactly
+as the metrics resolver does (\cref{sec:metrics-command}): they cost
+two more Git calls, and a plain [[learnlog list]] must stay at the
+constant number the test at the end of this section pins.
+
+\paragraph{The window.}
+A listing's windows are the report's windows read by a different kind
+of reader, so the vocabulary is the same one and the boundary
+resolution is literally the same function.
+Two things differ, and both follow from a listing being a listing.
+[[all]] is not a window here but the absence of one: a report's
+[[all]] starts at the first run because a report has to name the span
+it measured, while a listing has nothing to name and a window would
+quietly drop the records whose start time cannot be read---the
+opposite of what a listing is for.
+And a [[--until]] with no [[--since]] leaves the lower bound open
+instead of closing it at the present moment, because
+[[explicit_window]] defaults a missing [[--since]] to the first
+\emph{record}, and with no record list to ask it would answer
+[[now]]---an empty window for every listing of the past.
+
+<<helper functions>>=
+def refuse_two_windows(period, since, until):
+    """Exit when ``--period`` is given beside ``--since``/``--until``."""
+    if period is not None and (since or until):
+        raise SystemExit(
+            "--period cannot be combined with --since or --until."
+        )
+
+
+def list_window(period, since, until, starts, now=None):
+    """The ``[start, end)`` a listing covers, or ``None`` for none.
+
+    ``starts`` maps tag names to their period starts, for a
+    boundary that names a tag.  A missing boundary is left open
+    rather than closed at the present moment.
+    """
+    if since or until:
+        try:
+            begin = (
+                resolve_boundary(since, starts) if since
+                else datetime.datetime.min
+            )
+            end = (
+                resolve_boundary(until, starts, inclusive_end=True)
+                if until else datetime.datetime.max
+            )
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        return begin, end
+    if period is None or period is Period.ALL:
+        return None
+    return period_window(period, [], now)
+<<constants>>=
+LIST_PERIOD_OPTION = typer.Option(
+    "--period",
+    help=(
+        "Window to list: today (calendar day), yesterday, week "
+        "(last 7 days), month (last 30 days), or all (the "
+        "default)."
+    ),
+)
+@
+
+Let's verify the refusal, that [[all]] and no option alike mean no
+window, the rolling periods against a fixed [[now]], and the open
+defaults of the explicit boundaries---including the inclusive date
+[[--until]] and a tag name that resolves through [[starts]]:
+
+<<test functions>>=
+def test_refuse_two_windows():
+    from learnlog.cli import refuse_two_windows
+    from learnlog.metrics import Period
+    with pytest.raises(SystemExit) as caught:
+        refuse_two_windows(Period.WEEK, "lab1", None)
+    assert "cannot be combined" in str(caught.value)
+    refuse_two_windows(None, "lab1", "lab2")
+    refuse_two_windows(Period.WEEK, None, None)
+
+def test_list_window_all_is_no_window():
+    from learnlog.cli import list_window
+    from learnlog.metrics import Period
+    assert list_window(None, None, None, {}) is None
+    assert list_window(Period.ALL, None, None, {}) is None
+
+def test_list_window_rolling_periods():
+    from learnlog.cli import list_window
+    from learnlog.metrics import Period
+    now = datetime.datetime(2026, 9, 17, 9, 30)
+    day = datetime.datetime(2026, 9, 17)
+    assert list_window(Period.TODAY, None, None, {}, now) == \
+        (day, now)
+    assert list_window(Period.YESTERDAY, None, None, {}, now) == \
+        (day - datetime.timedelta(days=1), day)
+    assert list_window(Period.WEEK, None, None, {}, now) == \
+        (now - datetime.timedelta(days=7), now)
+
+def test_list_window_open_boundaries():
+    from learnlog.cli import list_window
+    lab1 = datetime.datetime(2026, 9, 1, 12, 0)
+    begin, end = list_window(None, None, "2026-09-01", {})
+    assert begin == datetime.datetime.min
+    assert end == datetime.datetime(2026, 9, 2)
+    begin, end = list_window(None, "lab1", None, {"lab1": lab1})
+    assert begin == lab1
+    assert end == datetime.datetime.max
+    with pytest.raises(SystemExit) as caught:
+        list_window(None, "lab9", None, {"lab1": lab1})
+    assert "lab9" in str(caught.value)
 @
 
 The two outcome flags share a single representation: a set of
@@ -3790,6 +3941,27 @@ if failure:
     wanted.add("failure")
 @
 
+The loop walks the thinned list (\cref{sec:visible-commits}) and
+counts what it printed, because an empty listing has to say why it
+is empty (below).
+The heading is emitted when the day changes between one listed
+commit and the next, in the order [[get_commits]] returns them, which
+is the order the log was written.
+Sorting by start time instead would be tidier and would make the
+listing disagree with what [[play]] pages through.
+Runs can overlap---that is what the two-commit protocol is for
+(\cref{sec:two-commit-protocol})---so a day can legitimately appear
+twice, and when it does the repetition is evidence of two runs in
+flight rather than a fault in the display.
+
+<<list the records by day>>=
+listed = 0
+current_day = None
+for commit in records:
+    <<get and summarise commit>>
+<<say so when nothing was listed>>
+@
+
 Each commit's message body comes out of the scan's message map
 rather than from a fresh [[git log -1]] call.
 The scan read every message on the branch anyway to build the
@@ -3800,12 +3972,14 @@ A hash the map does not know yields an empty body, which
 [[parse_run_summary]] turns into [[None]] below---the same
 silent skip that a failed per-commit lookup produced before.
 We merge in the trailers of the runs the commit records
-(\cref{sec:run-join}), optionally filter out learnlog's internal
-runs using [[filter_internal_runs]], drop commits that do not
-match the outcome filter, and then extract the summary with
-[[parse_run_summary]].
-Commits whose runs are all filtered out (or that have no run
-blocks, like the initial commit) are silently skipped.
+(\cref{sec:run-join}), filter with the predicate [[hidden_runs]]
+picks for this commit (\cref{sec:filter-learnlog})---the tag names
+are read first because they are part of that choice---drop commits
+that do not match the outcome filter, and then extract the summary
+with [[parse_run_summary]].
+A commit whose runs are all hidden is already out of [[records]]; the
+filter here removes the hidden blocks from a mixed commit, and the
+[[None]] test covers the initial commit, which has no run block.
 
 Merging matters here beyond cosmetics: the outcome filters read the
 exit code, which lives in the trailer.
@@ -3814,24 +3988,103 @@ nothing at all, since every commit would look like an interrupted
 run.
 
 <<get and summarise commit>>=
+names = tag_map.get(commit["hash"], [])
 body = scan.messages.get(commit["hash"], "").rstrip("\n")
 body = merge_run_trailers(body, scan.trailers)
-if filter_internal:
-    body = filter_internal_runs(body)
+body = filter_runs(
+    body, hidden_runs(show_all=show_all, tagged=bool(names)),
+)
 <<skip commits that do not match the outcome filter>>
 summary = parse_run_summary(body)
 if summary is None:
     continue
-command, start_time, run_count = summary
-short_hash = commit["hash"][:7]
+command, start, run_count = summary
+<<skip commits outside the window>>
+<<emit the day heading when the day changes>>
+<<emit the commit's entry line>>
+listed += 1
+@
+
+A window is half-open, [[[start, end)]], the same reading every report
+gives it (\cref{sec:metrics-periods}).
+A record with no readable start time is excluded by any active
+window, since a bound cannot be evaluated against an unknown moment.
+
+<<skip commits outside the window>>=
+if window is not None:
+    begin, end = window
+    if start is None or not begin <= start < end:
+        continue
+@
+
+The record that does not say when it ran says so, under a heading
+of its own and with a blank in the time column, because the listing
+is evidence: a date inherited from the neighbouring entry is the one
+kind of error a reader cannot detect.
+The first heading is printed even when the day is unknown, which is
+why the test is on the count of listed records rather than on the
+day alone.
+
+<<emit the day heading when the day changes>>=
+day = start.date() if start is not None else None
+if listed == 0 or day != current_day:
+    if listed:
+        typer.echo("")
+    typer.echo(day_heading(day))
+    current_day = day
+@
+
+<<emit the commit's entry line>>=
+clock = (
+    start.strftime("%H:%M") if start is not None else UNKNOWN_TIME
+)
 suffix = (
     f" ({run_count} runs)" if run_count > 1 else ""
 )
-names = tag_map.get(commit["hash"], [])
 tags = f" (tag: {', '.join(names)})" if names else ""
 typer.echo(
-    f"{short_hash} {start_time} {command}{suffix}{tags}"
+    f"{LIST_INDENT}{commit['hash'][:7]} {clock} "
+    f"{command}{suffix}{tags}"
 )
+<<helper functions>>=
+def day_heading(day):
+    """The heading a listing prints above a day's runs."""
+    if day is None:
+        return UNKNOWN_DAY_HEADING
+    return day.strftime("%Y-%m-%d (%A)")
+<<constants>>=
+LIST_INDENT = "  "
+UNKNOWN_DAY_HEADING = "(unknown date)"
+UNKNOWN_TIME = "--:--"
+@
+
+Nothing on the terminal is what a crash looks like.
+When the listing emits no entry it says which of the reasons applies,
+and when the reason is that everything it had was learnlog's own, it
+names [[--all]]---for the reason the playback placeholder does
+(\cref{viewer}): a reader who meets the note is looking for what is
+missing.
+The window and the outcome flags are named before the hiding, since
+a student who asked for today and got nothing is told about today,
+not about a flag that would not help.
+
+<<say so when nothing was listed>>=
+if not listed:
+    if window is not None:
+        typer.echo(NO_RUNS_IN_WINDOW_NOTE)
+    elif wanted:
+        typer.echo(NO_RUNS_WITH_OUTCOME_NOTE)
+    elif len(records) < len(commits):
+        typer.echo(ONLY_LEARNLOG_RUNS_NOTE)
+    else:
+        typer.echo(NOTHING_RECORDED_NOTE)
+<<constants>>=
+NO_RUNS_IN_WINDOW_NOTE = "No runs in this window."
+NO_RUNS_WITH_OUTCOME_NOTE = "No runs with that outcome."
+ONLY_LEARNLOG_RUNS_NOTE = (
+    "Only learnlog's own runs so far; use --all to see them."
+)
+NOTHING_RECORDED_NOTE = "No runs recorded yet."
 @
 
 When at least one outcome flag is active (so [[wanted]] is
@@ -3862,8 +4115,8 @@ def test_list_command_via_cli(workdir):
     runner = CliRunner()
     result = runner.invoke(app, ["list", "--from", str(workdir)])
     assert result.exit_code == 0
-    assert "hello.py arg1" in result.output
-    assert "2026-03-20 14:30" in result.output
+    assert "2026-03-20 (Friday)" in result.output
+    assert "14:30 hello.py arg1" in result.output
 
 def test_list_command_via_from_option(workdir):
     """The list command also accepts -f/--from."""
@@ -3893,8 +4146,9 @@ def test_list_command_lists_each_run(workdir):
         app, ["list", "--from", str(workdir)]
     )
     assert result.exit_code == 0
-    assert "2026-01-01 10:00 hello.py" in result.output
-    assert "2026-01-01 10:05 hello.py" in result.output
+    assert result.output.count("2026-01-01 (Thursday)") == 1
+    assert "10:00 hello.py" in result.output
+    assert "10:05 hello.py" in result.output
 
 def test_list_command_counts_runs_in_one_commit(workdir):
     """A commit holding several runs shows the run count.
@@ -3926,8 +4180,8 @@ def test_list_command_counts_runs_in_one_commit(workdir):
     assert result.exit_code == 0
     assert "(2 runs)" in result.output
 
-def test_list_shows_review_runs(workdir):
-    """Review runs are listed without asking for --all."""
+def test_list_hides_review_runs(workdir):
+    """Review runs are listed only under --all."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -3940,7 +4194,197 @@ def test_list_shows_review_runs(workdir):
     )
     assert result.exit_code == 0
     assert "hello.py" in result.output
+    assert "learnlog play" not in result.output
+    result = runner.invoke(
+        app, ["list", "--all", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "hello.py" in result.output
     assert "learnlog play" in result.output
+
+def test_list_keeps_a_tagged_review_run(workdir):
+    """A tag keeps the review run it sits on in the listing."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["list"], t1)
+    repo.git("tag", "lab1")
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "learnlog list (tag: lab1)" in result.output
+
+def test_list_groups_by_day(workdir):
+    """One heading per day, entries indented, days apart."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    for when in [
+        datetime.datetime(2026, 1, 1, 10, 0),
+        datetime.datetime(2026, 1, 1, 10, 5),
+        datetime.datetime(2026, 1, 2, 9, 0),
+    ]:
+        repo.begin_run("hello.py", [], when)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert lines[0] == "2026-01-01 (Thursday)"
+    assert lines[1].startswith("  ") and "10:00 hello.py" in lines[1]
+    assert lines[2].startswith("  ") and "10:05 hello.py" in lines[2]
+    assert lines[3] == ""
+    assert lines[4] == "2026-01-02 (Friday)"
+    assert lines[5].startswith("  ") and "09:00 hello.py" in lines[5]
+    assert len(lines) == 6
+
+def test_list_period_filters(workdir):
+    """Explicit boundaries are half-open, a date --until inclusive."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    for day in (1, 2, 3):
+        repo.begin_run(
+            "hello.py", [], datetime.datetime(2026, 1, day, 10, 0),
+        )
+    runner = CliRunner()
+
+    def days(*args):
+        result = runner.invoke(
+            app, ["list", *args, "--from", str(workdir)],
+        )
+        assert result.exit_code == 0, result.output
+        return [
+            line[:10] for line in result.output.splitlines()
+            if line.startswith("2026-")
+        ]
+
+    assert days("--since", "2026-01-02") == \
+        ["2026-01-02", "2026-01-03"]
+    assert days("--until", "2026-01-02") == \
+        ["2026-01-01", "2026-01-02"]
+    assert days("--since", "2026-01-02", "--until", "2026-01-02") == \
+        ["2026-01-02"]
+    assert days("--period", "all") == \
+        ["2026-01-01", "2026-01-02", "2026-01-03"]
+
+def test_list_refuses_two_window_vocabularies(workdir):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    result = CliRunner().invoke(
+        app,
+        ["list", "--period", "all", "--since", "2026-01-01",
+         "--from", str(workdir)],
+    )
+    assert result.exit_code != 0
+    assert "cannot be combined" in result.output
+
+def test_list_says_when_nothing_matches(workdir):
+    """An empty listing names its reason."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["list", "--from", str(workdir)])
+    assert result.exit_code == 0
+    assert "No runs recorded yet." in result.output
+    repo.begin_run(
+        "learnlog", ["list"], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    result = runner.invoke(app, ["list", "--from", str(workdir)])
+    assert "use --all" in result.output
+    result = runner.invoke(
+        app, ["list", "--period", "today", "--from", str(workdir)],
+    )
+    assert "No runs in this window." in result.output
+    result = runner.invoke(
+        app, ["list", "--period", "yesterday", "--from", str(workdir)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "No runs in this window." in result.output
+    result = runner.invoke(
+        app, ["list", "--success", "--from", str(workdir)],
+    )
+    assert "No runs with that outcome." in result.output
+
+def test_list_undated_run(workdir):
+    """A record with no readable start says so."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    repo.git(
+        "commit", "--allow-empty", "-m",
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "Arguments: (none)\nStart-Time: whenever",
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["list", "--from", str(workdir)])
+    assert result.exit_code == 0
+    assert "(unknown date)" in result.output
+    assert "--:-- hello.py" in result.output
+    result = runner.invoke(
+        app, ["list", "--period", "today", "--from", str(workdir)],
+    )
+    assert "hello.py" not in result.output
+
+def test_list_reopens_headings_across_undated_runs(workdir):
+    """An undated record between dated ones gets its own heading."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    undated = (
+        "Run: odd.py (none)\n\nScript: odd.py\n"
+        "Arguments: (none)\nStart-Time: whenever"
+    )
+    repo.begin_run("hello.py", [], datetime.datetime(2026, 1, 1, 10, 0))
+    repo.git("commit", "--allow-empty", "-m", undated)
+    repo.begin_run("hello.py", [], datetime.datetime(2026, 1, 1, 10, 5))
+    runner = CliRunner()
+    result = runner.invoke(app, ["list", "--from", str(workdir)])
+    assert result.exit_code == 0
+    headings = [
+        line for line in result.output.splitlines()
+        if line and not line.startswith("  ")
+    ]
+    assert headings == [
+        "2026-01-01 (Thursday)", "(unknown date)",
+        "2026-01-01 (Thursday)",
+    ]
+
+def test_list_and_play_show_the_same_records(workdir):
+    """The two reading views agree on which records exist."""
+    from learnlog.cli import app
+    from learnlog.commits import get_commits
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["play"], t1)
+    repo.begin_run("pip", ["install", "learnlog"], t1)
+    repo.begin_run("learnlog", ["list"], t1)
+    repo.git("tag", "lab1")
+    initial = get_commits(repo)[0]["hash"]
+    runner = CliRunner()
+    for flags in ([], ["--all"]):
+        listed = runner.invoke(
+            app, ["list", *flags, "--from", str(workdir)],
+        ).output
+        played = runner.invoke(
+            app, ["play", "-b", "--raw", *flags, "--from", str(workdir)],
+        ).output
+        in_list = set(re.findall(r"^  ([0-9a-f]{7}) ", listed, re.M))
+        in_play = {
+            h[:7]
+            for h in re.findall(r"^commit ([0-9a-f]{40})", played, re.M)
+            if h != initial
+        }
+        assert in_list == in_play
+        assert len(in_list) == (4 if flags else 2)
 
 def test_list_shows_tags(workdir):
     """A tagged run's line carries the tag names."""
@@ -6642,13 +7086,35 @@ set the Git environment, and forward all arguments to
 [[git tag]] with no ref tags HEAD, and which commit that is depends
 on something outside this command: whether [[learnlog tag]] is itself
 recorded.
-It is not (\cref{sec:veto}), and that is what makes the shipped
-workflow work.
-The tag lands on the last thing the student ran, so [[learnlog play
-lab1]] starts where they think they left off.
+It is not (\cref{sec:veto}), and that is half of what makes the
+shipped workflow work.
 While administrative commands still logged themselves, HEAD at this
 moment was the header commit of the [[learnlog tag]] run---so the tag
 named the act of tagging, on a commit that every view filters out.
+The other half is that HEAD is still not always the last thing the
+student \emph{ran}: a student who runs their program, types
+[[learnlog list]] to look at it, and then tags, has a review run at
+the tip (\cref{sec:review-runs}), and a tag on it would name the act
+of looking---again a record the views hide by default, and one that
+would start the milestone's period at the moment of a listing
+(\cref{sec:metrics-tags}).
+So the bare [[learnlog tag name]] form aims the tag itself: it walks
+back from the tip past learnlog's own records---the review runs and
+the plumbing, by the same rule the views hide them
+(\cref{sec:filter-learnlog})---to the newest record that is the
+student's work, a program run or a checkout, and hands that commit to
+[[git tag]] explicitly.
+The commit is the run's trailer when the run finished, the header
+otherwise, so that the tag sits where HEAD would have been had the
+student tagged straight after the run.
+Only the bare form is aimed.
+An explicit ref means the student knows where they want the tag, and
+the option forms ([[-l]], [[-d]], [[-a ... -m ...]]) are Git's own
+grammar, which a passthrough should not parse; a log with no student
+run at all falls back to HEAD rather than refusing, because a tag on
+a review run is still a tag.
+The result is that [[learnlog play lab1]] starts where the student
+thinks they left off.
 
 That checkpoint is read as a \emph{start marker}, the way
 [[git describe]] reads one: the tag names the run it sits on and
@@ -6699,18 +7165,62 @@ def tag_command(
     learnlog_dir = workdir / ".learnlog"
     env = git_environment(learnlog_dir, workdir)
 
+    args = list(ctx.args)
+    <<aim a bare tag at the student's last run>>
     result = run_git(
-        ["tag", *ctx.args],
+        ["tag", *args],
         env=env,
         cwd=str(workdir),
     )
     if result.returncode == 0:
-        <<confirm a tag created at HEAD>>
+        <<confirm a bare tag>>
     raise typer.Exit(code=result.returncode)
 @
 
-<<confirm a tag created at HEAD>>=
-if len(ctx.args) == 1 and not ctx.args[0].startswith("-"):
+<<aim a bare tag at the student's last run>>=
+if bare_tag_form(args):
+    target = latest_student_commit(LearnlogRepo(workdir))
+    if target is not None:
+        args.append(target)
+@
+
+The search reads the header messages out of one scan and the
+trailer-to-header map out of the same scan, so aiming costs the two
+Git calls the confirmation was already going to make and no more,
+however many listings the student did before tagging.
+A record counts as the student's when its message still has a run
+block after the reading views' filter; the initial commit has none,
+so it is never chosen and the fallback to HEAD covers it.
+
+<<helper functions>>=
+def bare_tag_form(args):
+    """True for ``learnlog tag name``, the form the tutorial teaches."""
+    return len(args) == 1 and not args[0].startswith("-")
+
+
+def latest_student_commit(repo):
+    """The newest commit that records the student's own work.
+
+    Review runs and plumbing at the tip are skipped; a program
+    run or a checkout is taken, as its trailer commit when the
+    run finished and its header otherwise.  ``None`` when the
+    log holds no such record.
+    """
+    scan = scan_run_commits(repo)
+    trailer_of = {
+        header: trailer for trailer, header in scan.records.items()
+    }
+    for commit in reversed(get_commits(repo)):
+        message = scan.messages.get(commit["hash"], "")
+        kept = filter_runs(message, is_hidden_command)
+        if parse_run_summary(kept) is None:
+            continue
+        return trailer_of.get(commit["hash"], commit["hash"])
+    return None
+@
+
+<<confirm a bare tag>>=
+if bare_tag_form(ctx.args):
     <<name the run the tag landed on>>
 @
 
@@ -6724,7 +7234,8 @@ line is the cheap failure.
 
 <<name the run the tag landed on>>=
 repo = LearnlogRepo(workdir)
-head = repo.git("rev-parse", "HEAD", check=False).stdout.strip()
+head = args[1] if len(args) > 1 else \
+    repo.git("rev-parse", "HEAD", check=False).stdout.strip()
 if head:
     subject = repo.git(
         "log", "-1", "--format=%s",
@@ -6740,7 +7251,11 @@ if head:
 
 Let's verify that the command creates and lists tags, that the tag
 names the student's run and stays on the history as later runs append,
-and that it reports an error when no repository exists:
+that a bare tag steps back over a review run but not over a checkout
+and reaches the metrics as the program run's moment, that an explicit
+ref and the option forms are left alone, that a log with no student
+run still gets its tag, and that the command reports an error when no
+repository exists:
 
 <<test functions>>=
 def test_tag_command_creates_tag(workdir, monkeypatch):
@@ -6807,6 +7322,99 @@ def test_tag_lands_on_the_students_own_run(
         "merge-base", "--is-ancestor", "lab1", "HEAD",
     )
     assert ancestor.returncode == 0
+
+def test_tag_skips_a_review_run_at_the_tip(workdir, monkeypatch):
+    """A bare tag after learnlog list names the program run."""
+    from learnlog.cli import app
+    from learnlog.metrics import tag_boundaries
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t1, exit_code=0,
+    )
+    repo.begin_run("learnlog", ["list"], t2)
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t2, exit_code=0,
+    )
+    head = repo.git("rev-parse", "HEAD").stdout.strip()
+
+    result = CliRunner().invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0, result.output
+    assert "lab1 -> Run: hello.py" in result.output
+    tagged = repo.git("rev-parse", "lab1^{commit}").stdout.strip()
+    assert tagged != head
+    subject = repo.git("log", "-1", "--format=%s", "lab1").stdout
+    assert subject.startswith("Run-End: hello.py")
+    boundary, = tag_boundaries(repo)
+    assert boundary.start == t1
+    assert repo.git(
+        "merge-base", "--is-ancestor", "lab1", "HEAD",
+    ).returncode == 0
+
+def test_tag_keeps_a_checkout_at_the_tip(workdir, monkeypatch):
+    """A checkout is the student's work, so a bare tag stays on it."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["checkout", "abc1234"], t1)
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t1, exit_code=0,
+    )
+    head = repo.git("rev-parse", "HEAD").stdout.strip()
+    result = CliRunner().invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0, result.output
+    assert repo.git("rev-parse", "lab1^{commit}").stdout.strip() == head
+    assert "learnlog checkout" in result.output
+
+def test_tag_explicit_ref_and_options_pass_through(
+    workdir, monkeypatch,
+):
+    """Only the bare form is aimed; a ref names its own target."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["list"], t1)
+    review = repo.git("rev-parse", "HEAD").stdout.strip()
+    runner = CliRunner()
+    result = runner.invoke(app, ["tag", "looked", review])
+    assert result.exit_code == 0, result.output
+    assert repo.git(
+        "rev-parse", "looked^{commit}",
+    ).stdout.strip() == review
+    result = runner.invoke(app, ["tag", "-a", "noted", "-m", "note"])
+    assert result.exit_code == 0, result.output
+    assert repo.git(
+        "rev-parse", "noted^{commit}",
+    ).stdout.strip() == review
+
+def test_tag_falls_back_to_head_without_a_student_run(
+    workdir, monkeypatch,
+):
+    """A log of only review runs still gets its tag, on HEAD."""
+    from learnlog.cli import app
+    from learnlog.cli import latest_student_commit
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    assert latest_student_commit(repo) is None
+    repo.begin_run(
+        "learnlog", ["list"], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    assert latest_student_commit(repo) is None
+    head = repo.git("rev-parse", "HEAD").stdout.strip()
+    result = CliRunner().invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0, result.output
+    assert repo.git("rev-parse", "lab1^{commit}").stdout.strip() == head
 
 def test_tag_command_no_learnlog_dir(
     tmp_path, monkeypatch
@@ -7205,6 +7813,10 @@ the last test records one: its header sits on the checkout's trailer,
 [[list]] shows the checkout between the two, and the churn that
 \cref{metrics} charges the new run is the one line the student added
 after the restore, not the reversion.
+The listing is read through its entry lines, because the checkout is
+dated by the clock while the fixture's runs are not: it sits under
+today's heading and the run after it re-opens the fixture's day,
+which is the commit-order rule of \cref{sec:list-command} at work.
 
 <<test functions>>=
 def test_next_run_after_checkout_is_charged_only_its_edit(
@@ -7242,11 +7854,14 @@ def test_next_run_after_checkout_is_charged_only_its_edit(
 
     listing = runner.invoke(app, ["list"])
     assert listing.exit_code == 0, listing.output
-    lines = listing.output.splitlines()
-    assert any(f"learnlog checkout {old[:7]}" in l for l in lines)
-    assert lines.index(
-        next(l for l in lines if "learnlog checkout" in l)
-    ) == len(lines) - 2
+    entries = [
+        l for l in listing.output.splitlines()
+        if l.startswith("  ")
+    ]
+    assert any(f"learnlog checkout {old[:7]}" in l for l in entries)
+    assert entries.index(
+        next(l for l in entries if "learnlog checkout" in l)
+    ) == len(entries) - 2
 
 def test_checkout_no_learnlog_dir(tmp_path, monkeypatch):
     """Error when no .learnlog/ directory exists."""
@@ -7282,17 +7897,26 @@ standard output is not a terminal (for example when piped to
 This means [[learnlog play | less]] just works without the user
 having to remember the flag.
 
-What playback shows by default is the student's own history: their
-program runs, and the [[play]] and [[list]] runs in which they read
-it back (\cref{sec:filter-learnlog}).
-What it leaves out is learnlog's plumbing---the [[pip]] install that
+What playback shows by default is the student's own work: their
+program runs, and the checkouts that went back to one
+(\cref{sec:checkout}).
+What it leaves out is learnlog reading itself.
+The [[play]], [[list]] and [[metrics]] runs are recorded in full and
+reach every researcher path unchanged (\cref{progsnap2},
+\cref{metrics}), but a log read ten times in an evening buries the
+writing under the reading, and the view a student opens to see their
+work should show their work (\cref{sec:filter-learnlog}).
+Also left out is learnlog's plumbing---the [[pip]] install that
 [[learnlog init]] performs, and whatever an older version recorded of
 the administrative subcommands that no longer log themselves at all
 (\cref{sec:veto}).
-The [[--all]] / [[-a]] flag disables that filter.
-It is a debugging and archaeology switch rather than a reading one:
-the material it restores is setup noise and history from a policy that
-no longer applies, which is exactly why the default hides it.
+The [[--all]] / [[-a]] flag restores both.
+A record the student tagged is never hidden, whatever it holds: the
+tag is their milestone marker, and [[learnlog play lab1]] has to be
+able to start on it (\cref{sec:visible-commits}).
+The commit list is thinned before either medium sees it, so that the
+viewer's position counter counts records the student can read and
+never lands on a placeholder.
 
 [[--raw]] / [[-r]] is the other axis, and the two compose because they
 answer different questions.
@@ -7326,51 +7950,71 @@ oldest.
 A student who types [[learnlog play]] has just run something and wants
 to see how it went; the beginning of the log is where they were weeks
 ago.
-The newest record, though, is usually the [[play]] run itself:
-playback is recorded (\cref{sec:review-runs}), and its header commit is
-in the list before the viewer opens.
-So the default is the record just before the run in progress---the
-one that made the student look---and the run in progress is one
-[[\textrightarrow]] away, which is where a reader expects the present
-to be.
-Reading the log from a bundle or from an unwired interpreter records
-no run, and then the newest record is simply the last one.
+The newest record used to need a special case: playback is recorded
+(\cref{sec:review-runs}), so its own header commit ended the list and
+the viewer had to step back one to land on what the student had just
+done.
+That commit is now one of the hidden ones and is not in the list at
+all, so the last record already is the one that made the student
+look.
+Under [[--all]] the run in progress is back in the list and the viewer
+opens on it: the student asked to see everything, and the present is
+where it is.
 Batch mode keeps starting from the beginning: it prints rather than
 positions, and [[learnlog play -b | less]] is how a reader gets the
 whole log.
 
+A starting ref is looked up in the thinned list, and a ref that names
+a record the view hides is refused with the flag that would show it,
+rather than silently moved to the nearest visible record:
+[[learnlog play <hash>]] opening somewhere other than [[<hash>]] is
+exactly the quiet disagreement the ref resolution of
+\cref{sec:run-join} exists to avoid.
+
 <<helper functions>>=
-def current_run_commit():
-    """The header commit of the run being recorded, or ``None``."""
-    return getattr(learnlog.repo, "run_commit", None)
+def record_index(records, commits, matches, missing):
+    """Index in ``records`` of the commit ``matches`` accepts.
 
-
-def latest_record_index(commits, current=None):
-    """Index of the newest record other than the run in progress.
-
-    ``current`` is that run's header commit; when it is the last
-    entry the one before it is chosen, so that ``learnlog play``
-    opens on what the student just did rather than on itself.
+    ``records`` is the list a reading view shows and ``commits``
+    the full log.  Exits with ``missing`` when nothing matches,
+    and with a message naming ``--all`` when the match is a
+    record the view hides.
     """
-    last = len(commits) - 1
-    if last > 0 and commits[last]["hash"] == current:
-        return last - 1
-    return last
+    for index, commit in enumerate(records):
+        if matches(commit):
+            return index
+    for commit in commits:
+        if matches(commit):
+            raise SystemExit(
+                f"Record {commit['hash'][:7]} is one of "
+                "learnlog's own runs, which play hides.  "
+                "Use --all to start playback there."
+            )
+    raise SystemExit(missing)
 @
 
-Let's verify the choice in the three situations the viewer meets: a
-recorded playback whose own header ends the list, a log read without
-a run in progress, and a run in progress that is not in this list at
-all (playback of a bundle):
+Let's verify the three answers: an index into the shown list, the
+refusal naming [[--all]] for a record only the full log has, and the
+caller's own message when nothing matches at all:
 
 <<test functions>>=
-def test_latest_record_index_skips_the_run_in_progress():
-    from learnlog.cli import latest_record_index
+def test_record_index_three_answers():
+    from learnlog.cli import record_index
     commits = [{"hash": "aaa"}, {"hash": "bbb"}, {"hash": "ccc"}]
-    assert latest_record_index(commits, "ccc") == 1
-    assert latest_record_index(commits, None) == 2
-    assert latest_record_index(commits, "zzz") == 2
-    assert latest_record_index([{"hash": "ccc"}], "ccc") == 0
+    records = [commits[0], commits[2]]
+    assert record_index(
+        records, commits, lambda c: c["hash"] == "ccc", "missing",
+    ) == 1
+    with pytest.raises(SystemExit) as caught:
+        record_index(
+            records, commits, lambda c: c["hash"] == "bbb", "missing",
+        )
+    assert "--all" in str(caught.value)
+    with pytest.raises(SystemExit) as caught:
+        record_index(
+            records, commits, lambda c: c["hash"] == "zzz", "missing",
+        )
+    assert str(caught.value) == "missing"
 @
 
 <<typer commands>>=
@@ -7412,9 +8056,10 @@ def play(
         typer.Option(
             "--all", "-a",
             help=(
-                "Include learnlog's internal runs "
-                "(e.g. the pip install from "
-                "learnlog init)."
+                "Include learnlog's own runs: the "
+                "play/list/metrics runs in which you read "
+                "your log back, and the pip install from "
+                "learnlog init."
             ),
         ),
     ] = False,
@@ -7448,6 +8093,13 @@ def play(
         commits = get_commits(repo)
         if not commits:
             raise SystemExit("No commits found.")
+        scan = scan_run_commits(repo)
+        tag_map = get_tag_map(repo)
+        records = visible_commits(
+            commits, scan.messages, tag_map, show_all=show_all,
+        )
+        if not records:
+            raise SystemExit(NOTHING_TO_PLAY_NOTE)
 
         start_index = None
         if start:
@@ -7464,24 +8116,80 @@ we fall back to TTY detection via [[sys.stdout.isatty()]].
 An explicit [[--batch]] or [[--no-batch]] always wins.
 
 <<choose playback mode>>=
-filter_internal = not show_all
 use_batch = (
     batch if batch is not None
     else not sys.stdout.isatty()
 )
 if use_batch:
-    play_batch(repo, commits, start_index or 0,
-               filter_internal, raw=raw, color=color)
+    if start_index is None:
+        start_index = 0
+    play_batch(repo, records, start_index, show_all,
+               trailers=scan.trailers, tag_map=tag_map,
+               raw=raw, color=color)
 else:
     if start_index is None:
-        start_index = latest_record_index(
-            commits, current_run_commit(),
-        )
+        start_index = len(records) - 1
     viewer = PlaybackViewer(
-        repo, commits, start_index, filter_internal,
+        repo, records, start_index, show_all,
+        trailers=scan.trailers, tag_map=tag_map,
         raw=raw, color=color,
     )
     viewer.run()
+@
+
+The scan and the tag map are read here once and handed to both media,
+which otherwise read each lazily on their own; thinning the list costs
+no Git call the viewer was not already going to make.
+
+A live [[.learnlog/]] can never thin to nothing, because its initial
+commit has no run block and is therefore never hidden.
+A ProgSnap2 source can: the reconstruction starts its branch over
+from the dataset (\cref{progsnap2}), so a dataset holding only
+review runs rebuilds into a log in which every commit is hidden.
+The viewer would open on index [[-1]] of an empty list, so the case
+is refused before either medium is chosen, with the flag that would
+show something.
+
+<<constants>>=
+NOTHING_TO_PLAY_NOTE = (
+    "Nothing to play: every record is one of learnlog's own "
+    "runs.  Use --all to see them."
+)
+@
+
+Let's verify that the viewer opens on the last visible record---the
+student's run when the run in progress is hidden, the run in progress
+itself under [[--all]].
+The command is called as a function with the viewer replaced, since
+[[CliRunner]] connects no terminal and would choose batch mode:
+
+<<test functions>>=
+def test_play_opens_on_the_newest_record(workdir, monkeypatch):
+    """Without a ref the viewer opens on the last listed record."""
+    import learnlog.cli as cli
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["play"], t1)
+    opened = []
+
+    class FakeViewer:
+        def __init__(self, repo, commits, start_index,
+                     *args, **kwargs):
+            opened.append((commits, start_index))
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(cli, "PlaybackViewer", FakeViewer)
+    cli.play(source=str(workdir), batch=False)
+    commits, index = opened[-1]
+    assert index == len(commits) - 1
+    assert commits[index]["subject"].startswith("Run: hello.py")
+    cli.play(source=str(workdir), batch=False, show_all=True)
+    commits, index = opened[-1]
+    assert index == len(commits) - 1
+    assert commits[index]["subject"] == "Run: learnlog play"
 @
 
 Typer's [[CliRunner]] does not connect a real terminal, so
@@ -7578,13 +8286,13 @@ def test_play_colour_follows_the_flags(workdir, monkeypatch):
     ).output
 @
 
-We verify that review runs reach playback without [[--all]], while
-learnlog's internal runs are filtered from it by default and [[--all]]
-restores them:
+We verify that review runs and learnlog's internal runs are both
+filtered from playback by default and that [[--all]] restores them
+together:
 
 <<test functions>>=
-def test_play_shows_review_runs(workdir):
-    """Review runs are played back like student runs."""
+def test_play_hides_review_runs(workdir):
+    """Review runs stay out of playback unless asked for."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
@@ -7598,8 +8306,9 @@ def test_play_shows_review_runs(workdir):
     )
     assert result.exit_code == 0
     assert "You ran hello.py" in result.output
-    assert "You looked back through your log" in result.output
+    assert "You looked back through your log" not in result.output
     assert "learnlog export" not in result.output
+    assert "hidden; use --all" not in result.output
 
 def test_play_keeps_student_run_intact(workdir):
     """A learnlog run overlapping a student run stays separate.
@@ -7607,7 +8316,9 @@ def test_play_keeps_student_run_intact(workdir):
     The student starts a program; while it runs, ``learnlog
     play`` is invoked and finishes first.  The student's output
     must be attributed to the student's run---each record keeps
-    its own I/O rather than absorbing the other's.
+    its own I/O rather than absorbing the other's.  The test is
+    about attribution, so it asks for ``--all`` to get both
+    records on screen to compare.
     """
     from learnlog.cli import app
     from typer.testing import CliRunner
@@ -7630,7 +8341,7 @@ def test_play_keeps_student_run_intact(workdir):
     )
     runner = CliRunner()
     result = runner.invoke(
-        app, ["play", "--from", str(workdir)]
+        app, ["play", "--all", "--from", str(workdir)]
     )
     assert result.exit_code == 0
     review_start = result.output.index(
@@ -7640,12 +8351,13 @@ def test_play_keeps_student_run_intact(workdir):
     assert result.output.index("CURSES SCREEN") > review_start
 
 def test_play_all_shows_internal_runs(workdir):
-    """The --all flag includes learnlog's internal runs."""
+    """The --all flag includes review runs and plumbing alike."""
     from learnlog.cli import app
     from typer.testing import CliRunner
     repo = LearnlogRepo(workdir)
     t1 = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["play"], t1)
     repo.begin_run("learnlog", ["export", "out.bundle"], t1)
     runner = CliRunner()
     result = runner.invoke(
@@ -7654,7 +8366,83 @@ def test_play_all_shows_internal_runs(workdir):
     )
     assert result.exit_code == 0
     assert "You ran hello.py" in result.output
+    assert "You looked back through your log" in result.output
     assert "learnlog export" in result.output
+@
+
+A tag on a review run is the milestone rule of
+\cref{sec:filter-learnlog} seen from the command line: the tagged
+record plays without [[--all]], while the same record untagged is
+refused by name with the flag that shows it.
+
+<<test functions>>=
+def test_play_starts_from_a_tag_on_a_review_run(workdir):
+    """A tagged review run is a valid starting point."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["list"], t1)
+    repo.git("tag", "lab1")
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "lab1", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "You looked back through your log" in result.output
+    assert "Tags: lab1" in result.output
+
+def test_play_refuses_a_hidden_start_ref(workdir):
+    """A ref naming a hidden record says which flag shows it."""
+    from learnlog.cli import app
+    from learnlog.commits import get_commits
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["list"], t1)
+    hidden = get_commits(repo)[-1]["hash"]
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", hidden[:7], "--from", str(workdir)]
+    )
+    assert result.exit_code == 1
+    assert "--all" in result.output
+    result = runner.invoke(
+        app, ["play", hidden[:7], "--all", "--from", str(workdir)]
+    )
+    assert result.exit_code == 0
+    assert "You looked back through your log" in result.output
+
+def test_play_refuses_a_log_with_nothing_to_show(workdir):
+    """A log whose every record is hidden is refused, not crashed."""
+    from learnlog.cli import app
+    from learnlog.commits import get_commits
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    initial = get_commits(repo)[0]["hash"]
+    repo.begin_run(
+        "learnlog", ["list"], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    branch = repo.recording_branch()
+    kept = repo.git("rev-list", "--reverse", branch).stdout.split()
+    rest = [h for h in kept if h != initial]
+    tree = repo.git("rev-parse", f"{rest[0]}^{{tree}}").stdout.strip()
+    message = repo.git("log", "-1", "--format=%B", rest[0]).stdout
+    root = repo.git(
+        "commit-tree", tree, input=message,
+    ).stdout.strip()
+    repo.git("update-ref", branch, root)
+    runner = CliRunner()
+    result = runner.invoke(app, ["play", "-b", "--from", str(workdir)])
+    assert result.exit_code == 1
+    assert "Nothing to play" in result.output
+    assert "--all" in result.output
+    result = runner.invoke(
+        app, ["play", "-b", "--all", "--from", str(workdir)],
+    )
+    assert result.exit_code == 0
 @
 
 We resolve the starting ref through [[git rev-parse]], which
@@ -7677,25 +8465,18 @@ if resolved.returncode == 0:
     full_hash = resolve_record_commit(
         repo, resolved.stdout.strip(),
     )
-    for i, c in enumerate(commits):
-        if c["hash"] == full_hash:
-            start_index = i
-            break
-    else:
-        raise SystemExit(
-            f"Ref {start} resolves to "
-            f"{full_hash[:8]} which is not "
-            f"in the commit list."
-        )
+    start_index = record_index(
+        records, commits,
+        lambda c: c["hash"] == full_hash,
+        f"Ref {start} resolves to {full_hash[:8]} "
+        "which is not in the commit list.",
+    )
 else:
-    for i, c in enumerate(commits):
-        if c["hash"].startswith(start):
-            start_index = i
-            break
-    else:
-        raise SystemExit(
-            f"Commit {start} not found."
-        )
+    start_index = record_index(
+        records, commits,
+        lambda c: c["hash"].startswith(start),
+        f"Commit {start} not found.",
+    )
 @
 
 Let's verify that tags and commit hashes both work as
@@ -8574,8 +9355,9 @@ METRICS_SOURCE_OPTION = typer.Option(
 METRICS_PERIOD_OPTION = typer.Option(
     "--period",
     help=(
-        "Window to summarise: today (calendar day), week (last 7 "
-        "days, the default), month (last 30 days), or all."
+        "Window to summarise: today (calendar day), yesterday, "
+        "week (last 7 days, the default), month (last 30 days), "
+        "or all."
     ),
 )
 METRICS_BY_OPTION = typer.Option(
@@ -8641,10 +9423,7 @@ def metrics_inputs(source, period, by, since, until, idle,
     `cleanup()` when done, because the source may be a temporary
     checkout and a series needs a directory for its snapshots.
     """
-    if period is not None and (since or until):
-        raise SystemExit(
-            "--period cannot be combined with --since or --until."
-        )
+    refuse_two_windows(period, since, until)
     repo, tmpdir = resolve_source(source)
     try:
         <<resolve the metrics window and buckets>>
@@ -9196,6 +9975,9 @@ def test_metrics_trends_and_window_rules(workdir):
     assert json.loads(result.output)["trends"]
     result = _metrics(["time"], workdir)
     assert result.exit_code == 0
+    assert "0 runs" in result.output
+    result = _metrics(["time", "--period", "yesterday"], workdir)
+    assert result.exit_code == 0, result.output
     assert "0 runs" in result.output
     result = _metrics(
         ["time", "--period", "all", "--since", "2026-01-01"], workdir,

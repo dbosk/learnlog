@@ -244,24 +244,10 @@ NUMSTAT_LINE = re.compile(r"^(\d+|-)\t(\d+|-)\t")
 COMMIT_HASH_LINE = re.compile(r"^[0-9a-f]{40}$")
 @
 
-The recorder writes [[datetime.now().isoformat()]], a naive local time,
-and every comparison in this chapter is between such values.
-A history that went through a ProgSnap2 round trip or another machine
-may carry an offset, so timestamps are normalised on the way in rather
-than compared as they come: an aware value is moved to local time and
-its offset dropped, a naive one is trusted.
-[[utcnow]] never appears, because the student's day boundaries are
-local ones.
-
-<<metrics functions>>=
-def local_naive(value):
-    """Return `value` as a naive local datetime, or `None`."""
-    if value is None:
-        return None
-    if value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
-    return value
-@
+Timestamps arrive normalised: [[commits]] moves an aware value to
+local time and drops the offset where it parses
+(\cref{sec:parse-iso}), so every comparison in this chapter is between
+naive local values, and the student's day boundaries are local ones.
 
 Reading the log combines the three per-branch scans with the
 per-commit parsing the exporter already does.
@@ -281,6 +267,7 @@ from learnlog.commits import (
     get_commits,
     get_tag_map,
     is_learnlog_run,
+    local_naive,
     merge_run_trailers,
     parse_exception_line,
     scan_run_commits,
@@ -373,19 +360,8 @@ def test_run_records_reads_student_runs_only(workdir):
   assert len(run_records(repo, include_learnlog=True)) == 3
 @
 
-And the normalisation: an aware timestamp is compared in local time,
-a naive one untouched.
-
-<<metrics test functions>>=
-def test_local_naive_drops_offset_after_conversion():
-  aware = datetime.datetime(
-    2026, 8, 31, 10, 0, tzinfo=datetime.timezone.utc,
-  )
-  converted = local_naive(aware)
-  assert converted.tzinfo is None
-  assert converted == aware.astimezone().replace(tzinfo=None)
-  assert local_naive(T0) is T0
-  assert local_naive(None) is None
+The normalisation itself is verified where it lives
+(\cref{sec:parse-iso}).
 @
 
 
@@ -976,6 +952,11 @@ A window is rolling: \enquote{last week} means the last seven days,
 because an ISO week is empty every Monday morning, and a default that
 says nothing two days out of seven is the wrong default; \enquote{today}
 is the local calendar day, since it is not a rolling notion.
+\enquote{Yesterday} joins it on the calendar side for the same reason:
+a student asking what they did yesterday means the day, not the
+twenty-four hours ending now---and unlike every other window this one
+ends before [[now]], which is exactly what makes it answer the
+question.
 Buckets are calendar units---days, ISO weeks, months---because a series
 is read across its labels, and \enquote{2026-W35} is a name the student
 can put beside a course schedule where \enquote{the seven days ending
@@ -989,6 +970,7 @@ class Period(str, enum.Enum):
     """The rolling windows a single report can cover."""
 
     TODAY = "today"
+    YESTERDAY = "yesterday"
     WEEK = "week"
     MONTH = "month"
     ALL = "all"
@@ -1025,6 +1007,9 @@ def period_window(period, records, now=None):
     now = now or datetime.datetime.now()
     if period is Period.TODAY:
         return midnight(now), now
+    if period is Period.YESTERDAY:
+        today = midnight(now)
+        return today - datetime.timedelta(days=1), today
     if period is Period.ALL:
         start = records[0].start if records else now
         return min(start, now), now
@@ -1249,6 +1234,8 @@ def test_bucket_labels_iso_week_and_day():
 def test_windows():
   now = T0
   assert period_window(Period.TODAY, [], now) == (midnight(T0), T0)
+  assert period_window(Period.YESTERDAY, [], now) == (
+    midnight(T0) - datetime.timedelta(days=1), midnight(T0))
   assert period_window(Period.WEEK, [], now)[0] == \
     T0 - datetime.timedelta(days=7)
   assert period_window(Period.ALL, [_rec(-60)], now)[0] == \
@@ -1287,10 +1274,14 @@ precisely \enquote{up to the next milestone}.
 
 A boundary needs a moment, and the honest moment is the start of the
 earliest run recorded on the tagged commit---\emph{including}
-learnlog's own runs, which [[run_records]] drops: a student who ran
-[[learnlog list]], looked at their history and then tagged, tagged
-\emph{then}, and the review run's start is that moment even though
-no student program ran.
+learnlog's own runs, which [[run_records]] drops: a tag that sits on
+a review run marks the moment of that review, even though no student
+program ran.
+The bare [[learnlog tag name]] no longer puts a tag there---it steps
+back over the review runs at the tip to the student's last run
+(\cref{sec:tag})---so this case now comes from an explicit ref or
+from a log written before that, and the rule is kept for them: a tag
+on a review run is still a tag, and its moment is still its own.
 So the map below is built from the scans directly rather than from
 [[run_records(include_learnlog=True)]], which would also compute
 trees and churn no boundary needs, and whose churn attribution

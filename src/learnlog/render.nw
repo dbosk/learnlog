@@ -1142,6 +1142,9 @@ A review run's card says what the student went and looked at.
 The [[Viewed:]] lines themselves stay out of it: they are forty-digit
 hashes, and the record that matters is that the looking happened and
 how much of it there was.
+The card is reached through [[--all]] or through a milestone the
+student tagged (\cref{sec:filter-learnlog}), so it is read by someone
+who asked to see it, and it still has to read well on its own.
 
 <<render functions>>=
 def _review_meta(run):
