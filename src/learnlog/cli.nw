@@ -1948,6 +1948,72 @@ both PowerShell and WSL; [[find_in_venv]] now picks the
 interpreter the host can run, and going through it keeps
 [[init]] out of the launcher business altogether.
 
+\paragraph{Why the install has its own function.}
+The student who reported the WinError got it as a full
+traceback: Typer's rich rendering of every frame from
+[[init]] down to [[CreateProcess]], with the one line that
+mattered at the very bottom.  The audience is beginners in
+an editor's terminal, who mail the whole wall to the
+teacher instead of acting on it.  [[find_in_venv]] already
+turns its failure into a one-line [[SystemExit]], and the
+app does the same for a missing Git, so the install follows
+suit.  Two failures are told apart because they call for
+different actions: an [[OSError]] means the interpreter
+itself could not be started, which is a broken venv;
+[[CalledProcessError]] means pip ran and refused, typically
+without network, and pip's own output, which keeps the
+inherited terminal so the student sees it, already says
+why---our sentence only points at it.
+
+<<helper functions>>=
+def install_learnlog(venv_dir):
+    """Install learnlog into ``venv_dir`` with its own interpreter.
+
+    Runs ``python -m pip install learnlog``.  A venv whose
+    interpreter cannot be started, or a pip that fails, ends in
+    ``SystemExit`` with one sentence rather than a traceback.
+    """
+    python = find_in_venv(venv_dir, "python")
+    try:
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "learnlog"],
+            check=True,
+        )
+    except OSError as error:
+        raise SystemExit(
+            f"Could not run {python}: {error}"
+        ) from error
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(
+            f"pip install learnlog failed in {venv_dir} "
+            f"(exit status {error.returncode}); "
+            "see pip's message above."
+        ) from error
+@
+
+Both failure paths are driven through a stubbed
+[[subprocess.run]], the same pattern the [[init]] tests use:
+
+<<test functions>>=
+@pytest.mark.parametrize("error, message", [
+    (OSError(193, "%1 is not a valid Win32 application"), "Could not run"),
+    (subprocess.CalledProcessError(1, ["pip"]), "failed in"),
+])
+def test_install_learnlog_reports_failure_in_one_line(
+    tmp_path, monkeypatch, error, message,
+):
+    from learnlog import cli
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python").write_text("")
+
+    def fake_run(cmd, **kwargs):
+        raise error
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with pytest.raises(SystemExit, match=message):
+        cli.install_learnlog(tmp_path)
+@
+
 <<helper functions>>=
 def init_python(workdir, python=None):
     """Set up a Python environment for learnlog in ``workdir``.
@@ -1977,11 +2043,7 @@ def init_python(workdir, python=None):
         cli_run(["--python", str(target), str(venv_dir)])
         created_venv = True
 
-    subprocess.run(
-        [str(find_in_venv(venv_dir, "python")),
-         "-m", "pip", "install", "learnlog"],
-        check=True,
-    )
+    install_learnlog(venv_dir)
 
     write_autostart_files(venv_dir, workdir)
 
