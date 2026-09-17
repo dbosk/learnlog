@@ -1624,6 +1624,9 @@ def venv_purelib(venv_dir):
     (``lib/pythonX.Y/site-packages``) and Windows
     (``Lib\\site-packages``) without the caller having to
     branch on ``os.name``.
+
+    The probe opts out of recording, so a re-run of ``init``
+    on a venv that is already wired leaves no trace of it.
     """
     probe = (
         "import sysconfig, sys; "
@@ -1634,8 +1637,43 @@ def venv_purelib(venv_dir):
         [str(find_in_venv(venv_dir, "python")), "-c", probe],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         check=True, timeout=10,
+        env={**os.environ, "LEARNLOG_SKIP_AUTOSTART": "1"},
     )
     return pathlib.Path(result.stdout.strip())
+@
+
+The probe carries [[LEARNLOG_SKIP_AUTOSTART]] because of what a
+second [[init]] used to leave behind.  Students re-run [[init]] after
+moving machines or on a hunch, and by then the venv is wired: its
+interpreter imports learnlog at startup and records every run,
+including this one-liner, which then showed up in [[learnlog list]] as
+a student's [[<python -c>]] run and counted toward their sessions.
+The [[pip install]] from the same [[init]] is recorded on purpose and
+hidden by the readers as plumbing; the probe has nothing to reflect
+on, so it is simplest to never record it at all.
+
+<<test functions>>=
+def test_venv_purelib_probe_is_never_recorded(tmp_path, monkeypatch):
+    """The probe runs with the autostart veto set."""
+    from learnlog import cli
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python").write_text("")
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+
+        class Result:
+            stdout = "/venv/lib/site-packages\n"
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.delenv("LEARNLOG_SKIP_AUTOSTART", raising=False)
+    assert cli.venv_purelib(tmp_path) == pathlib.Path(
+        "/venv/lib/site-packages"
+    )
+    assert seen["env"]["LEARNLOG_SKIP_AUTOSTART"] == "1"
 @
 
 With [[purelib]] known, [[write_autostart_files]]
