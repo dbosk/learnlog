@@ -1274,10 +1274,14 @@ precisely \enquote{up to the next milestone}.
 
 A boundary needs a moment, and the honest moment is the start of the
 earliest run recorded on the tagged commit---\emph{including}
-learnlog's own runs, which [[run_records]] drops: a student who ran
-[[learnlog list]], looked at their history and then tagged, tagged
-\emph{then}, and the review run's start is that moment even though
-no student program ran.
+learnlog's own runs, which [[run_records]] drops: a tag that sits on
+a review run marks the moment of that review, even though no student
+program ran.
+The bare [[learnlog tag name]] no longer puts a tag there---it steps
+back over the review runs at the tip to the student's last run
+(\cref{sec:tag})---so this case now comes from an explicit ref or
+from a log written before that, and the rule is kept for them: a tag
+on a review run is still a tag, and its moment is still its own.
 So the map below is built from the scans directly rather than from
 [[run_records(include_learnlog=True)]], which would also compute
 trees and churn no boundary needs, and whose churn attribution

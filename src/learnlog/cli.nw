@@ -150,6 +150,7 @@ from learnlog.commits import (
     parse_run_summary,
     filter_runs,
     hidden_runs,
+    is_hidden_command,
     local_naive,
     visible_commits,
     resolve_record_commit,
@@ -7085,13 +7086,35 @@ set the Git environment, and forward all arguments to
 [[git tag]] with no ref tags HEAD, and which commit that is depends
 on something outside this command: whether [[learnlog tag]] is itself
 recorded.
-It is not (\cref{sec:veto}), and that is what makes the shipped
-workflow work.
-The tag lands on the last thing the student ran, so [[learnlog play
-lab1]] starts where they think they left off.
+It is not (\cref{sec:veto}), and that is half of what makes the
+shipped workflow work.
 While administrative commands still logged themselves, HEAD at this
 moment was the header commit of the [[learnlog tag]] run---so the tag
 named the act of tagging, on a commit that every view filters out.
+The other half is that HEAD is still not always the last thing the
+student \emph{ran}: a student who runs their program, types
+[[learnlog list]] to look at it, and then tags, has a review run at
+the tip (\cref{sec:review-runs}), and a tag on it would name the act
+of looking---again a record the views hide by default, and one that
+would start the milestone's period at the moment of a listing
+(\cref{sec:metrics-tags}).
+So the bare [[learnlog tag name]] form aims the tag itself: it walks
+back from the tip past learnlog's own records---the review runs and
+the plumbing, by the same rule the views hide them
+(\cref{sec:filter-learnlog})---to the newest record that is the
+student's work, a program run or a checkout, and hands that commit to
+[[git tag]] explicitly.
+The commit is the run's trailer when the run finished, the header
+otherwise, so that the tag sits where HEAD would have been had the
+student tagged straight after the run.
+Only the bare form is aimed.
+An explicit ref means the student knows where they want the tag, and
+the option forms ([[-l]], [[-d]], [[-a ... -m ...]]) are Git's own
+grammar, which a passthrough should not parse; a log with no student
+run at all falls back to HEAD rather than refusing, because a tag on
+a review run is still a tag.
+The result is that [[learnlog play lab1]] starts where the student
+thinks they left off.
 
 That checkpoint is read as a \emph{start marker}, the way
 [[git describe]] reads one: the tag names the run it sits on and
@@ -7142,18 +7165,62 @@ def tag_command(
     learnlog_dir = workdir / ".learnlog"
     env = git_environment(learnlog_dir, workdir)
 
+    args = list(ctx.args)
+    <<aim a bare tag at the student's last run>>
     result = run_git(
-        ["tag", *ctx.args],
+        ["tag", *args],
         env=env,
         cwd=str(workdir),
     )
     if result.returncode == 0:
-        <<confirm a tag created at HEAD>>
+        <<confirm a bare tag>>
     raise typer.Exit(code=result.returncode)
 @
 
-<<confirm a tag created at HEAD>>=
-if len(ctx.args) == 1 and not ctx.args[0].startswith("-"):
+<<aim a bare tag at the student's last run>>=
+if bare_tag_form(args):
+    target = latest_student_commit(LearnlogRepo(workdir))
+    if target is not None:
+        args.append(target)
+@
+
+The search reads the header messages out of one scan and the
+trailer-to-header map out of the same scan, so aiming costs the two
+Git calls the confirmation was already going to make and no more,
+however many listings the student did before tagging.
+A record counts as the student's when its message still has a run
+block after the reading views' filter; the initial commit has none,
+so it is never chosen and the fallback to HEAD covers it.
+
+<<helper functions>>=
+def bare_tag_form(args):
+    """True for ``learnlog tag name``, the form the tutorial teaches."""
+    return len(args) == 1 and not args[0].startswith("-")
+
+
+def latest_student_commit(repo):
+    """The newest commit that records the student's own work.
+
+    Review runs and plumbing at the tip are skipped; a program
+    run or a checkout is taken, as its trailer commit when the
+    run finished and its header otherwise.  ``None`` when the
+    log holds no such record.
+    """
+    scan = scan_run_commits(repo)
+    trailer_of = {
+        header: trailer for trailer, header in scan.records.items()
+    }
+    for commit in reversed(get_commits(repo)):
+        message = scan.messages.get(commit["hash"], "")
+        kept = filter_runs(message, is_hidden_command)
+        if parse_run_summary(kept) is None:
+            continue
+        return trailer_of.get(commit["hash"], commit["hash"])
+    return None
+@
+
+<<confirm a bare tag>>=
+if bare_tag_form(ctx.args):
     <<name the run the tag landed on>>
 @
 
@@ -7167,7 +7234,8 @@ line is the cheap failure.
 
 <<name the run the tag landed on>>=
 repo = LearnlogRepo(workdir)
-head = repo.git("rev-parse", "HEAD", check=False).stdout.strip()
+head = args[1] if len(args) > 1 else \
+    repo.git("rev-parse", "HEAD", check=False).stdout.strip()
 if head:
     subject = repo.git(
         "log", "-1", "--format=%s",
@@ -7183,7 +7251,11 @@ if head:
 
 Let's verify that the command creates and lists tags, that the tag
 names the student's run and stays on the history as later runs append,
-and that it reports an error when no repository exists:
+that a bare tag steps back over a review run but not over a checkout
+and reaches the metrics as the program run's moment, that an explicit
+ref and the option forms are left alone, that a log with no student
+run still gets its tag, and that the command reports an error when no
+repository exists:
 
 <<test functions>>=
 def test_tag_command_creates_tag(workdir, monkeypatch):
@@ -7250,6 +7322,99 @@ def test_tag_lands_on_the_students_own_run(
         "merge-base", "--is-ancestor", "lab1", "HEAD",
     )
     assert ancestor.returncode == 0
+
+def test_tag_skips_a_review_run_at_the_tip(workdir, monkeypatch):
+    """A bare tag after learnlog list names the program run."""
+    from learnlog.cli import app
+    from learnlog.metrics import tag_boundaries
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    t2 = datetime.datetime(2026, 1, 1, 10, 5)
+    repo.begin_run("hello.py", [], t1)
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t1, exit_code=0,
+    )
+    repo.begin_run("learnlog", ["list"], t2)
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t2, exit_code=0,
+    )
+    head = repo.git("rev-parse", "HEAD").stdout.strip()
+
+    result = CliRunner().invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0, result.output
+    assert "lab1 -> Run: hello.py" in result.output
+    tagged = repo.git("rev-parse", "lab1^{commit}").stdout.strip()
+    assert tagged != head
+    subject = repo.git("log", "-1", "--format=%s", "lab1").stdout
+    assert subject.startswith("Run-End: hello.py")
+    boundary, = tag_boundaries(repo)
+    assert boundary.start == t1
+    assert repo.git(
+        "merge-base", "--is-ancestor", "lab1", "HEAD",
+    ).returncode == 0
+
+def test_tag_keeps_a_checkout_at_the_tip(workdir, monkeypatch):
+    """A checkout is the student's work, so a bare tag stays on it."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["checkout", "abc1234"], t1)
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t1, exit_code=0,
+    )
+    head = repo.git("rev-parse", "HEAD").stdout.strip()
+    result = CliRunner().invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0, result.output
+    assert repo.git("rev-parse", "lab1^{commit}").stdout.strip() == head
+    assert "learnlog checkout" in result.output
+
+def test_tag_explicit_ref_and_options_pass_through(
+    workdir, monkeypatch,
+):
+    """Only the bare form is aimed; a ref names its own target."""
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t1)
+    repo.begin_run("learnlog", ["list"], t1)
+    review = repo.git("rev-parse", "HEAD").stdout.strip()
+    runner = CliRunner()
+    result = runner.invoke(app, ["tag", "looked", review])
+    assert result.exit_code == 0, result.output
+    assert repo.git(
+        "rev-parse", "looked^{commit}",
+    ).stdout.strip() == review
+    result = runner.invoke(app, ["tag", "-a", "noted", "-m", "note"])
+    assert result.exit_code == 0, result.output
+    assert repo.git(
+        "rev-parse", "noted^{commit}",
+    ).stdout.strip() == review
+
+def test_tag_falls_back_to_head_without_a_student_run(
+    workdir, monkeypatch,
+):
+    """A log of only review runs still gets its tag, on HEAD."""
+    from learnlog.cli import app
+    from learnlog.cli import latest_student_commit
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    assert latest_student_commit(repo) is None
+    repo.begin_run(
+        "learnlog", ["list"], datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    assert latest_student_commit(repo) is None
+    head = repo.git("rev-parse", "HEAD").stdout.strip()
+    result = CliRunner().invoke(app, ["tag", "lab1"])
+    assert result.exit_code == 0, result.output
+    assert repo.git("rev-parse", "lab1^{commit}").stdout.strip() == head
 
 def test_tag_command_no_learnlog_dir(
     tmp_path, monkeypatch

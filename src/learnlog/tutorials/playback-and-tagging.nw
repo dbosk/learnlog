@@ -138,7 +138,9 @@ covers the tagged run and everything after it, until the next tag
 The expert extra says what the name is---a lightweight Git tag on the
 run's commit---and why tagging leaves no trace of its own: [[tag]] is
 not a recorded command, so the learner can tag their most recent run
-without creating new history behind it.
+without creating new history behind it; and that a review run at the
+tip is stepped over (\cref{sec:tag}), so looking at the log between
+the run and the tag does not move the milestone.
 
 <<shared step: add a memorable tag>>=
 # Add a memorable tag
@@ -164,6 +166,9 @@ pointing at the run's commit.
 Unlike `play`, `tag` does not record itself, which is what makes it
 possible to name your own most recent run without creating new history
 behind it.
+If the last thing you ran was `learnlog list` or `learnlog play`, the
+tag steps back over that and names your most recent program run, which
+is what you meant; the confirmation line says which run it landed on.
 
 `learnlog metrics --since`, `--by tag` and `learnlog analyse` all
 read the tag as a start marker, the way `git describe` does---which
