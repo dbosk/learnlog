@@ -1896,6 +1896,20 @@ lets [[--python]] dictate the target.  Importing
 function) also keeps [[learnlog]]'s other CLI commands
 snappy, since nothing else needs it at import time.
 
+\paragraph{Why \texttt{python -m pip}.}
+The install goes through the venv's interpreter,
+[[python -m pip install learnlog]], not through the [[pip]]
+launcher next to it.  That is the form pip's own
+documentation recommends, and it removes a moving part: on
+Windows the launcher is a small [[pip.exe]] that a failed
+self-upgrade leaves broken, whereas the venv's
+[[python.exe]] is what ran [[learnlog]] itself and is
+therefore known to work.  The venv that made this matter is
+the one from \cref{sec:setup-pip-in-venv}, populated from
+both PowerShell and WSL; [[find_in_venv]] now picks the
+interpreter the host can run, and going through it keeps
+[[init]] out of the launcher business altogether.
+
 <<helper functions>>=
 def init_python(workdir, python=None):
     """Set up a Python environment for learnlog in ``workdir``.
@@ -1926,7 +1940,8 @@ def init_python(workdir, python=None):
         created_venv = True
 
     subprocess.run(
-        [str(find_in_venv(venv_dir, "pip")), "install", "learnlog"],
+        [str(find_in_venv(venv_dir, "python")),
+         "-m", "pip", "install", "learnlog"],
         check=True,
     )
 
@@ -1943,7 +1958,9 @@ invariant that no subprocess call ever uses
 stub out [[resolve_target_python]] so the pipeline is
 driven by explicit test inputs, stub [[virtualenv.cli_run]]
 so no real venv is created, stub [[subprocess.run]] so no
-network traffic happens, stub [[write_autostart_files]] so
+network traffic happens (the fake venvs carry a
+[[bin/python]], the one binary the install goes through
+now), stub [[write_autostart_files]] so
 the autostart concern is tested separately, and always
 [[delenv VIRTUAL_ENV]] before each scenario so that the
 test runner's own venv (pytest typically runs inside one)
@@ -1972,7 +1989,7 @@ def test_init_python_creates_venv(
         cli_run_calls.append(list(argv))
         venv_path = pathlib.Path(argv[-1])
         (venv_path / "bin").mkdir(parents=True)
-        (venv_path / "bin" / "pip").write_text("")
+        (venv_path / "bin" / "python").write_text("")
 
     monkeypatch.setattr(
         cli, "resolve_target_python",
@@ -1993,8 +2010,8 @@ def test_init_python_creates_venv(
         "--python", "/opt/python3",
         str(tmp_path / ".venv"),
     ]]
-    assert pip_calls[0][1:] == ["install", "learnlog"]
-    assert pip_calls[0][0].endswith("/pip")
+    assert pip_calls[0][1:] == ["-m", "pip", "install", "learnlog"]
+    assert pip_calls[0][0].endswith("/python")
     assert sys.executable not in {c[0] for c in pip_calls}
 
 def test_init_python_idempotent_with_existing_venv(
@@ -2005,7 +2022,7 @@ def test_init_python_idempotent_with_existing_venv(
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     venv = tmp_path / ".venv"
     (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "pip").write_text("")
+    (venv / "bin" / "python").write_text("")
     pip_calls = []
     cli_run_calls = []
 
@@ -2036,7 +2053,7 @@ def test_init_python_idempotent_with_existing_venv(
     cli.init_python(tmp_path)
 
     assert cli_run_calls == []
-    assert pip_calls[0][1:] == ["install", "learnlog"]
+    assert pip_calls[0][1:] == ["-m", "pip", "install", "learnlog"]
 
 def test_init_python_honours_active_venv(
     tmp_path, monkeypatch,
@@ -2045,7 +2062,7 @@ def test_init_python_honours_active_venv(
     from learnlog import cli
     active = tmp_path / "active-venv"
     (active / "bin").mkdir(parents=True)
-    (active / "bin" / "pip").write_text("")
+    (active / "bin" / "python").write_text("")
     monkeypatch.setenv("VIRTUAL_ENV", str(active))
     pip_calls = []
     cli_run_calls = []
@@ -2072,8 +2089,8 @@ def test_init_python_honours_active_venv(
 
     assert cli_run_calls == []
     assert pip_calls == [[
-        str(active / "bin" / "pip"),
-        "install", "learnlog",
+        str(active / "bin" / "python"),
+        "-m", "pip", "install", "learnlog",
     ]]
     assert not (tmp_path / ".venv").exists()
 
@@ -2084,7 +2101,7 @@ def test_init_python_explicit_python_overrides_active_venv(
     from learnlog import cli
     active = tmp_path / "active-venv"
     (active / "bin").mkdir(parents=True)
-    (active / "bin" / "pip").write_text("")
+    (active / "bin" / "python").write_text("")
     monkeypatch.setenv("VIRTUAL_ENV", str(active))
     pip_calls = []
     cli_run_calls = []
@@ -2101,7 +2118,7 @@ def test_init_python_explicit_python_overrides_active_venv(
         cli_run_calls.append(list(argv))
         venv_path = pathlib.Path(argv[-1])
         (venv_path / "bin").mkdir(parents=True)
-        (venv_path / "bin" / "pip").write_text("")
+        (venv_path / "bin" / "python").write_text("")
 
     monkeypatch.setattr(
         cli, "resolve_target_python",
@@ -2122,7 +2139,7 @@ def test_init_python_explicit_python_overrides_active_venv(
         "--python", "/opt/python3.12",
         str(tmp_path / ".venv"),
     ]]
-    assert str(active / "bin" / "pip") not in {
+    assert str(active / "bin" / "python") not in {
         c[0] for c in pip_calls
     }
 
@@ -2143,7 +2160,7 @@ def test_init_python_invokes_write_autostart_files(
     def fake_cli_run(argv):
         venv_path = pathlib.Path(argv[-1])
         (venv_path / "bin").mkdir(parents=True)
-        (venv_path / "bin" / "pip").write_text("")
+        (venv_path / "bin" / "python").write_text("")
 
     monkeypatch.setattr(
         cli, "resolve_target_python",

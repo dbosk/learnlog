@@ -845,23 +845,36 @@ development, so it is hidden by the same flag.
 We match only [[pip]] commands that mention learnlog, so a student
 installing their own dependencies still sees those runs.
 
+The install has two spellings.  Logs written by older versions carry
+[[pip install learnlog]], the [[pip]] launcher run directly.  Current
+versions run [[python -m pip]] instead, because that launcher was the
+file [[init]] tripped over on a Windows venv shared with WSL
+(\cref{sec:setup-pip-in-venv}), and the recorder writes such a run as
+[[<python -m> pip install learnlog]].  The [[<python -m>]] marker is
+stripped before the installer check and nowhere else, so a
+[[python -m learnlog play]] keeps whatever status it has today.
+
 <<commits functions>>=
 def is_learnlog_command(command):
     """Return true if ``command`` is learnlog's own activity.
 
     Covers ``learnlog`` itself and the ``pip`` invocation that
-    installs it during ``learnlog init``.
+    installs it during ``learnlog init``, whether pip ran as a
+    launcher or as ``python -m pip``.
     """
     parts = command.split()
     if not parts:
         return False
     if parts[0] == "learnlog":
         return True
-    return parts[0] in INSTALLER_COMMANDS and any(
+    if parts[:2] == PYTHON_MODULE_RUN.split():
+        parts = parts[2:]
+    return bool(parts) and parts[0] in INSTALLER_COMMANDS and any(
         "learnlog" in argument for argument in parts[1:]
     )
 <<commits constants>>=
 INSTALLER_COMMANDS = ("pip", "pip3")
+PYTHON_MODULE_RUN = "<python -m>"
 @
 
 A commit records learnlog activity when either half of a run record
@@ -891,6 +904,12 @@ def test_is_learnlog_commit():
     )
     assert is_learnlog_commit(
         {"subject": "Run: pip install learnlog"}
+    )
+    assert is_learnlog_commit(
+        {"subject": "Run: <python -m> pip install learnlog"}
+    )
+    assert not is_learnlog_commit(
+        {"subject": "Run: <python -m> pip install requests"}
     )
     assert not is_learnlog_commit({"subject": "Run: hello.py"})
     assert not is_learnlog_commit(
@@ -1683,6 +1702,9 @@ def test_is_learnlog_run_parsed_block():
     assert is_learnlog_run(
         {"script": "pip", "arguments": "install learnlog"}
     )
+    assert is_learnlog_run(
+        {"script": "<python -m>", "arguments": "pip install learnlog"}
+    )
     assert not is_learnlog_run(
         {"script": "hello.py", "arguments": "(none)"}
     )
@@ -1698,6 +1720,9 @@ def test_is_internal_run():
     )
     assert is_internal_run(
         {"script": "pip", "arguments": "install learnlog"}
+    )
+    assert is_internal_run(
+        {"script": "<python -m>", "arguments": "pip install learnlog"}
     )
     assert is_internal_run(
         {"script": "learnlog", "arguments": "export out.bundle"}
