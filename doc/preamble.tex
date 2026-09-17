@@ -13,6 +13,15 @@
 \usepackage{noweb}
 \noweboptions{shift,breakcode,longxref,longchunks}
 
+% Every \autocite is a margin footnote (see the biblatex note below),
+% and each pending margin note holds a float register until the page
+% is shipped out.  A citation-dense page in the metrics chapter needs
+% more than the kernel's default 18, and which page that is moves
+% whenever an earlier chapter grows: "Too many unprocessed floats" at
+% a first-use \autocite is this, not a real float problem.  The kernel
+% command below adds registers without another package.
+\extrafloats{100}
+
 % Verbose citation style: full reference on first use, short form on
 % repeats.  This goes with memoir + didactic: didactic sets
 % autocite=footnote and places footnotes in the margin, so \autocite

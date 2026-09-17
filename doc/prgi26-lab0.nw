@@ -412,8 +412,10 @@ environment the editor selected is the one [[init]] wires.
 [[learnlog doctor]] closes the step as a check-before-use, for the
 same reason the Python step opened with a check: the student sees the
 wiring reported before any run depends on it.
-It is used instead of [[learnlog list]], which on an empty log says
-\enquote{No commits found} and reads as an error to a beginner.
+It is used instead of [[learnlog list]], which on an empty log can
+only say that nothing has been recorded yet---true, but silent about
+whether recording is wired at all, which is the question at this
+point.
 
 The closing paragraph states the cost of the route: the [[learnlog]]
 command exists only inside the environment.
@@ -504,13 +506,17 @@ Because [[learnlog]] was wired before this first run, the first run
 and the first record coincide, and recording cannot be mistaken for a
 separate act performed afterwards.
 
-The list also shows a line for the [[learnlog list]] command itself,
-since [[learnlog]] records its own review commands
-(\cref{sec:review-runs} explains why those, and only those, leave
-a record).
-Rather than hide this, the text names it, because a beginner who
-notices an unexplained extra line will otherwise wonder whether
-something went wrong.
+The listing shows the student's own runs and nothing else.
+The [[learnlog list]] invocation that produced it is recorded too
+(\cref{sec:review-runs} explains why the review commands, and only
+those, leave a record) but kept out of the way
+(\cref{sec:filter-learnlog}), so the first thing a beginner sees is
+one line naming the file they just ran, under a heading with the
+date.
+An earlier version of this text had to name an extra line for the
+listing itself and explain it away; now the contrast the step depends
+on---the terminal that said \enquote{Hello World!} now says which
+file said it---is the only thing on screen.
 
 <<lab0: hello world>>=
 ## Skriv ett enkelt program
@@ -541,11 +547,10 @@ Det du inte såg: learnlog sparade körningen. Skriv i terminalen
 learnlog list
 ```
 
-så får du en rad per körning, med tidpunkt och programmets namn. Du
-ska se en rad som nämner `helloworld.py` (texten `(none)` efter namnet
-betyder bara att programmet kördes utan argument). Du ser också en
-rad för `learnlog list` självt: även när du tittar på det som sparats
-sparas det.
+så får du en rubrik med dagens datum och under den en rad per
+körning, med klockslag och programmets namn. Du ska se en rad som
+nämner `helloworld.py` (texten `(none)` efter namnet betyder bara att
+programmet kördes utan argument).
 
 @
 

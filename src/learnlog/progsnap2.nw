@@ -4067,9 +4067,13 @@ def test_build_reconstructed_run_block_without_end_time():
 
 A review run has to make the same journey.
 The test below follows one out through the export and back in through
-the reconstruction, and then reads the rebuilt repository the way
-[[list]] and [[play]] read it---through [[filter_internal_runs]] and
-[[parse_commit_runs]]---rather than by matching the message text.
+the reconstruction, and then reads the rebuilt repository through
+[[filter_internal_runs]] and [[parse_commit_runs]], the readers a log
+is read with once the plumbing is out of the way, rather than by
+matching the message text.
+The reading views hide more than this by default
+(\cref{sec:filter-learnlog}); what the round trip has to preserve is
+the record, and the record is what this filter leaves standing.
 That is the property that matters: not that the [[Viewed:]] lines came
 back as characters, but that a reader arriving at the reconstructed log
 with no knowledge of ProgSnap2 finds a review run with its trace,
