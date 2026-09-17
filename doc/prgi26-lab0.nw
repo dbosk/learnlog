@@ -654,14 +654,22 @@ om hur du går tillväga.
 The troubleshooting list covers the failures the venv-first route is
 known to have, each stated as the symptom the student will see and
 the check that resolves it.
-Three of the four are the same failure seen from different places:
+Three of the five are the same failure seen from different places:
 the terminal, the editor or the program using a Python other than the
 course folder's.
 The list therefore points back to the same two checks each time, the
 [[(.venv)]] prefix and [[learnlog doctor]], rather than introducing
 new commands to remember.
-The Debian entry is the one platform-specific gap of the route: the
+The Debian entry is one platform-specific gap of the route: the
 [[venv]] module ships in a separate package there.
+The WSL entry is the other, and comes from a student's report: a
+project folder used from both PowerShell and WSL gets one [[.venv]]
+with a Windows [[Scripts/]] beside a POSIX [[bin/]].  learnlog copes
+with that, since it picks the host's own layout, but the two
+interpreters also share one [[pyvenv.cfg]], and whichever created the
+venv last owns its [[home]] entry, so the other side's Python stops
+finding its base installation.  The lab cannot make that work and
+says so: stay with one of the two.
 The last entry protects a student who already uses Git from
 committing the record into their own repository; [[.learnlog/]]
 manages itself.
@@ -678,6 +686,10 @@ manages itself.
   Select Interpreter**).
 - **`python3 -m venv .venv` misslyckas på Linux:** på Debian och Ubuntu
   behöver du först `sudo apt install python3-venv`.
+- **Du använder kursmappen både från PowerShell och från WSL:** Windows
+  och WSL kan inte dela på samma `.venv`. Den som skapade miljön senast
+  vinner, och den andra sidans `python` slutar fungera. Håll dig till
+  en av dem i kursmappen.
 - **Du använder redan Git i kursmappen:** mappen `.learnlog/` sköter
   sig själv. Lägg aldrig till den i ditt eget Git-förråd.
 
