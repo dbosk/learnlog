@@ -1182,29 +1182,73 @@ recognises the [[-c]] sentinel: that path recovers the real source from
 The bare [[sys.argv]] fast path remains only as a fallback for callers
 that do not supply [[sys.orig_argv]].
 
+[[python -m]] has the same wrinkle, with the module name in the role
+of the source.  The autostart hook imports learnlog while [[site]] is
+still running, and at that point CPython's [[sys.argv]] for
+[[python -m pip install learnlog]] is [["-m", "install", "learnlog"]]:
+[[runpy]] replaces the [[-m]] placeholder with the module's path only
+later, and the module name itself never appears in [[sys.argv]] at all.
+Read from [[sys.argv]] alone, the run was recorded as
+[[<python -m> install learnlog]], indistinguishable from any other
+module given those arguments.  [[sys.orig_argv]] still holds the
+interpreter's own command line, where the module is the argument after
+the first [[-m]]---or glued to it, as in [[-mpip]]---so it is put back
+in front of the arguments.  The plumbing filter among the readers is
+the first consumer to depend on this: it recognises the
+[[pip install learnlog]] that [[learnlog init]] runs through the venv's
+interpreter only when the [[pip]] is there to be seen.
+
+<<functions>>=
+def _run_module_name(orig_argv):
+    """Return the module ``-m`` names in ``orig_argv``, or ``None``."""
+    for index, item in enumerate(orig_argv[1:], start=1):
+        if item == "-m" and index + 1 < len(orig_argv):
+            return orig_argv[index + 1]
+        if item.startswith("-m") and not item.startswith("--"):
+            return item[2:]
+    return None
+@
+
 <<functions>>=
 def _normalize_main_invocation(argv, orig_argv=None):
     """Return a normalised ``(script, args)`` pair from ``argv``."""
     argv = list(argv) if argv else [""]
     orig_argv = list(orig_argv) if orig_argv else []
     script = argv[0]
-    special = {
-        "": ("<repl>", lambda values: []),
-        "-m": ("<python -m>", lambda values: values[1:]),
-    }
+    if script == "":
+        return "<repl>", []
     if script == "-c":
         if len(orig_argv) > 2 and orig_argv[1] == "-c":
             return "<python -c>", [orig_argv[2], *argv[1:]]
         if len(argv) > 1:
             return "<python -c>", [argv[1]]
         return "<python -c>", []
-    if script in special:
-        name, args_factory = special[script]
-        return name, args_factory(argv)
+    if script == "-m":
+        module = _run_module_name(orig_argv)
+        return "<python -m>", [module, *argv[1:]] if module else argv[1:]
     basename = os.path.basename(script)
     if script.endswith(".py"):
         return basename, argv[1:]
     return basename, argv[1:]
+@
+
+The three [[-m]] shapes are checked directly: the separate option, the
+glued one, and a caller without [[sys.orig_argv]], which keeps today's
+module-less record rather than guessing.
+
+<<test functions>>=
+def test_python_m_module_name_comes_from_orig_argv():
+    from learnlog import _normalize_main_invocation
+    assert _normalize_main_invocation(
+        ["-m", "install", "learnlog"],
+        [sys.executable, "-m", "pip", "install", "learnlog"],
+    ) == ("<python -m>", ["pip", "install", "learnlog"])
+    assert _normalize_main_invocation(
+        ["-m", "-q"], [sys.executable, "-B", "-mpytest", "-q"],
+    ) == ("<python -m>", ["pytest", "-q"])
+    assert _normalize_main_invocation(["-m", "-q"]) == (
+        "<python -m>", ["-q"]
+    )
 @
 
 A [[python -c]] run differs from a normal script run in one important
@@ -3447,8 +3491,7 @@ def committed_c_source(workdir, name=C_INVOCATION_NAME):
         [
             ([""], "<repl>", "(none)"),
             (["-c"], "<python -c>", shlex.quote("print(1)")),
-            (["-m", "pip", "--version"], "<python -m>",
-             "pip --version"),
+            (["-m", "--version"], "<python -m>", "pip --version"),
             (["/tmp/demo.py", "arg1"], "demo.py", "arg1"),
             (["/tmp/.venv/bin/pytest", "-q"], "pytest", "-q"),
         ],
@@ -3458,6 +3501,8 @@ def committed_c_source(workdir, name=C_INVOCATION_NAME):
     ):
         if argv == ["-c"]:
             orig_argv = [sys.executable, "-c", "print(1)"]
+        elif argv and argv[0] == "-m":
+            orig_argv = [sys.executable, "-m", "pip", *argv[1:]]
         elif argv is not None:
             orig_argv = [sys.executable, *argv]
         else:
