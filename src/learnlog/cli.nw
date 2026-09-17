@@ -127,6 +127,7 @@ import learnlog
 from learnlog import _is_home_or_above, find_learnlog_dir
 from learnlog._autostart import (
     venv_script_candidates,
+    venv_script_directories,
     _DEFAULT_MARKER_PATH,
     _is_autostart_wired,
     _replace_file,
@@ -1074,6 +1075,18 @@ on the binary name picks the layout that actually exists.
 Returning the path (not the string) keeps [[pathlib]]
 semantics in the callers.
 
+Both layouts can exist at once.  A student who uses one
+project folder from PowerShell and from WSL gets a [[.venv]]
+with a POSIX [[bin/]] next to a Windows [[Scripts/]], and the
+first such venv broke [[learnlog init]] on Windows with
+\enquote{[[WinError 193]]: \%1 is not a valid Win32
+application}: the candidates were tried [[bin/]] first, so
+Windows was handed WSL's [[bin/pip]], a shebang script it
+cannot execute.  The candidate order now puts the host's own
+layout first (see [[venv_script_candidates]] in the startup
+module), so this helper returns [[Scripts/pip.exe]] on
+Windows and [[bin/pip]] on WSL from the very same directory.
+
 Callers reach for this helper immediately after venv
 creation, so an absent binary means the venv itself is
 incomplete---a condition worth turning into [[SystemExit]]
@@ -1086,7 +1099,8 @@ def find_in_venv(venv_dir, name):
 
     ``name`` is the bare binary name (``pip``, ``python``,
     ``pytest``, ...).  Handles POSIX (``bin/<name>``) and
-    Windows (``Scripts/<name>.exe``) layouts.  Raises
+    Windows (``Scripts/<name>.exe``) layouts, preferring the
+    host's own when a venv carries both.  Raises
     ``SystemExit`` if neither is present---which means the
     venv is broken or incomplete.
     """
@@ -1121,6 +1135,28 @@ def test_find_in_venv_errors_when_absent(tmp_path):
     from learnlog.cli import find_in_venv
     with pytest.raises(SystemExit, match="No pip found"):
         find_in_venv(tmp_path, "pip")
+@
+
+The shared PowerShell-and-WSL venv is reproduced literally: both
+[[bin/pip]] and [[Scripts/pip.exe]] exist, and the platform alone
+decides which one comes back.
+
+<<test functions>>=
+@pytest.mark.parametrize("platform, expected", [
+    ("win32", pathlib.Path("Scripts", "pip.exe")),
+    ("linux", pathlib.Path("bin", "pip")),
+])
+def test_find_in_venv_prefers_host_layout(
+    tmp_path, monkeypatch, platform, expected,
+):
+    """With bin/ and Scripts/ side by side, the host's own layout wins."""
+    from learnlog import cli
+    for relative in (("bin", "pip"), ("Scripts", "pip.exe")):
+        binary = tmp_path.joinpath(*relative)
+        binary.parent.mkdir()
+        binary.write_text("")
+    monkeypatch.setattr(cli.sys, "platform", platform)
+    assert cli.find_in_venv(tmp_path, "pip") == tmp_path / expected
 @
 
 
@@ -1227,9 +1263,13 @@ minimal and the most correct option.
 
 PowerShell invokes [[Activate.ps1]] with [[&]] and cmd invokes
 [[activate.bat]] with [[call]].  Both [[bin/]] and [[Scripts/]] are
-searched, including both spellings of the PowerShell filename because
+searched, the host's own layout first ([[venv_script_directories]],
+the same order the interpreter lookup in \cref{sec:setup-pip-in-venv}
+uses), including both spellings of the PowerShell filename because
 [[virtualenv]] and the standard library differ in capitalisation.
-Git Bash can therefore use [[Scripts/activate]] too.
+Git Bash can therefore use [[Scripts/activate]] too, and in a venv
+that WSL has also populated it is not handed WSL's [[bin/activate]],
+whose paths mean nothing to a Windows shell.
 The emitted code delegates to the project venv's own activation script.
 If the script is missing even though [[.venv/]]
 exists, the venv is incomplete and we fail early rather than emitting
@@ -1243,7 +1283,7 @@ def activation_script(venv_dir, shell):
         Shell.powershell: ("activate.ps1", "Activate.ps1"),
         Shell.cmd: ("activate.bat",),
     }[shell]
-    for directory in ("bin", "Scripts"):
+    for directory in venv_script_directories():
         for name in names:
             script = venv_dir / directory / name
             if script.is_file():
@@ -1378,6 +1418,28 @@ def test_activation_supports_shells_and_layouts(
     shell = Shell(shell_name)
     assert emit_activate_shell_code(venv, shell) == (
         f"{operator} {shell_quote(script, shell)}"
+    )
+@
+
+A venv with both layouts must yield the host's script, so the same
+directory is checked under both platforms:
+
+<<test functions>>=
+@pytest.mark.parametrize("platform, directory", [
+    ("win32", "Scripts"),
+    ("linux", "bin"),
+])
+def test_activation_prefers_host_layout(
+    tmp_path, monkeypatch, platform, directory,
+):
+    from learnlog import cli
+    venv = tmp_path / ".venv"
+    for layout in ("bin", "Scripts"):
+        (venv / layout).mkdir(parents=True)
+        (venv / layout / "activate").write_text("")
+    monkeypatch.setattr(cli.sys, "platform", platform)
+    assert cli.activation_script(venv, cli.Shell.bash) == (
+        venv / directory / "activate"
     )
 
 
