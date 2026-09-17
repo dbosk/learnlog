@@ -94,7 +94,9 @@ the pacing cue: [[Time since last run]] makes quick retries and long
 pauses visible.
 The expert extra is that this review run records itself---reflection
 is part of the story the log tells---which reframes [[play]] from a
-passive reader to a participant.
+passive reader to a participant; and that the listing keeps that
+record out of the way until asked, so the learner also meets
+[[--all]] here, the flag that shows the reading beside the writing.
 
 <<shared step: review the whole log in batch mode>>=
 # Review the whole log in batch mode
@@ -117,10 +119,13 @@ retries and longer pauses visible during playback.
 <<shared step: review the whole log in batch mode>>
 
 This review run is itself part of the story: `play`, `list` and
-`metrics` record themselves, so your log also shows when you went back
+`metrics` record themselves, so your log also holds when you went back
 and read it.
+Your own listing hides those records so that what you see is your
+work; run `learnlog list --all` to see the reading beside the writing.
 (`checkout`, which you meet at the end of this tutorial, records itself
-too, before it changes anything.)
+too, before it changes anything, and is never hidden: going back is
+work.)
 Batch playback records a view of each commit it prints.
 @
 
@@ -315,6 +320,9 @@ The instruction sends the learner to the file and to [[learnlog list]]
 afterwards, because the two observations together carry the point:
 the change is gone from the file but not from the log, which lists
 both the run that made it and the checkout that replaced it.
+That the plain listing shows the checkout is what makes the
+instruction work: a checkout is never hidden, unlike the review runs
+(\cref{sec:filter-learnlog}), so the learner needs no flag here.
 The expert extra names the mechanism that makes this safe: the
 checkout records the files it is about to replace before it touches
 them, and the restored files become the tip of the same branch, so

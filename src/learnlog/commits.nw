@@ -19,7 +19,8 @@ to import the CLI module.
 """Functions for querying learnlog commit data.
 
 Provides commit listing, summary parsing, detail
-retrieval, filtering of learnlog's internal run blocks,
+retrieval, the filtering of learnlog's own run blocks and
+the choice of which commits a reading view lists,
 view-trace parsing, and tag resolution.
 """
 
@@ -725,6 +726,7 @@ student commit to the current one, while the ProgSnap2 analyser computes the
 more precise end-to-start interval from the run data itself.
 
 \subsection{Parsing ISO timestamps defensively}
+\label{sec:parse-iso}
 
 The run logs and Git commit dates both use ISO timestamps.
 We treat empty or malformed strings as missing data rather than raising, so
@@ -754,6 +756,44 @@ def test_parse_iso_valid_and_invalid():
         datetime.datetime(2026, 1, 1, 10, 0)
     assert _parse_iso("") is None
     assert _parse_iso("not-a-date") is None
+@
+
+A timestamp is normalised where it is parsed, not where it is compared,
+so that every reader of the log gets the same answer without each
+deciding for itself.
+The recorder writes [[datetime.now().isoformat()]], a naive local time,
+and every comparison the readers make---the listing's windows
+(\cref{sec:list-command}), the sessions and buckets of the metrics
+(\cref{metrics})---is between such values.
+A history that went through a ProgSnap2 round trip or another machine
+may carry an offset, so an aware value is moved to local time and its
+offset dropped, while a naive one is trusted.
+[[utcnow]] never appears, because the student's day boundaries are
+local ones.
+
+<<commits functions>>=
+def local_naive(value):
+    """Return ``value`` as a naive local datetime, or ``None``."""
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+@
+
+Let's verify that a naive value passes through untouched, that
+[[None]] stays [[None]], and that an aware value loses its offset:
+
+<<commits test functions>>=
+def test_local_naive_keeps_naive_and_strips_offset():
+    from learnlog.commits import local_naive
+    naive = datetime.datetime(2026, 1, 1, 10, 0)
+    assert local_naive(naive) is naive
+    assert local_naive(None) is None
+    aware = datetime.datetime(
+        2026, 1, 1, 10, 0, tzinfo=datetime.timezone.utc,
+    )
+    assert local_naive(aware).tzinfo is None
 @
 
 
@@ -813,28 +853,40 @@ def test_format_elapsed_human_readable():
 
 \subsection{Recognising learnlog's own commits}
 
-A [[Run: learnlog ...]] block can mean two quite different things to
-whoever reads the log.
+A [[Run: learnlog ...]] block can mean three things to whoever reads
+the log, and the three want three different treatments.
 [[learnlog play]], [[learnlog list]] and [[learnlog metrics]] are the
 student stepping back through their own history, and the recorder
 logs exactly those three subcommands because that reflection is itself
-evidence of learning (\cref{learnlog}); every view therefore shows
-them by default.
+evidence of learning (\cref{learnlog}).
+The record is written in full and reaches every researcher path
+unchanged---the export (\cref{progsnap2}) and the metrics
+(\cref{metrics}) both see it---but a student who reads their log ten
+times in an evening has ten records of reading for one of writing, and
+a listing that buries the writing under the reading defeats the
+purpose of keeping either.
+So the two reading views, [[list]] and [[play]], fold review runs away
+until [[--all]] asks for them.
+[[learnlog checkout]] is the one learnlog run that changes the files
+(\cref{sec:checkout}); going back is work, so it is shown like any
+run of the student's own.
 Everything else learnlog leaves behind is plumbing: the [[pip]] install
 that [[learnlog init]] performs, and---in repositories written before
 the recorder narrowed to review runs---records of the remaining
 subcommands, which used to log themselves as well.
-That kind is noise in every view, so it is what [[--all]] now reveals.
+That kind is noise in every view, so [[--all]] is the only way to see
+it.
 
-Four predicates therefore share one text-matching core, and each view
+Five predicates therefore share one text-matching core, and each view
 picks the one that matches its question.
 [[is_learnlog_command]] asks \enquote{is this learnlog at all}, which
 is what the elapsed indicator needs; [[is_review_command]] picks out
-the reflection runs and [[is_checkout_command]] the one learnlog run
-that changes the files (\cref{sec:checkout}); [[is_internal_command]]
-is the remainder, and is the one the display filters use.
+the reflection runs and [[is_checkout_command]] the checkouts;
+[[is_internal_command]] is the plumbing remainder, and
+[[is_hidden_command]] is the union the reading views filter
+by---everything of learnlog's except a checkout.
 
-All three read the command line rather than the commit, so the same
+All of them read the command line rather than the commit, so the same
 test serves a commit subject (\cref{sec:filter-learnlog}) and a parsed
 run block (\cref{progsnap2}).
 
@@ -985,6 +1037,33 @@ def is_internal_command(command):
     )
 @
 
+The hidden test is the other difference: learnlog's own activity minus
+the checkouts.
+It is spelled as a difference for the same reason---a checkout can
+never be hidden by accident, whatever the recorder of a future version
+adds to its list---and it is the widest of the filters because a
+reading view has exactly one question, \enquote{is this the student's
+work}, to which a review and the plumbing both answer no.
+[[is_internal_command]] remains the narrower question, and
+\cref{sec:filter-learnlog} says which record it is still asked about.
+
+<<commits functions>>=
+def is_hidden_command(command):
+    """Return true if a reading view hides ``command`` by default.
+
+    Learnlog's own activity minus the checkouts: the review
+    runs and the plumbing alike.
+    """
+    return (
+        is_learnlog_command(command)
+        and not is_checkout_command(command)
+    )
+@
+
+Let's verify the five predicates against the commands the recorder
+actually writes, including the two-token rule and the bare
+[[learnlog]] with no subcommand:
+
 <<commits test functions>>=
 def test_is_review_command():
     from learnlog.commits import (
@@ -1009,6 +1088,17 @@ def test_is_review_command():
     assert is_internal_command("learnlog export out.bundle")
     assert is_internal_command("pip install learnlog")
     assert not is_internal_command("hello.py")
+
+def test_is_hidden_command():
+    from learnlog.commits import is_hidden_command
+    assert is_hidden_command("learnlog play")
+    assert is_hidden_command("learnlog list --all")
+    assert is_hidden_command("learnlog metrics eq --by week")
+    assert is_hidden_command("learnlog export out.bundle")
+    assert is_hidden_command("pip install learnlog")
+    assert not is_hidden_command("learnlog checkout abc1234")
+    assert not is_hidden_command("hello.py")
+    assert is_hidden_command("learnlog")
 @
 
 
@@ -1021,13 +1111,14 @@ student run}---its subject begins [[Run:]] but is not one of learnlog's own
 [[Run: learnlog ...]] invocations---and subtract its date from the current
 commit's date.
 
-Review runs are skipped here deliberately, even though every other view
-now shows them: this number is meant to be read as thinking time between
-attempts at the code, and time spent paging through the log is not an
-attempt.
-The reference point is therefore chosen with [[is_learnlog_commit]], the
-widest of the three predicates, rather than with the narrower internal
-test that the displays filter by.
+Review runs are skipped here for the reason the reading views hide
+them, and for one more besides: this number is meant to be read as
+thinking time between attempts at the code, and time spent paging
+through the log is not an attempt.
+The reference point is therefore chosen with [[is_learnlog_commit]],
+the widest of the predicates, so that the gap is computed the same way
+whether or not the reader asked for [[--all]]---a tagged review run,
+which the views do show, still does not count as an attempt.
 
 Since every run now has a header commit of its own
 (\cref{sec:two-commit-protocol}), that date is the run's own start
@@ -1308,11 +1399,12 @@ have been filtered out.
 def parse_run_summary(message):
     """Extract a summary from a commit message body.
 
-    Returns ``(command, start_time, run_count)`` where
-    ``command`` is the script and arguments string,
-    ``start_time`` is formatted as ``YYYY-MM-DD HH:MM``,
-    and ``run_count`` is the number of run blocks.
-    Returns ``None`` if the message contains no runs.
+    Returns ``(command, start, run_count)`` where ``command``
+    is the script and arguments string, ``start`` is the first
+    run's ``Start-Time`` as a naive local datetime (``None``
+    when it is missing or unreadable), and ``run_count`` is the
+    number of run blocks.  Returns ``None`` if the message
+    contains no runs.
     """
     if not message or not message.strip():
         return None
@@ -1328,7 +1420,7 @@ def parse_run_summary(message):
     <<extract command from first run block>>
     <<extract start time from first run block>>
 
-    return (command, start_time, len(run_blocks))
+    return (command, start, len(run_blocks))
 @
 
 The first line of a run block is [[Run: script args]]---the same
@@ -1344,20 +1436,22 @@ command = first_line[len("Run: "):]
 
 The [[Start-Time:]] field sits in the same first run block
 ([[first]]) parsed above.
-Its value is an ISO\,8601 timestamp that we reformat to a
-human-friendly [[YYYY-MM-DD HH:MM]] since full ISO timestamps
-are noisy in a compact listing.
+Its value is an ISO\,8601 timestamp, and it is handed back as a
+[[datetime]] rather than as text: how a moment is spelled is a decision
+about the listing's layout, not about the log, and the day-grouped
+listing (\cref{sec:list-command}) needs the date and the time in two
+different places, which a pre-formatted string would have to be taken
+apart to supply.
+A timestamp that cannot be read comes back as [[None]] rather than as
+the raw text, so that a caller filtering by time never compares a
+moment against a string.
 
 <<extract start time from first run block>>=
-start_time = ""
+start = None
 for line in first.split("\n"):
     if line.startswith("Start-Time:"):
         iso = line.split(":", 1)[1].strip()
-        try:
-            dt = datetime.datetime.fromisoformat(iso)
-            start_time = dt.strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            start_time = iso
+        start = local_naive(_parse_iso(iso))
         break
 @
 
@@ -1376,9 +1470,9 @@ def test_parse_run_summary_single_run():
     )
     result = parse_run_summary(msg)
     assert result is not None
-    command, start_time, count = result
+    command, start, count = result
     assert command == "hello.py arg1 arg2"
-    assert start_time == "2026-03-20 14:30"
+    assert start == datetime.datetime(2026, 3, 20, 14, 30)
     assert count == 1
 
 def test_parse_run_summary_multiple_runs():
@@ -1398,10 +1492,17 @@ def test_parse_run_summary_multiple_runs():
     )
     result = parse_run_summary(msg)
     assert result is not None
-    command, start_time, count = result
+    command, start, count = result
     assert command == "hello.py (none)"
-    assert start_time == "2026-01-01 10:00"
+    assert start == datetime.datetime(2026, 1, 1, 10, 0)
     assert count == 2
+
+def test_parse_run_summary_unreadable_start():
+    from learnlog.commits import parse_run_summary
+    msg = "Run: hello.py (none)\n\nStart-Time: whenever"
+    assert parse_run_summary(msg)[1] is None
+    msg = "Run: hello.py (none)\n\nScript: hello.py"
+    assert parse_run_summary(msg)[1] is None
 
 def test_parse_run_summary_empty():
     from learnlog.commits import parse_run_summary
@@ -1579,57 +1680,97 @@ def reorder_commit_detail(detail):
 @
 
 
-\section{Filtering learnlog's internal runs}
+\section{Filtering runs out of a message}
 \label{sec:filter-learnlog}
 
-Two kinds of block in a log are not the student running their own
-program, and they deserve opposite treatment.
-A review run is one of them, and it stays: that a student went back
-through their history the evening before the deadline is part of the
-story a reader came for.
-The other kind is plumbing---the [[pip]] install that
-[[learnlog init]] performs, and whatever an older version recorded of
-the subcommands that no longer log themselves.
-Plumbing is noise in every view, so it is hidden unless the user asks
-for it with [[--all]].
-
-Filtering happens at the run-block level within each commit message
-rather than at the commit level, because a message can carry several
-blocks (\cref{sec:block-sep}) and a mixed message must keep its student
-runs.
+Three questions are asked of a [[Run: learnlog ...]] block---is it
+plumbing, is it anything of learnlog's but a checkout, or is nothing
+hidden at all---and the same surgery answers all of them: split the
+message on the block separator, drop the blocks whose header names a
+command the question accepts, and join what is left.
+So the filter takes the question as a parameter.
+The block level is where every one of them has to be asked, because a
+message can carry several blocks (\cref{sec:block-sep}) and a mixed
+message must keep its student runs.
+A filter that hides nothing is spelled as the absence of a filter,
+[[None]], so that [[--all]] costs its callers no branch of their own.
 
 <<commits functions>>=
-def filter_internal_runs(message):
-    """Remove learnlog's internal run blocks from a message.
+def filter_runs(message, hide):
+    """Remove the run blocks ``hide`` names from a message.
 
-    Splits on the ``---`` block separator and removes blocks
-    whose header records learnlog's own plumbing.  Review runs
-    (``learnlog play``, ``list`` and ``metrics``) and checkouts
-    are kept, as are the student's own programs.  Returns the
-    filtered message, which may be empty if every block was
-    internal.
+    ``hide`` is a predicate on the command a block's ``Run:``
+    header names, or ``None`` to keep every block.  Splits on
+    the ``---`` block separator and drops the blocks ``hide``
+    accepts.  Returns the filtered message, which may be empty
+    if every block was hidden.
     """
-    blocks = message.split(BLOCK_SEP)
-    filtered = [
-        b for b in blocks if not _is_internal_block(b)
+    if hide is None:
+        return message
+    kept = [
+        block for block in message.split(BLOCK_SEP)
+        if not _block_hidden(block, hide)
     ]
-    return BLOCK_SEP.join(filtered)
+    return BLOCK_SEP.join(kept)
 @
 
 A block's first line is its [[Run:]] header, which carries the same
 command string as the commit subject---so the block-level and the
-commit-level tests ask [[is_internal_command]] the same question about
-the same text.
+commit-level tests ask the predicate the same question about the same
+text.
+A block with no such header---the initial commit's message, or a
+fragment---names no command, and no predicate is asked about it.
 
 <<commits functions>>=
-def _is_internal_block(block):
-    """True if ``block`` records learnlog's own plumbing."""
+def _block_hidden(block, hide):
+    """True if ``hide`` accepts the command ``block`` records."""
     first_line = block.lstrip().split("\n", 1)[0]
     if not first_line.startswith(RUN_SUBJECT_PREFIX):
         return False
-    return is_internal_command(
-        first_line[len(RUN_SUBJECT_PREFIX):]
-    )
+    return hide(first_line[len(RUN_SUBJECT_PREFIX):])
+@
+
+The plumbing filter is the instance every reader of [[git show]] output
+applies unless told otherwise (\cref{sec:filter-show}), and the one
+the ProgSnap2 round trip is held to (\cref{progsnap2}): what an import
+has to preserve is the record, and the record is what this filter
+leaves standing.
+
+<<commits functions>>=
+def filter_internal_runs(message):
+    """Remove learnlog's plumbing blocks from a message.
+
+    Review runs (``learnlog play``, ``list`` and ``metrics``)
+    and checkouts are kept, as are the student's own programs.
+    """
+    return filter_runs(message, is_internal_command)
+@
+
+Which of the wider filters a reading view applies is decided once per
+commit, and in one place.
+[[--all]] hides nothing, and neither does a tag.
+[[learnlog tag]] names whatever ran last (\cref{sec:tag}), which is
+often the [[learnlog list]] the student consulted before choosing the
+name, and a view that hid the record they chose to name would lose
+the milestone marker it exists to show---the [[(tag: lab1)]] in the
+listing, and the place [[learnlog play lab1]] starts.
+The tag is the student's mark, not learnlog's noise, whatever the
+record holds: a tag on the [[pip]] install that [[learnlog init]]
+performed shows that install, rather than a marker with nothing
+under it.
+Every other record hides everything of learnlog's but a checkout.
+
+<<commits functions>>=
+def hidden_runs(*, show_all=False, tagged=False):
+    """The block filter a reading view applies to one commit.
+
+    ``None`` hides nothing, which is what ``--all`` asks for and
+    what a tagged record gets; every other record hides all of
+    learnlog's own runs except a checkout.
+    """
+    if show_all or tagged:
+        return None
+    return is_hidden_command
 @
 
 The exporter (\cref{progsnap2}) asks the same questions about a run it
@@ -1782,6 +1923,191 @@ def test_filter_internal_runs_preserves_io_separator():
     )
     result = filter_internal_runs(msg)
     assert "stdout: hello" in result
+@
+
+The wider filter drops the review run the plumbing filter kept, an
+absent filter drops nothing, and the chooser hands out exactly those
+three answers:
+
+<<commits test functions>>=
+def test_filter_runs_hides_review_and_plumbing():
+    from learnlog.commits import filter_runs, is_hidden_command
+    msg = (
+        "Run: hello.py (none)\n\nScript: hello.py\n"
+        "\n\n---\n\n"
+        "Run: learnlog play\n\nScript: learnlog\n"
+        "\n\n---\n\n"
+        "Run: pip install learnlog\n\nScript: pip\n"
+    )
+    result = filter_runs(msg, is_hidden_command)
+    assert "hello.py" in result
+    assert "learnlog play" not in result
+    assert "install learnlog" not in result
+
+def test_filter_runs_keeps_everything_with_no_filter():
+    from learnlog.commits import filter_runs
+    msg = (
+        "Run: learnlog play\n\nScript: learnlog\n"
+        "\n\n---\n\n"
+        "Run: pip install learnlog\n\nScript: pip\n"
+    )
+    assert filter_runs(msg, None) == msg
+
+def test_hidden_runs_picks_the_filter():
+    from learnlog.commits import hidden_runs, is_hidden_command
+    assert hidden_runs(show_all=True) is None
+    assert hidden_runs(show_all=True, tagged=True) is None
+    assert hidden_runs(tagged=True) is None
+    assert hidden_runs() is is_hidden_command
+@
+
+
+\section{Which commits a reading view shows}
+\label{sec:visible-commits}
+
+The filter above works on one message; the reading views page through
+a list.
+The interactive viewer numbers its position in that list and moves
+through it one entry at a time, so a list that still contains a commit
+nothing can be drawn for makes the position counter disagree with the
+keys---the defect the viewer's placeholder line papers over
+(\cref{viewer})---and a student who has listed their log a hundred
+times would meet a hundred placeholders.
+So the list is filtered before either view sees it, with the same
+predicate per commit that [[get_commit_detail]] will apply later.
+
+The decision reads the header messages from [[scan_run_commits]]
+(\cref{sec:run-join}) rather than [[git show]], because the scan is
+one Git call for the whole log where a show is one per commit.
+The trailer merge is not needed for it: [[merge_run_trailers]] folds a
+run's results into a block that is already there, and never creates or
+removes a block, so whether any block survives is decided by the header
+alone.
+The rule keeps exactly the commits whose filtered message is not
+blank, which is also exactly when [[get_commit_detail]] answers
+something rather than [[None]] (\cref{sec:commit-detail}); a commit
+with no run block at all---the initial commit---has a message nothing
+filters, so it stays in both.
+A commit the scan does not know is kept too: hiding what we have not
+read would be a guess.
+The last test below holds the two readers to that agreement, because a
+disagreement shows up as a placeholder nobody asked for or a gap nobody
+can see.
+
+<<commits functions>>=
+def visible_commits(commits, messages, tag_map=None, *,
+                    show_all=False):
+    """The commits a reading view lists, in the order given.
+
+    A commit stays when its message still has content after
+    the filter :func:`hidden_runs` picks for it.  ``messages``
+    is the map from :func:`scan_run_commits`; ``tag_map`` the
+    one from :func:`get_tag_map`, which decides which records
+    are tagged.
+    """
+    tag_map = tag_map or {}
+    visible = []
+    for commit in commits:
+        commit_hash = commit["hash"]
+        hide = hidden_runs(
+            show_all=show_all,
+            tagged=bool(tag_map.get(commit_hash)),
+        )
+        message = messages.get(commit_hash)
+        if message is None or filter_runs(message, hide).strip():
+            visible.append(commit)
+    return visible
+@
+
+Let's verify the rule on a hand-built message map first---review
+and plumbing dropped, the initial commit kept, a tag keeping whatever
+it sits on, [[--all]] keeping everything:
+
+<<commits test functions>>=
+def _message_map():
+    return {
+        "aaa": "learnlog: initial commit",
+        "bbb": "Run: hello.py (none)\n\nScript: hello.py\n",
+        "ccc": "Run: learnlog play\n\nScript: learnlog\n",
+        "ddd": "Run: pip install learnlog\n\nScript: pip\n",
+        "eee": "Run: learnlog list\n\nScript: learnlog\n",
+    }
+
+def _commit_list():
+    return [{"hash": h} for h in "aaa bbb ccc ddd eee".split()]
+
+def test_visible_commits_drops_review_and_plumbing():
+    from learnlog.commits import visible_commits
+    visible = visible_commits(_commit_list(), _message_map())
+    assert [c["hash"] for c in visible] == ["aaa", "bbb"]
+
+def test_visible_commits_keeps_a_tagged_review_run():
+    from learnlog.commits import visible_commits
+    visible = visible_commits(
+        _commit_list(), _message_map(), {"eee": ["lab1"]},
+    )
+    assert [c["hash"] for c in visible] == ["aaa", "bbb", "eee"]
+
+def test_visible_commits_keeps_tagged_plumbing():
+    from learnlog.commits import visible_commits
+    visible = visible_commits(
+        _commit_list(), _message_map(), {"ddd": ["start"]},
+    )
+    assert [c["hash"] for c in visible] == ["aaa", "bbb", "ddd"]
+
+def test_visible_commits_show_all():
+    from learnlog.commits import visible_commits
+    commits = _commit_list()
+    assert visible_commits(
+        commits, _message_map(), show_all=True,
+    ) == commits
+@
+
+And then the agreement with [[get_commit_detail]] on a real
+repository, over both values of [[show_all]]:
+
+<<commits test functions>>=
+def test_visible_commits_agrees_with_commit_detail(workdir):
+    from learnlog.commits import (
+        get_commit_detail, get_commits, get_tag_map, hidden_runs,
+        scan_run_commits, visible_commits,
+    )
+    repo = LearnlogRepo(workdir)
+    when = datetime.datetime(2026, 1, 1, 10, 0)
+    for script, args in [
+        ("hello.py", []),
+        ("learnlog", ["play"]),
+        ("pip", ["install", "learnlog"]),
+        ("learnlog", ["list"]),
+    ]:
+        repo.begin_run(script, args, when)
+        repo.finalize_run(
+            io_log="", exception_info=None,
+            end_time=when, exit_code=0,
+        )
+    repo.git("tag", "lab1")
+    commits = get_commits(repo)
+    scan = scan_run_commits(repo)
+    tag_map = get_tag_map(repo)
+    for show_all in (False, True):
+        visible = {
+            c["hash"] for c in visible_commits(
+                commits, scan.messages, tag_map,
+                show_all=show_all,
+            )
+        }
+        for commit in commits:
+            hide = hidden_runs(
+                show_all=show_all,
+                tagged=bool(tag_map.get(commit["hash"])),
+            )
+            detail = get_commit_detail(
+                repo, commit["hash"], hide, scan.trailers,
+            )
+            assert (commit["hash"] in visible) == \
+                (detail is not None)
+    listed = visible_commits(commits, scan.messages, tag_map)
+    assert len(listed) == 3
 @
 
 
@@ -2515,6 +2841,7 @@ def test_parse_exception_line_none():
 
 
 \section{Filtering [[git show]] output}
+\label{sec:filter-show}
 
 We could fetch the raw commit message separately
 ([[git log --format=%B]]), but that would require an extra subprocess
@@ -2524,8 +2851,8 @@ Instead, we take the message out of the [[git show]] output with
 and put the output back together around the result.
 
 Two different rewrites need this: merging a run's trailer back into its
-header (\cref{sec:run-join}) and dropping learnlog's internal runs
-(review runs stay---\cref{sec:filter-learnlog}).
+header (\cref{sec:run-join}) and dropping the runs a view hides
+(\cref{sec:filter-learnlog}).
 Taking the rewrite as a parameter keeps the re-indent surgery in one
 place instead of two.
 
@@ -2573,27 +2900,27 @@ return "\n".join(header + reindented + diff)
 @
 
 <<commits functions>>=
-def filter_show_output(show_output):
-    """Filter learnlog's internal runs from ``git show``.
+def filter_show_output(show_output, hide):
+    """Filter the run blocks ``hide`` names from ``git show``.
 
     Returns ``None`` if all run blocks were filtered out.
     """
     return rewrite_show_message(
-        show_output, filter_internal_runs,
+        show_output, lambda message: filter_runs(message, hide),
     )
 @
 
 
 \section{Retrieving commit detail}
+\label{sec:commit-detail}
 
-Filtering is enabled by default because learnlog's plumbing is never
-part of the student's story---a teacher reviewing the log should not
-have to remember a flag to get a clean view.
-The [[filter_internal]] parameter lets the [[--all]] flag disable it
-for debugging or completeness.
-Review runs come through either way: they are the student's activity,
-not learnlog's, and hiding them behind a flag would hide the very
-reflection the recorder logs them for.
+Plumbing is filtered by default because it is never part of anybody's
+story---a teacher reviewing the log should not have to remember a flag
+to get a clean view.
+Which of the wider filters applies is a question about the
+\emph{view}, not about the commit: the reading views pass their own
+predicate down, chosen by [[hidden_runs]] (\cref{sec:filter-learnlog}),
+and this function guesses nothing about who is asking.
 
 The trailer map is a parameter rather than something we fetch here
 because callers show many commits in a row: fetching it per commit
@@ -2631,7 +2958,7 @@ filtered detail in Git's own order.
 
 <<commits functions>>=
 def get_commit_detail(repo, commit_hash,
-                      filter_internal=True,
+                      hide=is_internal_command,
                       trailers=None,
                       reorder=True):
     """Return ``git show`` output for a single commit,
@@ -2639,12 +2966,13 @@ def get_commit_detail(repo, commit_hash,
 
     ``trailers`` is the map from :func:`get_run_trailers`; when
     given, each run's results are merged into its header block.
-    When ``filter_internal`` is ``True`` (the default),
-    learnlog's internal run blocks are stripped from the commit
-    message; review runs are kept.  Returns ``None`` if every
-    run in the commit was internal.  With ``reorder`` false the
-    text keeps git's own order, header then message then diff,
-    for a caller that lays the parts out itself.
+    ``hide`` is the predicate on run commands whose blocks are
+    stripped from the commit message: learnlog's plumbing by
+    default, ``None`` for nothing (:func:`hidden_runs` picks
+    the reading views' choice).  Returns ``None`` if every run
+    in the commit was hidden.  With ``reorder`` false the text
+    keeps git's own order, header then message then diff, for
+    a caller that lays the parts out itself.
     """
     result = repo.git("show", "--no-color", commit_hash)
     detail = result.stdout
@@ -2656,8 +2984,8 @@ def get_commit_detail(repo, commit_hash,
                 message, trailers,
             ),
         )
-    if filter_internal and detail is not None:
-        detail = filter_show_output(detail)
+    if hide is not None and detail is not None:
+        detail = filter_show_output(detail, hide)
     if detail is None:
         return None
 

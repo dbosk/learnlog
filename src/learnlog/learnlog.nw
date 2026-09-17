@@ -916,10 +916,16 @@ That argument was half right and the half it got wrong was expensive.
 What it got right is that reflection matters, and reflection is what
 [[learnlog play]], [[learnlog list]] and [[learnlog metrics]] are: the
 student reading their own history back.
-Those three stay recorded---indeed they become \emph{visible} records
-rather than hidden ones (\cref{commits})---because a log that shows
-only writing and never reading tells half the story of how someone
-learns to program.
+Those three stay recorded---the whole record, view trace included,
+reaching the export and the metrics unchanged---because a log that
+shows only writing and never reading tells half the story of how
+someone learns to program.
+What the default view shows is a separate question: [[list]] and
+[[play]] fold the review runs away so that a student's own history
+reads as their own work, and [[--all]] unfolds them
+(\cref{sec:filter-learnlog}).
+Recorded is not the same as displayed, and this is the one place the
+difference is deliberate.
 
 What it got wrong is that the remaining subcommands are not
 interactions with a log at all; they are the commands that
@@ -7259,8 +7265,10 @@ def test_checkout_records_once_and_the_next_run_follows(cli_project):
 The last test is the positive half of the policy, and it has to hold
 all three of its parts at once, because each is a way the others could
 be satisfied vacuously.
-[[play]] must be recorded and \emph{shown}---a hidden record would be
-no more use to a teacher than no record.
+[[play]] must be recorded and \emph{findable}---a record no command
+can reach would be no more use to a teacher than no record, which is
+why the listing is asked with [[--all]]: the default hides the review
+run (\cref{sec:filter-learnlog}), and nothing else does.
 Its trailer must name every commit that reached standard output, which
 is what makes the reflection legible rather than merely counted; we
 read the shown hashes out of [[git show]]'s own header lines and
@@ -7300,8 +7308,10 @@ def test_batch_playback_is_recorded_and_traced(cli_project):
     )
     assert shown
 
-    listed = _run_cli(learnlog, ["list"], cwd=project)
+    listed = _run_cli(learnlog, ["list", "--all"], cwd=project)
     assert "learnlog play" in listed.stdout
+    listed = _run_cli(learnlog, ["list"], cwd=project)
+    assert "learnlog play" not in listed.stdout
 
     trailer = _commit_body(project, "^Run-End: learnlog play")
     assert {
@@ -7337,7 +7347,7 @@ def test_metrics_is_recorded_without_a_view_trace(cli_project):
     )
     assert "active time (run-to-run)" in report.stdout
 
-    listed = _run_cli(learnlog, ["list"], cwd=project)
+    listed = _run_cli(learnlog, ["list", "--all"], cwd=project)
     assert "learnlog metrics time" in listed.stdout
 
     trailer = _commit_body(project, "^Run-End: learnlog metrics")
