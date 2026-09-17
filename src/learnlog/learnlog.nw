@@ -1188,29 +1188,73 @@ recognises the [[-c]] sentinel: that path recovers the real source from
 The bare [[sys.argv]] fast path remains only as a fallback for callers
 that do not supply [[sys.orig_argv]].
 
+[[python -m]] has the same wrinkle, with the module name in the role
+of the source.  The autostart hook imports learnlog while [[site]] is
+still running, and at that point CPython's [[sys.argv]] for
+[[python -m pip install learnlog]] is [["-m", "install", "learnlog"]]:
+[[runpy]] replaces the [[-m]] placeholder with the module's path only
+later, and the module name itself never appears in [[sys.argv]] at all.
+Read from [[sys.argv]] alone, the run was recorded as
+[[<python -m> install learnlog]], indistinguishable from any other
+module given those arguments.  [[sys.orig_argv]] still holds the
+interpreter's own command line, where the module is the argument after
+the first [[-m]]---or glued to it, as in [[-mpip]]---so it is put back
+in front of the arguments.  The plumbing filter among the readers is
+the first consumer to depend on this: it recognises the
+[[pip install learnlog]] that [[learnlog init]] runs through the venv's
+interpreter only when the [[pip]] is there to be seen.
+
+<<functions>>=
+def _run_module_name(orig_argv):
+    """Return the module ``-m`` names in ``orig_argv``, or ``None``."""
+    for index, item in enumerate(orig_argv[1:], start=1):
+        if item == "-m" and index + 1 < len(orig_argv):
+            return orig_argv[index + 1]
+        if item.startswith("-m") and not item.startswith("--"):
+            return item[2:]
+    return None
+@
+
 <<functions>>=
 def _normalize_main_invocation(argv, orig_argv=None):
     """Return a normalised ``(script, args)`` pair from ``argv``."""
     argv = list(argv) if argv else [""]
     orig_argv = list(orig_argv) if orig_argv else []
     script = argv[0]
-    special = {
-        "": ("<repl>", lambda values: []),
-        "-m": ("<python -m>", lambda values: values[1:]),
-    }
+    if script == "":
+        return "<repl>", []
     if script == "-c":
         if len(orig_argv) > 2 and orig_argv[1] == "-c":
             return "<python -c>", [orig_argv[2], *argv[1:]]
         if len(argv) > 1:
             return "<python -c>", [argv[1]]
         return "<python -c>", []
-    if script in special:
-        name, args_factory = special[script]
-        return name, args_factory(argv)
+    if script == "-m":
+        module = _run_module_name(orig_argv)
+        return "<python -m>", [module, *argv[1:]] if module else argv[1:]
     basename = os.path.basename(script)
     if script.endswith(".py"):
         return basename, argv[1:]
     return basename, argv[1:]
+@
+
+The three [[-m]] shapes are checked directly: the separate option, the
+glued one, and a caller without [[sys.orig_argv]], which keeps today's
+module-less record rather than guessing.
+
+<<test functions>>=
+def test_python_m_module_name_comes_from_orig_argv():
+    from learnlog import _normalize_main_invocation
+    assert _normalize_main_invocation(
+        ["-m", "install", "learnlog"],
+        [sys.executable, "-m", "pip", "install", "learnlog"],
+    ) == ("<python -m>", ["pip", "install", "learnlog"])
+    assert _normalize_main_invocation(
+        ["-m", "-q"], [sys.executable, "-B", "-mpytest", "-q"],
+    ) == ("<python -m>", ["pytest", "-q"])
+    assert _normalize_main_invocation(["-m", "-q"]) == (
+        "<python -m>", ["-q"]
+    )
 @
 
 A [[python -c]] run differs from a normal script run in one important
@@ -3453,8 +3497,7 @@ def committed_c_source(workdir, name=C_INVOCATION_NAME):
         [
             ([""], "<repl>", "(none)"),
             (["-c"], "<python -c>", shlex.quote("print(1)")),
-            (["-m", "pip", "--version"], "<python -m>",
-             "pip --version"),
+            (["-m", "--version"], "<python -m>", "pip --version"),
             (["/tmp/demo.py", "arg1"], "demo.py", "arg1"),
             (["/tmp/.venv/bin/pytest", "-q"], "pytest", "-q"),
         ],
@@ -3464,6 +3507,8 @@ def committed_c_source(workdir, name=C_INVOCATION_NAME):
     ):
         if argv == ["-c"]:
             orig_argv = [sys.executable, "-c", "print(1)"]
+        elif argv and argv[0] == "-m":
+            orig_argv = [sys.executable, "-m", "pip", *argv[1:]]
         elif argv is not None:
             orig_argv = [sys.executable, *argv]
         else:
@@ -5634,38 +5679,80 @@ import sysconfig
 \subsection{Finding scripts across venv layouts}
 
 A project may contain [[.venv/bin/ruff]] or
-[[.venv/Scripts/ruff.exe]].  The directory layout belongs to the venv,
-so discovering it from existing files works even when the host platform
-differs.  The CLI and metrics module share these stdlib-only candidates
-with the startup module that already knows venv geometry.
+[[.venv/Scripts/ruff.exe]]---or both.  A student who opens the same
+project folder from PowerShell and from WSL ends up with one [[.venv]]
+holding a POSIX [[bin/]] beside a Windows [[Scripts/]], because each
+side's interpreter installs its own scripts there.  The layout is
+therefore a property of the venv and is discovered from the files that
+exist; but which of those files the host can \emph{run} is a property
+of the host.  Windows, handed a POSIX shebang script, fails with
+\enquote{[[WinError 193]]: \%1 is not a valid Win32 application}, and
+that is how the mixed layout first surfaced: [[learnlog init]] on
+Windows found [[bin/pip]] before [[Scripts/pip.exe]].  So the host's
+own spelling comes first at both levels---the suffix within a
+directory and the directory within the venv---while the other layout
+stays reachable for a venv that has nothing else.  The CLI and metrics
+module share these stdlib-only candidates with the startup module that
+already knows venv geometry.
+
+The platform is read on every call rather than once at import, so a
+test can monkeypatch [[sys.platform]] and exercise the Windows order on
+a POSIX host.  It is [[sys.platform]] and not [[os.name]] for the
+reason given with the activation hint in the CLI: [[pathlib]] consults
+[[os.name]] whenever a [[Path]] is built, so patching that would switch
+every path pytest itself constructs to Windows flavour.
 
 <<venv script helpers>>=
 def script_candidates(directory, name):
-    """Yield bare and executable-suffixed paths in ``directory``."""
+    """Yield ``name`` in ``directory``, the host's runnable spelling first."""
     directory = pathlib.Path(directory)
-    yield directory / name
-    yield directory / f"{name}.exe"
+    suffixes = (".exe", "") if sys.platform.startswith("win") else ("", ".exe")
+    for suffix in suffixes:
+        yield directory / f"{name}{suffix}"
 @
 
-Trying [[bin]] before [[Scripts]] preserves the POSIX preference when
-both directories exist.  Callers decide whether a candidate exists and
-how to report a missing tool; discovery itself has no side effects.
+The same rule picks the directory: a [[bin/]] left by WSL must not
+shadow [[Scripts/]] on Windows, and on WSL the reverse holds.  The
+order is a function of its own because the CLI's [[activation_script]]
+walks the same two directories for a shell's [[activate]] script and
+has to agree with the interpreter lookup---a Git Bash user on Windows
+is served [[Scripts/activate]], not WSL's [[bin/activate]].
+
+<<venv script helpers>>=
+def venv_script_directories():
+    """Return the venv script directories, the host's own layout first."""
+    if sys.platform.startswith("win"):
+        return ("Scripts", "bin")
+    return ("bin", "Scripts")
+@
+
+Callers decide whether a candidate exists and how to report a missing
+tool; discovery itself has no side effects.
 
 <<venv script helpers>>=
 def venv_script_candidates(venv_dir, name):
     """Yield script candidates in POSIX and Windows venv layouts."""
-    for directory in ("bin", "Scripts"):
+    for directory in venv_script_directories():
         yield from script_candidates(pathlib.Path(venv_dir) / directory, name)
 @
 
+Both orders are pinned down, since a regression in either one would
+only show up on the other platform:
+
 <<autostart test functions>>=
-def test_venv_script_candidates_cover_both_layouts(tmp_path):
-    from learnlog._autostart import venv_script_candidates
-    assert list(venv_script_candidates(tmp_path, "python")) == [
-        tmp_path / "bin" / "python",
-        tmp_path / "bin" / "python.exe",
-        tmp_path / "Scripts" / "python",
-        tmp_path / "Scripts" / "python.exe",
+@pytest.mark.parametrize("platform, expected", [
+    ("linux", ["bin/python", "bin/python.exe",
+               "Scripts/python", "Scripts/python.exe"]),
+    ("win32", ["Scripts/python.exe", "Scripts/python",
+               "bin/python.exe", "bin/python"]),
+])
+def test_venv_script_candidates_put_host_layout_first(
+    tmp_path, monkeypatch, platform, expected,
+):
+    from learnlog import _autostart
+    monkeypatch.setattr(_autostart.sys, "platform", platform)
+    assert list(_autostart.venv_script_candidates(tmp_path, "python")) == [
+        tmp_path / relative for relative in expected
     ]
 @
 
