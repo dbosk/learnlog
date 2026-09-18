@@ -126,7 +126,7 @@ route; the chapter says why. `learnlog play` there relies on the
   its own pytest process; `test_env`/`_autostart_env` strip it for the
   subprocess tests that must be logged
 - **Encoding**: runtime text files are UTF-8; decoded subprocess pipes use UTF-8 with `errors="replace"`. `LearnlogRepo.git(text=False)` omits the codec entirely to preserve binary archives.
-- **Windows imports**: pytorial >= 0.8.1 defers POSIX terminal imports. Keep the dependency floor rather than guarding `import pytorial`; catalog commands work natively and tutorial shell steps report the WSL requirement.
+- **Windows and tutorials**: pytorial defers POSIX terminal imports (since 0.8.1) and, from the 0.9.0 floor, owns the WSL guidance: `tutorial list` marks entries `needs WSL`, `tutorial run` refuses before the first step, the help texts carry the note. Keep the dependency floor rather than guarding `import pytorial`, and do not repeat "run this in WSL" inside tutorial step text (a step is only shown where the run could start). `test_cli_without_posix_terminal_modules` in `cli.nw` pins all three
 - Git operations use `subprocess.run` (no GitPython dependency)
 - `LearnlogRepo.git()` raises `GitError` by default; pass `check=False` only
   where the exit status is the answer (`git diff --cached --quiet`, probes),
@@ -174,7 +174,7 @@ route; the chapter says why. `learnlog play` there relies on the
   with `LEARNLOG_DEBUG` set, mirrored to stderr — never `except: pass`
 - Runtime dependencies: `typer>=0.9.0` (CLI), `virtualenv>=20` (used by
   `learnlog init` to create project venvs reliably on PEP 668 / split-
-  `python3-venv` systems), `pytorial>=0.8.1,<0.9` (embedded interactive
+  `python3-venv` systems), `pytorial>=0.9.0,<0.10` (embedded interactive
   tutorials), and `radon>=6.0` (CC/LOC/Halstead/MI for `learnlog metrics
   code`), and `ruff`/`pylint` (both bundled for `learnlog metrics lint`;
   ruff is the default, `--linter pylint` or `learnlog config linter pylint`

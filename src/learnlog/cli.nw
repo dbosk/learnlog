@@ -2704,15 +2704,37 @@ pytorial.add_typer_subcommand(
 )
 @
 
-Pytorial 0.8.1 defers POSIX terminal imports, so the dependency floor is
-what makes every CLI command importable on Windows.  An import guard
-here would hide a broken installation by silently removing the tutorial
-command.  A fresh interpreter with all four POSIX modules blocked checks
-both the catalog path and the shell runner's WSL diagnostic.
+The dependency floor, not an import guard, is what makes this work on
+Windows.
+Pytorial defers its POSIX terminal imports ([[fcntl]], [[pty]],
+[[termios]], [[tty]]) since 0.8.1, so [[import pytorial]] at module
+scope no longer takes every CLI command down with it.
+An import guard here would instead hide a broken installation by
+silently removing the tutorial command.
+
+Importable is not yet helpful, though.
+Under 0.8.1 a Windows student could start a tutorial and only learn at
+its first shell step that it cannot run there, and nothing in
+[[learnlog tutorial list]] warned them beforehand.
+Every tutorial we ship has shell steps and a bash [[pre_command]], so
+that was every tutorial.
+Pytorial 0.9.0 moves the answer to where the student looks first: the
+list marks such entries \enquote{needs WSL}, [[run]] refuses before the
+first step with a message that names WSL, and the help texts carry the
+same note.
+That is why the floor is 0.9.0, and why learnlog's own tutorials say
+nothing about Windows: pytorial owns that guidance, and a step's text
+is only ever shown where the run was allowed to start.
+
+A fresh interpreter with all four POSIX modules blocked stands in for
+Windows.
+The first case checks that our catalog still loads there, the other two
+pin the 0.9.0 behaviour the floor promises.
 
 <<test functions>>=
 @pytest.mark.parametrize("command, status, expected", [
     (["tutorial", "list"], 0, "getting-started"),
+    (["tutorial", "list"], 0, "needs WSL"),
     (["tutorial", "run", "getting-started"], 1, "WSL"),
 ])
 def test_cli_without_posix_terminal_modules(tmp_path, command, status, expected):
