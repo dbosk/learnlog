@@ -29,8 +29,9 @@ If PowerShell blocks activation scripts, run
 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once for your user.
 Use `--shell bash`, `--shell powershell`, or `--shell cmd` to choose the
 syntax explicitly. The commands print code for that shell to execute.
-Interactive tutorial shell steps need WSL on Windows; `learnlog tutorial list`
-works natively.
+Interactive tutorials need WSL on Windows: `learnlog tutorial list` works
+natively and marks them `needs WSL`, and `learnlog tutorial run` says so
+instead of starting.
 
 ## Use cases
 
