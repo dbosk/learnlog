@@ -1162,6 +1162,7 @@ class TestIsOptedOut:
 @
 
 \subsection{Normalising the invocation}
+\label{sec:normalising-the-invocation}
 
 An invocation that survives the veto still has to be given a name.
 The invocation name is normalised rather than copied from
@@ -1203,6 +1204,13 @@ in front of the arguments.  The plumbing filter among the readers is
 the first consumer to depend on this: it recognises the
 [[pip install learnlog]] that [[learnlog init]] runs through the venv's
 interpreter only when the [[pip]] is there to be seen.
+One consequence is worth knowing when reading a log: the
+[[python -m pip install -U learnlog]] that brings this fix in is itself
+recorded by the version being replaced, since that is what the hook
+imported before pip ran, so a log can still hold a module-less
+[[<python -m> install -U learnlog]] record after the upgrade.  The name
+was never stored, so such records cannot be repaired; only the runs
+that follow show the difference.
 
 <<functions>>=
 def _run_module_name(orig_argv):
@@ -6648,6 +6656,47 @@ def test_autostart_captures_syntax_error_end_to_end(tmp_path):
     history = _git_history(project)
     assert "Script: main.py" in history
     assert "SyntaxError" in history
+@
+
+The module name of a [[python -m]] run comes from [[sys.orig_argv]]
+(\cref{sec:normalising-the-invocation}), and every other test of that
+path hands the normaliser an [[orig_argv]] it made up itself: the unit
+test calls the function directly, and the explicit-import matrix sets
+[[sys.orig_argv]] in its prelude.  Neither can tell a working fix from
+a hook that runs before CPython has populated [[sys.orig_argv]].  That
+gap was visible once: after the fix had shipped, a log still gained
+records reading [[<python -m> install -U learnlog]]---written, it
+turned out, by the version being replaced---and nothing in the suite
+could say which explanation held.  This test therefore runs
+[[python -m pip --version]] through the real [[.pth]] hook, in both
+spellings CPython accepts, and reads the module name back from the
+history.  [[pip]] is the module because the plumbing filter depends on
+seeing it, and [[virtualenv]] seeds it into every venv it creates.
+
+<<autostart test functions>>=
+@pytest.mark.parametrize("module_option", [["-m", "pip"], ["-mpip"]])
+def test_autostart_records_the_module_of_a_python_m_run(
+    tmp_path, module_option,
+):
+    project, venv_dir = _prepare_autostart_project(tmp_path)
+    python = _venv_binary(venv_dir, "python")
+
+    result = subprocess.run(
+        [str(python), *module_option, "--version"],
+        cwd=str(project),
+        env=_autostart_env(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("pip ")
+
+    history = _git_history(project)
+    assert "Script: <python -m>" in history
+    assert "Arguments: pip --version" in history
+    assert "stdout: pip " in history
 @
 
 The next two tests pin down the activation gate through the real
