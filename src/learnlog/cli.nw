@@ -135,12 +135,18 @@ from learnlog._autostart import (
     _resolve_project_root,
 )
 from learnlog.gitrepo import (
+    BUNDLE_SUFFIX,
+    GIT_DIR_NAME,
     GIT_TREE_TIMEOUT,
     GitError,
     GitNotFoundError,
     LearnlogRepo,
     git_environment,
+    parse_run_arguments,
+    PROGSNAP2_SUFFIX,
     run_git,
+    source_arguments,
+    source_files,
 )
 from learnlog.commits import (
     CHECKOUT_SUBCOMMAND,
@@ -156,11 +162,14 @@ from learnlog.commits import (
     visible_commits,
     resolve_record_commit,
     commit_outcomes,
+    is_checkout_command,
+    last_playback,
 )
 from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
     _iter_event_tags,
     do_export_progsnap2,
+    extract_code_state,
     read_progsnap2,
     read_progsnap2_as_repo,
     group_edit_run_pairs,
@@ -2695,6 +2704,8 @@ pytorial.add_typer_subcommand(
         str(_builtin_tutorials_dir / "getting-started-expert.md"),
         str(_builtin_tutorials_dir / "playback-and-tagging.md"),
         str(_builtin_tutorials_dir / "playback-and-tagging-expert.md"),
+        str(_builtin_tutorials_dir / "playing-lectures.md"),
+        str(_builtin_tutorials_dir / "playing-lectures-expert.md"),
         str(_builtin_tutorials_dir / "export-and-share.md"),
         str(_builtin_tutorials_dir / "export-and-share-expert.md"),
         str(_builtin_tutorials_dir / "metrics.md"),
@@ -2879,6 +2890,8 @@ def test_tutorial_list_lists_builtin_tutorials():
     assert "getting-started-expert" in out
     assert "playback-and-tagging" in out
     assert "playback-and-tagging-expert" in out
+    assert "playing-lectures" in out
+    assert "playing-lectures-expert" in out
     assert "export-and-share" in out
     assert "export-and-share-expert" in out
     assert "metrics" in out
@@ -2889,6 +2902,8 @@ def test_tutorial_list_lists_builtin_tutorials():
         < out.index("getting-started-expert")
         < out.index("playback-and-tagging")
         < out.index("playback-and-tagging-expert")
+        < out.index("playing-lectures")
+        < out.index("playing-lectures-expert")
         < out.index("export-and-share")
         < out.index("export-and-share-expert")
         < out.index("metrics")
@@ -2901,6 +2916,7 @@ def test_expert_variants_share_their_novice_contract():
     for base in (
         "getting-started",
         "playback-and-tagging",
+        "playing-lectures",
         "export-and-share",
         "metrics",
     ):
@@ -7674,25 +7690,131 @@ snapshot and keeps them on the branch.
 <<typer commands>>=
 @app.command()
 def checkout(
-    run: Annotated[str, typer.Argument(
-        help="A run's hash from `learnlog list`, or a tag.",
-    )],
+    run: Annotated[str | None, typer.Argument(
+        help=(
+            "A run's hash from `learnlog list`, or a tag.  With "
+            "--restore, the number of the checkout to undo."
+        ),
+    )] = None,
+    source: Annotated[str | None, typer.Option(
+        "--from", "-f",
+        help=(
+            "Take the run from another log: a directory with "
+            ".learnlog/, a bundle, or a ProgSnap2 zip.  Its files "
+            "are copied into your project over files of the same "
+            "name; your other files stay."
+        ),
+    )] = None,
+    output: Annotated[str | None, typer.Option(
+        "--output", "-o",
+        help=(
+            "Directory inside your project to copy the files into "
+            "(with --from).  Default: one named after the source, "
+            "lecture21/ for lecture21.learnlog; -o . is the root."
+        ),
+    )] = None,
+    restore: Annotated[bool, typer.Option(
+        "--restore",
+        help=(
+            "Bring back the files from before one of your "
+            "checkouts: lists them and asks which, or takes the "
+            "number as the argument."
+        ),
+    )] = False,
 ):
     """Bring back the files of an earlier run as your next version.
 
     The files you have now are recorded first, so nothing is
     lost, and your next run continues the log from the
-    restored version.
+    restored version.  With --from, the run's files are copied
+    in from another log instead; with --restore, a checkout is
+    undone.
     """
+    import shutil
+
     workdir = find_learnlog_dir()
     if workdir is None:
         raise SystemExit("No .learnlog/ directory found.")
     repo = LearnlogRepo(workdir)
-    <<resolve the run to restore>>
-    <<refuse while a Git operation is unfinished>>
-    <<record the files about to be replaced>>
-    <<restore the run and close its record>>
-    <<confirm the restore and the way back>>
+    <<refuse option combinations that do not make sense>>
+    if restore:
+        <<choose the checkout to undo>>
+    origin, tmpdir = (
+        (repo, None) if source is None else resolve_source(source)
+    )
+    try:
+        if not restore:
+            <<resolve the run to restore>>
+        <<refuse while a Git operation is unfinished>>
+        <<record the files about to be replaced>>
+        if source is None:
+            <<restore the run and close its record>>
+        else:
+            <<copy the run's files in and close its record>>
+        <<confirm the restore and the way back>>
+    finally:
+        if tmpdir is not None:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+The command has grown two more shapes since the one above, and they
+are told apart before anything is read.
+[[learnlog checkout --from lecture.learnlog <hash>]] copies a run's
+files in from another log (\cref{sec:checkout-from}), and
+[[learnlog checkout --restore]] undoes a checkout
+(\cref{sec:checkout-restore}).
+Each option belongs to one shape: [[--output]] names where the copied
+files go, so it needs [[--from]]; [[--restore]] chooses among this
+log's own checkouts, so it takes neither.
+A destination outside the project is refused for the reason that
+makes the copy worth recording at all: files there are in no
+snapshot, and the log would say the student got files it cannot
+show.
+The Git directory is inside the project but is not the student's
+files, so it is refused with the same words.
+Without [[--output]] the copy goes into a directory named after the
+source---[[lecture21/]] for [[lecture21.learnlog]]---so that a
+student who fetches from several lectures gets one folder each and
+never a lecture's [[main.py]] over their own; [[-o .]] asks for the
+project root explicitly.
+The name is the source's last path component with the export suffix
+gone, which serves a bundle, a ProgSnap2 archive and a directory
+alike.
+
+<<refuse option combinations that do not make sense>>=
+if restore and (source is not None or output is not None):
+    raise SystemExit("--restore takes no --from or --output.")
+if output is not None and source is None:
+    raise SystemExit(
+        "--output needs --from: it says where the copied files go."
+    )
+if run is None and not restore:
+    raise SystemExit("Give a run to check out, or --restore.")
+destination = workdir
+target_dir = None
+if source is not None:
+    target_dir = (
+        output if output is not None else default_output(source)
+    )
+    destination = pathlib.Path(target_dir).resolve()
+    if (
+        not destination.is_relative_to(workdir.resolve())
+        or destination.is_relative_to(
+            (workdir / GIT_DIR_NAME).resolve()
+        )
+    ):
+        raise SystemExit(
+            f"{target_dir} is not inside your project, so files "
+            "there could not be recorded."
+        )
+<<helper functions>>=
+def default_output(source):
+    """The directory a copy from ``source`` goes into by default."""
+    name = pathlib.Path(source).resolve().name
+    for suffix in (BUNDLE_SUFFIX, PROGSNAP2_SUFFIX):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    return name or "."
 @
 
 The argument is whatever the student has to hand: the seven-character
@@ -7714,28 +7836,37 @@ student can see.
 A typo therefore fails before anything is recorded.
 
 <<resolve the run to restore>>=
-peeled = repo.git(
+peeled = origin.git(
     "rev-parse", "--verify", "--quiet", f"{run}^{{commit}}",
     check=False,
 )
 target = None
 if peeled.returncode == 0:
-    target = resolve_record_commit(repo, peeled.stdout.strip())
-    on_branch = repo.git(
+    target = resolve_record_commit(origin, peeled.stdout.strip())
+    on_branch = origin.git(
         "merge-base", "--is-ancestor",
-        target, repo.recording_branch(), check=False,
+        target, origin.recording_branch(), check=False,
     )
     if on_branch.returncode != 0:
         target = None
 if target is None:
     raise SystemExit(
-        f"{run} is not a run in this log; "
+        f"{run} is not a run in {source or 'this log'}; "
         "pick a hash or tag from learnlog list."
     )
-subject = repo.git(
+subject = origin.git(
     "log", "-1", "--format=%s", target, check=False,
 ).stdout.strip()
+headline = (
+    f"{run} -> {subject}; files restored, "
+    "your next run continues from here"
+)
 @
+
+The log the ref is looked up in is [[origin]]: this project's own,
+or the one [[--from]] named, resolved by [[resolve_source]] exactly as
+[[play]] resolves it (\cref{sec:resolve-source}); the record always
+goes to this project's log, [[repo]].
 
 A merge or rebase the student left half-finished in the log is the one
 state the restore cannot be made safe in.
@@ -7765,10 +7896,11 @@ touched, because an unrecorded overwrite is the one outcome this
 command exists to rule out.
 
 <<record the files about to be replaced>>=
+<<the command line to record>>
 try:
     repo.begin_run(
-        "learnlog", [CHECKOUT_SUBCOMMAND, run],
-        datetime.datetime.now(),
+        "learnlog", recorded, datetime.datetime.now(),
+        include=source_files(recorded, workdir),
     )
 except GitError as error:
     raise SystemExit(
@@ -7776,6 +7908,24 @@ except GitError as error:
         f"restored: {error}"
     )
 snapshot = repo.run_commit
+@
+
+The command line recorded is the shape that ran, options included, so
+that the log itself says whether files came from this project, from
+another log and into which directory, or from a snapshot being
+restored; and a source file among those words is recorded with the
+snapshot, as \cref{sec:source-files} explains.
+
+<<the command line to record>>=
+if restore:
+    recorded = [CHECKOUT_SUBCOMMAND, "--restore", run]
+elif source is not None:
+    recorded = [CHECKOUT_SUBCOMMAND, "--from", source]
+    if output is not None:
+        recorded += ["-o", output]
+    recorded.append(run)
+else:
+    recorded = [CHECKOUT_SUBCOMMAND, run]
 @
 
 The trailer closes the record whether the restore succeeded or not,
@@ -7791,23 +7941,29 @@ but a failed command, and it propagates with the record left open,
 exactly as a killed program run leaves its header.
 
 <<restore the run and close its record>>=
-confirmation = [
-    f"{run} -> {subject}; files restored, "
-    "your next run continues from here",
-    f"Your previous files were recorded as {snapshot[:7]}: "
-    f"learnlog checkout {snapshot[:7]} brings them back",
-]
+<<the confirmation lines>>
 failure = None
 try:
     repo.restore_code_state(target)
+    tree = f"{target}^{{tree}}"
 except GitError as error:
     failure = str(error)
+    tree = None
+<<close the record with the outcome>>
+@
+
+<<the confirmation lines>>=
+confirmation = [
+    headline,
+    f"Your previous files were recorded as {snapshot[:7]}: "
+    f"learnlog checkout {snapshot[:7]} or learnlog checkout "
+    "--restore brings them back",
+]
+<<close the record with the outcome>>=
 if failure is None:
     io_log = "".join(f"stdout: {line}\n" for line in confirmation)
-    tree = f"{target}^{{tree}}"
 else:
     io_log = f"stderr: {failure}\n"
-    tree = None
 repo.finalize_run(
     io_log=io_log,
     exception_info=None,
@@ -7816,6 +7972,174 @@ repo.finalize_run(
     tree=tree,
 )
 @
+
+\subsubsection{Copying a run's files in from another log}
+\label{sec:checkout-from}
+
+A student who has played back a lecture's recording
+([[learnlog play -f lecture.learnlog]], \cref{sec:play}) wants the
+code at some point of it in their own project, to run and change.
+[[learnlog checkout --from lecture.learnlog <hash>]] copies that
+run's files in and records the copy as a checkout in the student's
+log, and the record is the point: the [[Run:]] line names the source
+and the ref as typed, the confirmation recorded as the run's output
+names the full hash, and the trailer's tree is the project with the
+copied files in it, so the student's next run diffs against the
+lecture's code and a teacher reading the log sees what was taken and
+what was done with it.
+The bundle itself joins the snapshot ([[source_files]],
+\cref{sec:source-files}), as it does for a playback, so a student who
+copies without ever playing still leaves the recording in their log.
+
+The files are copied in \emph{over} the project, not in place of it.
+An own-log checkout replaces the work tree because its target is an
+earlier state of this very project; a lecture's tree is not, and a
+student whose lab files vanished because they fetched a lecture's
+would have learnt the wrong lesson about a command meant to be safe.
+So files of the same name are overwritten---they are in the snapshot
+the record starts with---and everything else stays.
+The copy goes into a directory named after the source unless
+[[--output]] says otherwise, so a student who keeps each lecture in
+its own folder gets that for free.
+
+Copying files rather than fetching objects is what lets one code path
+serve every kind of source [[resolve_source]] knows, and it keeps the
+other log's history out of the student's object store; the trailer's
+tree is built from the work tree afterwards ([[stage_work_tree]],
+\cref{sec:stage-work-tree}), so it holds exactly what is on disk and
+[[git status]] is clean.
+[[extract_code_state]] (\cref{sec:extract-code-state}) does the
+copying, and its [[tarfile]] filter is the guard against a tree that
+would write outside the destination.
+The way back is the same as for any checkout: the snapshot taken
+first, restored as a replace, removes the copied files again.
+
+<<copy the run's files in and close its record>>=
+headline = (
+    f"{run} from {source} -> {subject}; files copied into "
+    f"{target_dir} ({target}), your next run continues from here"
+)
+<<the confirmation lines>>
+failure = None
+try:
+    destination.mkdir(parents=True, exist_ok=True)
+    extract_code_state(origin, target, destination)
+    tree = repo.stage_work_tree()
+except (GitError, OSError) as error:
+    failure = str(error)
+    tree = None
+<<close the record with the outcome>>
+@
+
+\subsubsection{Undoing a checkout}
+\label{sec:checkout-restore}
+
+Every checkout starts by recording the files it is about to replace,
+and that snapshot is the checkout's own header commit---the hash
+[[list]] prints on the checkout's line and the confirmation names as
+the way back.
+So \enquote{the files from before that checkout} is always one
+[[learnlog checkout <hash>]] away, and [[--restore]] exists to save
+the student the hash.
+
+It is a chooser rather than a rule, because after two checkouts
+\enquote{my code} is ambiguous: the code before the lecture came in,
+or the edits made to the lecture's code since?
+And a bare undo cannot chain, since a restore is itself a checkout
+and becomes the newest one; a second bare undo would only undo the
+undo.
+The command therefore lists the log's checkouts, newest first and
+numbered, each with the command as recorded and the snapshot it would
+bring back, and asks for a number---the most recent by default, which
+is the common case.
+Restores are listed like any other checkout, so one can be redone.
+The number can be given as the argument instead, for a student who
+already knows, and when there is no terminal to ask on the default is
+taken and said, so a script gets the common case rather than a hang.
+A number outside the list is a mistake to report, not to clamp.
+
+<<helper functions>>=
+def checkout_records(repo):
+    """The log's checkouts, newest first.
+
+    Each is ``(commit, start, command)``: the checkout's header
+    commit, which snapshots the files from before it, and the
+    start time and command line as `parse_run_summary` reads them.
+    """
+    scan = scan_run_commits(repo)
+    found = []
+    for commit in reversed(get_commits(repo)):
+        summary = parse_run_summary(
+            scan.messages.get(commit["hash"], "")
+        )
+        if summary is not None and is_checkout_command(summary[0]):
+            found.append((commit["hash"], summary[1], summary[0]))
+    return found
+@
+
+The chosen header is the target, with no ref to peel and no trailer
+to step back from: a header commit is a run's record and its tree is
+the snapshot.
+The record's command line carries the number, so the log says which
+checkout was undone.
+A failed checkout is listed with the rest: its files were never
+touched, but its header is a snapshot like any other and the list is
+of snapshots.
+
+<<choose the checkout to undo>>=
+checkouts = checkout_records(repo)
+if not checkouts:
+    raise SystemExit(
+        "Nothing to restore: there is no checkout in this log."
+    )
+typer.echo("Your checkouts, newest first:")
+for number, (commit, start, command) in enumerate(checkouts, 1):
+    when = (
+        UNKNOWN_START if start is None
+        else start.strftime("%Y-%m-%d %H:%M")
+    )
+    typer.echo(
+        f"{number:>3}  {when}  {command}"
+        f"   files before it: {commit[:7]}"
+    )
+<<take the number from the argument or the prompt>>
+target, _, undone = checkouts[choice - 1]
+subject = repo.git(
+    "log", "-1", "--format=%s", target, check=False,
+).stdout.strip()
+run = str(choice)
+headline = (
+    f"Brought back the files from before {undone} "
+    f"({target[:7]}); your next run continues from here"
+)
+<<constants>>=
+UNKNOWN_START = "----------  --:--"
+@
+
+<<take the number from the argument or the prompt>>=
+if run is not None:
+    try:
+        choice = int(run)
+    except ValueError:
+        raise SystemExit(
+            f"{run} is not the number of a checkout; "
+            f"give 1 to {len(checkouts)}."
+        )
+else:
+    try:
+        choice = typer.prompt(
+            "Bring back the files from before which one?",
+            default=1, type=int,
+        )
+    except typer.Abort:
+        choice = 1
+        typer.echo("No answer; taking 1, the most recent.")
+if not 1 <= choice <= len(checkouts):
+    raise SystemExit(
+        f"There is no checkout {choice}; give 1 to {len(checkouts)}."
+    )
+@
+
 
 <<confirm the restore and the way back>>=
 if failure is not None:
@@ -8074,6 +8398,246 @@ def test_checkout_no_learnlog_dir(tmp_path, monkeypatch):
     assert result.exit_code == 1
 @
 
+Let's verify the copy from a bundle on the lecture scenario, with the
+lecture log the play tests export ([[_lecture_bundle]],
+\cref{sec:play}): the run's file arrives, the student's own files
+stay, the record names source and hash, the tip's tree is the work
+tree---bundle included---and the snapshot brings the project back
+without the copied file.
+
+<<test functions>>=
+def test_checkout_from_a_bundle_copies_the_files_in(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    bundle, (first, second) = _lecture_bundle(tmp_path, workdir)
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    (workdir / "lab.py").write_text('print("lab")\n')
+    _record_run(
+        repo, 'print("mine")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app, ["checkout", "--from", "lecture.learnlog", second[:7]],
+    )
+    assert result.exit_code == 0, result.output
+    assert (workdir / "lecture" / "lecture.py").read_text() \
+        == 'print("part 1")\n'
+    assert (workdir / "lab.py").read_text() == 'print("lab")\n'
+    assert (workdir / "hello.py").read_text() == 'print("mine")\n'
+    assert repo.git("status", "--porcelain").stdout == ""
+    assert second in result.output
+    assert "copied into lecture " in result.output
+    header = repo.git("rev-parse", f"{branch}~1").stdout.strip()
+    assert repo.git(
+        "log", "-1", "--format=%s", header,
+    ).stdout.strip() == (
+        f"Run: learnlog checkout --from lecture.learnlog {second[:7]}"
+    )
+    names = repo.git(
+        "ls-tree", "-r", "--name-only", branch,
+    ).stdout.split()
+    assert {
+        "lecture/lecture.py", "lab.py", "hello.py", "lecture.learnlog",
+    } <= set(names)
+
+    result = runner.invoke(app, ["checkout", header[:7]])
+    assert result.exit_code == 0, result.output
+    assert not (workdir / "lecture" / "lecture.py").exists()
+    assert (workdir / "lab.py").exists()
+    assert (workdir / "lecture.learnlog").exists()
+
+def test_checkout_from_a_directory_source(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    _, (first, second) = _lecture_bundle(tmp_path, workdir)
+    lecture_dir = tmp_path / "lecturer-lecture.learnlog"
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["checkout", "--from", str(lecture_dir), first[:7]],
+    )
+    assert result.exit_code == 0, result.output
+    assert (workdir / "lecturer-lecture" / "lecture.py").read_text() \
+        == 'print("part 0")\n'
+    assert repo.git("log", "-1", "--format=%s", "HEAD~1").stdout \
+        .strip() == (
+            f"Run: learnlog checkout --from {lecture_dir} {first[:7]}"
+        )
+
+def test_checkout_from_refuses_a_hash_the_source_lacks(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    _lecture_bundle(tmp_path, workdir)
+    repo = LearnlogRepo(workdir)
+    mine = _record_run(
+        repo, 'print("mine")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    monkeypatch.chdir(workdir)
+    result = CliRunner().invoke(
+        app, ["checkout", "--from", "lecture.learnlog", mine[:7]],
+    )
+    assert result.exit_code == 1
+    assert "not a run in lecture.learnlog" in result.output
+    assert "learnlog checkout" not in repo.git(
+        "log", "--format=%s",
+    ).stdout
+@
+
+The output directory is a directory of the project or nothing: a
+path outside it, and the Git directory, are refused before any
+record is made, the option is refused without a source to copy from,
+and [[-o .]] is the way to the project root now that the default is a
+folder of the source's name.
+
+<<test functions>>=
+def test_checkout_from_into_an_output_directory(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    _, (first, _) = _lecture_bundle(tmp_path, workdir)
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, [
+            "checkout", "--from", "lecture.learnlog",
+            "-o", "lecture21", first[:7],
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (workdir / "lecture21" / "lecture.py").read_text() \
+        == 'print("part 0")\n'
+    assert repo.git(
+        "log", "-1", "--format=%s", f"{branch}~1",
+    ).stdout.strip() == (
+        "Run: learnlog checkout --from lecture.learnlog "
+        f"-o lecture21 {first[:7]}"
+    )
+    assert "lecture21/lecture.py" in repo.git(
+        "ls-tree", "-r", "--name-only", branch,
+    ).stdout.split()
+    count = repo.git("rev-list", "--count", branch).stdout
+    for bad in ("../outside", ".learnlog/x"):
+        result = runner.invoke(
+            app, [
+                "checkout", "--from", "lecture.learnlog",
+                "-o", bad, first[:7],
+            ],
+        )
+        assert result.exit_code == 1
+        assert "not inside your project" in result.output
+    result = runner.invoke(app, ["checkout", "-o", "x", first[:7]])
+    assert result.exit_code == 1
+    assert "--output needs --from" in result.output
+    assert repo.git("rev-list", "--count", branch).stdout == count
+    result = runner.invoke(
+        app, ["checkout", "--from", "lecture.learnlog", "-o", ".", first[:7]],
+    )
+    assert result.exit_code == 0, result.output
+    assert (workdir / "lecture.py").read_text() == 'print("part 0")\n'
+
+def test_default_output_is_the_source_name_without_its_suffix():
+    from learnlog.cli import default_output
+    assert default_output("lecture21.learnlog") == "lecture21"
+    assert default_output("/tmp/x/dataset.progsnap2") == "dataset"
+    assert default_output("../lecture-dir") == "lecture-dir"
+@
+
+Let's verify the chooser on a history with two checkouts and edits
+between them.
+Answering [[2]] brings back the files from before the older one; the
+restore is then itself the newest checkout, so [[--restore 1]] brings
+back the files from before the restore, edit included; and the branch
+only ever grows---every commit it had is still there, in order, with
+the restore's two on top.
+
+<<test functions>>=
+def test_checkout_restore_lists_and_undoes_a_checkout(
+    workdir, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    branch = repo.recording_branch()
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    old = _record_run(repo, 'print("v1")\n', t)
+    newer = _record_run(repo, 'print("v2")\n', t.replace(minute=5))
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    assert runner.invoke(app, ["checkout", old[:7]]).exit_code == 0
+    _record_run(repo, 'print("v1 edited")\n', t.replace(minute=10))
+    assert runner.invoke(app, ["checkout", newer[:7]]).exit_code == 0
+    (workdir / "hello.py").write_text('print("v2 edited")\n')
+    before = repo.git("rev-list", branch).stdout.split()
+
+    result = runner.invoke(app, ["checkout", "--restore"], input="2\n")
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0] == "Your checkouts, newest first:"
+    assert f"learnlog checkout {newer[:7]}" in lines[1]
+    assert f"learnlog checkout {old[:7]}" in lines[2]
+    assert "files before it:" in lines[1]
+    assert (workdir / "hello.py").read_text() == 'print("v2")\n'
+    after = repo.git("rev-list", branch).stdout.split()
+    assert after[2:] == before
+    assert repo.git(
+        "log", "-1", "--format=%s", f"{branch}~1",
+    ).stdout.strip() == "Run: learnlog checkout --restore 2"
+    assert repo.git(
+        "show", f"{branch}~1:hello.py",
+    ).stdout == 'print("v2 edited")\n'
+
+    result = runner.invoke(app, ["checkout", "--restore", "1"])
+    assert result.exit_code == 0, result.output
+    assert "--restore 2" in result.output.splitlines()[1]
+    assert len(result.output.splitlines()) >= 4
+    assert (workdir / "hello.py").read_text() == 'print("v2 edited")\n'
+    assert repo.git("rev-list", branch).stdout.split()[2:] == after
+
+    result = runner.invoke(app, ["checkout", "--restore", "9"])
+    assert result.exit_code == 1
+    assert "no checkout 9" in result.output
+    result = runner.invoke(app, ["checkout", "--restore", "x"])
+    assert result.exit_code == 1
+    assert "not the number of a checkout" in result.output
+    result = runner.invoke(app, ["checkout", "--restore"])
+    assert result.exit_code == 0, result.output
+    assert "taking 1" in result.output
+
+def test_checkout_restore_refuses_other_shapes(workdir, monkeypatch):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    _record_run(
+        repo, 'print("v1")\n', datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["checkout", "--restore"])
+    assert result.exit_code == 1
+    assert "no checkout in this log" in result.output
+    result = runner.invoke(app, ["checkout", "--restore", "--from", "x"])
+    assert result.exit_code == 1
+    assert "--restore takes no" in result.output
+    result = runner.invoke(app, ["checkout"])
+    assert result.exit_code == 1
+    assert "Give a run" in result.output
+    assert "learnlog checkout" not in repo.git(
+        "log", "--format=%s",
+    ).stdout
+@
+
 
 \subsection{The [[play]] command}
 \label{sec:play}
@@ -8164,6 +8728,43 @@ where it is.
 Batch mode keeps starting from the beginning: it prints rather than
 positions, and [[learnlog play -b | less]] is how a reader gets the
 whole log.
+
+The third way to choose a position is the one the student's own
+history supplies.
+Playback at a lecture's tag, half read; [[q]]; a
+[[learnlog checkout]] back to an earlier version (\cref{sec:checkout});
+an hour of experiments; and then the wish to pick the lecture up where
+it stopped, without remembering a hash.
+[[--continue]] / [[-c]] opens on the record the previous playback
+showed last, which the log already knows: it is the last [[Viewed:]]
+line of that playback's trailer, and [[last_playback]]
+(\cref{sec:last-viewed}) reads it back.
+Nothing is stored for this---the log is the bookmark---and because the
+bookmark is a hash rather than a position, the checkouts and runs made
+in between, which only append records, do not move it.
+The flag composes with the other two on the same terms as they
+compose with each other: [[--all]] decides which records are shown,
+[[--raw]] how, [[--continue]] where to open.
+In batch mode it prints from the bookmark to the end, the half of the
+log the student has not read yet.
+
+The bookmark is read from the student's own log, whatever log is being
+played.
+A playback is recorded where it was run, so a student who plays a
+lecture's bundle with [[-f lecture.learnlog]] leaves the trace in
+their own project's log, with the lecture's hashes in it; the bundle
+itself holds the lecturer's playbacks, which are not the student's
+place in anything.
+So [[-c]] starts from the log of the current project and asks it for
+the newest playback, then plays whatever that playback played: with
+[[-f]] given, only playbacks of that same source count, and without
+it the last playback wins and brings its own source along---
+[[learnlog play -c]] after [[learnlog play -f lecture.learnlog]] is
+the lecture again, and a line on standard error says so, where it
+cannot end up in a batch listing.
+A project with no log of its own has nothing to continue, even when
+the log it is about to play holds playbacks: those are somebody
+else's.
 
 A starting ref is looked up in the thinned list, and a ref that names
 a record the view hides is refused with the flag that would show it,
@@ -8285,10 +8886,24 @@ def play(
             ),
         ),
     ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--continue", "-c",
+            help=(
+                "Open on the record your previous learnlog "
+                "play showed last."
+            ),
+        ),
+    ] = False,
 ):
     """Interactively play back the development log."""
     import shutil
 
+    if start and resume:
+        raise SystemExit(START_OR_CONTINUE_NOTE)
+    if resume:
+        <<find the playback to continue>>
     repo, tmpdir = resolve_source(source)
     try:
         commits = get_commits(repo)
@@ -8305,6 +8920,8 @@ def play(
         start_index = None
         if start:
             <<find starting commit index>>
+        elif resume:
+            <<find the record last viewed>>
 
         <<choose playback mode>>
     finally:
@@ -8767,6 +9384,421 @@ def test_play_from_progsnap2_start_tag(workdir):
     assert result.exit_code == 0
     assert "stdout: second" in result.output
     assert "stdout: first" not in result.output
+@
+
+The bookmark goes through the same lookup as a starting ref, so it
+gets the same three answers: an index into the shown list; the refusal
+naming [[--all]] when the record last viewed is one playback hides,
+which happens when the previous playback ran under [[--all]] and
+stopped on a review run; and a message of its own when the hash is in
+no record at all.
+The last case is real rather than defensive: a ProgSnap2
+reconstruction gives its commits new hashes (\cref{progsnap2}), so a
+trace exported from one log names records that the rebuilt log does
+not have.
+A log with no playback in it has nothing to continue, and a starting
+ref beside the flag is two answers to one question, refused rather
+than ranked.
+Which log the bookmark is read from is the question the rest of this
+part answers.
+
+The source a playback was given is on its recorded command line, and
+[[source_arguments]] (\cref{sec:source-files}) reads it back from the
+words of the [[Arguments:]] field, which [[parse_run_arguments]]
+restores exactly as typed.
+A recorded [[-f]] value and one typed now are compared as resolved
+paths: the typed one against the current directory, the recorded one
+against the directory its run was started in, which the header names
+relative to the project root (\cref{sec:run-directory}).
+So a lecture played from a subfolder as [[-f ../lecture.learnlog]]
+and continued from the root as [[-f lecture.learnlog]] are the same
+lecture.
+A header from before the directory was recorded has no better answer
+than the current directory, and a mismatch there costs at most a
+\enquote{nothing to continue}, never a wrong record.
+No [[-f]] means the project's own log, so a playback without one and
+[[-f .]] name the same log and match.
+
+<<helper functions>>=
+def playback_source_argument(run):
+    """The ``-f``/``--from`` value a recorded playback was given.
+
+    ``None`` when the playback showed the project's own log.
+    """
+    values = source_arguments(
+        parse_run_arguments(run["arguments"] or "")
+    )
+    return values[-1] if values else None
+
+
+def source_path(value, own, directory=None):
+    """The log ``value`` names, resolved; the project's own for ``None``.
+
+    A relative ``value`` is taken from ``directory``, a path relative
+    to ``own``, when given, and from the current directory otherwise.
+    """
+    if value is None:
+        return pathlib.Path(own).resolve()
+    base = pathlib.Path.cwd() if directory is None \
+        else pathlib.Path(own) / directory
+    return (base / value).resolve()
+@
+
+The bookmark is found before the source is resolved, because it may
+\emph{be} the source: when no [[-f]] was given, the playback found
+decides what is played.
+A source that has gone since---a bundle the student deleted---is
+refused by name rather than left to the resolver's generic complaint,
+since the student did not type it this time and would not know what
+it refers to.
+The source handed on is the resolved path, since the recorded words
+were relative to where they were typed, and the name shown is that
+path relative to here, the way the student would type it now.
+
+<<find the playback to continue>>=
+own = find_learnlog_dir()
+if own is None:
+    raise SystemExit(NOTHING_TO_CONTINUE_NOTE)
+own_repo = LearnlogRepo(own)
+wanted = None if source is None else source_path(source, own)
+playback = last_playback(
+    get_commits(own_repo), scan_run_commits(own_repo),
+    matches=None if wanted is None else (
+        lambda run: source_path(
+            playback_source_argument(run), own, run["directory"],
+        ) == wanted
+    ),
+)
+if playback is None:
+    if source is None:
+        raise SystemExit(NOTHING_TO_CONTINUE_NOTE)
+    raise SystemExit(
+        f"Nothing to continue: you have not played {source} yet."
+    )
+viewed = playback["viewed"][-1][0]
+if source is None:
+    recorded = playback_source_argument(playback)
+    if recorded is not None:
+        played = source_path(recorded, own, playback["directory"])
+        shown = os.path.relpath(played)
+        if not played.exists():
+            raise SystemExit(
+                f"Cannot continue: {shown}, which you were "
+                "playing, is not here any more."
+            )
+        source = str(played)
+        typer.echo(
+            f"Continuing {shown} where you left off.", err=True,
+        )
+@
+
+<<find the record last viewed>>=
+start_index = record_index(
+    records, commits,
+    lambda c: c["hash"] == viewed,
+    f"The record you last viewed, {viewed[:8]}, "
+    "is not in this log.",
+)
+<<constants>>=
+NOTHING_TO_CONTINUE_NOTE = (
+    "Nothing to continue: no earlier learnlog play has been "
+    "recorded in this log."
+)
+START_OR_CONTINUE_NOTE = (
+    "Give a starting ref or --continue, not both."
+)
+@
+
+Let's verify the scenario itself on a log built by hand: three runs,
+a playback whose trace ends on the middle one, then a checkout and a
+fourth run after it.
+The viewer must open on the middle run, not on the newest record, and
+batch mode must print from there---the first run is before the
+bookmark and stays out, the fourth is after it and comes along.
+The interactive half calls the command as a function with the viewer
+replaced, for the reason [[test_play_opens_on_the_newest_record]]
+gives; the batch half goes through [[CliRunner]]:
+
+<<test functions>>=
+def _log_with_a_playback(workdir):
+    """Four runs of hello.py with a playback that stopped on the
+    second, and a checkout after it.  Returns the four hashes."""
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    hashes = []
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    for n in range(3):
+        script.write_text(f'print("run {n}")\n')
+        repo.begin_run("hello.py", [], t.replace(minute=n))
+        hashes.append(repo.run_commit)
+    first, second, third = hashes
+    repo.begin_run("learnlog", ["play"], t.replace(minute=10))
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=t.replace(minute=12),
+        exit_code=0,
+        view_trace=[
+            (t.replace(minute=11, second=0), third, "open"),
+            (t.replace(minute=11, second=1), first, "prev"),
+            (t.replace(minute=11, second=2), second, "next"),
+        ],
+    )
+    repo.begin_run(
+        "learnlog", ["checkout", first[:7]], t.replace(minute=20),
+    )
+    script.write_text('print("run 3")\n')
+    repo.begin_run("hello.py", [], t.replace(minute=30))
+    hashes.append(repo.run_commit)
+    return hashes
+
+def test_play_continue_opens_where_the_last_playback_stopped(
+    workdir, monkeypatch,
+):
+    import learnlog.cli as cli
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    first, second, third, fourth = _log_with_a_playback(workdir)
+    monkeypatch.chdir(workdir)
+    opened = []
+
+    class FakeViewer:
+        def __init__(self, repo, commits, start_index,
+                     *args, **kwargs):
+            opened.append((commits, start_index))
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(cli, "PlaybackViewer", FakeViewer)
+    cli.play(source=str(workdir), batch=False, resume=True)
+    commits, index = opened[-1]
+    assert commits[index]["hash"] == second
+    assert index < len(commits) - 1
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "-c", "--raw", "--from", str(workdir)],
+    )
+    assert result.exit_code == 0
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == second
+    assert first not in shown
+    assert fourth in shown
+@
+
+The refusals are the other half of the contract.
+A log that was never played back has no bookmark; a starting ref
+beside the flag is refused before either is resolved; and a bookmark
+on a hidden record names [[--all]], with which it then opens there:
+
+<<test functions>>=
+def test_play_continue_needs_an_earlier_playback(workdir, monkeypatch):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(workdir)
+    repo = LearnlogRepo(workdir)
+    repo.begin_run("hello.py", [], datetime.datetime(2026, 1, 1, 10, 0))
+    result = CliRunner().invoke(
+        app, ["play", "-c", "--from", str(workdir)],
+    )
+    assert result.exit_code == 1
+    assert "Nothing to continue" in result.output
+
+def test_play_continue_refuses_a_start_ref(workdir, monkeypatch):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(workdir)
+    _log_with_a_playback(workdir)
+    result = CliRunner().invoke(
+        app, ["play", "-c", "HEAD", "--from", str(workdir)],
+    )
+    assert result.exit_code == 1
+    assert "not both" in result.output
+
+def test_play_continue_names_all_for_a_hidden_record(
+    workdir, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    monkeypatch.chdir(workdir)
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t)
+    repo.begin_run("learnlog", ["list"], t.replace(minute=1))
+    listed = repo.run_commit
+    repo.begin_run("learnlog", ["play", "--all"], t.replace(minute=2))
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=3), exit_code=0,
+        view_trace=[(t.replace(minute=2, second=30), listed, "open")],
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "-c", "--from", str(workdir)],
+    )
+    assert result.exit_code == 1
+    assert "--all" in result.output
+    result = runner.invoke(
+        app, ["play", "-c", "--all", "--raw", "--from", str(workdir)],
+    )
+    assert result.exit_code == 0
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == listed
+@
+
+The lecture scenario needs two logs: the lecturer's, exported to a
+bundle, and the student's, holding a playback of that bundle whose
+trace ends on one of the lecture's records.
+[[-c]] alone must play the bundle from that record and say so;
+[[-c -f lecture.learnlog]] must do the same silently; a bundle the
+student never played, and a bundle that has gone, must each be refused
+by name.
+
+<<test functions>>=
+def _lecture_bundle(tmp_path, workdir, name="lecture.learnlog"):
+    """Export a two-run lecture log to ``workdir/name``.
+
+    Returns the bundle path and the two lecture run hashes.
+    """
+    from learnlog.cli import do_export
+    lecture_dir = tmp_path / f"lecturer-{name}"
+    lecture_dir.mkdir()
+    lecture = LearnlogRepo(lecture_dir)
+    t = datetime.datetime(2026, 1, 1, 9, 0)
+    hashes = []
+    for n in range(2):
+        (lecture_dir / "lecture.py").write_text(f'print("part {n}")\n')
+        lecture.begin_run("lecture.py", [], t.replace(minute=n))
+        hashes.append(lecture.run_commit)
+    bundle = workdir / name
+    do_export(lecture, bundle)
+    return bundle, hashes
+
+def test_play_continue_reads_the_students_own_log_for_a_bundle(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    bundle, (first, second) = _lecture_bundle(tmp_path, workdir)
+    _lecture_bundle(tmp_path, workdir, "other.learnlog")
+    monkeypatch.chdir(workdir)
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t)
+    repo.begin_run(
+        "learnlog", ["play", "-f", "lecture.learnlog"],
+        t.replace(minute=1),
+    )
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=2), exit_code=0,
+        view_trace=[
+            (t.replace(minute=1, second=1), second, "open"),
+            (t.replace(minute=1, second=2), first, "prev"),
+        ],
+    )
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["play", "-c", "-b", "--raw"])
+    assert result.exit_code == 0, result.output
+    assert "Continuing lecture.learnlog" in result.output
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown == [first, second]
+
+    result = runner.invoke(
+        app, ["play", "-c", "-f", "lecture.learnlog", "-b", "--raw"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Continuing" not in result.output
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown == [first, second]
+
+    result = runner.invoke(app, ["play", "-c", "-f", "other.learnlog"])
+    assert result.exit_code == 1
+    assert "have not played other.learnlog" in result.output
+
+    bundle.unlink()
+    result = runner.invoke(app, ["play", "-c", "-b"])
+    assert result.exit_code == 1
+    assert "lecture.learnlog, which you were playing" in result.output
+@
+
+The other half of the rule: a bundle that carries its author's own
+playbacks lends none of them to a student who has not played it.
+
+<<test functions>>=
+def test_play_continue_ignores_the_played_logs_own_playbacks(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app, do_export
+    from typer.testing import CliRunner
+    lecture_dir = tmp_path / "lecturer"
+    lecture_dir.mkdir()
+    lecture = LearnlogRepo(lecture_dir)
+    t = datetime.datetime(2026, 1, 1, 9, 0)
+    (lecture_dir / "lecture.py").write_text('print("part 0")\n')
+    lecture.begin_run("lecture.py", [], t)
+    shown = lecture.run_commit
+    lecture.begin_run("learnlog", ["play"], t.replace(minute=1))
+    lecture.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=2), exit_code=0,
+        view_trace=[(t.replace(minute=1, second=1), shown, "open")],
+    )
+    do_export(lecture, workdir / "lecture.learnlog")
+    repo = LearnlogRepo(workdir)
+    repo.begin_run("hello.py", [], t.replace(hour=10))
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "-c", "-f", "lecture.learnlog", "-b"],
+    )
+    assert result.exit_code == 1
+    assert "have not played lecture.learnlog" in result.output
+    result = runner.invoke(app, ["play", "-c", "-b"])
+    assert result.exit_code == 1
+    assert "Nothing to continue" in result.output
+@
+
+A playback started in a subfolder names the bundle relative to that
+folder; continued from the root, the recorded directory is what makes
+the same file findable, with [[-f]] naming it from the root and
+without:
+
+<<test functions>>=
+def test_play_continue_resolves_the_source_from_its_directory(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    bundle, (first, second) = _lecture_bundle(tmp_path, workdir)
+    repo = LearnlogRepo(workdir)
+    (workdir / "notes").mkdir()
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t)
+    repo.begin_run(
+        "learnlog", ["play", "-f", "../lecture.learnlog"],
+        t.replace(minute=1), directory="notes",
+    )
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=2), exit_code=0,
+        view_trace=[(t.replace(minute=1, second=1), first, "open")],
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["play", "-c", "-b", "--raw"])
+    assert result.exit_code == 0, result.output
+    assert "Continuing lecture.learnlog" in result.output
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == first
+    result = runner.invoke(
+        app, ["play", "-c", "-f", "lecture.learnlog", "-b", "--raw"],
+    )
+    assert result.exit_code == 0, result.output
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == first
 @
 
 

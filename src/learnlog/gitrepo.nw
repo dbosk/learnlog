@@ -1396,6 +1396,21 @@ that exports a bundle containing the previous bundle.
 Each cycle roughly doubles what the log carries, from a file the log
 already contains in full.
 
+The pattern governs what learnlog \emph{writes}, and it governs it only
+while the file is untracked: an exclude pattern never applies to a
+file already in the index.
+That distinction is what lets the same suffix stand for two different
+things.
+A bundle the student \emph{received}---a lecture recording they play
+back with [[learnlog play -f]]---is material of theirs, and the run
+that used it records it by adding it once by force
+(\cref{sec:beginning-a-run}); from then on every snapshot carries it
+while it exists on disk, at the cost of one blob however many trees
+name it.
+A bundle [[learnlog export]] wrote is never added that way, so it
+stays untracked, the pattern keeps applying, and the log still never
+contains itself.
+
 The two export extensions are named here rather than imported from the
 modules that write them---[[cli]] and [[progsnap2]] both import this
 one, so the dependency only goes this way---and a test in [[cli]],
@@ -2780,21 +2795,27 @@ The probe that fills its place is the combined [[HEAD]] lookup of
 parent it would otherwise read for itself.
 
 <<repo methods>>=
-def begin_run(self, script, args, start_time):
+def begin_run(self, script, args, start_time, include=(),
+              directory=None):
     """Record the start of a program run.
 
     Snapshots the current code state and commits it with the run
     header, which carries the run id that :meth:`finalize_run`
     will refer back to.  The header commit's hash is kept in
-    `run_commit`.
+    `run_commit`.  Files in `include` are recorded even where the
+    exclude patterns would leave them out.  `directory` is where
+    the run was started, relative to the project root; by default
+    the current directory.
 
     Returns the run header string.
     """
     self.run_id = new_run_id()
     self.run_script = script
     self.run_args = list(args)
+    if directory is None:
+        directory = run_directory(self.workdir)
     header = format_run_header(
-        script, args, start_time, self.run_id,
+        script, args, start_time, self.run_id, directory=directory,
     )
 
     with self.commit_lock() as lock:
@@ -2828,6 +2849,7 @@ with self.run_index(f"{self.run_id}-begin") as index_path:
     if unfinished:
         <<clear the half-finished operation from the private index>>
     self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+    <<add the files the run must record>>
     tree = self.git(
         "write-tree", timeout=GIT_TREE_TIMEOUT,
     ).stdout.strip()
@@ -2836,6 +2858,87 @@ with self.run_index(f"{self.run_id}-begin") as index_path:
     )
     if not unfinished:
         <<publish the private index as the shared one>>
+@
+
+Some files a run must record are ones the exclude patterns keep out.
+The case is the recording a student plays back, a bundle named with
+[[learnlog play -f lecture.learnlog]] that sits in the project
+directory under the very suffix \cref{sec:ensure-configured} excludes so that
+the log never swallows its own exports.
+A researcher reading the student's log later needs that file to see
+what the student watched, and the run that used it is where it
+belongs.
+The caller names such files in [[include]], and each is staged with
+[[git add -f]] after the ordinary scan.
+Once is enough: the exclude patterns apply to untracked files only, so
+a file added by force is tracked from then on and every later
+[[git add .]] keeps it while it is on disk---and records its removal
+when it goes, as for any other file.
+Which files qualify is decided by the caller ([[source_files]] below,
+\cref{sec:source-files}), because this method knows nothing about
+command lines.
+
+<<add the files the run must record>>=
+for path in include:
+    self.git("add", "-f", "--", str(path), timeout=GIT_TREE_TIMEOUT)
+@
+
+The header also names where the run was started
+(\cref{sec:run-directory}).
+The method reads the current directory itself rather than asking the
+caller, because every caller would answer the same way and one of
+them, the autostart of \cref{sec:initialize}, runs inside the
+student's program, where the current directory is exactly the fact
+worth recording; a caller that knows better---a test, a
+reconstruction---passes [[directory]].
+
+Let's verify that a run started in a subdirectory of the project says
+so, and one started at the root says [[.]]:
+
+<<test functions>>=
+def test_begin_run_records_the_directory(workdir, monkeypatch):
+    repo = LearnlogRepo(workdir)
+    (workdir / "lecture21").mkdir()
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    monkeypatch.chdir(workdir / "lecture21")
+    repo.begin_run("main.py", [], t)
+    body = repo.git("log", "-1", "--format=%B").stdout
+    assert "Directory: lecture21\n" in body
+    monkeypatch.chdir(workdir)
+    repo.begin_run("main.py", [], t.replace(minute=1))
+    body = repo.git("log", "-1", "--format=%B").stdout
+    assert "Directory: .\n" in body
+@
+
+Let's verify the three moments of such a file: absent from a snapshot
+that did not ask for it, present from the run that did and in the run
+after it that did not ask again, and gone from the run after the file
+was deleted.
+
+<<test functions>>=
+def test_begin_run_include_records_an_excluded_file(workdir):
+    repo = LearnlogRepo(workdir)
+    bundle = workdir / "lecture.learnlog"
+    bundle.write_bytes(b"not really a bundle")
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+
+    def tree_names(commit):
+        return repo.git(
+            "ls-tree", "--name-only", commit,
+        ).stdout.split()
+
+    repo.begin_run("hello.py", [], t)
+    assert "lecture.learnlog" not in tree_names(repo.run_commit)
+    repo.begin_run(
+        "learnlog", ["play", "-f", "lecture.learnlog"],
+        t.replace(minute=1), include=[bundle],
+    )
+    assert "lecture.learnlog" in tree_names(repo.run_commit)
+    repo.begin_run("hello.py", [], t.replace(minute=2))
+    assert "lecture.learnlog" in tree_names(repo.run_commit)
+    bundle.unlink()
+    repo.begin_run("hello.py", [], t.replace(minute=3))
+    assert "lecture.learnlog" not in tree_names(repo.run_commit)
 @
 
 \subsection{Indexes a killed run left behind}
@@ -3716,17 +3819,168 @@ def test_parse_run_arguments_tolerates_unquotable_text():
     assert parse_run_arguments("") == []
 @
 
+\subsection{The files a command's source names}
+\label{sec:source-files}
+
+[[begin_run]] takes the files it must record by force from its caller
+(\cref{sec:beginning-a-run}), and two callers have to agree on which
+those are: the autostart that records [[learnlog play -f lecture.learnlog]]
+(\cref{sec:initialize}) and the [[checkout --from]] command that records
+itself (\cref{sec:checkout}).
+Both read the answer off the command line, so the rule lives here,
+where both can import it without either depending on the other.
+
+The source option is spelled three ways on a command line---[[-f X]],
+[[--from X]] and [[--from=X]]---and the first function collects the
+values of all three in order, from a list of words.
+That the input is a list of words rather than a string is what lets
+the same function serve a recorded [[Arguments:]] field: split it with
+[[parse_run_arguments]] first and the words are back exactly as typed.
+
+<<functions>>=
+def source_arguments(args):
+    """Return the values given to ``-f``/``--from`` in ``args``."""
+    values = []
+    words = list(args)
+    for index, word in enumerate(words):
+        if word in SOURCE_OPTIONS and index + 1 < len(words):
+            values.append(words[index + 1])
+        elif word.startswith(SOURCE_OPTION_PREFIX):
+            values.append(word[len(SOURCE_OPTION_PREFIX):])
+    return values
+<<constants>>=
+SOURCE_OPTIONS = ("-f", "--from")
+SOURCE_OPTION_PREFIX = "--from="
+@
+
+The second function keeps the values that can be recorded at all.
+A relative name is resolved against the current directory, which is
+where the student typed it.
+A directory source is another log, not a file, and has nothing to add
+to a snapshot; a file outside the project cannot be in its tree; and
+a file under the Git directory itself is one Git refuses.
+Each of those is left out silently rather than reported, because the
+caller records the run either way---a lecture the student keeps in
+their downloads folder is still a lecture they watched, only one the
+log cannot carry.
+
+<<functions>>=
+def source_files(args, workdir):
+    """Return the files under ``workdir`` that the sources in ``args`` name.
+
+    Relative names are resolved against the current directory.
+    Directories, missing files, files outside ``workdir`` and files
+    under its Git directory are left out.
+    """
+    workdir = pathlib.Path(workdir).resolve()
+    git_dir = workdir / GIT_DIR_NAME
+    found = []
+    for value in source_arguments(args):
+        path = pathlib.Path(value).resolve()
+        if (
+            path.is_file()
+            and path.is_relative_to(workdir)
+            and not path.is_relative_to(git_dir)
+        ):
+            found.append(path)
+    return found
+@
+
+Let's verify the three spellings, and that a directory, a file
+outside the project and a missing file are all left out:
+
+<<test functions>>=
+def test_source_arguments_reads_the_three_spellings():
+    assert source_arguments(["play", "-f", "a", "--from", "b"]) \
+        == ["a", "b"]
+    assert source_arguments(["play", "--from=c", "-c"]) == ["c"]
+    assert source_arguments(["play", "-f"]) == []
+
+def test_source_files_keeps_only_recordable_files(
+    workdir, tmp_path, monkeypatch,
+):
+    monkeypatch.chdir(workdir)
+    bundle = workdir / "lecture.learnlog"
+    bundle.write_bytes(b"x")
+    (workdir / "other").mkdir()
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.learnlog"
+    outside.write_bytes(b"x")
+    assert source_files(["play", "-f", "lecture.learnlog"], workdir) \
+        == [bundle.resolve()]
+    assert source_files(["play", f"--from={bundle}"], workdir) \
+        == [bundle.resolve()]
+    assert source_files(["play", "-f", "other"], workdir) == []
+    assert source_files(["play", "-f", str(outside)], workdir) == []
+    assert source_files(["play", "-f", "missing.learnlog"], workdir) \
+        == []
+@
+
+
+\subsection{Where a run was started}
+\label{sec:run-directory}
+
+A header used to say what ran and when, but not from where.
+That gap costs in two places.
+A student who works in a subdirectory of their project---a folder per
+lecture, say---runs [[python main.py]] there, and the record cannot
+tell that [[main.py]] from the one in the root; and a recorded
+command line with a relative path in it, [[play -f ../lecture.learnlog]],
+can only be followed from the directory it was typed in, which the
+log did not name (\cref{sec:play}).
+So the header now carries the directory the command was run in,
+relative to the project root, the directory [[.learnlog]] lives in.
+Relative rather than absolute because the log travels: a bundle
+cloned by a teacher, a project moved to another machine, and the
+root itself is wherever [[.learnlog]] is now.
+
+The form is a POSIX path, [[.]] for the root itself, so a log written
+on Windows reads the same everywhere and a reader can join it to the
+root with nothing but a slash.
+A run started outside the project---possible when the project is
+named by [[LEARNLOG_PROJECT_ROOT]] or wired through a venv---records
+the relative path anyway, [[..]] and all, since that is still where
+it was in relation to the root; only a directory on another Windows
+drive, which has no relative form, is recorded as it is.
+
+<<functions>>=
+def run_directory(workdir, cwd=None):
+    """The directory a run was started in, relative to ``workdir``.
+
+    A POSIX-style relative path, ``.`` for ``workdir`` itself.
+    ``cwd`` defaults to the current directory.
+    """
+    cwd = pathlib.Path.cwd() if cwd is None else pathlib.Path(cwd)
+    try:
+        relative = os.path.relpath(cwd, workdir)
+    except ValueError:
+        return cwd.resolve().as_posix()
+    return pathlib.PurePath(relative).as_posix()
+@
+
+Let's verify the three answers: the root, a subdirectory, and a
+directory outside the project:
+
+<<test functions>>=
+def test_run_directory_is_relative_to_the_root(tmp_path):
+    root = tmp_path / "project"
+    (root / "lecture21").mkdir(parents=True)
+    assert run_directory(root, root) == "."
+    assert run_directory(root, root / "lecture21") == "lecture21"
+    assert run_directory(root, tmp_path) == ".."
+@
 
 \subsection{The header block}
 
 <<functions>>=
 def format_run_header(script, args, start_time,
-                      run_id=None):
+                      run_id=None, directory=None):
     """Format a run header block.
 
     The header records which script was run, its arguments, and
     the start time.  When ``run_id`` is given, it is recorded as
-    the ``Run-Id`` field that links this run to its trailer.
+    the ``Run-Id`` field that links this run to its trailer;
+    ``directory``, when given, is where the run was started,
+    relative to the project root (see `run_directory`).
     """
     args_str = format_run_arguments(args)
     lines = [
@@ -3734,14 +3988,23 @@ def format_run_header(script, args, start_time,
         "",
         f"Script: {script}",
         f"Arguments: {args_str}",
-        f"Start-Time: {start_time.isoformat()}",
     ]
+    if directory is not None:
+        lines.append(f"{DIRECTORY_FIELD} {directory}")
+    lines.append(f"Start-Time: {start_time.isoformat()}")
     if run_id:
         lines.append(f"{RUN_ID_FIELD} {run_id}")
     return "\n".join(lines)
 <<constants>>=
 RUN_ID_FIELD = "Run-Id:"
+DIRECTORY_FIELD = "Directory:"
 @
+
+The directory line is optional in the format so that a header written
+by an older version, or rebuilt from a dataset without the column,
+reads exactly as it always did; \cref{sec:run-directory} explains the
+value.
+
 
 Let's verify the format:
 
@@ -3754,6 +4017,11 @@ def test_format_run_header_basic():
     assert "Arguments: arg1" in header
     assert "Start-Time: 2026-03-20T14:30:00" in header
     assert "Run-Id:" not in header
+    assert "Directory:" not in header
+    header = format_run_header(
+        "hello.py", ["arg1"], t, directory="lecture21",
+    )
+    assert "Directory: lecture21\n" in header
 
 def test_format_run_header_no_args():
     t = datetime.datetime(2026, 3, 20, 14, 30)
@@ -4875,6 +5143,59 @@ def test_restore_code_state_leaves_excluded_files(workdir):
 
     assert (workdir / "notes.txt").read_text() == "mine\n"
     assert (workdir / "hello.py").read_text() == 'print("hello")\n'
+@
+
+
+\subsection{Recording the work tree as it is}
+\label{sec:stage-work-tree}
+
+The restore above makes the index and the files follow a tree.
+[[checkout --from]] (\cref{sec:checkout}) needs the opposite: it
+copies files from another log into the work tree and then needs a
+tree object that is those files, to close its record with.
+Building that tree from the shared index, with [[git add .]] and
+[[git write-tree]], is deliberately unlike [[begin_run]]'s private
+index (\cref{sec:private-index}) and exactly like [[read-tree]]
+above: the point is that the shared index ends up matching both the
+files and the tree the trailer will carry, so that [[git status]] is
+clean afterwards and the next [[git add .]] has nothing to undo.
+The commit lock is held for the reason the restore holds it: a run
+beginning beside this call stages the work tree under the same lock,
+and the two must not interleave.
+The exclude patterns apply as they do to every snapshot, so a bundle
+sitting in the project is not swept in here by accident; it is
+recorded only through [[include]] (\cref{sec:beginning-a-run}).
+
+<<repo methods>>=
+def stage_work_tree(self):
+    """Make the shared index match the work tree; return the tree."""
+    with self.commit_lock():
+        self.git("add", ".", timeout=GIT_TREE_TIMEOUT)
+        return self.git(
+            "write-tree", timeout=GIT_TREE_TIMEOUT,
+        ).stdout.strip()
+@
+
+Let's verify it on the shape [[checkout --from]] uses: a record is
+begun, a file appears, the tree is staged and the record closed with
+it, and the log's tip then carries the file with a clean status.
+
+<<test functions>>=
+def test_stage_work_tree_closes_a_record_with_new_files(workdir):
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("learnlog", ["checkout", "--from", "x", "abc"], t)
+    (workdir / "lecture.py").write_text("print('lecture')\n")
+    tree = repo.stage_work_tree()
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=1), exit_code=0, tree=tree,
+    )
+    tip = repo.recording_branch()
+    assert "lecture.py" in repo.git(
+        "ls-tree", "--name-only", tip,
+    ).stdout.split()
+    assert repo.git("status", "--porcelain").stdout == ""
 @
 
 

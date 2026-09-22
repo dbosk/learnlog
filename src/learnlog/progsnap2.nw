@@ -1007,6 +1007,7 @@ for run in runs:
         "X-ExitCode": run["exit_code"] or "",
         "X-Script": run["script"] or "",
         "X-Arguments": run["arguments"] or "",
+        "X-Directory": run["directory"] or "",
         "X-ExceptionType": exc_type or "",
         "X-ExceptionMessage": exc_msg or "",
         "ProgramOutput": "",
@@ -1310,6 +1311,11 @@ That is what lets each event above list only the columns it actually
 has something to say about---a [[File.Edit]] carries no [[X-EndTime]],
 a [[Run.Program]] no [[X-ViewedCommit]]---without every new column
 having to be threaded back through every other event type.
+[[X-Directory]] is the newest such column: the header's
+[[Directory:]] line (\cref{sec:run-directory}), where the run was
+started relative to the project root, so that an analysis can tell a
+[[main.py]] in one lecture's folder from the one in another; it is
+empty for a log written before it was recorded.
 
 <<build main table csv string>>=
 main_columns = [
@@ -1320,6 +1326,7 @@ main_columns = [
     "ProgramResult",
     "X-EndTime",
     "X-ExitCode", "X-Script", "X-Arguments",
+    "X-Directory",
     "X-ExceptionType", "X-ExceptionMessage",
     "ProgramOutput",
     "ProgramInput",
@@ -3119,7 +3126,9 @@ behaviour and omit the [[End-Time:]] line.
 
 [[X-Arguments]] holds the field exactly as the header wrote it, so
 recovering the list is [[parse_run_arguments]] and nothing else
-(\cref{sec:run-arguments}).
+(\cref{sec:run-arguments}); [[X-Directory]] goes back the same way,
+and an empty column---a dataset from before it existed---rebuilds a
+header without the line, as that version wrote it.
 Splitting the column on whitespace instead---which is what this did
 before---turns one argument containing a space into two, and a
 [[python -c]] source into as many arguments as it has words, so the
@@ -3149,7 +3158,10 @@ def build_reconstructed_run_block(event, io_log, view_trace=None):
     start_time = datetime.datetime.fromisoformat(
         event["ServerTimestamp"]
     )
-    header = format_run_header(script, args, start_time)
+    header = format_run_header(
+        script, args, start_time,
+        directory=event.get("X-Directory") or None,
+    )
     exception_info = rebuild_exception_info(event)
     exit_code = event.get("X-ExitCode", "")
     end_time_value = event.get("X-EndTime", "")
@@ -4307,6 +4319,38 @@ def test_progsnap2_round_trips_python_c_arguments(workdir):
             if line.startswith("Arguments:")
         ]
         assert parse_run_arguments(recovered[0]) == args
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def test_progsnap2_round_trips_the_run_directory(workdir, monkeypatch):
+    """Where a run was started travels as X-Directory and back."""
+    import csv as csv_mod
+    import shutil
+    from learnlog.progsnap2 import (
+        do_export_progsnap2, read_progsnap2_as_repo,
+    )
+    repo = LearnlogRepo(workdir)
+    (workdir / "lecture21").mkdir()
+    monkeypatch.chdir(workdir / "lecture21")
+    t1 = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("main.py", [], t1)
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1), exit_code=0,
+    )
+    output = workdir / "where.progsnap2"
+    do_export_progsnap2(repo, output)
+    with zipfile.ZipFile(str(output)) as zf:
+        main = zf.read("MainTable.csv").decode("utf-8")
+    runs = [
+        event for event in csv_mod.DictReader(io.StringIO(main))
+        if event["EventType"] == "Run.Program"
+    ]
+    assert runs[0]["X-Directory"] == "lecture21"
+    reconstructed, tmpdir = read_progsnap2_as_repo(output)
+    try:
+        message = reconstructed.git("log", "-1", "--format=%B").stdout
+        assert "Directory: lecture21\n" in message
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
