@@ -582,6 +582,7 @@ from learnlog.gitrepo import (
     LearnlogRepo,
     report_error,
     lock_exclusive,
+    source_files,
     unlock,
 )
 from learnlog._autostart import (
@@ -2849,9 +2850,32 @@ tree back.
 repo = LearnlogRepo(workdir)
 <<reclaim what killed runs left behind>>
 <<persist -c source>>
-repo.begin_run(main_script, main_args, start_time)
+repo.begin_run(
+    main_script, main_args, start_time,
+    include=source_files(main_args, workdir) if review_run else (),
+)
 <<release -c source>>
 @
+
+A review run has one more thing to put in its header: the log it is
+about to read, when that is a file.
+A student who plays back a lecture recording with
+[[learnlog play -f lecture.learnlog]] has the bundle in their project,
+under the suffix the exclude patterns keep out of every snapshot so
+that the log never swallows its own exports
+(\cref{sec:ensure-configured}).
+The researcher reading the student's log later needs that file to see
+what was watched, so the run that watched it names it in [[include]]
+and [[begin_run]] adds it by force (\cref{sec:beginning-a-run}), once;
+it is tracked from then on.
+Which words on the command line name a source is [[source_files]]'s
+rule (\cref{sec:source-files}), shared with [[checkout --from]], which
+records itself the same way.
+The header is the right place rather than the trailer, because the
+header is the state the run started from, and the recording was on
+disk then.
+Only review runs ask: a program run's arguments are the student's
+program's, and [[-f]] there means whatever the program says it means.
 
 <<reclaim what killed runs left behind>>=
 _reclaim_c_invocations(repo)
@@ -7523,6 +7547,152 @@ def test_playback_continues_where_it_stopped(cli_project):
     assert len(shown) == 3
     assert f"learnlog checkout {earlier}" in resumed.stdout
     assert "stdout: after the checkout" in resumed.stdout
+@
+
+The lecture scenario is the one that ties the shared-log features
+together, and it belongs here for the same reason as the test above:
+each step reads what the step before recorded.
+A lecturer's log is exported to a bundle in the student's project; the
+student plays it, and their own log records the playback with the
+lecture's hashes---its initial commit among them, since playback
+shows it---and the bundle itself in the run's tree; they copy
+one of its runs into a folder of their project and run it, and both
+land in their log; [[play -c]] with no source then continues the
+lecture and says so; the plain listing shows the copy and the run and
+not the playbacks; a restore removes the copied file and keeps the
+bundle; and a researcher who clones the student's export reads the
+lecture back out of it, byte for byte.
+
+<<autostart test functions>>=
+def test_a_lecture_bundle_is_played_copied_and_continued(
+    cli_project, tmp_path,
+):
+    import datetime
+    import re
+    from learnlog.cli import do_export
+    from learnlog.gitrepo import LearnlogRepo
+
+    project, venv_dir, learnlog = cli_project
+    lecture_dir = tmp_path / "lecturer"
+    lecture_dir.mkdir()
+    lecture = LearnlogRepo(lecture_dir)
+    t = datetime.datetime(2026, 1, 1, 9, 0)
+    hashes = []
+    for n in range(2):
+        (lecture_dir / "lecture.py").write_text(
+            f"print('lecture part {n}')\n"
+        )
+        lecture.begin_run("lecture.py", [], t.replace(minute=n))
+        hashes.append(lecture.run_commit)
+    bundle = project / "lecture.learnlog"
+    do_export(lecture, bundle)
+    bundle_bytes = bundle.read_bytes()
+
+    <<play the bundle and check the student's record of it>>
+    <<copy a lecture run in and run it>>
+    <<continue the lecture without naming it>>
+    <<restore, then read the lecture out of the student's export>>
+@
+
+<<play the bundle and check the student's record of it>>=
+played = _run_cli(
+    learnlog, ["play", "-b", "--raw", "-f", "lecture.learnlog"],
+    cwd=project,
+)
+shown = re.findall(r"^commit ([0-9a-f]{40})$", played.stdout, re.M)
+assert set(hashes) <= set(shown)
+trailer = _commit_body(
+    project, "^Run-End: learnlog play .*lecture.learnlog",
+)
+viewed = [
+    line.split()[1] for line in trailer.splitlines()
+    if line.startswith("Viewed:")
+]
+assert viewed == shown
+bookmark = viewed[-1]
+play_header = subprocess.run(
+    ["git", "--git-dir=.learnlog", "--work-tree=.", "log", "-1",
+     "--grep=^Run: learnlog play .*lecture.learnlog", "--format=%H"],
+    cwd=str(project), capture_output=True, text=True, check=True,
+    timeout=30,
+).stdout.strip()
+assert "lecture.learnlog" in _tree_names(project, play_header)
+@
+
+<<copy a lecture run in and run it>>=
+copied = _run_cli(
+    learnlog, [
+        "checkout", "--from", "lecture.learnlog", "-o", "lecture21",
+        hashes[0][:7],
+    ],
+    cwd=project,
+)
+assert hashes[0] in copied.stdout
+assert (project / "lecture21" / "lecture.py").read_text() \
+    == "print('lecture part 0')\n"
+subprocess.run(
+    [str(_venv_binary(venv_dir, "python")), "lecture21/lecture.py"],
+    cwd=str(project), env=_autostart_env(),
+    capture_output=True, text=True, check=True, timeout=30,
+)
+history = _git_history(project)
+assert (
+    "Run: learnlog checkout --from lecture.learnlog -o lecture21 "
+    f"{hashes[0][:7]}"
+) in history
+assert "stdout: lecture part 0" in history
+assert "lecture.learnlog" in _tree_names(project, "HEAD")
+@
+
+<<continue the lecture without naming it>>=
+resumed = _run_cli(
+    learnlog, ["play", "-c", "-b", "--raw"], cwd=project,
+)
+assert "Continuing lecture.learnlog" in resumed.stderr
+shown = re.findall(r"^commit ([0-9a-f]{40})$", resumed.stdout, re.M)
+assert shown[0] == bookmark
+listing = _run_cli(learnlog, ["list"], cwd=project).stdout
+assert "learnlog checkout --from lecture.learnlog" in listing
+assert " lecture.py" in listing
+assert "learnlog play" not in listing
+@
+
+<<restore, then read the lecture out of the student's export>>=
+restored = _run_cli(
+    learnlog, ["checkout", "--restore", "1"], cwd=project,
+)
+assert "Brought back the files from before" in restored.stdout
+assert not (project / "lecture21" / "lecture.py").exists()
+assert bundle.exists()
+
+export = tmp_path / "student.learnlog"
+_run_cli(learnlog, ["export", "-o", str(export)], cwd=project)
+clone = tmp_path / "researcher"
+subprocess.run(
+    ["git", "clone", "--quiet", str(export), str(clone)],
+    capture_output=True, text=True, check=True, timeout=60,
+)
+recovered = subprocess.run(
+    ["git", "-C", str(clone), "show",
+     f"{play_header}:lecture.learnlog"],
+    capture_output=True, check=True, timeout=30,
+).stdout
+assert recovered == bundle_bytes
+@
+
+<<autostart test helpers>>=
+def _tree_names(project, commit):
+    """Return the paths in ``commit``'s tree, recursively."""
+    result = subprocess.run(
+        ["git", "--git-dir=.learnlog", "--work-tree=.",
+         "ls-tree", "-r", "--name-only", commit],
+        cwd=str(project),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return result.stdout.split()
 @
 
 A metrics run is the third kind of review run, and the shape of its

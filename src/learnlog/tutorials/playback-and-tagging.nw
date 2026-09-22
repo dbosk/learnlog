@@ -388,6 +388,10 @@ Requiring a hash rather than a name is what distinguishes this step
 from the previous one in the transcript, and it is also the habit the
 step teaches: the confirmation line names the way back, and the way
 back is a run's hash.
+The expert extra mentions [[checkout --restore]], which finds the
+same snapshot by listing the checkouts; the step itself keeps to the
+hash, because the hash route is the one that generalises to any run
+in the log.
 
 <<shared step: come forward again>>=
 # Come forward again
@@ -414,6 +418,9 @@ A checkout is undone by another checkout because nothing is ever
 rewritten: the snapshot the first checkout made is an ordinary run
 record on the branch, and checking it out records the restored
 version in turn.
+`learnlog checkout --restore` finds that snapshot for you: it lists
+your checkouts and brings back the files from before the one you
+pick.
 @
 
 \subsection{Resume where you left off}

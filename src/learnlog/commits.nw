@@ -2287,6 +2287,21 @@ The checkouts and runs the student has made since only append records
 (\cref{sec:checkout}), so the hash still names the same record however
 much the list has grown, whereas the index the viewer was on has moved.
 
+The bookmark belongs to whoever played, which decides which log it is
+read from.
+A playback is recorded in the log of the project it was run in, not
+in the log it showed: a student who plays a lecture's bundle with
+[[learnlog play -f lecture.learnlog]] leaves the trace in their own
+log, with the lecture's hashes in it, while the bundle carries the
+lecturer's own playbacks, if any.
+So the caller reads the bookmark from its own log and looks the hash
+up in whatever log it is about to play---and since the log being
+played is named on the recorded command line, the caller needs the
+whole run, not the last line alone.
+That is why this reader returns the parsed block, and why it takes a
+predicate: with [[-f]] given, only playbacks of that same source are
+the student's place in it.
+
 The newest run with a trace is the one to read, whatever its command
 was.
 Only playback ever records views---listing and metrics show the student
@@ -2306,25 +2321,27 @@ made, and the order is the one [[latest_student_commit]]
 Merging the trailer in is what makes the lines visible at all: they
 live in the trailer commit, which [[get_commits]] hides
 (\cref{sec:run-visibility}).
-The merged message is parsed whole rather than block by block, because
-the blocks of a multi-run commit are in the order the runs happened,
-so the last line of the message is the newest view.
+Within a commit the blocks are walked newest first too, since a
+multi-run commit holds its runs in the order they happened.
 
 <<commits functions>>=
-def last_viewed_commit(commits, scan):
-    """Hash of the record the newest recorded review displayed last.
+def last_playback(commits, scan, matches=None):
+    """The newest run with a view trace, as a parsed run block.
 
     ``commits`` is the list from :func:`get_commits`, oldest first,
-    and ``scan`` the `RunScan` of the same log.  ``None`` when no
-    run in the log carries a view trace.
+    and ``scan`` the `RunScan` of the same log.  ``matches`` narrows
+    the choice to the runs it accepts.  ``None`` when no run
+    qualifies; otherwise a dict as :func:`parse_run_block` returns,
+    whose ``viewed`` ends on the record shown last.
     """
     for commit in reversed(commits):
         message = merge_run_trailers(
             scan.messages.get(commit["hash"], ""), scan.trailers,
         )
-        views = parse_view_trace(message)
-        if views:
-            return views[-1][0]
+        for block in reversed(message.split(BLOCK_SEP)):
+            run = parse_run_block(block)
+            if run["viewed"] and (matches is None or matches(run)):
+                return run
     return None
 @
 
@@ -2332,11 +2349,13 @@ Let's verify the choice on a log built by hand: the newest run is a
 playback that was killed, so it has no trailer; the one before it is a
 metrics run, complete but without views; and the playback before that
 carries a three-entry trace, whose last entry must be the answer.
-A log with no trace at all answers [[None]]:
+A predicate that rejects that playback reaches the one before it,
+which played a bundle, and a log with no trace at all answers
+[[None]]:
 
 <<commits test functions>>=
-def test_last_viewed_commit_reads_the_newest_trace():
-    from learnlog.commits import RunScan, last_viewed_commit
+def test_last_playback_reads_the_newest_trace():
+    from learnlog.commits import RunScan, last_playback
     first, second, third = "a" * 40, "b" * 40, "c" * 40
 
     def header(run_id, arguments):
@@ -2348,16 +2367,22 @@ def test_last_viewed_commit_reads_the_newest_trace():
     commits = [
         {"hash": first}, {"hash": second}, {"hash": third},
         {"hash": "d" * 40}, {"hash": "e" * 40}, {"hash": "f" * 40},
+        {"hash": "0" * 40},
     ]
     messages = {
         first: "Run: hello.py (none)\n\nScript: hello.py",
         second: "Run: hello.py (none)\n\nScript: hello.py",
         third: "Run: hello.py (none)\n\nScript: hello.py",
-        "d" * 40: header("play1", "play"),
-        "e" * 40: header("metrics1", "metrics time"),
-        "f" * 40: header("play2", "play"),
+        "d" * 40: header("play0", "play -f lecture.learnlog"),
+        "e" * 40: header("play1", "play"),
+        "f" * 40: header("metrics1", "metrics time"),
+        "0" * 40: header("play2", "play"),
     }
     trailers = {
+        "play0": (
+            "End-Time: 2026-01-01T09:00:20\nExit-Code: 0\n"
+            f"Viewed: {'9' * 40} 2026-01-01T09:00:01 open"
+        ),
         "play1": (
             "End-Time: 2026-01-01T10:00:20\nExit-Code: 0\n"
             f"Viewed: {third} 2026-01-01T10:00:01 open\n"
@@ -2367,8 +2392,14 @@ def test_last_viewed_commit_reads_the_newest_trace():
         "metrics1": "End-Time: 2026-01-01T11:00:00\nExit-Code: 0",
     }
     scan = RunScan(trailers, {}, messages)
-    assert last_viewed_commit(commits, scan) == second
-    assert last_viewed_commit(commits[:3], scan) is None
+    playback = last_playback(commits, scan)
+    assert playback["arguments"] == "play"
+    assert playback["viewed"][-1][0] == second
+    bundled = last_playback(
+        commits, scan, matches=lambda run: "-f" in run["arguments"],
+    )
+    assert bundled["viewed"][-1][0] == "9" * 40
+    assert last_playback(commits[:3], scan) is None
 @
 
 
