@@ -7465,6 +7465,66 @@ def test_batch_playback_is_recorded_and_traced(cli_project):
     assert "Code changes" not in trailer
 @
 
+Continuing a playback is the one playback feature that cannot be
+exercised where recording is switched off, because it reads what the
+\emph{previous} playback recorded: the whole feature is the trailer of
+one review run feeding the start position of the next
+(\cref{sec:last-viewed}).
+So the scenario runs here, as the student would run it: a batch
+playback of the whole log, whose last shown record is the bookmark;
+a checkout back to an earlier run and a fresh run after it, the
+records that must not move the bookmark; then [[play --continue]],
+which must print from the bookmark on---that record, the checkout,
+and the new run, and nothing before.
+The bookmark is read from the playback's own trailer before the
+second playback runs, since [[_commit_body]] answers with the newest
+matching commit.
+
+<<autostart test functions>>=
+def test_playback_continues_where_it_stopped(cli_project):
+    import re
+
+    project, venv_dir, learnlog = cli_project
+    _run_student_program(venv_dir, project, "print('lecture 1')\n")
+    _run_student_program(venv_dir, project, "print('lecture 2')\n")
+
+    played = _run_cli(
+        learnlog, ["play", "-b", "--raw"], cwd=project,
+    )
+    shown = re.findall(
+        r"^commit ([0-9a-f]{40})$", played.stdout, re.M,
+    )
+    trailer = _commit_body(project, "^Run-End: learnlog play")
+    viewed = [
+        line.split()[1]
+        for line in trailer.splitlines()
+        if line.startswith("Viewed:")
+    ]
+    bookmark = viewed[-1]
+    assert bookmark == shown[-1]
+
+    listing = _run_cli(learnlog, ["list"], cwd=project).stdout
+    earlier = [
+        line.split()[0] for line in listing.splitlines()
+        if "quick.py" in line
+    ][0]
+    _run_cli(learnlog, ["checkout", earlier], cwd=project)
+    _run_student_program(
+        venv_dir, project, "print('after the checkout')\n",
+    )
+
+    resumed = _run_cli(
+        learnlog, ["play", "-c", "-b", "--raw"], cwd=project,
+    )
+    shown = re.findall(
+        r"^commit ([0-9a-f]{40})$", resumed.stdout, re.M,
+    )
+    assert shown[0] == bookmark
+    assert len(shown) == 3
+    assert f"learnlog checkout {earlier}" in resumed.stdout
+    assert "stdout: after the checkout" in resumed.stdout
+@
+
 A metrics run is the third kind of review run, and the shape of its
 record is the contrast with playback: it is recorded, it captures
 nothing of what it printed, and it carries no view trace, because it

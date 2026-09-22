@@ -156,6 +156,7 @@ from learnlog.commits import (
     visible_commits,
     resolve_record_commit,
     commit_outcomes,
+    last_viewed_commit,
 )
 from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
@@ -8165,6 +8166,25 @@ Batch mode keeps starting from the beginning: it prints rather than
 positions, and [[learnlog play -b | less]] is how a reader gets the
 whole log.
 
+The third way to choose a position is the one the student's own
+history supplies.
+Playback at a lecture's tag, half read; [[q]]; a
+[[learnlog checkout]] back to an earlier version (\cref{sec:checkout});
+an hour of experiments; and then the wish to pick the lecture up where
+it stopped, without remembering a hash.
+[[--continue]] / [[-c]] opens on the record the previous playback
+showed last, which the log already knows: it is the last [[Viewed:]]
+line of that playback's trailer, and [[last_viewed_commit]]
+(\cref{sec:last-viewed}) reads it back.
+Nothing is stored for this---the log is the bookmark---and because the
+bookmark is a hash rather than a position, the checkouts and runs made
+in between, which only append records, do not move it.
+The flag composes with the other two on the same terms as they
+compose with each other: [[--all]] decides which records are shown,
+[[--raw]] how, [[--continue]] where to open.
+In batch mode it prints from the bookmark to the end, the half of the
+log the student has not read yet.
+
 A starting ref is looked up in the thinned list, and a ref that names
 a record the view hides is refused with the flag that would show it,
 rather than silently moved to the nearest visible record:
@@ -8285,6 +8305,16 @@ def play(
             ),
         ),
     ] = None,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--continue", "-c",
+            help=(
+                "Open on the record your previous learnlog "
+                "play showed last."
+            ),
+        ),
+    ] = False,
 ):
     """Interactively play back the development log."""
     import shutil
@@ -8303,8 +8333,12 @@ def play(
             raise SystemExit(NOTHING_TO_PLAY_NOTE)
 
         start_index = None
+        if start and resume:
+            raise SystemExit(START_OR_CONTINUE_NOTE)
         if start:
             <<find starting commit index>>
+        elif resume:
+            <<find the record last viewed>>
 
         <<choose playback mode>>
     finally:
@@ -8767,6 +8801,172 @@ def test_play_from_progsnap2_start_tag(workdir):
     assert result.exit_code == 0
     assert "stdout: second" in result.output
     assert "stdout: first" not in result.output
+@
+
+The bookmark goes through the same lookup as a starting ref, so it
+gets the same three answers: an index into the shown list; the refusal
+naming [[--all]] when the record last viewed is one playback hides,
+which happens when the previous playback ran under [[--all]] and
+stopped on a review run; and a message of its own when the hash is in
+no record at all.
+The last case is real rather than defensive: a ProgSnap2
+reconstruction gives its commits new hashes (\cref{progsnap2}), so a
+trace exported from one log names records that the rebuilt log does
+not have.
+A log with no playback in it has nothing to continue, and a starting
+ref beside the flag is two answers to one question, refused rather
+than ranked.
+
+<<find the record last viewed>>=
+viewed = last_viewed_commit(commits, scan)
+if viewed is None:
+    raise SystemExit(NOTHING_TO_CONTINUE_NOTE)
+start_index = record_index(
+    records, commits,
+    lambda c: c["hash"] == viewed,
+    f"The record you last viewed, {viewed[:8]}, "
+    "is not in this log.",
+)
+<<constants>>=
+NOTHING_TO_CONTINUE_NOTE = (
+    "Nothing to continue: no earlier learnlog play has been "
+    "recorded in this log."
+)
+START_OR_CONTINUE_NOTE = (
+    "Give a starting ref or --continue, not both."
+)
+@
+
+Let's verify the scenario itself on a log built by hand: three runs,
+a playback whose trace ends on the middle one, then a checkout and a
+fourth run after it.
+The viewer must open on the middle run, not on the newest record, and
+batch mode must print from there---the first run is before the
+bookmark and stays out, the fourth is after it and comes along.
+The interactive half calls the command as a function with the viewer
+replaced, for the reason [[test_play_opens_on_the_newest_record]]
+gives; the batch half goes through [[CliRunner]]:
+
+<<test functions>>=
+def _log_with_a_playback(workdir):
+    """Four runs of hello.py with a playback that stopped on the
+    second, and a checkout after it.  Returns the four hashes."""
+    repo = LearnlogRepo(workdir)
+    script = workdir / "hello.py"
+    hashes = []
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    for n in range(3):
+        script.write_text(f'print("run {n}")\n')
+        repo.begin_run("hello.py", [], t.replace(minute=n))
+        hashes.append(repo.run_commit)
+    first, second, third = hashes
+    repo.begin_run("learnlog", ["play"], t.replace(minute=10))
+    repo.finalize_run(
+        io_log="",
+        exception_info=None,
+        end_time=t.replace(minute=12),
+        exit_code=0,
+        view_trace=[
+            (t.replace(minute=11, second=0), third, "open"),
+            (t.replace(minute=11, second=1), first, "prev"),
+            (t.replace(minute=11, second=2), second, "next"),
+        ],
+    )
+    repo.begin_run(
+        "learnlog", ["checkout", first[:7]], t.replace(minute=20),
+    )
+    script.write_text('print("run 3")\n')
+    repo.begin_run("hello.py", [], t.replace(minute=30))
+    hashes.append(repo.run_commit)
+    return hashes
+
+def test_play_continue_opens_where_the_last_playback_stopped(
+    workdir, monkeypatch,
+):
+    import learnlog.cli as cli
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    first, second, third, fourth = _log_with_a_playback(workdir)
+    opened = []
+
+    class FakeViewer:
+        def __init__(self, repo, commits, start_index,
+                     *args, **kwargs):
+            opened.append((commits, start_index))
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(cli, "PlaybackViewer", FakeViewer)
+    cli.play(source=str(workdir), batch=False, resume=True)
+    commits, index = opened[-1]
+    assert commits[index]["hash"] == second
+    assert index < len(commits) - 1
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "-c", "--raw", "--from", str(workdir)],
+    )
+    assert result.exit_code == 0
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == second
+    assert first not in shown
+    assert fourth in shown
+@
+
+The refusals are the other half of the contract.
+A log that was never played back has no bookmark; a starting ref
+beside the flag is refused before either is resolved; and a bookmark
+on a hidden record names [[--all]], with which it then opens there:
+
+<<test functions>>=
+def test_play_continue_needs_an_earlier_playback(workdir):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    repo.begin_run("hello.py", [], datetime.datetime(2026, 1, 1, 10, 0))
+    result = CliRunner().invoke(
+        app, ["play", "-c", "--from", str(workdir)],
+    )
+    assert result.exit_code == 1
+    assert "Nothing to continue" in result.output
+
+def test_play_continue_refuses_a_start_ref(workdir):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    _log_with_a_playback(workdir)
+    result = CliRunner().invoke(
+        app, ["play", "-c", "HEAD", "--from", str(workdir)],
+    )
+    assert result.exit_code == 1
+    assert "not both" in result.output
+
+def test_play_continue_names_all_for_a_hidden_record(workdir):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t)
+    repo.begin_run("learnlog", ["list"], t.replace(minute=1))
+    listed = repo.run_commit
+    repo.begin_run("learnlog", ["play", "--all"], t.replace(minute=2))
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=3), exit_code=0,
+        view_trace=[(t.replace(minute=2, second=30), listed, "open")],
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["play", "-c", "--from", str(workdir)],
+    )
+    assert result.exit_code == 1
+    assert "--all" in result.output
+    result = runner.invoke(
+        app, ["play", "-c", "--all", "--raw", "--from", str(workdir)],
+    )
+    assert result.exit_code == 0
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == listed
 @
 
 

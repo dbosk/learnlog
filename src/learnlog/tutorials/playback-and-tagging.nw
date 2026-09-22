@@ -24,6 +24,11 @@ with [[play]] to \emph{getting it back} with [[checkout]], and the
 final step varies only the direction---forward again, by the same
 command---so the learner discerns that a checkout replaces files but
 never history.
+A last step returns to reading: [[play --continue]] reopens the
+viewer on the record the learner left, so what varies is once more
+the anchor---the tag placed the viewer before, the learner's own
+recorded reading places it now---and the learner discerns that the
+log keeps their reading as well as their writing.
 
 \subsection{Two variants, one contract}
 
@@ -60,6 +65,8 @@ summary: Review a log in batch and interactive mode, jump to tags, and go back.
 <<novice step: go back to the tagged version>>
 
 <<novice step: come forward again>>
+
+<<novice step: resume where you left off>>
 <<[[playback-and-tagging-expert.md]]>>=
 ---
 id: playback-and-tagging-expert
@@ -82,6 +89,8 @@ summary: The same review and restore workflow, with the Git record explained.
 <<expert step: go back to the tagged version>>
 
 <<expert step: come forward again>>
+
+<<expert step: resume where you left off>>
 @
 
 \subsection{Review the whole log in batch mode}
@@ -405,4 +414,53 @@ A checkout is undone by another checkout because nothing is ever
 rewritten: the snapshot the first checkout made is an ordinary run
 record on the branch, and checking it out records the restored
 version in turn.
+@
+
+\subsection{Resume where you left off}
+
+The added closing step returns from acting to reading, and its object
+of learning is that the log records the learner's reading well enough
+to resume it.
+Several steps ago the learner quit the viewer somewhere in the log;
+since then they have measured, gone back and come forward, so the
+record they were reading is no longer the newest and its position in
+the list has moved.
+[[play --continue]] reopens the viewer on it anyway.
+The contrast with the earlier viewer step is the anchor: there the tag
+placed the viewer, here the learner's own trace does, and nothing was
+typed or noted down to make that possible.
+The step comes last because it needs the intervening steps to have
+happened---a [[--continue]] right after quitting would reopen the
+newest record, which the plain [[play]] does as well, and the point
+would be invisible.
+The expert extra names the bookmark: the last [[Viewed:]] line of the
+previous playback's record, read back rather than stored anywhere,
+which is why a playback that was killed leaves no bookmark and the one
+before it is used instead.
+
+<<shared step: resume where you left off>>=
+# Resume where you left off
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+play\b[^\n]*(?:-c\b|--continue\b)'
+hint: Run `learnlog play --continue` (or `learnlog play -c`) and quit with `q`.
+```
+
+A few steps ago you quit the viewer somewhere in your log, and you
+have gone back and forward since.
+Run `learnlog play --continue` (or `learnlog play -c` for short): the
+viewer opens on the record you were reading when you quit, because the
+log remembers what you looked at.
+Quit with `q` when you are done.
+<<novice step: resume where you left off>>=
+<<shared step: resume where you left off>>
+<<expert step: resume where you left off>>=
+<<shared step: resume where you left off>>
+
+The bookmark is the last `Viewed:` line of your previous playback's
+record, read back from the log rather than stored anywhere.
+A playback that was killed before it finished wrote no such line, so
+`--continue` then goes to the playback before it.
 @

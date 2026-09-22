@@ -2266,6 +2266,111 @@ def test_merge_run_trailers_carries_view_trace():
     ]
 @
 
+\subsection{Where the last review stopped}
+\label{sec:last-viewed}
+
+The trace answers a question the student has, not only the teacher:
+\emph{where was I?}
+A student opens playback at a lecture's tag, reads half of it, quits,
+goes back to an earlier version with [[learnlog checkout]]
+(\cref{sec:checkout}), experiments for a while, and then wants the
+playback to pick up where it stopped.
+The last [[Viewed:]] line of their previous playback names exactly that
+record, so [[learnlog play --continue]] (\cref{sec:play}) can read its
+bookmark out of the log instead of the log growing a bookmark file.
+Nothing new is written: the two-commit protocol of \cref{gitrepo} is
+all a run ever leaves behind, and a log written by an older version
+resumes just as well, since it recorded the same lines.
+
+The bookmark is a commit hash, not a position in the list.
+The checkouts and runs the student has made since only append records
+(\cref{sec:checkout}), so the hash still names the same record however
+much the list has grown, whereas the index the viewer was on has moved.
+
+The newest run with a trace is the one to read, whatever its command
+was.
+Only playback ever records views---listing and metrics show the student
+a summary rather than any commit (\cref{sec:review-subcommands})---so
+looking for [[Viewed:]] lines finds the playbacks without a predicate
+on the command line.
+A playback killed before its trailer was written has no lines, and is
+passed over for the one before it: its trace is lost with it, which is
+the cost of writing the trailer once at the end rather than a bookmark
+on every keypress, and the run in progress, whose trailer does not
+exist yet, is passed over the same way.
+
+The walk goes over the caller's commit list, newest first, and the
+caller's scan; [[play]] holds both already, so no further Git call is
+made, and the order is the one [[latest_student_commit]]
+(\cref{sec:tag}) walks for the same reason.
+Merging the trailer in is what makes the lines visible at all: they
+live in the trailer commit, which [[get_commits]] hides
+(\cref{sec:run-visibility}).
+The merged message is parsed whole rather than block by block, because
+the blocks of a multi-run commit are in the order the runs happened,
+so the last line of the message is the newest view.
+
+<<commits functions>>=
+def last_viewed_commit(commits, scan):
+    """Hash of the record the newest recorded review displayed last.
+
+    ``commits`` is the list from :func:`get_commits`, oldest first,
+    and ``scan`` the `RunScan` of the same log.  ``None`` when no
+    run in the log carries a view trace.
+    """
+    for commit in reversed(commits):
+        message = merge_run_trailers(
+            scan.messages.get(commit["hash"], ""), scan.trailers,
+        )
+        views = parse_view_trace(message)
+        if views:
+            return views[-1][0]
+    return None
+@
+
+Let's verify the choice on a log built by hand: the newest run is a
+playback that was killed, so it has no trailer; the one before it is a
+metrics run, complete but without views; and the playback before that
+carries a three-entry trace, whose last entry must be the answer.
+A log with no trace at all answers [[None]]:
+
+<<commits test functions>>=
+def test_last_viewed_commit_reads_the_newest_trace():
+    from learnlog.commits import RunScan, last_viewed_commit
+    first, second, third = "a" * 40, "b" * 40, "c" * 40
+
+    def header(run_id, arguments):
+        return (
+            f"Run: learnlog {arguments}\n\nScript: learnlog\n"
+            f"Arguments: {arguments}\nRun-Id: {run_id}"
+        )
+
+    commits = [
+        {"hash": first}, {"hash": second}, {"hash": third},
+        {"hash": "d" * 40}, {"hash": "e" * 40}, {"hash": "f" * 40},
+    ]
+    messages = {
+        first: "Run: hello.py (none)\n\nScript: hello.py",
+        second: "Run: hello.py (none)\n\nScript: hello.py",
+        third: "Run: hello.py (none)\n\nScript: hello.py",
+        "d" * 40: header("play1", "play"),
+        "e" * 40: header("metrics1", "metrics time"),
+        "f" * 40: header("play2", "play"),
+    }
+    trailers = {
+        "play1": (
+            "End-Time: 2026-01-01T10:00:20\nExit-Code: 0\n"
+            f"Viewed: {third} 2026-01-01T10:00:01 open\n"
+            f"Viewed: {first} 2026-01-01T10:00:05 prev\n"
+            f"Viewed: {second} 2026-01-01T10:00:09 next"
+        ),
+        "metrics1": "End-Time: 2026-01-01T11:00:00\nExit-Code: 0",
+    }
+    scan = RunScan(trailers, {}, messages)
+    assert last_viewed_commit(commits, scan) == second
+    assert last_viewed_commit(commits[:3], scan) is None
+@
+
 
 \section{Classifying run outcomes}
 \label{sec:classify-run-outcomes}
