@@ -9407,11 +9407,15 @@ The source a playback was given is on its recorded command line, and
 words of the [[Arguments:]] field, which [[parse_run_arguments]]
 restores exactly as typed.
 A recorded [[-f]] value and one typed now are compared as resolved
-paths, both against the current directory---the student works from
-one directory, VSCode's terminal opens at the project root, and no
-run header records where it was typed, so nothing better is at hand.
-A mismatch costs at most a \enquote{nothing to continue}, never a
-wrong record.
+paths: the typed one against the current directory, the recorded one
+against the directory its run was started in, which the header names
+relative to the project root (\cref{sec:run-directory}).
+So a lecture played from a subfolder as [[-f ../lecture.learnlog]]
+and continued from the root as [[-f lecture.learnlog]] are the same
+lecture.
+A header from before the directory was recorded has no better answer
+than the current directory, and a mismatch there costs at most a
+\enquote{nothing to continue}, never a wrong record.
 No [[-f]] means the project's own log, so a playback without one and
 [[-f .]] name the same log and match.
 
@@ -9427,11 +9431,17 @@ def playback_source_argument(run):
     return values[-1] if values else None
 
 
-def source_path(value, own):
-    """The log ``value`` names, resolved; the project's own for ``None``."""
+def source_path(value, own, directory=None):
+    """The log ``value`` names, resolved; the project's own for ``None``.
+
+    A relative ``value`` is taken from ``directory``, a path relative
+    to ``own``, when given, and from the current directory otherwise.
+    """
     if value is None:
         return pathlib.Path(own).resolve()
-    return pathlib.Path(value).resolve()
+    base = pathlib.Path.cwd() if directory is None \
+        else pathlib.Path(own) / directory
+    return (base / value).resolve()
 @
 
 The bookmark is found before the source is resolved, because it may
@@ -9441,6 +9451,9 @@ A source that has gone since---a bundle the student deleted---is
 refused by name rather than left to the resolver's generic complaint,
 since the student did not type it this time and would not know what
 it refers to.
+The source handed on is the resolved path, since the recorded words
+were relative to where they were typed, and the name shown is that
+path relative to here, the way the student would type it now.
 
 <<find the playback to continue>>=
 own = find_learnlog_dir()
@@ -9452,7 +9465,7 @@ playback = last_playback(
     get_commits(own_repo), scan_run_commits(own_repo),
     matches=None if wanted is None else (
         lambda run: source_path(
-            playback_source_argument(run), own,
+            playback_source_argument(run), own, run["directory"],
         ) == wanted
     ),
 )
@@ -9466,14 +9479,16 @@ viewed = playback["viewed"][-1][0]
 if source is None:
     recorded = playback_source_argument(playback)
     if recorded is not None:
-        if not pathlib.Path(recorded).exists():
+        played = source_path(recorded, own, playback["directory"])
+        shown = os.path.relpath(played)
+        if not played.exists():
             raise SystemExit(
-                f"Cannot continue: {recorded}, which you were "
+                f"Cannot continue: {shown}, which you were "
                 "playing, is not here any more."
             )
-        source = recorded
+        source = str(played)
         typer.echo(
-            f"Continuing {recorded} where you left off.", err=True,
+            f"Continuing {shown} where you left off.", err=True,
         )
 @
 
@@ -9667,6 +9682,7 @@ def test_play_continue_reads_the_students_own_log_for_a_bundle(
     from typer.testing import CliRunner
     bundle, (first, second) = _lecture_bundle(tmp_path, workdir)
     _lecture_bundle(tmp_path, workdir, "other.learnlog")
+    monkeypatch.chdir(workdir)
     repo = LearnlogRepo(workdir)
     t = datetime.datetime(2026, 1, 1, 10, 0)
     repo.begin_run("hello.py", [], t)
@@ -9682,7 +9698,6 @@ def test_play_continue_reads_the_students_own_log_for_a_bundle(
             (t.replace(minute=1, second=2), first, "prev"),
         ],
     )
-    monkeypatch.chdir(workdir)
     runner = CliRunner()
 
     result = runner.invoke(app, ["play", "-c", "-b", "--raw"])
@@ -9744,6 +9759,46 @@ def test_play_continue_ignores_the_played_logs_own_playbacks(
     result = runner.invoke(app, ["play", "-c", "-b"])
     assert result.exit_code == 1
     assert "Nothing to continue" in result.output
+@
+
+A playback started in a subfolder names the bundle relative to that
+folder; continued from the root, the recorded directory is what makes
+the same file findable, with [[-f]] naming it from the root and
+without:
+
+<<test functions>>=
+def test_play_continue_resolves_the_source_from_its_directory(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    bundle, (first, second) = _lecture_bundle(tmp_path, workdir)
+    repo = LearnlogRepo(workdir)
+    (workdir / "notes").mkdir()
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("hello.py", [], t)
+    repo.begin_run(
+        "learnlog", ["play", "-f", "../lecture.learnlog"],
+        t.replace(minute=1), directory="notes",
+    )
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=2), exit_code=0,
+        view_trace=[(t.replace(minute=1, second=1), first, "open")],
+    )
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["play", "-c", "-b", "--raw"])
+    assert result.exit_code == 0, result.output
+    assert "Continuing lecture.learnlog" in result.output
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == first
+    result = runner.invoke(
+        app, ["play", "-c", "-f", "lecture.learnlog", "-b", "--raw"],
+    )
+    assert result.exit_code == 0, result.output
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown[0] == first
 @
 
 

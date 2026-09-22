@@ -2795,22 +2795,27 @@ The probe that fills its place is the combined [[HEAD]] lookup of
 parent it would otherwise read for itself.
 
 <<repo methods>>=
-def begin_run(self, script, args, start_time, include=()):
+def begin_run(self, script, args, start_time, include=(),
+              directory=None):
     """Record the start of a program run.
 
     Snapshots the current code state and commits it with the run
     header, which carries the run id that :meth:`finalize_run`
     will refer back to.  The header commit's hash is kept in
     `run_commit`.  Files in `include` are recorded even where the
-    exclude patterns would leave them out.
+    exclude patterns would leave them out.  `directory` is where
+    the run was started, relative to the project root; by default
+    the current directory.
 
     Returns the run header string.
     """
     self.run_id = new_run_id()
     self.run_script = script
     self.run_args = list(args)
+    if directory is None:
+        directory = run_directory(self.workdir)
     header = format_run_header(
-        script, args, start_time, self.run_id,
+        script, args, start_time, self.run_id, directory=directory,
     )
 
     with self.commit_lock() as lock:
@@ -2876,6 +2881,33 @@ command lines.
 <<add the files the run must record>>=
 for path in include:
     self.git("add", "-f", "--", str(path), timeout=GIT_TREE_TIMEOUT)
+@
+
+The header also names where the run was started
+(\cref{sec:run-directory}).
+The method reads the current directory itself rather than asking the
+caller, because every caller would answer the same way and one of
+them, the autostart of \cref{sec:initialize}, runs inside the
+student's program, where the current directory is exactly the fact
+worth recording; a caller that knows better---a test, a
+reconstruction---passes [[directory]].
+
+Let's verify that a run started in a subdirectory of the project says
+so, and one started at the root says [[.]]:
+
+<<test functions>>=
+def test_begin_run_records_the_directory(workdir, monkeypatch):
+    repo = LearnlogRepo(workdir)
+    (workdir / "lecture21").mkdir()
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    monkeypatch.chdir(workdir / "lecture21")
+    repo.begin_run("main.py", [], t)
+    body = repo.git("log", "-1", "--format=%B").stdout
+    assert "Directory: lecture21\n" in body
+    monkeypatch.chdir(workdir)
+    repo.begin_run("main.py", [], t.replace(minute=1))
+    body = repo.git("log", "-1", "--format=%B").stdout
+    assert "Directory: .\n" in body
 @
 
 Let's verify the three moments of such a file: absent from a snapshot
@@ -3884,16 +3916,71 @@ def test_source_files_keeps_only_recordable_files(
 @
 
 
+\subsection{Where a run was started}
+\label{sec:run-directory}
+
+A header used to say what ran and when, but not from where.
+That gap costs in two places.
+A student who works in a subdirectory of their project---a folder per
+lecture, say---runs [[python main.py]] there, and the record cannot
+tell that [[main.py]] from the one in the root; and a recorded
+command line with a relative path in it, [[play -f ../lecture.learnlog]],
+can only be followed from the directory it was typed in, which the
+log did not name (\cref{sec:play}).
+So the header now carries the directory the command was run in,
+relative to the project root, the directory [[.learnlog]] lives in.
+Relative rather than absolute because the log travels: a bundle
+cloned by a teacher, a project moved to another machine, and the
+root itself is wherever [[.learnlog]] is now.
+
+The form is a POSIX path, [[.]] for the root itself, so a log written
+on Windows reads the same everywhere and a reader can join it to the
+root with nothing but a slash.
+A run started outside the project---possible when the project is
+named by [[LEARNLOG_PROJECT_ROOT]] or wired through a venv---records
+the relative path anyway, [[..]] and all, since that is still where
+it was in relation to the root; only a directory on another Windows
+drive, which has no relative form, is recorded as it is.
+
+<<functions>>=
+def run_directory(workdir, cwd=None):
+    """The directory a run was started in, relative to ``workdir``.
+
+    A POSIX-style relative path, ``.`` for ``workdir`` itself.
+    ``cwd`` defaults to the current directory.
+    """
+    cwd = pathlib.Path.cwd() if cwd is None else pathlib.Path(cwd)
+    try:
+        relative = os.path.relpath(cwd, workdir)
+    except ValueError:
+        return cwd.resolve().as_posix()
+    return pathlib.PurePath(relative).as_posix()
+@
+
+Let's verify the three answers: the root, a subdirectory, and a
+directory outside the project:
+
+<<test functions>>=
+def test_run_directory_is_relative_to_the_root(tmp_path):
+    root = tmp_path / "project"
+    (root / "lecture21").mkdir(parents=True)
+    assert run_directory(root, root) == "."
+    assert run_directory(root, root / "lecture21") == "lecture21"
+    assert run_directory(root, tmp_path) == ".."
+@
+
 \subsection{The header block}
 
 <<functions>>=
 def format_run_header(script, args, start_time,
-                      run_id=None):
+                      run_id=None, directory=None):
     """Format a run header block.
 
     The header records which script was run, its arguments, and
     the start time.  When ``run_id`` is given, it is recorded as
-    the ``Run-Id`` field that links this run to its trailer.
+    the ``Run-Id`` field that links this run to its trailer;
+    ``directory``, when given, is where the run was started,
+    relative to the project root (see `run_directory`).
     """
     args_str = format_run_arguments(args)
     lines = [
@@ -3901,14 +3988,23 @@ def format_run_header(script, args, start_time,
         "",
         f"Script: {script}",
         f"Arguments: {args_str}",
-        f"Start-Time: {start_time.isoformat()}",
     ]
+    if directory is not None:
+        lines.append(f"{DIRECTORY_FIELD} {directory}")
+    lines.append(f"Start-Time: {start_time.isoformat()}")
     if run_id:
         lines.append(f"{RUN_ID_FIELD} {run_id}")
     return "\n".join(lines)
 <<constants>>=
 RUN_ID_FIELD = "Run-Id:"
+DIRECTORY_FIELD = "Directory:"
 @
+
+The directory line is optional in the format so that a header written
+by an older version, or rebuilt from a dataset without the column,
+reads exactly as it always did; \cref{sec:run-directory} explains the
+value.
+
 
 Let's verify the format:
 
@@ -3921,6 +4017,11 @@ def test_format_run_header_basic():
     assert "Arguments: arg1" in header
     assert "Start-Time: 2026-03-20T14:30:00" in header
     assert "Run-Id:" not in header
+    assert "Directory:" not in header
+    header = format_run_header(
+        "hello.py", ["arg1"], t, directory="lecture21",
+    )
+    assert "Directory: lecture21\n" in header
 
 def test_format_run_header_no_args():
     t = datetime.datetime(2026, 3, 20, 14, 30)

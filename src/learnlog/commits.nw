@@ -2667,13 +2667,14 @@ def parse_run_block(block_text):
     """Parse a single run block into a dict.
 
     Returns a dict with keys ``script``, ``arguments``,
-    ``start_time``, ``end_time``, ``exit_code``,
+    ``directory``, ``start_time``, ``end_time``, ``exit_code``,
     ``io_log``, ``exception_info``, and ``viewed``.
-    Missing trailer fields are ``None``; ``viewed`` is the
-    view trace, empty for everything but a review run.
+    Missing fields are ``None``---``directory`` for a header
+    written before it was recorded; ``viewed`` is the view
+    trace, empty for everything but a review run.
     """
     result = {
-        "script": None, "arguments": None,
+        "script": None, "arguments": None, "directory": None,
         "start_time": None, "end_time": None,
         "exit_code": None, "io_log": None,
         "exception_info": None,
@@ -2691,12 +2692,20 @@ we parse them in a single pass.
 We skip the first [[Run:]] line because it duplicates the
 [[Script:]] and [[Arguments:]] fields in a less structured form.
 
+The [[Directory:]] line is newer than the rest of the header
+(\cref{sec:run-directory}), so its absence is ordinary---every log
+written before it---and reads as [[None]] rather than as a fault.
+
 <<parse key-value fields>>=
 for line in block_text.split("\n"):
     if line.startswith("Script:"):
         result["script"] = line.split(":", 1)[1].strip()
     elif line.startswith("Arguments:"):
         result["arguments"] = (
+            line.split(":", 1)[1].strip()
+        )
+    elif line.startswith("Directory:"):
+        result["directory"] = (
             line.split(":", 1)[1].strip()
         )
     elif line.startswith("Start-Time:"):

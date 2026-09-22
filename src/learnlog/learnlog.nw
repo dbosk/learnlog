@@ -2876,6 +2876,9 @@ header is the state the run started from, and the recording was on
 disk then.
 Only review runs ask: a program run's arguments are the student's
 program's, and [[-f]] there means whatever the program says it means.
+Where the run was started is [[begin_run]]'s own to record
+(\cref{sec:run-directory}): the current directory at this point is
+the student's, since nothing here has changed it.
 
 <<reclaim what killed runs left behind>>=
 _reclaim_c_invocations(repo)
@@ -7557,7 +7560,8 @@ student plays it, and their own log records the playback with the
 lecture's hashes---its initial commit among them, since playback
 shows it---and the bundle itself in the run's tree; they copy
 one of its runs into their project, into the folder named after the
-bundle by default, and run it, and both land in their log;
+bundle by default, and run it from inside that folder, and both land
+in their log, the run with the folder on its [[Directory:]] line;
 [[play -c]] with no source then continues the lecture and says so;
 the plain listing shows the copy and the run and not the playbacks;
 a restore removes the copied file and keeps the bundle; and a
@@ -7629,8 +7633,8 @@ assert hashes[0] in copied.stdout
 assert (project / "lecture21" / "lecture.py").read_text() \
     == "print('lecture part 0')\n"
 subprocess.run(
-    [str(_venv_binary(venv_dir, "python")), "lecture21/lecture.py"],
-    cwd=str(project), env=_autostart_env(),
+    [str(_venv_binary(venv_dir, "python")), "lecture.py"],
+    cwd=str(project / "lecture21"), env=_autostart_env(),
     capture_output=True, text=True, check=True, timeout=30,
 )
 history = _git_history(project)
@@ -7638,6 +7642,7 @@ assert (
     f"Run: learnlog checkout --from lecture21.learnlog {hashes[0][:7]}"
 ) in history
 assert "stdout: lecture part 0" in history
+assert "Directory: lecture21\n" in history
 assert "lecture21.learnlog" in _tree_names(project, "HEAD")
 @
 
