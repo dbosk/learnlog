@@ -1,0 +1,323 @@
+\section{Playing back lectures}
+\label{tut:playing-lectures}
+
+A lecture's live coding, recorded with learnlog and exported as a
+bundle, is a log like the learner's own, and this tutorial is about
+reading someone else's log from inside one's own project.
+The learner already knows playback, tagging and checkout from
+\cref{tut:playback-and-tagging}; what varies here is the
+\emph{source}---a file they were given instead of their project---and
+the invariants are the commands, which are the same with [[-f]] or
+[[--from]] added.
+That is the tutorial's first object of learning: a shared log is
+played and used with the tools the learner already has.
+The second is that their own log keeps track of the reading: what
+they watched, the code they took from it, what they did with that
+code, and where they stopped, so that continuing needs no notes and
+a teacher can later see the lecture beside the work it led to.
+
+The steps follow the student's evening: get the lecture into the
+project; play it; take the code of one moment of it; run and change
+that code; pick the lecture up again where it stopped; and finally
+take the copied code out again.
+The two middle steps are where the reading turns into writing---the
+copied code is run and edited like any program---and the tutorial
+puts them between the two playback steps on purpose, so that the
+continue step demonstrates a bookmark that survived the learner's own
+work, not one used a second later.
+
+\subsection{Two variants, one contract}
+
+As in \cref{tut:playback-and-tagging}, the tutorial tangles into a
+novice entry, [[playing-lectures]], and an expert entry,
+[[playing-lectures-expert]], sharing every step's checks through
+common chunks.
+The expert extras name what the log records at each step and the
+rules behind the defaults: that the bundle file itself is recorded,
+that a copy overlays where a checkout replaces, that the bookmark is
+the learner's own, and that an undo is one more checkout.
+
+<<[[playing-lectures.md]]>>=
+---
+id: playing-lectures
+title: Playing back lectures
+summary: Play a lecture's recording, take its code into your project, and pick the lecture up again.
+---
+
+<<novice step: put the lecture in your project>>
+
+<<novice step: play the lecture>>
+
+<<novice step: take the code of one moment>>
+
+<<novice step: run and change the code>>
+
+<<novice step: pick the lecture up again>>
+
+<<novice step: take the copied code out again>>
+<<[[playing-lectures-expert.md]]>>=
+---
+id: playing-lectures-expert
+title: Playing back lectures, mechanics included
+summary: The same lecture workflow, with what your log records at each step.
+---
+
+<<expert step: put the lecture in your project>>
+
+<<expert step: play the lecture>>
+
+<<expert step: take the code of one moment>>
+
+<<expert step: run and change the code>>
+
+<<expert step: pick the lecture up again>>
+
+<<expert step: take the copied code out again>>
+@
+
+\subsection{Put the lecture in your project}
+
+The opening step is about place, and it exists because the rest of
+the tutorial depends on it: a bundle inside the project is one the
+log can record, a bundle in a downloads folder is not.
+A learner working through the tutorial without a teacher's bundle
+makes one from their own log, which is the same kind of file; the
+check accepts either the export or a listing that shows the file is
+there.
+The expert extra says why the place matters, in the log's terms.
+
+<<shared step: put the lecture in your project>>=
+# Put the lecture in your project
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: '(?:learnlog\s+export\b[^\n]*\S+\.learnlog\b|ls\b[^\n]*)'
+hint: Copy the `.learnlog` file into the project folder, or make one with `learnlog export -o lecture.learnlog`, then `ls`.
+```
+
+Your teacher gives you a lecture's live coding as a file ending in
+`.learnlog`.
+Put it in your project folder, the one you run `learnlog` in, and run
+`ls` to see it there.
+If you have no lecture file to hand, make one from your own log with
+`learnlog export -o lecture.learnlog`; it works the same way.
+<<novice step: put the lecture in your project>>=
+<<shared step: put the lecture in your project>>
+<<expert step: put the lecture in your project>>=
+<<shared step: put the lecture in your project>>
+
+The place matters: the steps that follow record the lecture file in
+your log along with what you do with it, and only a file inside the
+project can be in a snapshot.
+A file elsewhere still plays, but your log will only say that you
+played it, not what.
+@
+
+\subsection{Play the lecture}
+
+The playback step varies one thing against the viewer step of
+\cref{tut:playback-and-tagging}: the source.
+Its object of learning is that a bundle is playable as it is, with
+the same viewer and the same keys, and nothing to unpack.
+The learner is told to stop partway on purpose---the continue step
+later needs a place to come back to---and to note a moment they want
+the code of, which the next step uses.
+The expert extra is what the log records: a review run in the
+learner's own log, with the lecture file in its snapshot.
+
+<<shared step: play the lecture>>=
+# Play the lecture
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+play\b[^\n]*(?:-f|--from)\s+\S+\.learnlog\b'
+hint: Run `learnlog play -f lecture.learnlog`, watch a while, and quit with `q`.
+```
+
+Run `learnlog play -f lecture.learnlog` (with your file's name) to
+open the lecture in the viewer instead of your own log.
+Step through it with the arrow keys.
+Stop somewhere in the middle and quit with `q`; before you do, note
+the hash shown in the header of a moment whose code you would like to
+have.
+<<novice step: play the lecture>>=
+<<shared step: play the lecture>>
+<<expert step: play the lecture>>=
+<<shared step: play the lecture>>
+
+The playback is a review run in your own log, hidden from `learnlog
+list` until you ask with `--all`, and its record names every moment
+you looked at.
+The lecture file goes into that run's snapshot, even though
+`.learnlog` files are otherwise kept out of every snapshot so that a
+log never contains its own exports: a teacher reading your log later
+can open the lecture you watched.
+@
+
+\subsection{Take the code of one moment}
+
+This step turns reading into having.
+Its object of learning is that a moment of someone else's log can
+become files in your project, that the copy adds rather than
+replaces---a folder named after the lecture, beside your own
+files---and that it is recorded as a checkout, which the learner
+sees in [[learnlog list]].
+The contrast with the checkout the learner knows is the source,
+[[--from]], and the consequence is the folder.
+The expert extra names the folder rule and [[-o]], and says why a
+copy from another log overlays where a checkout in your own log
+replaces.
+
+<<shared step: take the code of one moment>>=
+# Take the code of one moment
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+checkout\b[^\n]*(?:-f|--from)\s+\S+\.learnlog\b\s+\S+'
+  - next run continues
+hint: Run `learnlog checkout --from lecture.learnlog <hash>` with the hash you noted.
+```
+
+Run `learnlog checkout --from lecture.learnlog <hash>` with the hash
+you noted.
+The lecture's files at that moment land in a folder named after the
+lecture file, `lecture/` for `lecture.learnlog`, and your own files
+stay as they are.
+Run `learnlog list`: the copy is in your log as a checkout, with the
+lecture's name on its line.
+<<novice step: take the code of one moment>>=
+<<shared step: take the code of one moment>>
+<<expert step: take the code of one moment>>=
+<<shared step: take the code of one moment>>
+
+The folder is the lecture file's name without its suffix; `-o` picks
+another folder inside your project, and `-o .` is the project root,
+where files of the same name are overwritten and the rest stay.
+A checkout within your own log replaces your files, because its target
+is an earlier state of this very project; a copy from another log
+overlays, because that log's files are not yours to lose.
+Either way the record starts with a snapshot of your files, and the
+run you record next diffs against the copied code.
+@
+
+\subsection{Run and change the code}
+
+The step that makes the tutorial more than a viewing exercise: the
+copied program is run from its folder, changed, and run again, and
+the learner sees in [[learnlog list]] that these runs are recorded
+like any other.
+Its object of learning is that code taken from a lecture is now
+theirs to work on, with the log following as usual.
+It sits between the two playback steps so that the bookmark the next
+step relies on has survived real work.
+The expert extra is what the record shows: the first run's diff is
+against the lecture's code, so the log tells the learner's edits from
+the lecturer's.
+
+<<shared step: run and change the code>>=
+# Run and change the code
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'python3?\s+\S+/\S+\.py\b'
+hint: Run the copied program from its folder, e.g. `python lecture/main.py`, then change it and run it again.
+```
+
+Run the copied program from its folder, for example
+`python lecture/main.py` (use the name of the file you got).
+Change something in it and run it again.
+Run `learnlog list`: both runs are in your log, like any run of your
+own.
+<<novice step: run and change the code>>=
+<<shared step: run and change the code>>
+<<expert step: run and change the code>>=
+<<shared step: run and change the code>>
+
+The copy closed its record with the copied files as the log's newest
+version, so your first run of the program shows no diff of the
+lecturer's code as yours, and your second run's diff is exactly your
+change.
+@
+
+\subsection{Pick the lecture up again}
+
+The step re-uses [[--continue]] from \cref{tut:playback-and-tagging}
+with one thing varied: no source is named, and the lecture opens
+anyway, where the learner stopped.
+The object of learning is that the bookmark is the learner's own---it
+lives in their log, together with what was played---so continuing
+needs neither the hash nor the file name.
+The expert extra is the rule behind it.
+
+<<shared step: pick the lecture up again>>=
+# Pick the lecture up again
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+play\b[^\n]*(?:-c\b|--continue\b)'
+hint: Run `learnlog play -c` with no `-f`; it continues the lecture.
+```
+
+Run `learnlog play -c`, without naming the lecture file.
+The viewer opens the lecture again, on the moment you were looking at
+when you quit, and says so: your log remembers what you played as
+well as where you stopped.
+Watch some more and quit with `q`.
+<<novice step: pick the lecture up again>>=
+<<shared step: pick the lecture up again>>
+<<expert step: pick the lecture up again>>=
+<<shared step: pick the lecture up again>>
+
+`--continue` looks in your own log for the newest playback and takes
+its source along; with `-f` it only considers playbacks of that file.
+The lecture's own review runs, if the lecturer made any, are never
+your bookmark, and a playback that was killed before it finished left
+no bookmark at all.
+@
+
+\subsection{Take the copied code out again}
+
+The closing step takes the copied folder out again, and its object of
+learning is that a checkout is undone by name, from a list, without a
+hash.
+[[--restore]] lists the log's checkouts newest first, the copy is the
+first of them, and answering [[1]] brings back the files from before
+it: the folder goes, the lecture file and the learner's own files
+stay, and the edited copy is not lost---it is in the log.
+The expert extra says what a restore is in the log: one more
+checkout, appended, with the undone one still there.
+
+<<shared step: take the copied code out again>>=
+# Take the copied code out again
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+checkout\b[^\n]*--restore\b'
+  - next run continues
+hint: Run `learnlog checkout --restore` and answer `1`.
+```
+
+Run `learnlog checkout --restore`: it lists your checkouts, newest
+first, and asks which one to undo.
+Answer `1`, the copy you made.
+The folder is gone, your own files and the lecture file are still
+there, and the changes you made to the copy are in your log, ready to
+be checked out again.
+<<novice step: take the copied code out again>>=
+<<shared step: take the copied code out again>>
+<<expert step: take the copied code out again>>=
+<<shared step: take the copied code out again>>
+
+Every checkout records the files from before it as its own header, so
+undoing one is checking that header out, and the list saves you the
+hash.
+A restore is itself a checkout, appended to the log like any other,
+and the one it undoes stays in the history---which is why your edits
+are still there.
+@

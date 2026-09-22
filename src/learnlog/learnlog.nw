@@ -7556,11 +7556,12 @@ A lecturer's log is exported to a bundle in the student's project; the
 student plays it, and their own log records the playback with the
 lecture's hashes---its initial commit among them, since playback
 shows it---and the bundle itself in the run's tree; they copy
-one of its runs into a folder of their project and run it, and both
-land in their log; [[play -c]] with no source then continues the
-lecture and says so; the plain listing shows the copy and the run and
-not the playbacks; a restore removes the copied file and keeps the
-bundle; and a researcher who clones the student's export reads the
+one of its runs into their project, into the folder named after the
+bundle by default, and run it, and both land in their log;
+[[play -c]] with no source then continues the lecture and says so;
+the plain listing shows the copy and the run and not the playbacks;
+a restore removes the copied file and keeps the bundle; and a
+researcher who clones the student's export reads the
 lecture back out of it, byte for byte.
 
 <<autostart test functions>>=
@@ -7584,7 +7585,7 @@ def test_a_lecture_bundle_is_played_copied_and_continued(
         )
         lecture.begin_run("lecture.py", [], t.replace(minute=n))
         hashes.append(lecture.run_commit)
-    bundle = project / "lecture.learnlog"
+    bundle = project / "lecture21.learnlog"
     do_export(lecture, bundle)
     bundle_bytes = bundle.read_bytes()
 
@@ -7596,13 +7597,13 @@ def test_a_lecture_bundle_is_played_copied_and_continued(
 
 <<play the bundle and check the student's record of it>>=
 played = _run_cli(
-    learnlog, ["play", "-b", "--raw", "-f", "lecture.learnlog"],
+    learnlog, ["play", "-b", "--raw", "-f", "lecture21.learnlog"],
     cwd=project,
 )
 shown = re.findall(r"^commit ([0-9a-f]{40})$", played.stdout, re.M)
 assert set(hashes) <= set(shown)
 trailer = _commit_body(
-    project, "^Run-End: learnlog play .*lecture.learnlog",
+    project, "^Run-End: learnlog play .*lecture21.learnlog",
 )
 viewed = [
     line.split()[1] for line in trailer.splitlines()
@@ -7612,19 +7613,16 @@ assert viewed == shown
 bookmark = viewed[-1]
 play_header = subprocess.run(
     ["git", "--git-dir=.learnlog", "--work-tree=.", "log", "-1",
-     "--grep=^Run: learnlog play .*lecture.learnlog", "--format=%H"],
+     "--grep=^Run: learnlog play .*lecture21.learnlog", "--format=%H"],
     cwd=str(project), capture_output=True, text=True, check=True,
     timeout=30,
 ).stdout.strip()
-assert "lecture.learnlog" in _tree_names(project, play_header)
+assert "lecture21.learnlog" in _tree_names(project, play_header)
 @
 
 <<copy a lecture run in and run it>>=
 copied = _run_cli(
-    learnlog, [
-        "checkout", "--from", "lecture.learnlog", "-o", "lecture21",
-        hashes[0][:7],
-    ],
+    learnlog, ["checkout", "--from", "lecture21.learnlog", hashes[0][:7]],
     cwd=project,
 )
 assert hashes[0] in copied.stdout
@@ -7637,22 +7635,21 @@ subprocess.run(
 )
 history = _git_history(project)
 assert (
-    "Run: learnlog checkout --from lecture.learnlog -o lecture21 "
-    f"{hashes[0][:7]}"
+    f"Run: learnlog checkout --from lecture21.learnlog {hashes[0][:7]}"
 ) in history
 assert "stdout: lecture part 0" in history
-assert "lecture.learnlog" in _tree_names(project, "HEAD")
+assert "lecture21.learnlog" in _tree_names(project, "HEAD")
 @
 
 <<continue the lecture without naming it>>=
 resumed = _run_cli(
     learnlog, ["play", "-c", "-b", "--raw"], cwd=project,
 )
-assert "Continuing lecture.learnlog" in resumed.stderr
+assert "Continuing lecture21.learnlog" in resumed.stderr
 shown = re.findall(r"^commit ([0-9a-f]{40})$", resumed.stdout, re.M)
 assert shown[0] == bookmark
 listing = _run_cli(learnlog, ["list"], cwd=project).stdout
-assert "learnlog checkout --from lecture.learnlog" in listing
+assert "learnlog checkout --from lecture21.learnlog" in listing
 assert " lecture.py" in listing
 assert "learnlog play" not in listing
 @
@@ -7674,7 +7671,7 @@ subprocess.run(
 )
 recovered = subprocess.run(
     ["git", "-C", str(clone), "show",
-     f"{play_header}:lecture.learnlog"],
+     f"{play_header}:lecture21.learnlog"],
     capture_output=True, check=True, timeout=30,
 ).stdout
 assert recovered == bundle_bytes

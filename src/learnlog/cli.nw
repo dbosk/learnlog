@@ -135,6 +135,7 @@ from learnlog._autostart import (
     _resolve_project_root,
 )
 from learnlog.gitrepo import (
+    BUNDLE_SUFFIX,
     GIT_DIR_NAME,
     GIT_TREE_TIMEOUT,
     GitError,
@@ -142,6 +143,7 @@ from learnlog.gitrepo import (
     LearnlogRepo,
     git_environment,
     parse_run_arguments,
+    PROGSNAP2_SUFFIX,
     run_git,
     source_arguments,
     source_files,
@@ -2702,6 +2704,8 @@ pytorial.add_typer_subcommand(
         str(_builtin_tutorials_dir / "getting-started-expert.md"),
         str(_builtin_tutorials_dir / "playback-and-tagging.md"),
         str(_builtin_tutorials_dir / "playback-and-tagging-expert.md"),
+        str(_builtin_tutorials_dir / "playing-lectures.md"),
+        str(_builtin_tutorials_dir / "playing-lectures-expert.md"),
         str(_builtin_tutorials_dir / "export-and-share.md"),
         str(_builtin_tutorials_dir / "export-and-share-expert.md"),
         str(_builtin_tutorials_dir / "metrics.md"),
@@ -2886,6 +2890,8 @@ def test_tutorial_list_lists_builtin_tutorials():
     assert "getting-started-expert" in out
     assert "playback-and-tagging" in out
     assert "playback-and-tagging-expert" in out
+    assert "playing-lectures" in out
+    assert "playing-lectures-expert" in out
     assert "export-and-share" in out
     assert "export-and-share-expert" in out
     assert "metrics" in out
@@ -2896,6 +2902,8 @@ def test_tutorial_list_lists_builtin_tutorials():
         < out.index("getting-started-expert")
         < out.index("playback-and-tagging")
         < out.index("playback-and-tagging-expert")
+        < out.index("playing-lectures")
+        < out.index("playing-lectures-expert")
         < out.index("export-and-share")
         < out.index("export-and-share-expert")
         < out.index("metrics")
@@ -2908,6 +2916,7 @@ def test_expert_variants_share_their_novice_contract():
     for base in (
         "getting-started",
         "playback-and-tagging",
+        "playing-lectures",
         "export-and-share",
         "metrics",
     ):
@@ -7700,7 +7709,8 @@ def checkout(
         "--output", "-o",
         help=(
             "Directory inside your project to copy the files into "
-            "(with --from).  Default: the project root."
+            "(with --from).  Default: one named after the source, "
+            "lecture21/ for lecture21.learnlog; -o . is the root."
         ),
     )] = None,
     restore: Annotated[bool, typer.Option(
@@ -7762,6 +7772,14 @@ snapshot, and the log would say the student got files it cannot
 show.
 The Git directory is inside the project but is not the student's
 files, so it is refused with the same words.
+Without [[--output]] the copy goes into a directory named after the
+source---[[lecture21/]] for [[lecture21.learnlog]]---so that a
+student who fetches from several lectures gets one folder each and
+never a lecture's [[main.py]] over their own; [[-o .]] asks for the
+project root explicitly.
+The name is the source's last path component with the export suffix
+gone, which serves a bundle, a ProgSnap2 archive and a directory
+alike.
 
 <<refuse option combinations that do not make sense>>=
 if restore and (source is not None or output is not None):
@@ -7773,8 +7791,12 @@ if output is not None and source is None:
 if run is None and not restore:
     raise SystemExit("Give a run to check out, or --restore.")
 destination = workdir
-if output is not None:
-    destination = pathlib.Path(output).resolve()
+target_dir = None
+if source is not None:
+    target_dir = (
+        output if output is not None else default_output(source)
+    )
+    destination = pathlib.Path(target_dir).resolve()
     if (
         not destination.is_relative_to(workdir.resolve())
         or destination.is_relative_to(
@@ -7782,9 +7804,17 @@ if output is not None:
         )
     ):
         raise SystemExit(
-            f"{output} is not inside your project, so files there "
-            "could not be recorded."
+            f"{target_dir} is not inside your project, so files "
+            "there could not be recorded."
         )
+<<helper functions>>=
+def default_output(source):
+    """The directory a copy from ``source`` goes into by default."""
+    name = pathlib.Path(source).resolve().name
+    for suffix in (BUNDLE_SUFFIX, PROGSNAP2_SUFFIX):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    return name or "."
 @
 
 The argument is whatever the student has to hand: the seven-character
@@ -7968,8 +7998,9 @@ student whose lab files vanished because they fetched a lecture's
 would have learnt the wrong lesson about a command meant to be safe.
 So files of the same name are overwritten---they are in the snapshot
 the record starts with---and everything else stays.
-[[--output]] puts the copy in a directory of the project instead of
-its root, for a student who keeps each lecture in its own folder.
+The copy goes into a directory named after the source unless
+[[--output]] says otherwise, so a student who keeps each lecture in
+its own folder gets that for free.
 
 Copying files rather than fetching objects is what lets one code path
 serve every kind of source [[resolve_source]] knows, and it keeps the
@@ -7986,7 +8017,7 @@ first, restored as a replace, removes the copied files again.
 <<copy the run's files in and close its record>>=
 headline = (
     f"{run} from {source} -> {subject}; files copied into "
-    f"{output or '.'} ({target}), your next run continues from here"
+    f"{target_dir} ({target}), your next run continues from here"
 )
 <<the confirmation lines>>
 failure = None
@@ -8394,24 +8425,29 @@ def test_checkout_from_a_bundle_copies_the_files_in(
         app, ["checkout", "--from", "lecture.learnlog", second[:7]],
     )
     assert result.exit_code == 0, result.output
-    assert (workdir / "lecture.py").read_text() == 'print("part 1")\n'
+    assert (workdir / "lecture" / "lecture.py").read_text() \
+        == 'print("part 1")\n'
     assert (workdir / "lab.py").read_text() == 'print("lab")\n'
     assert (workdir / "hello.py").read_text() == 'print("mine")\n'
     assert repo.git("status", "--porcelain").stdout == ""
     assert second in result.output
+    assert "copied into lecture " in result.output
     header = repo.git("rev-parse", f"{branch}~1").stdout.strip()
     assert repo.git(
         "log", "-1", "--format=%s", header,
     ).stdout.strip() == (
         f"Run: learnlog checkout --from lecture.learnlog {second[:7]}"
     )
-    names = repo.git("ls-tree", "--name-only", branch).stdout.split()
-    assert {"lecture.py", "lab.py", "hello.py", "lecture.learnlog"} \
-        <= set(names)
+    names = repo.git(
+        "ls-tree", "-r", "--name-only", branch,
+    ).stdout.split()
+    assert {
+        "lecture/lecture.py", "lab.py", "hello.py", "lecture.learnlog",
+    } <= set(names)
 
     result = runner.invoke(app, ["checkout", header[:7]])
     assert result.exit_code == 0, result.output
-    assert not (workdir / "lecture.py").exists()
+    assert not (workdir / "lecture" / "lecture.py").exists()
     assert (workdir / "lab.py").exists()
     assert (workdir / "lecture.learnlog").exists()
 
@@ -8428,7 +8464,8 @@ def test_checkout_from_a_directory_source(
         app, ["checkout", "--from", str(lecture_dir), first[:7]],
     )
     assert result.exit_code == 0, result.output
-    assert (workdir / "lecture.py").read_text() == 'print("part 0")\n'
+    assert (workdir / "lecturer-lecture" / "lecture.py").read_text() \
+        == 'print("part 0")\n'
     assert repo.git("log", "-1", "--format=%s", "HEAD~1").stdout \
         .strip() == (
             f"Run: learnlog checkout --from {lecture_dir} {first[:7]}"
@@ -8457,8 +8494,9 @@ def test_checkout_from_refuses_a_hash_the_source_lacks(
 
 The output directory is a directory of the project or nothing: a
 path outside it, and the Git directory, are refused before any
-record is made, and the option is refused without a source to copy
-from.
+record is made, the option is refused without a source to copy from,
+and [[-o .]] is the way to the project root now that the default is a
+folder of the source's name.
 
 <<test functions>>=
 def test_checkout_from_into_an_output_directory(
@@ -8503,6 +8541,17 @@ def test_checkout_from_into_an_output_directory(
     assert result.exit_code == 1
     assert "--output needs --from" in result.output
     assert repo.git("rev-list", "--count", branch).stdout == count
+    result = runner.invoke(
+        app, ["checkout", "--from", "lecture.learnlog", "-o", ".", first[:7]],
+    )
+    assert result.exit_code == 0, result.output
+    assert (workdir / "lecture.py").read_text() == 'print("part 0")\n'
+
+def test_default_output_is_the_source_name_without_its_suffix():
+    from learnlog.cli import default_output
+    assert default_output("lecture21.learnlog") == "lecture21"
+    assert default_output("/tmp/x/dataset.progsnap2") == "dataset"
+    assert default_output("../lecture-dir") == "lecture-dir"
 @
 
 Let's verify the chooser on a history with two checkouts and edits

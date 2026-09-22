@@ -4,9 +4,9 @@
 # as their novice twin, so they are listed separately rather than derived
 # from TUTORIAL_IDS (which would also demand nonexistent -expert.tex
 # weaves).  tutorials.nw carries the chapter prose and only weaves.
-TUTORIAL_IDS=	getting-started playback-and-tagging \
+TUTORIAL_IDS=	getting-started playback-and-tagging playing-lectures \
 		export-and-share metrics analysing-progsnap2
-EXPERT_IDS=	getting-started playback-and-tagging \
+EXPERT_IDS=	getting-started playback-and-tagging playing-lectures \
 		export-and-share metrics
 
 TUTORIAL_MD=	$(TUTORIAL_IDS:%=%.md) $(EXPERT_IDS:%=%-expert.md)
