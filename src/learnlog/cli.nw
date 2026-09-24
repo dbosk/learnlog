@@ -108,6 +108,7 @@ the same questions and reports the answers
 from __future__ import annotations
 
 import enum
+import fnmatch
 import os
 import pathlib
 import re
@@ -164,6 +165,9 @@ from learnlog.commits import (
     commit_outcomes,
     is_checkout_command,
     last_playback,
+    get_changed_files,
+    record_changed_files,
+    record_script_paths,
 )
 from learnlog.progsnap2 import (
     DEFAULT_PROGSNAP2_NAME,
@@ -3956,6 +3960,27 @@ recovery workflow, where the student's most recent known-good
 commit must not be hidden just because they later re-ran the
 code and broke it.
 
+The [[--runs]] and [[--changes]] options narrow the listing by file.
+Three examples show the difference:
+[[--runs main.py]] lists every run of a [[main.py]], in whatever
+folder;
+[[--runs lecture21/main.py]] lists only the runs of the one in
+[[lecture21]];
+and [[--changes lecture21/main.py]] lists the runs that changed it,
+which is where the student edited it (or copied it in with
+[[checkout --from]]) rather than where they ran it.
+A student looking for \enquote{the version of my lab program that
+worked} wants [[--runs]].
+A teacher asking \enquote{when did this file take shape} wants
+[[--changes]].
+Both options take the same patterns, whose rules are given below,
+where the filter is applied.
+Repeating one option means any of its patterns.
+Giving both means a run must match both.
+Every other filter of the listing narrows what the ones before it
+left, [[--success]] beside [[--since]] for one, and a reader who
+combines filters expects them to narrow.
+
 <<typer commands>>=
 @app.command(name="list")
 def list_commits(
@@ -4005,6 +4030,30 @@ def list_commits(
             ),
         ),
     ] = False,
+    runs: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--runs",
+            metavar="PATTERN",
+            help=(
+                "Show only runs of a matching file. A bare name "
+                "(main.py) matches in any folder, a path "
+                "(lab1/main.py or ./main.py) from the project root; "
+                "* and ? work. Repeat for more files."
+            ),
+        ),
+    ] = None,
+    changes: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--changes",
+            metavar="PATTERN",
+            help=(
+                "Show only runs that changed a matching file since "
+                "the run before. Patterns as for --runs."
+            ),
+        ),
+    ] = None,
 ):
     """List your runs by day, with start time and command."""
     import shutil
@@ -4027,6 +4076,7 @@ def list_commits(
             commits, scan.messages, tag_map, show_all=show_all,
         )
         <<build wanted outcome set>>
+        <<read the files the records touch>>
         <<list the records by day>>
     finally:
         if tmpdir is not None:
@@ -4212,6 +4262,7 @@ body = filter_runs(
     body, hidden_runs(show_all=show_all, tagged=bool(names)),
 )
 <<skip commits that do not match the outcome filter>>
+<<skip commits that do not match the file filters>>
 summary = parse_run_summary(body)
 if summary is None:
     continue
@@ -4281,7 +4332,8 @@ and when the reason is that everything it had was learnlog's own, it
 names [[--all]]---for the reason the playback placeholder does
 (\cref{viewer}): a reader who meets the note is looking for what is
 missing.
-The window and the outcome flags are named before the hiding, since
+The window, the outcome flags and the file filters are named before
+the hiding, since
 a student who asked for today and got nothing is told about today,
 not about a flag that would not help.
 
@@ -4291,6 +4343,8 @@ if not listed:
         typer.echo(NO_RUNS_IN_WINDOW_NOTE)
     elif wanted:
         typer.echo(NO_RUNS_WITH_OUTCOME_NOTE)
+    elif runs or changes:
+        typer.echo(NO_RUNS_FOR_FILES_NOTE)
     elif len(records) < len(commits):
         typer.echo(ONLY_LEARNLOG_RUNS_NOTE)
     else:
@@ -4298,6 +4352,7 @@ if not listed:
 <<constants>>=
 NO_RUNS_IN_WINDOW_NOTE = "No runs in this window."
 NO_RUNS_WITH_OUTCOME_NOTE = "No runs with that outcome."
+NO_RUNS_FOR_FILES_NOTE = "No runs match --runs or --changes."
 ONLY_LEARNLOG_RUNS_NOTE = (
     "Only learnlog's own runs so far; use --all to see them."
 )
@@ -4316,6 +4371,145 @@ runs never matches because we never add it to [[wanted]].
 <<skip commits that do not match the outcome filter>>=
 if wanted and not (commit_outcomes(body) & wanted):
     continue
+@
+
+\paragraph{The file filters.}
+Which files a record ran and changed is read by the commit readers
+(\cref{sec:record-files}).
+Those readers make both answers paths relative to the project root.
+The changed files cost one more Git call, for the whole log.
+Like the tag boundaries, it is made only when a file filter was
+given, so a plain [[learnlog list]] keeps its constant count.
+The set of every path the log has seen, [[known]], lets a script
+recorded by its absolute path be placed in a log cloned from
+elsewhere (\cref{sec:record-files}).
+
+<<read the files the records touch>>=
+changed, known = {}, frozenset()
+if runs or changes:
+    changed = record_changed_files(
+        get_changed_files(repo), scan.records,
+    )
+    known = frozenset().union(*changed.values())
+@
+
+The filter reads [[body]] after the hidden blocks have been removed.
+So in a mixed commit of an older log, only the runs the listing shows
+can make it match.
+A review run the student cannot see does not list its commit under
+[[--runs learnlog]].
+
+<<skip commits that do not match the file filters>>=
+if runs and not matches_any(
+    runs, record_script_paths(body, repo.workdir, known),
+):
+    continue
+if changes and not matches_any(
+    changes, changed.get(commit["hash"], ()),
+):
+    continue
+@
+
+A pattern is read the way a [[.gitignore]] line is, which is the
+file-pattern language closest to hand for anyone who has met Git.
+A bare name, [[main.py]], matches a file of that name in any folder.
+It matches a folder of that name too, and so everything in it:
+[[--changes lecture21]] is \enquote{anything in [[lecture21]]}.
+A pattern with a slash in it, [[lecture21/main.py]], is anchored at
+the project root.
+A leading [[./]] (or [[/]], as in [[.gitignore]]) anchors a bare
+name, so [[./main.py]] is only the one in the root.
+
+Anchored means relative to the root, not to where the command is
+typed.
+[[learnlog list]] reads bundles and clones as often as the student's
+project, and a bundle has no current directory to be relative to.
+The rule is also what [[.gitignore]] does.
+
+Matching goes one path component at a time, with
+[[fnmatch.fnmatchcase]] on each.
+So [[*]] and [[?]] work but never cross a slash: [[lab1/*.py]] is
+the programs in [[lab1]], not in its subfolders.
+Matching a whole path with [[fnmatch]] would let [[*]] cross folders.
+The case-sensitive variant is used because Git's paths are
+case-sensitive.
+[[fnmatch.fnmatch]] would fold case on Windows only, and a listing
+would then differ between the student's machine and the teacher's.
+Backslashes are read as separators, so a pattern typed in PowerShell
+means the same.
+
+<<helper functions>>=
+def path_matches(pattern, path):
+    """Whether root-relative POSIX `path` matches `pattern`.
+
+    A pattern without a slash matches any component of the path;
+    one with a slash, or starting with `./` or `/`, matches from
+    the root.  Components are matched with `fnmatch`, so `*`
+    never crosses a slash.
+    """
+    pattern = pattern.replace("\\", "/")
+    anchored = pattern.startswith(("/", "./"))
+    parts = [
+        part for part in pattern.split("/") if part not in ("", ".")
+    ]
+    if not parts:
+        return False
+    names = path.split("/")
+    if len(parts) == 1 and not anchored:
+        return any(
+            fnmatch.fnmatchcase(name, parts[0]) for name in names
+        )
+    return len(names) >= len(parts) and all(
+        fnmatch.fnmatchcase(name, part)
+        for name, part in zip(names, parts)
+    )
+
+
+def matches_any(patterns, paths):
+    """Whether any of `paths` matches any of `patterns`."""
+    return any(
+        path_matches(pattern, path)
+        for pattern in patterns for path in paths
+    )
+@
+
+Let's verify the rules one contrast at a time.
+A bare name matches at any depth, and so does a folder name.
+Anchoring by a slash or a leading [[./]] restricts to the root.
+A glob stays within its component.
+A backslash is a separator.
+Case matters:
+
+<<test functions>>=
+def test_path_matches_bare_names_anywhere():
+    from learnlog.cli import path_matches
+    assert path_matches("main.py", "main.py")
+    assert path_matches("main.py", "lab1/main.py")
+    assert path_matches("lab1", "lab1/main.py")
+    assert path_matches("lab1/", "x/lab1/main.py")
+    assert not path_matches("main.py", "main.pyc")
+
+def test_path_matches_anchored_patterns():
+    from learnlog.cli import path_matches
+    assert path_matches("lab1/main.py", "lab1/main.py")
+    assert not path_matches("lab1/main.py", "x/lab1/main.py")
+    assert path_matches("lab1/sub", "lab1/sub/main.py")
+    assert path_matches("./main.py", "main.py")
+    assert path_matches("/main.py", "main.py")
+    assert not path_matches("./main.py", "lab1/main.py")
+    assert not path_matches("./", "main.py")
+
+def test_path_matches_globs_stay_in_a_component():
+    from learnlog.cli import path_matches
+    assert path_matches("*.py", "lab1/sub/main.py")
+    assert path_matches("lab1/*.py", "lab1/main.py")
+    assert not path_matches("lab1/*.py", "lab2/main.py")
+    assert path_matches("lab?/main.py", "lab2/main.py")
+
+def test_path_matches_backslashes_and_case():
+    from learnlog.cli import path_matches
+    assert path_matches("lab1\\main.py", "lab1/main.py")
+    assert not path_matches("Main.py", "main.py")
 @
 
 Let's verify that the command lists commits with the expected
@@ -4818,13 +5012,104 @@ def test_list_mixed_commit_appears_in_both(workdir):
     assert "mixed.py" in failure_result.output
 @
 
+Let's verify the file filters on the listing.
+The log has the same [[main.py]] run from the root and from
+[[lab1]], and the one in [[lab1]] run from the root.
+Each pattern form then picks its subset of the runs.
+Repeating [[--runs]] widens the listing, and a pattern that matches
+nothing says so:
+
+<<test functions>>=
+def test_list_runs_matches_by_name_or_from_the_root(workdir):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("main.py", ["root"], t, directory=".")
+    repo.begin_run("main.py", ["sub"], t, directory="lab1")
+    repo.begin_run("lab1/main.py", ["typed"], t, directory=".")
+    repo.begin_run("other.py", [], t, directory=".")
+    runner = CliRunner()
+
+    def listed(*args):
+        result = runner.invoke(
+            app, ["list", *args, "--from", str(workdir)],
+        )
+        assert result.exit_code == 0, result.output
+        return set(re.findall(
+            r"(?:main\.py (\w+)|(other\.py))", result.output,
+        ))
+
+    root, sub, typed = ("root", ""), ("sub", ""), ("typed", "")
+    other = ("", "other.py")
+    assert listed("--runs", "main.py") == {root, sub, typed}
+    assert listed("--runs", "lab1/main.py") == {sub, typed}
+    assert listed("--runs", "./main.py") == {root}
+    assert listed("--runs", "lab1") == {sub, typed}
+    assert listed("--runs", "*.py") == {root, sub, typed, other}
+    assert listed("--runs", "./main.py", "--runs", "other.py") \
+        == {root, other}
+    result = runner.invoke(
+        app, ["list", "--runs", "none.py", "--from", str(workdir)],
+    )
+    assert "No runs match --runs or --changes." in result.output
+@
+
+[[--changes]] is checked against a log in which one run edits the
+file, one runs without editing it, and a checkout restores it.
+The checkout's restored file is in its trailer, so the checkout
+matching shows that the join of \cref{sec:record-files} reaches the
+listing.
+Given both options, a run must match both:
+
+<<test functions>>=
+def test_list_changes_finds_edits_and_checkouts(workdir):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    program = workdir / "lab1" / "main.py"
+    program.parent.mkdir()
+    program.write_text("print(1)\n")
+    repo.begin_run("hello.py", ["first"], t)
+    first = repo.run_commit
+    repo.begin_run("hello.py", ["again"], t)
+    program.write_text("print(2)\n")
+    repo.begin_run("hello.py", ["edited"], t)
+    repo.begin_run("learnlog", ["checkout", first[:7]], t)
+    repo.restore_code_state(first)
+    tree = repo.git("rev-parse", f"{first}^{{tree}}").stdout.strip()
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t, exit_code=0,
+        tree=tree,
+    )
+    runner = CliRunner()
+
+    def listed(*args):
+        result = runner.invoke(
+            app, ["list", *args, "--from", str(workdir)],
+        )
+        assert result.exit_code == 0, result.output
+        return result.output
+
+    changed = listed("--changes", "lab1/main.py")
+    assert "hello.py first" in changed
+    assert "hello.py edited" in changed
+    assert "learnlog checkout" in changed
+    assert "hello.py again" not in changed
+    both = listed("--runs", "hello.py", "--changes", "main.py")
+    assert "hello.py first" in both
+    assert "hello.py edited" in both
+    assert "learnlog checkout" not in both
+@
+
 The message map exists so that listing does not fork Git once per
 run, and only a test can keep it that way: the O(N) version was
 functionally indistinguishable, just slow.
 Rather than pinning the exact number of Git calls---which may
 drift as the repository plumbing changes---we pin the property
 that matters: listing a longer log costs exactly as many Git
-calls as listing a shorter one.
+calls as listing a shorter one, with the file filters and without.
 
 <<test functions>>=
 def test_list_git_calls_constant_in_log_length(workdir, monkeypatch):
@@ -4862,17 +5147,23 @@ def test_list_git_calls_constant_in_log_length(workdir, monkeypatch):
 
     monkeypatch.setattr(LearnlogRepo, "git", counting_git)
     runner = CliRunner()
-    result = runner.invoke(app, ["list", "--from", str(workdir)])
-    assert result.exit_code == 0
-    assert result.output.count("work.py") == 5
-    short_log_calls = len(counted)
+    filters = ["--runs", "work.py", "--changes", "work.py"]
+
+    def calls(expected, *args):
+        counted.clear()
+        result = runner.invoke(
+            app, ["list", *args, "--from", str(workdir)],
+        )
+        assert result.exit_code == 0
+        assert result.output.count("work.py") == expected
+        return len(counted)
+
+    short_log_calls = calls(5)
+    short_filtered_calls = calls(5, *filters)
 
     record_runs(range(5, 10))
-    counted.clear()
-    result = runner.invoke(app, ["list", "--from", str(workdir)])
-    assert result.exit_code == 0
-    assert result.output.count("work.py") == 10
-    assert len(counted) == short_log_calls
+    assert calls(10) == short_log_calls
+    assert calls(10, *filters) == short_filtered_calls
 @
 
 
