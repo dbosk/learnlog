@@ -17,8 +17,8 @@ code, and where they stopped, so that continuing needs no notes and
 a teacher can later see the lecture beside the work it led to.
 
 The steps follow the student's evening: get the lecture into the
-project; play it; take the code of one moment of it; run and change
-that code; find those runs again by file; pick the lecture up again
+project; play it; find the parts the lecturer named; take the code of
+one moment of it; run and change that code; find those runs again by file; pick the lecture up again
 where it stopped; and finally take the copied code out again.
 The middle steps are where the reading turns into writing---the
 copied code is run, edited and looked up like any program---and the
@@ -35,8 +35,8 @@ common chunks.
 The expert extras name what the log records at each step and the
 rules behind the defaults: that the bundle file itself is recorded,
 that a copy overlays where a checkout replaces, that the bookmark is
-the learner's own, how a file pattern is read, and that an undo is
-one more checkout.
+the learner's own, how a tag expression and a file pattern are read,
+and that an undo is one more checkout.
 
 <<[[playing-lectures.md]]>>=
 ---
@@ -48,6 +48,8 @@ summary: Play a lecture's recording, take its code into your project, and pick t
 <<novice step: put the lecture in your project>>
 
 <<novice step: play the lecture>>
+
+<<novice step: find the lecture's parts>>
 
 <<novice step: take the code of one moment>>
 
@@ -68,6 +70,8 @@ summary: The same lecture workflow, with what your log records at each step.
 <<expert step: put the lecture in your project>>
 
 <<expert step: play the lecture>>
+
+<<expert step: find the lecture's parts>>
 
 <<expert step: take the code of one moment>>
 
@@ -161,6 +165,70 @@ log never contains its own exports: a teacher reading your log later
 can open the lecture you watched.
 @
 
+\subsection{Find the lecture's parts}
+
+A lecturer who tags each part of the lecture as they start it leaves
+names in the bundle, and this step is about finding them.
+Its object of learning is that a tag is a named moment, usable
+wherever a hash is, and that [[--tags]] turns the listing of a whole
+lecture into a table of contents.
+The source stays the same while the flag varies:
+[[learnlog list -f lecture.learnlog]] first, every run of the
+lecture, then the same command with [[--tags]], only the tagged ones.
+What the flag removes is the part of the listing the learner does not
+need in order to find their way.
+The step then uses one tag as a start point for [[play]], so the name
+is seen doing a hash's job before the next step asks for one.
+
+It sits after the first playback, where the learner noted a moment by
+its hash, so that a tag arrives as a name for the same kind of
+moment.
+It sits before the copy, so that the copy step can take a tag as well
+as a hash.
+A learner whose stand-in bundle is their own export may have no tags
+at all.
+The listing then says [[No tagged runs.]], and the text prepares them
+for that rather than making the check depend on tags existing.
+The expert extra gives the expression rules and the start-marker
+reading of a tag.
+
+<<shared step: find the lecture's parts>>=
+# Find the lecture's parts
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+list\b(?=[^\n]*(?:-f|--from)\s+\S+\.learnlog\b)[^\n]*--tags\b'
+hint: Run `learnlog list -f lecture.learnlog --tags`, with your file's name.
+```
+
+Run `learnlog list -f lecture.learnlog`: it lists every run of the
+lecture, the way `learnlog list` lists yours.
+Now run it again with `--tags` added,
+`learnlog list -f lecture.learnlog --tags`: only the runs your teacher
+tagged are left, each with its tag at the end of the line, for
+example `(tag: lecture-loops)`.
+A tag marks where a part of the lecture starts.
+You can type the tag wherever you would type a hash:
+`learnlog play -f lecture.learnlog lecture-loops` opens the lecture at
+that part.
+If your file is an export of your own log, it may say
+`No tagged runs.`; a lecture file usually has a tag for each part.
+<<novice step: find the lecture's parts>>=
+<<shared step: find the lecture's parts>>
+<<expert step: find the lecture's parts>>=
+<<shared step: find the lecture's parts>>
+
+After `--tags` you can give a regular expression, and only the tags it
+matches anywhere in their name are listed: `--tags loops` keeps the
+tags with `loops` in them, and `--tags '^lecture21-'` the ones that
+start that way.
+A tag names its own run and every run after it, until the next tag,
+so tagging each part as it starts splits the lecture into parts.
+Tags on the lecturer's own `learnlog list` or `learnlog play` runs are
+listed too, although `learnlog list` otherwise hides those runs.
+@
+
 \subsection{Take the code of one moment}
 
 This step turns reading into having.
@@ -183,11 +251,11 @@ required_patterns:
   - mode: regex
     pattern: 'learnlog\s+checkout\b[^\n]*(?:-f|--from)\s+\S+\.learnlog\b\s+\S+'
   - next run continues
-hint: Run `learnlog checkout --from lecture.learnlog <hash>` with the hash you noted.
+hint: Run `learnlog checkout --from lecture.learnlog <hash>` with the hash you noted, or with a tag.
 ```
 
 Run `learnlog checkout --from lecture.learnlog <hash>` with the hash
-you noted.
+you noted, or with one of the lecture's tags instead of the hash.
 The lecture's files at that moment land in a folder named after the
 lecture file, `lecture/` for `lecture.learnlog`, and your own files
 stay as they are.

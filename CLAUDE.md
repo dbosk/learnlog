@@ -73,7 +73,7 @@ chapter via `tutorials.nw`, which also carries the catalog-level design
 prose and the `\input`s of the per-tutorial sections):
 - `getting-started.nw` — first-run setup, activation, running code, and batch playback
 - `playback-and-tagging.nw` — batch and interactive playback, tagging, measuring one milestone, going back to a tagged version with `learnlog checkout` (back to the tag, then forward again via the snapshot hash the command prints), and a closing `learnlog play --continue` step that reopens the viewer where the learner quit it; the expert twin of the forward step mentions `checkout --restore`
-- `playing-lectures.nw` — a log the learner was given (a lecture's bundle; their own export stands in): put it in the project, `play -f`, `checkout --from` into the folder named after it, run and edit the copy, `list --runs`/`--changes` on the copied file (ran vs changed), `play -c` resumes the lecture, `checkout --restore` takes the copy out
+- `playing-lectures.nw` — a log the learner was given (a lecture's bundle; their own export stands in): put it in the project, `play -f`, `list -f … --tags` to find the parts the lecturer tagged (a tag works where a hash does), `checkout --from` into the folder named after it, run and edit the copy, `list --runs`/`--changes` on the copied file (ran vs changed), `play -c` resumes the lecture, `checkout --restore` takes the copy out
 - `export-and-share.nw` — bundle export, ProgSnap2 export, and remote sharing workflows
 - `metrics.nw` — the `learnlog metrics` family: produce runs, `time`, `eq`, `code`, `lint`, `trends`, then `list`
 - `analysing-progsnap2.nw` — `learnlog analyse` reports and `Column=Regex` range filtering

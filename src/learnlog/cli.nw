@@ -3066,6 +3066,33 @@ def test_doctor_step_matches_the_report_it_checks(tmp_path):
     )
 @
 
+The lecture tutorial's tag step (\cref{tut:playing-lectures}) gates on
+a listing of the \emph{bundle's} tags, with the options in either
+order.
+A [[--tags]] listing of the learner's own log is not the step, and
+neither is a listing of the bundle without [[--tags]]:
+
+<<test functions>>=
+def test_lecture_tags_step_needs_the_bundle_and_the_flag():
+    """The tag step accepts either option order, and only both."""
+    from pytorial.run import transcript_matches_patterns
+
+    step = tutorial_step(
+        "playing-lectures.md", "Find the lecture's parts"
+    )
+
+    def matches(command):
+        return transcript_matches_patterns(
+            f"$ {command}\n", step.required_patterns,
+        )
+
+    assert matches("learnlog list -f lecture.learnlog --tags")
+    assert matches("learnlog list --tags --from lecture.learnlog")
+    assert matches("learnlog list -f lecture.learnlog --tags loops")
+    assert not matches("learnlog list --tags")
+    assert not matches("learnlog list -f lecture.learnlog")
+@
+
 
 \subsection{The [[init]] command}
 \label{sec:init}
