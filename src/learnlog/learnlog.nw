@@ -578,6 +578,7 @@ import traceback
 
 from learnlog.capture import IOLog, StreamCapture, InputCapture
 from learnlog.gitrepo import (
+    GIT_DIR_NAME,
     REVIEW_SUBCOMMANDS,
     LearnlogRepo,
     report_error,
@@ -973,6 +974,18 @@ into.
 That single ordering constraint is what makes [[clone]] into an empty
 directory work at all.
 
+A review subcommand asked for [[--help]] is vetoed too, and so is any
+other learnlog command line with [[--help]] on it.
+[[learnlog list --help]] prints a usage text and reads no log, so it
+is not reflection on anything; recording it would put a run in the
+student's history that shows only that they looked up an option.
+Outside a project it was worse: the run started a new log in the
+current directory and snapshotted all of it, which in a large
+directory took minutes, for a command that only prints text.
+The rule applies only once the command line is known to be learnlog's.
+A student's program that takes [[--help]], [[python quiz.py --help]],
+is their own work and is recorded like any other run.
+
 Being an allow-list rather than a deny-list is what keeps the policy
 honest as the CLI grows.
 An unrecognised subcommand---a future one, a typo, [[learnlog --help]],
@@ -1017,17 +1030,20 @@ runs it is testing.
 def _is_opted_out(argv, env=None):
     """True iff this invocation must not be logged at all.
 
-    Covers the ``LEARNLOG_SKIP_AUTOSTART`` escape hatch and every
-    learnlog subcommand outside ``REVIEW_SUBCOMMANDS``.
+    Covers the ``LEARNLOG_SKIP_AUTOSTART`` escape hatch, every
+    learnlog subcommand outside ``REVIEW_SUBCOMMANDS``, and any
+    learnlog command line asking for ``--help``.
     """
     if env is None:
         env = os.environ
     if env.get("LEARNLOG_SKIP_AUTOSTART"):
         return True
     subcommand = _learnlog_cli_subcommand(argv)
+    if subcommand is None:
+        return False
     return (
-        subcommand is not None
-        and subcommand not in REVIEW_SUBCOMMANDS
+        subcommand not in REVIEW_SUBCOMMANDS
+        or _asks_for_help(argv)
     )
 @
 
@@ -1101,14 +1117,45 @@ class TestLearnlogCliSubcommand:
         assert _learnlog_cli_subcommand(argv) == expected
 @
 
+Recognising a request for help reads the command line the way Click,
+which Typer is built on, parses it.
+Click acts on [[--help]] wherever it appears among the options, after
+the subcommand and after other options too.
+[[learnlog list --all --help]] and [[learnlog metrics time --help]]
+both print help, so we look at every word rather than only the
+first.
+The scan stops at a bare [[--]], because a [[--help]] after it is an
+argument rather than an option, and Click does not print help for it.
+The CLI defines no other spelling of the option (no [[-h]]), so this
+one constant is the whole vocabulary.
+If one is ever added through [[help_option_names]], it belongs in
+the constant too.
+
+<<functions>>=
+def _asks_for_help(argv):
+    """True iff the learnlog command line `argv` asks for help."""
+    for word in argv[1:]:
+        if word == END_OF_OPTIONS:
+            return False
+        if word == HELP_OPTION:
+            return True
+    return False
+<<constants>>=
+HELP_OPTION = "--help"
+END_OF_OPTIONS = "--"
+@
+
 Now the veto itself.
 The recorded cases are the two review subcommands, in the spellings a
 student's [[PATH]] actually produces; the vetoed cases are every other
-subcommand the CLI defines, plus the two no-subcommand shapes.
+subcommand the CLI defines, plus the two no-subcommand shapes, plus a
+review subcommand asked for [[--help]].
 The ordinary program shapes---a script, the bare REPL, [[python -c]],
 [[python -m]], console entry points for other tools---must all pass
 through untouched, and so must a student script that merely lives
 under a directory named [[learnlog]].
+A student script given [[--help]] is recorded, since the help rule
+applies only to learnlog's own command line.
 
 <<test functions>>=
 class TestIsOptedOut:
@@ -1121,6 +1168,9 @@ class TestIsOptedOut:
         ["/venv/bin/pytest", "--version"],
         ["/home/x/learnlog/mine.py"],
         ["/home/x/learnlog/mine.py", "init"],
+        ["quiz.py", "--help"],
+        ["/venv/bin/pytest", "--help"],
+        ["/home/x/learnlog/mine.py", "list", "--help"],
     ])
     def test_ordinary_invocations_are_logged(self, argv):
         assert not _is_opted_out(argv, env={})
@@ -1160,6 +1210,20 @@ class TestIsOptedOut:
     ])
     def test_unnamed_and_unknown_subcommands_are_vetoed(self, argv):
         assert _is_opted_out(argv, env={})
+
+    @pytest.mark.parametrize("argv", [
+        ["learnlog", "list", "--help"],
+        ["/venv/bin/learnlog", "list", "--all", "--help"],
+        ["/venv/bin/learnlog", "metrics", "time", "--help"],
+        ["learnlog", "play", "-f", "lecture.learnlog", "--help"],
+    ])
+    def test_help_is_vetoed_for_review_subcommands(self, argv):
+        assert _is_opted_out(argv, env={})
+
+    def test_help_after_end_of_options_is_an_argument(self):
+        assert not _is_opted_out(
+            ["learnlog", "list", "--", "--help"], env={},
+        )
 @
 
 \subsection{Normalising the invocation}
@@ -2547,6 +2611,7 @@ main_script, main_args = _normalize_main_invocation(
 )
 start_time = datetime.datetime.now()
 workdir = _resolve_workdir()
+<<refuse to start a log for a review run>>
 @
 
 The three-source lookup announced above is worth spelling out as its
@@ -2807,9 +2872,10 @@ rather than crashed.
 class UnanchoredRun(Exception):
     """Raised when a run belongs to no project that may be logged.
 
-    Signals a deliberate refusal, not a malfunction: either the
-    interpreter is wired for autostart but its project is gone, or
-    the only candidate directory is a home directory.
+    Signals a deliberate refusal, not a malfunction: the
+    interpreter is wired for autostart but its project is gone, the
+    only candidate directory is a home directory, or a review run
+    (`play`, `list`, `metrics`) found no log to read.
     """
 @
 
@@ -3263,6 +3329,68 @@ student looks at it.
 The rest of initialisation is unchanged: [[begin_run]] still
 snapshots the work tree and commits a header, so a review is a run
 like any other, just a silent one.
+
+A review run also differs in what it may create.
+[[play]], [[list]] and [[metrics]] read a log that already exists; a
+run of them with no log has nothing to review.
+The project [[_resolve_workdir]] settles on is a guess from the
+current directory when nothing states one, and for a student's
+program that guess makes the first run work with no setup at all
+(\cref{sec:find-learnlog-dir}).
+For a review run the same guess would start an empty log wherever the
+command was typed.
+It would also snapshot the whole directory, which in [[/tmp]] or a
+downloads folder took minutes.
+Worse, the command would then find that log and report it as empty
+instead of saying that there is none.
+So a review run whose project has no [[.learnlog/]] is not recorded.
+The check comes after the project is resolved, not inside the cwd
+guess, so it covers every source, including an anchor naming a
+project whose log has since been deleted.
+The refusal is an [[UnanchoredRun]], like the two in
+[[_resolve_workdir]].
+The command itself then runs unrecorded, as under
+[[LEARNLOG_SKIP_AUTOSTART]]: without [[-f]] it says
+\enquote{No .learnlog/ directory found}, and with [[-f]] it reads
+the source it was given.
+
+<<refuse to start a log for a review run>>=
+if review_run and not (workdir / GIT_DIR_NAME).is_dir():
+    raise UnanchoredRun(
+        f"no log in {workdir}; learnlog play, list and metrics "
+        "read an existing log and do not start one."
+    )
+@
+
+Let's verify both sides in a subprocess.
+[[run_explicit_import]] sets the process's [[argv]] to what the CLI
+launcher would have, so that [[initialize]] classifies it as
+[[learnlog list]].
+Outside a project no log appears.
+Beside an existing log, the same run is recorded into it:
+
+<<test functions>>=
+class TestReviewRunsNeedALog:
+    def test_a_review_run_starts_no_log(self, tmp_path, test_env):
+        result = run_explicit_import(
+            "import learnlog", cwd=tmp_path, env=test_env,
+            argv=["learnlog", "list"],
+        )
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / ".learnlog").exists()
+
+    def test_a_review_run_records_into_an_existing_log(
+        self, workdir, test_env,
+    ):
+        repo = LearnlogRepo(workdir)
+        result = run_explicit_import(
+            "import learnlog", cwd=workdir, env=test_env,
+            argv=["learnlog", "list"],
+        )
+        assert result.returncode == 0, result.stderr
+        history = repo.git("log", "--format=%B").stdout
+        assert "Run: learnlog list" in history
+@
 
 Leaving [[iolog]] as [[None]] is what makes the silence work end to
 end rather than needing a second flag.
@@ -3993,9 +4121,11 @@ promise: no run object, and nothing on disk.
 @
 
 A review subcommand is the mirror image, and needs all three of its
-distinguishing properties checked at once: the repository \emph{is}
-created and the two-commit protocol \emph{does} run, while the
-streams are left alone.
+distinguishing properties checked at once: the run \emph{is} recorded
+into the project's log and the two-commit protocol \emph{does} run,
+while the streams are left alone.
+The log exists before the run, because a review run never starts one
+(\cref{sec:review-runs}).
 The stream assertion is the one that is easy to get wrong, since a
 wrapped [[sys.stdout]] still prints correctly---so the test asks the
 subprocess what type its stdout actually is, which is the only
@@ -4005,6 +4135,7 @@ observation that tells the two apart.
     def test_review_subcommand_is_recorded_without_io(
         self, workdir, test_env,
     ):
+        LearnlogRepo(workdir)
         result = run_explicit_import(
             "import learnlog\n"
             "print('viewer output')\n"
@@ -4014,7 +4145,6 @@ observation that tells the two apart.
             argv=['/venv/bin/learnlog', 'play'],
         )
         assert result.returncode == 0
-        assert (workdir / ".learnlog").is_dir()
         printed = result.stdout.split("\n")
         assert printed[0] == "viewer output"
         assert "Capture" not in printed[1]
@@ -6979,11 +7109,14 @@ shapes as the installed entry points.
 That keeps the test focused on autostart's gate and script-name
 normalisation without turning it into a second packaging test.
 
-The [[learnlog]] wrapper is run twice, and the pair is what makes the
-veto observable end to end: [[play]] and [[export]] differ in nothing
-a name-normaliser can see---same [[argv[0]]], same basename, same
-program---so a history that grows for one and not for the other can
-only be \cref{sec:veto} at work.
+The [[learnlog]] wrapper is run three times, and the runs together
+are what make the veto observable end to end: [[play]], [[play --help]]
+and [[export]] differ in nothing a name-normaliser can see---same
+[[argv[0]]], same basename, same program---so a history that grows for
+one and not for the others can only be \cref{sec:veto} at work.
+Before them the [[pytest]] wrapper is run with [[--help]] and must be
+recorded: the help rule is about learnlog's command line, not about
+the option.
 The installed launcher then repeats the check for a real entry point.
 
 <<autostart test functions>>=
@@ -7010,6 +7143,17 @@ def test_autostart_captures_named_entry_points(tmp_path):
     assert "Script: pytest" in _latest_run_record(project)
 
     subprocess.run(
+        [str(python), str(pytest_script), "--help"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert "Arguments: --help" in _latest_run_record(project)
+
+    subprocess.run(
         [str(python), str(learnlog_script), "play"],
         cwd=str(project),
         env=env,
@@ -7021,6 +7165,17 @@ def test_autostart_captures_named_entry_points(tmp_path):
     after_play = _latest_run_record(project)
     assert "Script: learnlog" in after_play
     assert "Arguments: play" in after_play
+
+    subprocess.run(
+        [str(python), str(learnlog_script), "play", "--help"],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert _latest_run_record(project) == after_play
 
     subprocess.run(
         [str(python), str(learnlog_script), "export"],
