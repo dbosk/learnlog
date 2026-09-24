@@ -18,13 +18,13 @@ a teacher can later see the lecture beside the work it led to.
 
 The steps follow the student's evening: get the lecture into the
 project; play it; take the code of one moment of it; run and change
-that code; pick the lecture up again where it stopped; and finally
-take the copied code out again.
-The two middle steps are where the reading turns into writing---the
-copied code is run and edited like any program---and the tutorial
-puts them between the two playback steps on purpose, so that the
-continue step demonstrates a bookmark that survived the learner's own
-work, not one used a second later.
+that code; find those runs again by file; pick the lecture up again
+where it stopped; and finally take the copied code out again.
+The middle steps are where the reading turns into writing---the
+copied code is run, edited and looked up like any program---and the
+tutorial puts them between the two playback steps on purpose, so that
+the continue step demonstrates a bookmark that survived the learner's
+own work, not one used a second later.
 
 \subsection{Two variants, one contract}
 
@@ -35,7 +35,8 @@ common chunks.
 The expert extras name what the log records at each step and the
 rules behind the defaults: that the bundle file itself is recorded,
 that a copy overlays where a checkout replaces, that the bookmark is
-the learner's own, and that an undo is one more checkout.
+the learner's own, how a file pattern is read, and that an undo is
+one more checkout.
 
 <<[[playing-lectures.md]]>>=
 ---
@@ -51,6 +52,8 @@ summary: Play a lecture's recording, take its code into your project, and pick t
 <<novice step: take the code of one moment>>
 
 <<novice step: run and change the code>>
+
+<<novice step: find the runs of one file>>
 
 <<novice step: pick the lecture up again>>
 
@@ -69,6 +72,8 @@ summary: The same lecture workflow, with what your log records at each step.
 <<expert step: take the code of one moment>>
 
 <<expert step: run and change the code>>
+
+<<expert step: find the runs of one file>>
 
 <<expert step: pick the lecture up again>>
 
@@ -241,6 +246,63 @@ The copy closed its record with the copied files as the log's newest
 version, so your first run of the program shows no diff of the
 lecturer's code as yours, and your second run's diff is exactly your
 change.
+@
+
+\subsection{Find the runs of one file}
+
+By now the learner's log holds the lecture's playback, the copy, and
+their own runs, and [[learnlog list]] shows them all.
+This step asks the log about one file, and its object of learning is
+that \enquote{ran it} and \enquote{changed it} are different
+questions with different answers.
+The file stays the same while the option varies from [[--runs]] to
+[[--changes]], and the two listings differ where the two questions
+do.
+The first run of the copy ran the file without changing it, so it is
+under [[--runs]] only.
+The copy itself changed the file without running it, so it is under
+[[--changes]] only.
+The edited run is under both.
+The last sentence varies the pattern instead, from
+[[lecture/main.py]] to [[main.py]], so that the learner meets the
+folder as the part of a pattern that makes it one file among
+namesakes.
+The expert extra gives the pattern rules and what \enquote{changed}
+is measured against.
+
+<<shared step: find the runs of one file>>=
+# Find the runs of one file
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: 'learnlog\s+list\b[^\n]*--(?:runs|changes)\b'
+hint: Run `learnlog list --runs lecture/main.py`, then `learnlog list --changes lecture/main.py`, with your file's name.
+```
+
+Run `learnlog list --runs lecture/main.py` (with the name of the
+file you ran): only your two runs of the copied program are listed.
+Then run `learnlog list --changes lecture/main.py`: now the list is
+the moments the file changed, the copy and your second run, but not
+your first run, which ran the file without changing it.
+Without the folder, `--runs main.py` lists the runs of every
+`main.py`, in any folder of your project.
+<<novice step: find the runs of one file>>=
+<<shared step: find the runs of one file>>
+<<expert step: find the runs of one file>>=
+<<shared step: find the runs of one file>>
+
+A pattern is read like a line in `.gitignore`, always from the project
+root, whatever folder you type the command in.
+A bare name matches in any folder, and a folder's name matches
+everything in it; a path with a slash matches from the root, and
+`./main.py` is only the one in the root.
+`*` and `?` match within one folder level, so `lecture/*.py` is the
+lecture's programs.
+Repeat an option to ask for any of several files, and give both
+options to ask for runs that match both.
+Changed means changed since the run before, what `learnlog play`
+shows under Code changes; a checkout changes the files it brings in.
 @
 
 \subsection{Pick the lecture up again}
