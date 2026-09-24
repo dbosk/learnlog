@@ -47,6 +47,10 @@ for type annotations in docstrings---the functions accept a repo
 instance but do not construct one.
 [[collections]] provides the named tuple that carries the results
 of the shared log scan (\cref{sec:run-index}).
+[[pathlib]], [[posixpath]] and [[re]] turn the script a run was
+started on into a path relative to the project root
+(\cref{sec:record-files}).
+[[posixpath]] is used because that path is POSIX on every system.
 
 The recorder owns the commit format, so the field names, the section
 markers and the placeholder that stands in for an empty log all come
@@ -60,6 +64,9 @@ from __future__ import annotations
 
 import collections
 import datetime
+import pathlib
+import posixpath
+import re
 
 from learnlog.gitrepo import (
     EXCEPTION_SECTION_MARKER,
@@ -3007,6 +3014,333 @@ def test_parse_exception_line_none():
     from learnlog.commits import parse_exception_line
     assert parse_exception_line(None) == (None, None)
     assert parse_exception_line("") == (None, None)
+@
+
+
+\section{The files a record touches}
+\label{sec:record-files}
+
+A record touches files in two ways: it may \emph{run} a file, and it
+may \emph{change} files.
+[[learnlog list --runs]] and [[--changes]] (\cref{sec:list-command})
+ask which records do so for a given file.
+Both answers are paths relative to the project root, in POSIX form.
+That is the form the [[Directory:]] line uses
+(\cref{sec:run-directory}), and it is also the form Git gives tree
+paths in.
+It is the only form that means the same in the student's project and
+in a bundle a teacher cloned to some other directory.
+
+The two questions are answered from different parts of the record.
+The file a run ran is in its header text.
+The files it changed are in the commit's tree, compared with the tree
+before it.
+This section reads the changed files first, since the other answer
+needs them too, for one awkward case.
+
+\subsection{Changed files, in one walk}
+
+What a record changed is exactly what the reading card shows as
+\enquote{Code changes since your last run} (\cref{render}): the diff
+of the header commit against its parent.
+Asking [[git show]] once per record would make [[list]] fork Git once
+per run.
+The message map exists to avoid exactly that (\cref{sec:run-index}).
+So we ask [[git log]] for the names of every commit's changed files
+in one call on the recording branch, the branch every reader walks.
+
+The output is NUL-framed ([[-z]]), because a file name can contain
+anything but a NUL.
+Each commit's entry opens with its hash, behind a [[\x01]] mark.
+The mark is there because a hash alone does not tell a commit apart
+from a file that happens to be named like one.
+Git puts a newline between the hash line and the first file name; we
+drop it.
+A merge commit lists no files, because [[git log]] shows no diff for
+a merge unless asked to.
+Nothing is lost by that: a merge is where a [[learnlog pull]] joined
+two histories, and it holds no run of its own.
+
+[[--no-renames]] reports a renamed file as one deletion and one
+addition.
+A student who renamed [[lab1.py]] to [[main.py]] changed both names,
+so both have to match.
+It also overrides a user's [[diff.renames]] setting, which would
+otherwise decide what this function returns.
+
+<<commits functions>>=
+def get_changed_files(repo):
+    """Map each commit on the recording branch to the paths it changed.
+
+    Paths are relative to the project root, in POSIX form.  A
+    rename counts as both names.  One Git call however long the log.
+    """
+    result = repo.git(
+        "log", "-z", "--name-only", "--no-renames",
+        f"--format={CHANGES_COMMIT_MARK}%H",
+        repo.recording_branch(), check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    changed = {}
+    names = None
+    for token in result.stdout.split("\0"):
+        if token.startswith(CHANGES_COMMIT_MARK):
+            names = changed.setdefault(
+                token[len(CHANGES_COMMIT_MARK):], set(),
+            )
+        elif token and names is not None:
+            names.add(token.removeprefix("\n"))
+    return {
+        commit: frozenset(paths) for commit, paths in changed.items()
+    }
+<<commits constants>>=
+CHANGES_COMMIT_MARK = "\x01"
+@
+
+A record is a header commit and its trailer (\cref{sec:run-join}),
+and so its changes are both commits' changes.
+For an ordinary run the trailer changes nothing, since it reuses the
+tree at the tip of the branch.
+A [[learnlog checkout]] is the exception.
+Its trailer carries the files it restored ([[finalize_run(tree=)]]),
+and its header carries the snapshot taken before them.
+If we read only the header, [[--changes lecture21/main.py]] would
+never find the [[checkout --from]] that copied that file in.
+The pairing is the one the scan already built: [[scan.records]] maps
+each trailer commit to its header.
+
+<<commits functions>>=
+def record_changed_files(changed, records):
+    """Join each trailer commit's changed paths onto its header's.
+
+    `changed` is `get_changed_files`; `records` maps trailer commits
+    to header commits, as `scan_run_commits(repo).records` does.
+    """
+    joined = {commit: set(paths) for commit, paths in changed.items()}
+    for trailer, header in records.items():
+        joined.setdefault(header, set()).update(
+            changed.get(trailer, ())
+        )
+    return {
+        commit: frozenset(paths) for commit, paths in joined.items()
+    }
+@
+
+Let's verify the walk and the join on a real log.
+There is an edit, a run that changes nothing, a rename, and a
+checkout whose restored file shows up only through its trailer.
+A file name with a space in it checks that no text framing is at
+work:
+
+<<commits test functions>>=
+def test_get_changed_files_reads_every_commit(workdir):
+    from learnlog.commits import (
+        get_changed_files, record_changed_files, scan_run_commits,
+    )
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo = LearnlogRepo(workdir)
+    (workdir / "my file.py").write_text("print(1)\n")
+    repo.begin_run("my file.py", [], t)
+    edited = repo.run_commit
+    repo.begin_run("my file.py", [], t)
+    unchanged = repo.run_commit
+    (workdir / "my file.py").rename(workdir / "main.py")
+    repo.begin_run("main.py", [], t)
+    renamed = repo.run_commit
+    changed = get_changed_files(repo)
+    assert "my file.py" in changed[edited]
+    assert changed[unchanged] == frozenset()
+    assert changed[renamed] == {"my file.py", "main.py"}
+
+    (workdir / "main.py").write_text("print(2)\n")
+    repo.begin_run("learnlog", ["checkout", edited[:7]], t)
+    checkout = repo.run_commit
+    repo.restore_code_state(edited)
+    tree = repo.git("rev-parse", f"{edited}^{{tree}}").stdout.strip()
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t, exit_code=0,
+        tree=tree,
+    )
+    changed = get_changed_files(repo)
+    assert changed[checkout] == {"main.py"}
+    joined = record_changed_files(
+        changed, scan_run_commits(repo).records,
+    )
+    assert joined[checkout] == {"main.py", "my file.py"}
+@
+
+
+\subsection{The file a run ran}
+
+The [[Script:]] line holds what the interpreter was started on, as
+typed (\cref{sec:normalising-the-invocation}).
+That is relative to the directory the run was started in, which the
+[[Directory:]] line names relative to the root.
+Joining the two gives the root-relative path: [[main.py]] run in
+[[lab1]] is [[lab1/main.py]].
+A header older than the [[Directory:]] line is read as run from the
+root.
+That is wrong for a student who worked in a subfolder, but it is the
+only guess a header without the line allows.
+Such a run still matches by its bare name.
+
+Some scripts are not files, and match nothing.
+These are the sentinels in angle brackets: [[<python -c>]],
+[[<python -m>]] and [[<repl>]].
+A path typed on Windows, [[lab1\main.py]], is turned into the POSIX
+form first.
+A backslash or a drive letter marks it as such.
+On POSIX a backslash in a file name is legal but rare, and reading
+one as a separator is the better mistake.
+
+<<commits functions>>=
+def run_script_path(run, root=None, known=frozenset()):
+    """The file a run ran, relative to the project root.
+
+    `run` is a block parsed by `parse_run_block`.  Returns a POSIX
+    path, or `None` for a run of no file (`python -c`, `-m`, the
+    REPL).  `root` and `known` resolve an absolute script, see
+    `absolute_script_path`.
+    """
+    script = run.get("script")
+    if not script or script.startswith("<"):
+        return None
+    script = windows_as_posix(script)
+    directory = windows_as_posix(run.get("directory") or ".")
+    if is_absolute_path(script):
+        return absolute_script_path(script, root, known)
+    path = posixpath.normpath(posixpath.join(directory, script))
+    if is_absolute_path(directory):
+        return absolute_script_path(path, root, known)
+    return path
+@
+
+The helpers below recognise the two path forms.
+A Windows absolute path such as [[c:/Users/s/lab1/main.py]] is not
+absolute to [[posixpath]], so the drive letter is checked separately.
+
+<<commits functions>>=
+def windows_as_posix(path):
+    """`path` with Windows separators turned into slashes."""
+    if "\\" in path or WINDOWS_DRIVE.match(path):
+        return pathlib.PureWindowsPath(path).as_posix()
+    return path
+
+
+def is_absolute_path(path):
+    """Whether a POSIX-form `path` is absolute, on either system."""
+    return path.startswith("/") or bool(WINDOWS_DRIVE.match(path))
+<<commits constants>>=
+WINDOWS_DRIVE = re.compile(r"[A-Za-z]:(?:/|\\|$)")
+@
+
+\paragraph{Absolute scripts.}
+An editor's run button records the script as an absolute path; VS
+Code's does.
+In the student's own log the root is where the run happened, so the
+path is made relative to it.
+A log read from a bundle lives in a temporary clone, and the absolute
+path names a directory on the student's machine.
+The root it was relative to is gone, and the header does not say
+where it was.
+But every file the student ever had shows up in some commit's
+changes, because adding it was a change.
+So the longest trailing part of the path that is such a file is the
+file that ran.
+Longest, because [[lab1/main.py]] and [[main.py]] may both exist,
+and [[/home/s/proj/lab1/main.py]] is the first of them.
+A path that matches nothing stays absolute.
+It can still match by bare name, since that matches any part of a
+path.
+
+The guess can be wrong in one case: a file outside the project that
+has the name of a file inside it, run by the project's interpreter.
+Only patterns anchored at the root see the difference.
+A bare name matches that file anyway.
+
+<<commits functions>>=
+def absolute_script_path(path, root=None, known=frozenset()):
+    """An absolute script `path` relative to the project root.
+
+    Relative to `root` when it lies under it; else the longest
+    trailing part of it that is in `known`, the paths the log has
+    seen; else `path` itself.
+    """
+    if root is not None:
+        for base in (pathlib.Path(root), pathlib.Path(root).resolve()):
+            try:
+                return pathlib.Path(path).relative_to(base).as_posix()
+            except ValueError:
+                continue
+    parts = posixpath.normpath(path).split("/")
+    for start in range(1, len(parts)):
+        candidate = "/".join(parts[start:])
+        if candidate in known:
+            return candidate
+    return posixpath.normpath(path)
+@
+
+A record of an older log can hold several runs
+(\cref{sec:block-sep}), so a record ran every file its blocks name.
+This is the form [[list]] consumes.
+
+<<commits functions>>=
+def record_script_paths(message, root=None, known=frozenset()):
+    """The files the runs of a record's `message` ran, as a set.
+
+    Blocks that ran no file contribute nothing.
+    """
+    paths = (
+        run_script_path(parse_run_block(block), root, known)
+        for block in message.split(BLOCK_SEP)
+    )
+    return {path for path in paths if path is not None}
+@
+
+Let's verify the joins: from the root, from a subfolder, from before
+the [[Directory:]] line, out of the project, and typed on Windows.
+Then the absolute forms: under the root, resolved through the known
+paths (the longest match wins), and unresolvable.
+Last, the sentinels:
+
+<<commits test functions>>=
+def test_run_script_path_joins_the_directory():
+    from learnlog.commits import run_script_path
+
+    def ran(script, directory=None, **kwargs):
+        return run_script_path(
+            {"script": script, "directory": directory}, **kwargs,
+        )
+
+    assert ran("main.py", ".") == "main.py"
+    assert ran("main.py", "lab1") == "lab1/main.py"
+    assert ran("./main.py", "lab1") == "lab1/main.py"
+    assert ran("main.py") == "main.py"
+    assert ran("../main.py", "lab1") == "main.py"
+    assert ran("main.py", "..") == "../main.py"
+    assert ran("lab1\\main.py", ".") == "lab1/main.py"
+    assert ran("<python -c>", ".") is None
+    assert ran("<repl>", ".") is None
+    assert ran(None) is None
+
+def test_run_script_path_resolves_absolute_scripts(tmp_path):
+    from learnlog.commits import run_script_path
+
+    def ran(script, **kwargs):
+        return run_script_path(
+            {"script": script, "directory": "."}, **kwargs,
+        )
+
+    under = str(tmp_path / "lab1" / "main.py")
+    assert ran(under, root=tmp_path) == "lab1/main.py"
+    known = {"main.py", "lab1/main.py"}
+    assert ran("/home/s/proj/lab1/main.py", known=known) \
+        == "lab1/main.py"
+    assert ran("c:/Users/s/proj/main.py", known=known) == "main.py"
+    assert ran("C:\\Users\\s\\proj\\lab1\\main.py", known=known) \
+        == "lab1/main.py"
+    assert ran("/tmp/scratch.py", known=known) == "/tmp/scratch.py"
 @
 
 

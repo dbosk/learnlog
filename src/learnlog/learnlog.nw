@@ -7564,6 +7564,10 @@ bundle by default, and run it from inside that folder, and both land
 in their log, the run with the folder on its [[Directory:]] line;
 [[play -c]] with no source then continues the lecture and says so;
 the plain listing shows the copy and the run and not the playbacks;
+the file filters tell them apart---[[--runs lecture21/lecture.py]]
+finds the run only through its [[Directory:]] line, and
+[[--changes]] finds the copy, not the run, since the copy already
+brought the file in;
 a restore removes the copied file and keeps the bundle; and a
 researcher who clones the student's export reads the
 lecture back out of it, byte for byte.
@@ -7657,6 +7661,17 @@ listing = _run_cli(learnlog, ["list"], cwd=project).stdout
 assert "learnlog checkout --from lecture21.learnlog" in listing
 assert " lecture.py" in listing
 assert "learnlog play" not in listing
+
+def list_by(*args):
+    return _run_cli(learnlog, ["list", *args], cwd=project).stdout
+
+by_run = list_by("--runs", "lecture21/lecture.py")
+assert " lecture.py" in by_run
+assert "learnlog checkout" not in by_run
+assert "No runs match" in list_by("--runs", "./lecture.py")
+by_change = list_by("--changes", "lecture21/lecture.py")
+assert "learnlog checkout --from lecture21.learnlog" in by_change
+assert " lecture.py" not in by_change
 @
 
 <<restore, then read the lecture out of the student's export>>=
