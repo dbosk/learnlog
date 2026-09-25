@@ -517,6 +517,18 @@ names---so there we fall back to splitting at the first [[ b/]], which
 is what Git's own porcelain does and is wrong only for a name that
 contains that sequence itself.
 
+Both rules assume Git printed the names as they are.
+Under Git's default [[core.quotePath]] it does not for a name with
+non-ASCII bytes: [[övning-AF/age.py]] arrives as a quoted pair of
+octal-escaped names, which matches neither rule and used to reach the
+card whole.
+The repository wrapper therefore runs every command with
+[[core.quotePath=false]] (\cref{sec:unquoted-paths}), so such names
+reach this function as UTF-8 text.
+The few names Git quotes regardless---those containing a double quote,
+a backslash or a control character---still fall through and are shown
+exactly as Git spelled them, which is legible if not pretty.
+
 <<render functions>>=
 def _begin_file(paths):
     """Start a pending file headline from ``diff --git`` paths."""
@@ -1708,6 +1720,39 @@ def test_record_lines_of_a_real_record(workdir):
   assert "Run-Id:" not in text
 @
 
+The same path through a real repository is where issue~\#147 showed
+itself: a student whose exercise lives in [[övning-AF/]] saw the name
+of the file as [[\303\266vning-AF]] escapes in both views, while its
+contents rendered fine.
+The name is Git's display, not the stored record, so only a real
+[[git show]] can check it; the card and raw mode must both carry the
+name as the student typed it:
+
+<<render test functions>>=
+def test_record_lines_show_non_ascii_names(workdir):
+  import datetime
+  from learnlog.commits import get_commit_detail, get_commits
+  from learnlog.gitrepo import LearnlogRepo
+  repo = LearnlogRepo(workdir)
+  (workdir / "övning-AF").mkdir()
+  (workdir / "övning-AF" / "age.py").write_text("ålder = 1\n")
+  repo.begin_run(
+    "övning-AF/age.py", [], datetime.datetime(2026, 9, 9, 10, 4),
+  )
+  commits = get_commits(repo)
+  detail = get_commit_detail(
+    repo, commits[-1]["hash"], reorder=False,
+  )
+  card = styled_text(record_lines(
+    commits[-1], detail, index=len(commits) - 1,
+    total=len(commits),
+  ))
+  raw = styled_text(raw_lines(detail))
+  assert "  övning-AF/age.py (new file)" in card
+  assert "diff --git a/övning-AF/age.py b/övning-AF/age.py" in raw
+  assert "\\303" not in card + raw
+@
+
 
 \section{Raw mode}
 \label{sec:raw-lines}
@@ -1725,6 +1770,16 @@ that a tab in a raw line reaches [[addstr]] unexpanded, where it may
 cost that line; the drawer's [[curses.error]] guard is what keeps that
 from being more than a missing line, and it is the price of a view
 whose whole promise is fidelity.
+
+Fidelity is to Git's output, and that output is not itself stored: the
+commit message is the record, while the header and the diff are what
+[[git show]] computes from it each time.
+So the file names in a raw diff are spelled the way the repository
+wrapper asks Git to spell them---unquoted, as UTF-8
+(\cref{sec:unquoted-paths})---and a record shows [[övning-AF/age.py]]
+in raw mode exactly as it does on the card.
+The invariant is untouched by that: it concerns what this function
+does with its input, and it does nothing.
 
 A pleasant consequence of the invariant is that the region boundaries
 need only be approximately right.  Every branch emits its line
