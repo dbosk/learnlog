@@ -3129,6 +3129,33 @@ def test_doctor_step_matches_the_report_it_checks(tmp_path):
     )
 @
 
+The lecture tutorial's tag step (\cref{tut:playing-lectures}) gates on
+a listing of the \emph{bundle's} tags, with the options in either
+order.
+A [[--tags]] listing of the learner's own log is not the step, and
+neither is a listing of the bundle without [[--tags]]:
+
+<<test functions>>=
+def test_lecture_tags_step_needs_the_bundle_and_the_flag():
+    """The tag step accepts either option order, and only both."""
+    from pytorial.run import transcript_matches_patterns
+
+    step = tutorial_step(
+        "playing-lectures.md", "Find the lecture's parts"
+    )
+
+    def matches(command):
+        return transcript_matches_patterns(
+            f"$ {command}\n", step.required_patterns,
+        )
+
+    assert matches("learnlog list -f lecture.learnlog --tags")
+    assert matches("learnlog list --tags --from lecture.learnlog")
+    assert matches("learnlog list -f lecture.learnlog --tags loops")
+    assert not matches("learnlog list --tags")
+    assert not matches("learnlog list -f lecture.learnlog")
+@
+
 
 \subsection{The [[init]] command}
 \label{sec:init}
@@ -4044,6 +4071,53 @@ Every other filter of the listing narrows what the ones before it
 left, [[--success]] beside [[--since]] for one, and a reader who
 combines filters expects them to narrow.
 
+The [[--tags]] flag narrows the listing to the tagged records, and a
+regular expression after it narrows those to the tags it matches.
+Three examples again:
+[[learnlog list --tags]] lists the student's milestones;
+[[learnlog list --tags lecture]] lists only the lecture tags among
+them, [[lecture21]] and [[lecture22]] alike;
+and [[learnlog list -f lecture21.learnlog --tags]] lists the parts a
+lecturer marked in a lecture's bundle.
+The third is the one the flag exists for.
+A student who was given a bundle needs its tag names to hand them to
+[[play]] or [[checkout --from]], and the listing reads bundles
+already.
+So does its [[(tag: ...)]] marker, which shows the run each tag sits
+on.
+
+The regular expression is a search, not a full match: [[lecture]]
+finds [[lecture21]], and [[^lab1$]] is how to ask for exactly one tag.
+This differs from [[analyse]], whose tag boundaries must match the
+whole name (\cref{sec:analyse-tags}).
+A boundary has to be one moment, and [[lab1]] must not stop at
+[[lab10]].
+A filter is a question about a set of tags, and a prefix is the
+common case.
+The match is case-sensitive, like the file patterns, because Git
+compares tag names case-sensitively.
+
+The expression is a positional argument, not the value of
+[[--tags]].
+Typer gives no option whose value may be left out: the bare
+[[--tags]] would be refused, and [[--tags --all]] would take
+[[--all]] as the expression.
+As a flag plus a positional, all of [[--tags]], [[--tags lecture]] and
+[[--tags --all]] work, and the positional slot is the one [[--from]]
+was introduced to keep free.
+An expression without [[--tags]] is refused rather than guessed at,
+since the listing has no other positional argument it could mean.
+
+An obvious alternative was a [[-f]] option on [[learnlog tag]], so
+that [[learnlog tag -l -f lecture.learnlog]] would list a bundle's
+tags.
+It collides with Git.
+[[learnlog tag]] forwards its arguments to [[git tag]]
+(\cref{sec:tag}), where [[-f]] already means \emph{force}, moving an
+existing tag.
+[[git tag -l]] would also print bare names, without the run each name
+marks.
+
 <<typer commands>>=
 @app.command(name="list")
 def list_commits(
@@ -4117,11 +4191,33 @@ def list_commits(
             ),
         ),
     ] = None,
+    tags: Annotated[
+        bool,
+        typer.Option(
+            "--tags",
+            help=(
+                "Show only tagged runs. Give REGEX after it to show "
+                "only the tags it matches (--tags lecture)."
+            ),
+        ),
+    ] = False,
+    tag_pattern: Annotated[
+        str | None,
+        typer.Argument(
+            metavar="[REGEX]",
+            help=(
+                "With --tags: show only tags this regular expression "
+                "matches, anywhere in the name."
+            ),
+            show_default=False,
+        ),
+    ] = None,
 ):
     """List your runs by day, with start time and command."""
     import shutil
 
     refuse_two_windows(period, since, until)
+    tagged = tag_filter(tags, tag_pattern)
     repo, tmpdir = resolve_source(source)
     try:
         commits = get_commits(repo)
@@ -4319,6 +4415,7 @@ run.
 
 <<get and summarise commit>>=
 names = tag_map.get(commit["hash"], [])
+<<skip commits that do not match the tag filter>>
 body = scan.messages.get(commit["hash"], "").rstrip("\n")
 body = merge_run_trailers(body, scan.trailers)
 body = filter_runs(
@@ -4395,8 +4492,8 @@ and when the reason is that everything it had was learnlog's own, it
 names [[--all]]---for the reason the playback placeholder does
 (\cref{viewer}): a reader who meets the note is looking for what is
 missing.
-The window, the outcome flags and the file filters are named before
-the hiding, since
+The window, the outcome flags, the file filters and the tag filter
+are named before the hiding, since
 a student who asked for today and got nothing is told about today,
 not about a flag that would not help.
 
@@ -4408,6 +4505,8 @@ if not listed:
         typer.echo(NO_RUNS_WITH_OUTCOME_NOTE)
     elif runs or changes:
         typer.echo(NO_RUNS_FOR_FILES_NOTE)
+    elif tagged is not None:
+        typer.echo(no_tags_note(tag_pattern))
     elif len(records) < len(commits):
         typer.echo(ONLY_LEARNLOG_RUNS_NOTE)
     else:
@@ -4573,6 +4672,182 @@ def test_path_matches_backslashes_and_case():
     from learnlog.cli import path_matches
     assert path_matches("lab1\\main.py", "lab1/main.py")
     assert not path_matches("Main.py", "main.py")
+@
+
+\paragraph{The tag filter.}
+The filter is built from [[--tags]] and the expression before the
+source is resolved.
+Resolving a bundle clones it (\cref{sec:resolve-source}), and a typo
+in the expression should be refused before the student has waited
+for a clone.
+An expression that does not compile is refused with Python's own
+reason, which names the character at fault.
+
+Like the outcome set, the filter is [[None]] when no filter was asked
+for, so the loop's test is one comparison.
+Otherwise it is a predicate over the record's tag names.
+A record passes when any of its names matches, and its line still
+shows all of its names.
+A record tagged both [[lab1]] and [[lecture21]] is listed under
+[[--tags lecture]] as [[(tag: lab1, lecture21)]]: the other name is
+where the same moment sits in the student's other periods.
+
+<<helper functions>>=
+def tag_filter(tags, pattern):
+    """The predicate `list --tags [REGEX]` keeps records by.
+
+    `None` when `tags` is off.  Otherwise a function of a
+    record's tag names that is true when any name matches
+    `pattern` (searched, not fully matched), or when there is
+    any name at all if `pattern` is `None`.  Exits when a
+    pattern is given without `tags` or does not compile.
+    """
+    if not tags:
+        if pattern is not None:
+            raise SystemExit(
+                f"'{pattern}' needs --tags before it: "
+                f"learnlog list --tags {pattern}"
+            )
+        return None
+    if pattern is None:
+        return bool
+    try:
+        regex = re.compile(pattern)
+    except re.error as error:
+        raise SystemExit(
+            f"Not a valid regular expression: {pattern} ({error})"
+        ) from error
+    return lambda names: any(regex.search(name) for name in names)
+
+
+def no_tags_note(pattern):
+    """What an empty `list --tags [REGEX]` says."""
+    if pattern is None:
+        return NO_TAGGED_RUNS_NOTE
+    return f"No tags match {pattern}."
+<<constants>>=
+NO_TAGGED_RUNS_NOTE = "No tagged runs."
+@
+
+The skip comes right after the tag names are read, before the
+message is merged and filtered, because the tag map is already in
+memory and an untagged record needs no more work.
+Filtering tags adds no Git call: the map was read for the
+[[(tag: ...)]] markers anyway.
+[[--all]] is not needed to reach a tag on a review run, since a tagged
+record is never hidden (\cref{sec:visible-commits}).
+That matters for a lecture's bundle recorded by an older learnlog,
+which put a bare [[learnlog tag]] on HEAD, and so on the
+[[learnlog list]] the lecturer had typed just before tagging.
+
+One tag stays out of reach.
+A tag on the log's initial commit has no run to summarise, and the
+listing skips records without a summary.
+Only a [[learnlog tag]] typed before the first run of any kind puts a
+tag there.
+[[learnlog init]]'s own install is already a run.
+
+<<skip commits that do not match the tag filter>>=
+if tagged is not None and not tagged(names):
+    continue
+@
+
+Let's verify the filter on its own: off, the bare flag, a search, an
+anchored expression, and the two refusals:
+
+<<test functions>>=
+def test_tag_filter():
+    from learnlog.cli import tag_filter
+    assert tag_filter(False, None) is None
+    anything = tag_filter(True, None)
+    assert anything(["lab1"]) and not anything([])
+    lecture = tag_filter(True, "lecture")
+    assert lecture(["lab1", "lecture21"])
+    assert not lecture(["lab1"])
+    exact = tag_filter(True, "^lab1$")
+    assert exact(["lab1"]) and not exact(["lab10"])
+    assert not tag_filter(True, "Lab")(["lab1"])
+    with pytest.raises(SystemExit) as caught:
+        tag_filter(True, "(")
+    assert "Not a valid regular expression: (" in str(caught.value)
+    with pytest.raises(SystemExit) as caught:
+        tag_filter(False, "lecture")
+    assert "--tags lecture" in str(caught.value)
+@
+
+On a log, the filter keeps what the tags name: a program run tagged
+on its trailer, one tagged on its header, and a review run that is
+tagged.
+An untagged run never shows.
+A search, an anchored expression, and an expression that matches
+nothing each pick their subset:
+
+<<test functions>>=
+def test_list_tags_filters_tagged_runs(workdir):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("first.py", [], t)
+    repo.finalize_run(
+        io_log="", exception_info=None, end_time=t, exit_code=0,
+    )
+    repo.git("tag", "lab1")
+    repo.begin_run("second.py", [], t)
+    repo.git("tag", "lecture21")
+    repo.begin_run("untagged.py", [], t)
+    repo.begin_run("learnlog", ["list"], t)
+    repo.git("tag", "lecture22")
+    runner = CliRunner()
+
+    def listed(*args):
+        result = runner.invoke(
+            app, ["list", "--from", str(workdir), *args],
+        )
+        assert result.exit_code == 0, result.output
+        return result.output
+
+    every = listed("--tags")
+    assert "first.py (none) (tag: lab1)" in every
+    assert "second.py (none) (tag: lecture21)" in every
+    assert "learnlog list (tag: lecture22)" in every
+    assert "untagged.py" not in every
+    lectures = listed("--tags", "lecture")
+    assert "first.py" not in lectures
+    assert "second.py" in lectures
+    assert "learnlog list" in lectures
+    assert "first.py" in listed("--tags", "^lab")
+    assert "second.py" not in listed("--tags", "^lab")
+    assert listed("--tags", "nothing").strip() == \
+        "No tags match nothing."
+    result = runner.invoke(
+        app, ["list", "--from", str(workdir), "lecture"],
+    )
+    assert result.exit_code == 1
+    assert "--tags" in result.output
+@
+
+The flag exists for bundles, so the last test lists one.
+It fixes the property the feature rests on: a bundle written by
+[[export]] carries the tags, and the clone that reads it keeps them.
+
+<<test functions>>=
+def test_list_tags_from_a_bundle(workdir, tmp_path):
+    from learnlog.cli import app, do_export
+    from typer.testing import CliRunner
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run("loops.py", [], t)
+    repo.git("tag", "lecture21-loops")
+    repo.begin_run("other.py", [], t)
+    bundle = tmp_path / "lecture21.learnlog"
+    do_export(repo, bundle)
+    result = CliRunner().invoke(
+        app, ["list", "-f", str(bundle), "--tags", "loops"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "loops.py (none) (tag: lecture21-loops)" in result.output
+    assert "other.py" not in result.output
 @
 
 Let's verify that the command lists commits with the expected
@@ -5173,6 +5448,8 @@ Rather than pinning the exact number of Git calls---which may
 drift as the repository plumbing changes---we pin the property
 that matters: listing a longer log costs exactly as many Git
 calls as listing a shorter one, with the file filters and without.
+The tag filter reads nothing the plain listing does not, so on the
+same tagged log the two cost the same.
 
 <<test functions>>=
 def test_list_git_calls_constant_in_log_length(workdir, monkeypatch):
@@ -5227,6 +5504,9 @@ def test_list_git_calls_constant_in_log_length(workdir, monkeypatch):
     record_runs(range(5, 10))
     assert calls(10) == short_log_calls
     assert calls(10, *filters) == short_filtered_calls
+
+    repo.git("tag", "lab1")
+    assert calls(1, "--tags") == calls(10)
 @
 
 
