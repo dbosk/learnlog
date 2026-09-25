@@ -148,9 +148,12 @@ hint: Run `learnlog play -f lecture.learnlog`, watch a while, and quit with `q`.
 Run `learnlog play -f lecture.learnlog` (with your file's name) to
 open the lecture in the viewer instead of your own log.
 Step through it with the arrow keys.
-Stop somewhere in the middle and quit with `q`; before you do, note
-the hash shown in the header of a moment whose code you would like to
-have.
+Stop somewhere in the middle and quit with `q`; before you do, find a
+moment whose code you would like to have.
+Its card ends with the command that copies that code into your
+project, under `To copy this version into lecture/:`.
+Note that line: `learnlog checkout -f lecture.learnlog` followed by the
+moment's hash.
 <<novice step: play the lecture>>=
 <<shared step: play the lecture>>
 <<expert step: play the lecture>>=
@@ -181,8 +184,8 @@ The step then uses one tag as a start point for [[play]], so the name
 is seen doing a hash's job before the next step asks for one.
 
 It sits after the first playback, where the learner noted a moment by
-its hash, so that a tag arrives as a name for the same kind of
-moment.
+the command on its card, hash included, so that a tag arrives as a
+name for the same kind of moment.
 It sits before the copy, so that the copy step can take a tag as well
 as a hash.
 A learner whose stand-in bundle is their own export may have no tags
@@ -243,6 +246,20 @@ The expert extra names the folder rule and [[-o]], and says why a
 copy from another log overlays where a checkout in your own log
 replaces.
 
+The learner does not have to compose the command.
+Every card of another log ends with it, source, hash and destination
+folder filled in (\cref{sec:way-back}), so the playback step tells
+the learner to note that line rather than a hash, and this step gives
+the same line back with the hash left as the one blank to fill.
+The reading view's header shows no hash at all, only the position and
+the file that ran; the card's last line is where a hash can be copied
+from.
+Handing over the line costs the step nothing it is about: the object
+of learning is what the command does---the copy, the folder, the
+record---not how to spell it, and a learner who has to reconstruct
+[[--from]] and the file name from memory is practising recall of
+syntax at the moment they should be noticing where the files land.
+
 <<shared step: take the code of one moment>>=
 # Take the code of one moment
 
@@ -251,11 +268,13 @@ required_patterns:
   - mode: regex
     pattern: 'learnlog\s+checkout\b[^\n]*(?:-f|--from)\s+\S+\.learnlog\b\s+\S+'
   - next run continues
-hint: Run `learnlog checkout --from lecture.learnlog <hash>` with the hash you noted, or with a tag.
+hint: Run the line you noted from the card, `learnlog checkout -f lecture.learnlog <hash>`, or use a tag instead of the hash.
 ```
 
-Run `learnlog checkout --from lecture.learnlog <hash>` with the hash
-you noted, or with one of the lecture's tags instead of the hash.
+Run the command you noted from the card,
+`learnlog checkout -f lecture.learnlog <hash>`, with the moment's hash
+(`-f` is short for `--from`).
+One of the lecture's tags works instead of the hash.
 The lecture's files at that moment land in a folder named after the
 lecture file, `lecture/` for `lecture.learnlog`, and your own files
 stay as they are.
