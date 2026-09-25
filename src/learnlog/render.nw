@@ -812,8 +812,24 @@ program starts.
 A line that names no stream has no such boundary to mark, so its indent
 is part of its text.
 
+The margin is also as wide on every line.
+[[stdin: ]] is one character shorter than [[stdout: ]] and
+[[stderr: ]], so as recorded a student's answers started one column
+left of the prompts they answered:
+\begin{center}
+  [[stdout: Vad heter du?]]\\
+  [[stdin: Daniel]]
+\end{center}
+The card pads each prefix to the widest one, so the text of every line
+starts in the same column and the eye can run down the conversation
+without stepping.
+Only the card pads: the log keeps the prefixes as recorded, and raw
+mode, which splits at the same prefixes (\cref{sec:raw-lines}), shows
+them as recorded too.
+
 <<render constants>>=
 IO_INDENT = "  "
+IO_PREFIX_WIDTH = max(len(prefix) for prefix, _ in IO_STREAM_PREFIXES)
 IO_KINDS = {
     "stdout": KIND_OUT,
     "stderr": KIND_ERR,
@@ -865,8 +881,9 @@ def classify_io(io_log):
             ))
             continue
         prefix, text, kind = split
+        padding = " " * (IO_PREFIX_WIDTH - len(prefix.lstrip(" ")))
         result.append(StyledLine(
-            sanitise(text), kind, IO_INDENT + prefix,
+            sanitise(text), kind, IO_INDENT + prefix + padding,
         ))
     return result
 @
@@ -884,7 +901,9 @@ def test_classify_io_splits_each_stream():
   assert [line.kind for line in styled] == ["out", "input", "err"]
   assert styled[0].prefix == "  stdout: "
   assert styled[0].text == "Name? "
-  assert styled[1].prefix == "  stdin: "
+  assert styled[1].prefix == "  stdin:  "
+  assert styled[1].text == "Daniel"
+  assert len({len(line.prefix) for line in styled}) == 1
   assert styled[2].text == \
       "NameError: name 'nme' is not defined"
 
