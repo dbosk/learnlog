@@ -340,6 +340,9 @@ the method.
 A fourth decision---whether Git's output comes back as text or as
 bytes---costs no runs, but it decides who can use the wrapper at all,
 and a caller who cannot use it opts out of the other three as well.
+A fifth---how Git spells a file name in what it prints---decides
+whether a student sees the name of their own file or a row of octal
+escapes (\cref{sec:unquoted-paths}).
 The first decision has a corner of its own: what to say when there is
 no Git to fail, which is the one Git failure a student can fix
 themselves once told how (\cref{sec:starting-git}).
@@ -724,13 +727,14 @@ GIT_TEXT_CODEC = {"encoding": "utf-8", "errors": "replace"}
 
 Starting Git is [[run_git]]'s job (\cref{sec:starting-git}); what the
 wrapper adds is everything decided in this section---the captured
-output, the codec, the timeout and the standard-input plumbing.
+output, the codec, the timeout, the standard-input plumbing and the
+unquoted file names (\cref{sec:unquoted-paths}).
 A missing Git or an expired timeout therefore arrives here already
 as a [[GitError]], and only the exit status is left to judge.
 
 <<run Git, turning process failures into [[GitError]]>>=
 result = run_git(
-    args,
+    [*UNQUOTED_PATHS, *args],
     cwd=str(self.workdir),
     env=environment,
     capture_output=True,
@@ -879,6 +883,95 @@ def test_git_env_overlay_reaches_git(workdir):
     ).stdout
     assert "Ada Lovelace" in shown
     assert "2026-01-02" in shown
+@
+
+\subsection{File names are text, too}
+\label{sec:unquoted-paths}
+
+The codec above makes Git's output arrive as the text it is, but Git
+decides what that text says before any decoding happens.
+With its default [[core.quotePath=true]], Git spells every file name
+that contains a byte above 0x7F as a C string of octal escapes in
+double quotes.
+A Swedish student who keeps an exercise in [[övning-AF/age.py]] was
+therefore shown
+\begin{center}
+  [["a/\303\266vning-AF/age.py" "b/\303\266vning-AF/age.py"]]
+\end{center}
+on the playback card where the name of the file should have been,
+while the [[åäö]] \emph{inside} the file rendered correctly---file contents
+are not quoted, only names are.
+Nothing was wrong with the log: the name is stored as UTF-8, and it is
+[[git show]]'s display of it that mangled it.
+The card's reader (\cref{render}) then made it worse, because a quoted
+pair of names has none of the shapes it looks for and so came through
+whole, quotes and all.
+
+The remedy is Git's own [[core.quotePath=false]], which leaves
+non-ASCII bytes alone.
+We pass it on the command line as [[-c core.quotePath=false]] in front
+of every command the wrapper runs, rather than at each call that
+happens to print names.
+Which calls print names is an open-ended list---[[git show]]'s diff
+for the card, [[git merge-tree --name-only]] and
+[[git ls-files --unmerged]] for the conflicts a [[pull]] reports, and
+whatever reader comes next---and a per-call flag can only cover the
+calls somebody remembered.
+Setting it for every call is safe because no reader depends on the
+quoted form: nothing in learnlog unquotes a [["..."]] name, and the
+readers that parse names for a living ([[get_changed_files]] in
+\cref{commits}) use [[-z]], under which Git never quotes at all and
+the setting changes nothing.
+The setting only shapes what Git prints, never what it stores, so a
+log recorded before this change reads the same way as one recorded
+after it: there is nothing to migrate.
+
+The command line rather than the repository's configuration is the
+right place for it for the same reason.
+[[ensure_configured]] (\cref{sec:ensure-configured}) could write the
+key into [[.learnlog/config]], but then every log would read correctly
+only once a current learnlog had opened it for writing, whereas a
+lecture bundle cloned for [[learnlog play -f]] or a colleague's
+directory is read by whichever version the reader has.
+A [[-c]] flag has no state to keep current, and every Git released
+since 2010 understands it; the [[GIT_CONFIG_COUNT]] environment
+variables, which could have carried it inside [[git_environment]],
+need Git 2.31.
+
+The flag belongs to the wrapper, not to [[run_git]] underneath it.
+The callers that bypass the wrapper keep inherited standard I/O
+(\cref{sec:starting-git}), so learnlog never reads what they print:
+[[push]], [[clone]] and [[pull]]'s fetch show Git's progress, [[tag]]
+lists tag names, and the hidden [[learnlog git]] passthrough exists
+precisely to be Git, unchanged, for repairing a log.
+A student who runs [[learnlog git status]] gets their own Git
+configuration, whatever they chose for [[core.quotePath]], which is the
+same thing [[git status]] in their own repository would give them.
+
+Git does keep quoting a name that contains a double quote, a backslash
+or a control character such as a tab or newline, whatever the setting
+says, because such a name cannot be printed unambiguously on one line.
+Those names are rare enough on a student's machine---and impossible on
+Windows---that the readers show them exactly as Git spelled them rather
+than unquoting them.
+
+<<constants>>=
+UNQUOTED_PATHS = ("-c", "core.quotePath=false")
+@
+
+Let's verify with the student's own folder that a name Git prints
+comes back as the name, not as its escapes:
+
+<<test functions>>=
+def test_git_prints_non_ascii_names_unquoted(workdir):
+    """A Swedish folder name is shown as itself (issue #147)."""
+    repo = LearnlogRepo(workdir)
+    (workdir / "övning-AF").mkdir()
+    (workdir / "övning-AF" / "age.py").write_text("print(1)\n")
+    repo.git("add", "övning-AF/age.py")
+    listing = repo.git("diff", "--cached", "--name-only").stdout
+    assert listing.strip() == "övning-AF/age.py"
+    assert "\\303" not in listing
 @
 
 

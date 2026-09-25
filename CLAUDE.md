@@ -137,6 +137,13 @@ route; the chapter says why. `learnlog play` there relies on the
   fetch, the `learnlog git` passthrough) stay outside the wrapper: capturing
   would hide progress and credential prompts.  Pull's merge and ref advance
   go through the wrapper — they talk to no remote
+- Every wrapper call runs as `git -c core.quotePath=false …`
+  (`UNQUOTED_PATHS`), so file names with non-ASCII bytes (`övning-AF/`)
+  come back as UTF-8 text rather than `"\303\266…"` escapes (#147) —
+  display only, nothing stored changes. It is deliberately *not* in
+  `run_git`: the inherited-stdio sites and the `learnlog git` passthrough
+  keep the student's own Git config. Names with `"`, `\` or control
+  characters are still quoted by Git and shown as Git spells them
 - `extract_code_state()` accepts a genuinely empty tree (the initial commit
   of a repo begun in an empty directory) as an empty code state — verified
   via `git ls-tree` — while an unreadable archive for a non-empty tree
