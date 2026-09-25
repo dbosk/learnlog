@@ -573,6 +573,7 @@ import datetime
 import atexit
 import functools
 import hashlib
+import linecache
 import threading
 import traceback
 
@@ -619,10 +620,12 @@ import shlex
 import tempfile
 import subprocess
 import hashlib
+import linecache
 import os
 import pathlib
 import sys
 import time
+import types
 import pytest
 import learnlog
 from learnlog import (
@@ -2298,9 +2301,10 @@ statements that produced them.
 
 So we do not try to predict the frontend.
 We install a hook for each, and write each so that only the frontend
-that actually reads the lines can set it off: pyrepl never calls GNU
-[[readline]], and the classic REPL never calls pyrepl's
-[[multiline_input]].
+that actually reads the lines can set it off: the classic REPL never
+calls pyrepl's [[multiline_input]], and pyrepl neither reads through
+GNU [[readline]] nor names its statements the way the classic REPL
+does.
 Copying CPython's decision instead---[[PYTHON_BASIC_REPL]], the [[-E]]
 flag, the terminal test, pyrepl's own capability probe---would have to
 follow every later change to that decision, and would still guess
@@ -2355,50 +2359,143 @@ def _wrap_pyrepl_input(original_input, iolog):
 @
 
 \paragraph{The classic frontend.}
-The classic REPL gives us no call to wrap, but it leaves one useful
-trace: once it has accepted a top-level line, [[readline]] appends that
-line to its history.
+The classic REPL gives us no Python call to wrap, but since CPython
+3.13 it announces every statement it is about to run.
+It compiles each one under a name of its own, [[<stdin-0>]],
+[[<stdin-1>]], and so on, registers the typed source under that code
+object so that a traceback can quote the line, and raises the [[exec]]
+audit event with the code object just before running it.
+An audit hook therefore sees each statement, with its source, before
+the statement can print anything or ask for [[input()]], so the
+order in the log is the order on the screen without any deferred
+flushing.
+
+That this lives in the interpreter core rather than in a line editor
+is what makes it the right hook.
+On Windows the classic REPL reads the console directly and there is
+no [[readline]] module at all, so a VS Code terminal there---where the
+extension sets [[PYTHON_BASIC_REPL=1]] just as on Linux---left nothing
+else to read the statements from, and its REPL runs recorded only
+their results.
+It also avoids everything that makes the history route below fragile:
+nothing is read from a history file, and no hook slot is shared with
+the student's own startup script.
+
+The name is what keeps the hook to the classic REPL's statements.
+The [[exec]] event is raised for other code too, and two kinds matter
+here: pyrepl runs its statements through [[exec]] as well, but names
+them [[<python-input-N>]] and is logged by its own hook, and a student
+typing [[exec("y = 1")]] runs code named [[<string>]] inside a
+statement we have already logged.
+Only a [[<stdin-N>]] name is taken.
+
+Two properties of audit hooks shape the code.
+A hook cannot be removed once added, so [[restore]] disarms it
+instead.
+And an exception raised in a hook aborts the audited operation---here,
+the student's statement---so the hook swallows its own failures, the
+same rule as for every other wrapper around the student's program.
+The source registry, [[linecache._getlines_from_code]], is private;
+the installer uses this path only where it exists, so an interpreter
+that drops or renames it falls back to the history route rather than
+logging empty statements.
+
+<<functions>>=
+def _install_audit_repl_capture(iolog, source_lines):
+    """Log classic-REPL statements from the `exec` audit event.
+
+    Returns a function that disarms the hook, since audit hooks cannot
+    be removed.
+    """
+    armed = True
+
+    def on_audit(event, args):
+        if not armed or event != "exec":
+            return
+        try:
+            code = args[0]
+            if _is_classic_repl_statement(code.co_filename):
+                _log_repl_statement(iolog, "".join(source_lines(code)))
+        except Exception:
+            pass
+
+    def restore():
+        nonlocal armed
+        armed = False
+
+    sys.addaudithook(on_audit)
+    return restore
+
+
+def _is_classic_repl_statement(filename):
+    """True if `filename` names a statement typed at the classic REPL."""
+    prefix = CLASSIC_REPL_NAME_PREFIX
+    return (
+        filename.startswith(prefix)
+        and filename.endswith(">")
+        and filename[len(prefix):-1].isdigit()
+    )
+<<constants>>=
+CLASSIC_REPL_NAME_PREFIX = "<stdin-"
+@
+
+A block typed at the classic REPL is ended by an empty line, and its
+registered source keeps that line; [[_log_repl_statement]] writes it
+as a bare [[... ]] continuation, which is what the screen showed.
+
+\paragraph{Before 3.13: the readline history.}
+Older interpreters compile the classic REPL's statements under the
+plain name [[<stdin>]] and keep no source, so the audit event carries
+nothing we could log.
+They leave one other trace, on platforms with [[readline]]: once the
+REPL has accepted a top-level line, [[readline]] appends it to its
+history.
 The history does not tell us the exact instant a statement became
-complete, so this path is weaker than the pyrepl one: a silent
+complete, so this path is weaker than the audit one: a silent
 statement such as [[x = 5]] is only noticed at the next point where
 Python hands control back to us.
-Those points are enough to keep the order right---before stdout or
+Those points are enough to keep the order right: before stdout or
 stderr output, before unhandled exceptions, before nested [[input()]]
-replies, at exit---and one more makes silent statements timely: the
-next prompt.
+replies, and at exit.
 
 The history is also where this path can go badly wrong, because not
 everything in it was typed in this session.
 Just before the first prompt, CPython runs [[site]]'s interactive hook,
 which loads the user's [[~/.python_history]] into the same history.
 That happens after [[PYTHONSTARTUP]] and long after this autostart hook
-ran, so a baseline taken now would read the whole file as statements
-typed in the first second of the session, and publish it with the log.
-The baseline must therefore be taken at the first prompt, and [[readline]]
-lets us be there: its startup hook runs just before each prompt the
-library draws, the REPL's and [[input()]]'s alike.
-The first call records the history length as the baseline; later calls
-flush what has been added since.
-Until that first call the helpers log nothing, which also covers output
-written before the REPL is up, such as the [[PYTHONSTARTUP]] banner.
+took its baseline, so the first flush used to read the whole file as
+statements typed in the first second of the session---every line the
+user had ever typed at a Python prompt, published with the log.
 
-The startup hook is also what keeps this path silent under pyrepl.
-Pyrepl reads the terminal itself and never enters GNU [[readline]], so
-the hook never fires, the helpers never arm, and pyrepl's own hook is
-the only one that logs.
+The load goes through one call, and that call is the place to catch
+it.
+[[site]] looks up [[readline.read_history_file]] on the module when it
+calls it, so we replace that attribute with a wrapper: it flushes what
+was typed before the load, lets the file load, and moves the baseline
+past what the file added.
+A student's own [[PYTHONSTARTUP]] that loads a history file the same
+way is covered by the same wrapper.
+An earlier attempt took the baseline at the first prompt instead,
+through [[readline]]'s startup hook, and was dropped: libedit, the
+[[readline]] backend of macOS and of the standalone CPython builds
+that [[uv]] installs, never calls that hook, so there the capture
+never armed and nothing was recorded at all.
 
 <<functions>>=
 def _install_readline_repl_capture(iolog, readline_module):
     """Return flush, skip and restore helpers based on readline history.
 
-    Nothing is logged before the first readline prompt, which sets the
-    baseline, so history loaded from a file is never taken for input.
+    History loaded with `read_history_file`, as `site` does just before
+    the first prompt, is stepped over rather than taken for input.
     """
-    history_length = None
+    try:
+        history_length = readline_module.get_current_history_length()
+    except Exception:
+        return None, None, None
 
     <<flush the statements added since [[history_length]]>>
     <<skip a nested [[input()]] reply in the history>>
-    <<arm, and later flush, at every readline prompt>>
+    <<step over history loaded from a file>>
     return flush, skip_input, restore
 @
 
@@ -2407,14 +2504,12 @@ The classic REPL only ever appends, so the entries past the baseline
 are exactly the lines accepted since we last looked.
 That holds until the history reaches a [[history-size]] limit set in
 [[~/.inputrc]]: from then on each new line pushes the oldest out, the
-length stops growing, and this path goes quiet---again losing
-statements rather than inventing them.
+length stops growing, and this path goes quiet---losing statements
+rather than inventing them.
 
 <<flush the statements added since [[history_length]]>>=
 def flush():
     nonlocal history_length
-    if history_length is None:
-        return
     try:
         current = readline_module.get_current_history_length()
     except Exception:
@@ -2440,8 +2535,6 @@ reply itself.
 <<skip a nested [[input()]] reply in the history>>=
 def skip_input(line):
     nonlocal history_length
-    if history_length is None:
-        return
     try:
         current = readline_module.get_current_history_length()
     except Exception:
@@ -2464,40 +2557,35 @@ def skip_input(line):
     flush()
 @
 
-[[readline]] has one startup-hook slot and no way to read it, so we
-cannot chain to a hook someone else set; none is set by default.
-A student's [[PYTHONSTARTUP]] that sets its own replaces ours, and then
-nothing arms and nothing is logged.
-That is the failure we want: missing statements are visible in the log,
-while falling back to an install-time baseline would leak the history
-file.
-For the same reason a backend without [[set_startup_hook]] gets no
-helpers at all.
-The hook runs inside [[readline]]'s C callback, where an exception
-could only be printed over the student's prompt, so it swallows its
-own failures.
+The wrapper must behave exactly like the function it replaces, since
+the caller may be the student's code: same arguments, same result, and
+the same exception when the file is missing, which [[site]] expects and
+catches.
+Moving the baseline is therefore done in a [[finally]], so a partly read
+file is stepped over too.
+A backend without the function has nothing to wrap, and [[restore]]
+then has nothing to put back.
 
-<<arm, and later flush, at every readline prompt>>=
-def on_prompt():
+<<step over history loaded from a file>>=
+original_read = getattr(readline_module, "read_history_file", None)
+
+def read_history_file(*args, **kwargs):
     nonlocal history_length
+    flush()
     try:
-        if history_length is None:
+        return original_read(*args, **kwargs)
+    finally:
+        try:
             history_length = readline_module.get_current_history_length()
-        else:
-            flush()
-    except Exception:
-        pass
+        except Exception:
+            pass
 
 def restore():
-    try:
-        readline_module.set_startup_hook()
-    except Exception:
-        pass
+    if original_read is not None:
+        readline_module.read_history_file = original_read
 
-try:
-    readline_module.set_startup_hook(on_prompt)
-except Exception:
-    return None, None, None
+if original_read is not None:
+    readline_module.read_history_file = read_history_file
 @
 
 The other flushes are triggered from the places where Python hands
@@ -2542,15 +2630,20 @@ class ReplAwareStreamCapture(StreamCapture):
         return super().write(text)
 @
 
-The installer puts both hooks in place, each only if its module
-imports, and hands back one [[restore]] that undoes whichever were
-installed.
-Where neither is present we do nothing special here: the ordinary
-[[builtins.input]] wrapper still covers [[input()]] calls, including
-those made from REPL code, but top-level statements go unrecorded.
-Either way the result is what the frontend that runs can offer: inline
-statement logging under pyrepl, and statements at the next prompt or
-visible effect under the classic REPL.
+The installer puts a hook in place for each frontend it can reach and
+hands back one [[restore]] that undoes whichever were installed.
+For the classic REPL that is the audit hook where the interpreter
+registers the source, and the [[readline]] history otherwise---never
+both, since on an interpreter that has both they would log every
+statement twice.
+Where nothing is reachable (a pre-3.13 classic REPL on Windows, say)
+we do nothing special here: the ordinary [[builtins.input]] wrapper
+still covers [[input()]] calls, including those made from REPL code,
+but top-level statements go unrecorded.
+Otherwise the result is what the frontend that runs can offer:
+statements logged as they are run under pyrepl and under a 3.13+
+classic REPL, and at the next visible effect under an older
+one.
 
 <<functions>>=
 def _install_repl_capture(
@@ -2565,7 +2658,7 @@ def _install_repl_capture(
         return None, None, None
     restorers = []
     <<hook the pyrepl frontend, if present>>
-    <<hook the classic frontend, if [[readline]] is present>>
+    <<hook the classic frontend>>
 
     def restore():
         for undo in reversed(restorers):
@@ -2608,12 +2701,23 @@ if pyrepl_readline is not None and simple_interact is not None:
     restorers.append(restore_pyrepl)
 @
 
+The audit route is chosen by the presence of the source registry it
+reads, the one thing it cannot work without.
+
+<<hook the classic frontend>>=
+flush = skip_input = None
+source_lines = getattr(linecache, "_getlines_from_code", None)
+if source_lines is not None:
+    restorers.append(_install_audit_repl_capture(iolog, source_lines))
+else:
+    <<hook the classic frontend through [[readline]], if present>>
+@
+
 Importing [[readline]] here, even when pyrepl will run, changes
 nothing the student can see: [[site]]'s interactive hook imports it for
 every interactive session anyway.
 
-<<hook the classic frontend, if [[readline]] is present>>=
-flush = skip_input = None
+<<hook the classic frontend through [[readline]], if present>>=
 if readline_module is None:
     try:
         import readline as readline_module
@@ -4530,11 +4634,11 @@ def test_log_repl_statement_formats_multiline_input():
 
 
 class FakeReadline:
-    """A GNU readline stand-in: a history and one startup-hook slot."""
+    """A readline stand-in: a history, and a history file to load."""
 
-    def __init__(self, history=()):
+    def __init__(self, history=(), history_file=()):
         self.history = list(history)
-        self.startup_hook = None
+        self.history_file = list(history_file)
 
     def get_current_history_length(self):
         return len(self.history)
@@ -4542,17 +4646,16 @@ class FakeReadline:
     def get_history_item(self, index):
         return self.history[index - 1]
 
-    def set_startup_hook(self, function=None):
-        self.startup_hook = function
-
-    def prompt(self):
-        """Draw a prompt, as readline does before each line it reads."""
-        if self.startup_hook is not None:
-            self.startup_hook()
+    def read_history_file(self, filename=None):
+        if not self.history_file:
+            raise FileNotFoundError(filename)
+        self.history.extend(self.history_file)
 
 
-def test_install_repl_capture_logs_inline_repl_events():
+def test_install_repl_capture_logs_inline_repl_events(monkeypatch):
     import learnlog
+
+    monkeypatch.delattr(linecache, "_getlines_from_code", raising=False)
 
     class FakePyreplWrapper:
         def input(self, prompt=""):
@@ -4567,6 +4670,7 @@ def test_install_repl_capture_logs_inline_repl_events():
     simple_interact = FakeSimpleInteract()
     simple_interact.multiline_input = lambda more_lines, ps1, ps2: "2+2"
     readline = FakeReadline()
+    original_read = readline.read_history_file
 
     log = learnlog.IOLog()
     restore, flush, skip_input = learnlog._install_repl_capture(
@@ -4578,12 +4682,12 @@ def test_install_repl_capture_logs_inline_repl_events():
     )
 
     assert restore is not None
-    assert readline.startup_hook is not None
+    assert readline.read_history_file != original_read
     assert simple_interact.multiline_input(None, ">>> ", "... ") == "2+2"
     assert FakePyreplReadline._wrapper.input("prompt") == "typed"
 
     restore()
-    assert readline.startup_hook is None
+    assert readline.read_history_file == original_read
     assert simple_interact.multiline_input(None, ">>> ", "... ") == "2+2"
     assert FakePyreplReadline._wrapper.input("prompt") == "typed"
 
@@ -4593,27 +4697,108 @@ def test_install_repl_capture_logs_inline_repl_events():
     )
 @
 
-Under pyrepl the classic hooks are installed as well, but they must
-stay silent: pyrepl never draws a [[readline]] prompt, so they never
-arm, whatever lands in the history.
+Which classic hook goes in beside pyrepl's depends on the interpreter.
+Where the source registry exists, it is the audit hook and only that:
+installing the [[readline]] path too would log each classic statement
+twice.
+The tests replace [[sys.addaudithook]], because a real audit hook
+could never be taken out of the test process again.
 
 <<test functions>>=
-def test_readline_capture_stays_silent_without_a_prompt():
+def test_install_repl_capture_prefers_the_audit_hook(monkeypatch):
     import learnlog
 
+    hooks = []
+    monkeypatch.setattr(sys, "addaudithook", hooks.append)
+    monkeypatch.setattr(
+        linecache, "_getlines_from_code",
+        lambda code: ["x = 5\n"], raising=False,
+    )
     readline = FakeReadline()
     log = learnlog.IOLog()
-    flush, skip_input, restore = learnlog._install_readline_repl_capture(
-        log, readline,
+    restore, flush, skip_input = learnlog._install_repl_capture(
+        "<repl>", log,
+        pyrepl_readline=None, simple_interact=None,
+        readline_module=readline,
     )
 
-    readline.history.extend(["2+2", "typed"])
-    flush()
-    skip_input("typed")
+    assert len(hooks) == 1
+    assert "read_history_file" not in vars(readline)
+    assert (flush, skip_input) == (None, None)
+    hooks[0]("exec", (types.SimpleNamespace(co_filename="<stdin-0>"),))
+    restore()
+    hooks[0]("exec", (types.SimpleNamespace(co_filename="<stdin-1>"),))
+    assert log.getvalue() == "stdin: >>> x = 5\n"
+@
+
+The audit hook itself must pick out the classic REPL's statements and
+nothing else, and must never raise into the statement it is watching.
+
+<<test functions>>=
+@pytest.mark.parametrize("filename,expected", [
+    ("<stdin-0>", True),
+    ("<stdin-12>", True),
+    ("<stdin>", False),
+    ("<stdin-x>", False),
+    ("<python-input-0>", False),
+    ("<string>", False),
+    ("/home/x/stdin-0.py", False),
+])
+def test_is_classic_repl_statement(filename, expected):
+    import learnlog
+    assert learnlog._is_classic_repl_statement(filename) is expected
+
+
+def test_audit_repl_capture_logs_only_classic_statements(monkeypatch):
+    import learnlog
+
+    hooks = []
+    monkeypatch.setattr(sys, "addaudithook", hooks.append)
+    sources = {
+        "<stdin-0>": ["for i in range(2):\n", "    print(i)\n", "\n"],
+        "<python-input-0>": ["2+2\n"],
+        "<string>": ["y = 1\n"],
+    }
+    log = learnlog.IOLog()
+    learnlog._install_audit_repl_capture(
+        log, lambda code: sources[code.co_filename],
+    )
+    hook, = hooks
+
+    hook("open", ("<stdin-0>", "r", 0))
+    for name in ("<python-input-0>", "<string>", "<stdin-0>"):
+        hook("exec", (types.SimpleNamespace(co_filename=name),))
+
+    assert log.getvalue() == (
+        "stdin: >>> for i in range(2):\n"
+        "stdin: ...     print(i)\n"
+        "stdin: ... \n"
+    )
+
+
+def test_audit_repl_capture_never_raises_into_the_statement(
+    monkeypatch,
+):
+    import learnlog
+
+    hooks = []
+    monkeypatch.setattr(sys, "addaudithook", hooks.append)
+
+    def broken(code):
+        raise RuntimeError("registry changed")
+
+    log = learnlog.IOLog()
+    learnlog._install_audit_repl_capture(log, broken)
+    hooks[0]("exec", (types.SimpleNamespace(co_filename="<stdin-0>"),))
+    hooks[0]("exec", (object(),))
 
     assert log.getvalue() == ""
+@
 
+Where no frontend can be reached, the installer hands back nothing at
+all.
 
+<<test functions>>=
 def test_install_repl_capture_returns_no_hooks_without_support(
     monkeypatch,
 ):
@@ -4628,6 +4813,7 @@ def test_install_repl_capture_returns_no_hooks_without_support(
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.delattr(linecache, "_getlines_from_code", raising=False)
 
     log = learnlog.IOLog()
     assert learnlog._install_repl_capture(
@@ -4639,9 +4825,9 @@ def test_install_repl_capture_returns_no_hooks_without_support(
     ) == (None, None, None)
 @
 
-The classic path proper: once the first prompt has set the baseline,
-accepted statements are logged in the REPL's format, multi-line ones
-with continuation prompts.
+The history path proper: accepted statements are logged in the REPL's
+format, multi-line ones with continuation prompts, and what was in the
+history before the capture started is not.
 
 <<test functions>>=
 def test_install_readline_repl_capture_logs_history_entries():
@@ -4656,7 +4842,6 @@ def test_install_readline_repl_capture_logs_history_entries():
     assert flush is not None
     assert skip_input is not None
 
-    readline.prompt()
     readline.history.extend([
         "2+2",
         "for i in range(2):\n    print(i)",
@@ -4670,64 +4855,55 @@ def test_install_readline_repl_capture_logs_history_entries():
     )
 @
 
-The case that motivated the prompt baseline: the history file is
-loaded after the capture is installed but before the first prompt, and
-something is printed in between (the [[PYTHONSTARTUP]] banner).
-None of those lines may reach the log; only what is typed at the
-prompts does.
+The case that motivated the wrapper: [[site]] loads the history file
+after the capture is installed, and something may be printed before
+that (the [[PYTHONSTARTUP]] banner).
+None of the file's lines may reach the log.
+Statements typed before a load---a student loading a history file
+mid-session---must still be logged, and they are, because the wrapper
+flushes first.
 
 <<test functions>>=
-def test_readline_capture_ignores_history_loaded_before_first_prompt():
+def test_readline_capture_steps_over_a_loaded_history_file():
     import learnlog
 
-    readline = FakeReadline()
+    readline = FakeReadline(
+        history_file=["secret = 'old session'", "old2"],
+    )
     log = learnlog.IOLog()
     flush, skip_input, restore = learnlog._install_readline_repl_capture(
         log, readline,
     )
 
     flush()
-    readline.history.extend(["secret = 'old session'", "old2"])
-    readline.prompt()
+    readline.read_history_file("~/.python_history")
     readline.history.append("-3")
     flush()
+    readline.history.append("x = 5")
+    readline.read_history_file()
+    flush()
 
-    assert log.getvalue() == "stdin: >>> -3\n"
+    assert log.getvalue() == "stdin: >>> -3\nstdin: >>> x = 5\n"
 @
 
-A silent statement produces no output to flush on, so the next prompt
-logs it.
-Restoring removes our startup hook again.
+The wrapper stands in for a function [[site]] calls inside
+[[try]]/[[except OSError]], so a missing file must still raise, and
+restoring must hand back the original.
 
 <<test functions>>=
-def test_readline_capture_logs_silent_statement_at_next_prompt():
+def test_readline_capture_keeps_read_history_file_transparent():
     import learnlog
 
     readline = FakeReadline()
-    log = learnlog.IOLog()
+    original_read = readline.read_history_file
     flush, skip_input, restore = learnlog._install_readline_repl_capture(
-        log, readline,
+        learnlog.IOLog(), readline,
     )
 
-    readline.prompt()
-    readline.history.append("x = 5")
-    readline.prompt()
-
-    assert log.getvalue() == "stdin: >>> x = 5\n"
+    with pytest.raises(FileNotFoundError):
+        readline.read_history_file("missing")
     restore()
-    assert readline.startup_hook is None
-
-
-def test_readline_capture_needs_a_startup_hook():
-    import learnlog
-
-    class HooklessReadline:
-        def get_current_history_length(self):
-            return 0
-
-    assert learnlog._install_readline_repl_capture(
-        learnlog.IOLog(), HooklessReadline(),
-    ) == (None, None, None)
+    assert readline.read_history_file == original_read
 
 
 def test_readline_repl_capture_skips_nested_input_history():
@@ -4739,7 +4915,6 @@ def test_readline_repl_capture_skips_nested_input_history():
         log, readline,
     )
 
-    readline.prompt()
     readline.history.extend(["value = input()", "typed"])
     skip_input("typed")
 
@@ -7510,25 +7685,54 @@ def test_autostart_captures_repl_history_and_traceback(tmp_path):
 
 The third smoke test reproduces a VS Code terminal, where
 [[PYTHON_BASIC_REPL=1]] selects the classic REPL.
-[[PYTHON_HISTORY]] points the history file at one holding lines from
-an \enquote{earlier session}; they are loaded just before the first
-prompt and must not appear in the log, while every statement typed
-here must, the silent [[x = 5]] included.
+[[HOME]] points at a directory whose [[.python_history]] holds lines
+from an \enquote{earlier session} ([[PYTHON_HISTORY]], which would be
+more direct, is only read from 3.13 on).
+The file starts with libedit's header line, which GNU [[readline]]
+simply loads as one more entry, so both backends read the sentinels.
+They are loaded just before the first prompt and must not appear in
+the log, while every statement typed here must, the silent [[x = 5]]
+included.
 The [[input()]] reply must appear exactly once, although it lands in
 the [[readline]] history too.
+
+The test runs twice, the second time with [[readline]] made
+unimportable by a [[readline.py]] on [[PYTHONPATH]] that raises
+[[ImportError]].
+That is the classic REPL as Windows runs it, reading the console
+without a line editor, which a pty on Linux can otherwise not show:
+on 3.13 and later it must be recorded just the same, while an older
+interpreter has nothing left to record the statements from.
 
 <<autostart test functions>>=
 @pytest.mark.skipif(
     sys.platform == "win32", reason="pty is unavailable on Windows"
 )
-def test_autostart_captures_basic_repl_statements(tmp_path):
+@pytest.mark.parametrize(
+    "without_readline", [False, True],
+    ids=["readline", "no-readline"],
+)
+def test_autostart_captures_basic_repl_statements(
+    tmp_path, without_readline,
+):
+    if without_readline and sys.version_info < (3, 13):
+        pytest.skip("before 3.13 only readline can see the statements")
     project, venv_dir = _prepare_autostart_project(tmp_path)
-    history_file = tmp_path / "python_history"
-    history_file.write_text("earlier_session_1\nearlier_session_2\n")
+    (tmp_path / ".python_history").write_text(
+        "_HiStOrY_V2_\nearlier_session_1\nearlier_session_2\n"
+    )
     env = _autostart_env()
     env["PYTHON_BASIC_REPL"] = "1"
-    env["PYTHON_HISTORY"] = str(history_file)
+    env["HOME"] = str(tmp_path)
+    env.pop("PYTHON_HISTORY", None)
     env.pop("PYTHONSTARTUP", None)
+    if without_readline:
+        blocker = tmp_path / "no-readline"
+        blocker.mkdir()
+        (blocker / "readline.py").write_text(
+            "raise ImportError('no readline here')\n"
+        )
+        env["PYTHONPATH"] = str(blocker)
     returncode, _ = _run_in_pty(
         [str(_venv_binary(venv_dir, "python"))],
         cwd=project,
