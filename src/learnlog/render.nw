@@ -1254,6 +1254,7 @@ def _session_lines(run):
 @
 
 \subsection{The way back}
+\label{sec:way-back}
 
 Each card ends with the command that restores this version.
 [[learnlog checkout]] is the one thing in the tool a student reaches
@@ -1263,16 +1264,164 @@ reader who has to go and find out how to say it usually does not
 The short hash is Git's own seven digits, which is what the rest of
 learnlog prints and enough to be unique in a lab-sized log.
 
+That command is only right for the student's own log, and not every
+card comes from one.
+[[learnlog play -f livekod.learnlog]] shows a lecture's recording, and
+its cards used to end with the same hint as the student's own:
+\enquote{To go back to this version: learnlog checkout 9fb28a2}.
+The hash [[9fb28a2]] exists only in the lecture's log.
+A novice who typed it, as the card invited, ran a checkout against
+their \emph{own} log, which refused a hash it had never seen---or,
+had a prefix happened to match one of the student's records, restored
+the wrong files.
+What works for another log is
+[[learnlog checkout -f livekod.learnlog 9fb28a2]]
+(\cref{sec:checkout-from}), and it does something different: it copies
+the run's files into a folder named after the source, [[livekod/]],
+rather than replacing the student's files.
+So the card says both, the command and where the files will land,
+because a student who expects their own files to change and finds a
+new folder instead has been told something false by omission.
+
+Which log is being played is not something this module can find out:
+it takes no repository, by design (\cref{render}).
+The caller says it, in an [[OtherLog]] of three plain values: the
+source spelt the way the student would type it after [[-f]], the
+folder [[checkout --from]] would copy into, and whether the log's
+hashes survive being read again.
+The command computes all three (\cref{sec:play-other-log}), including
+the folder, whose rule belongs to [[checkout --from]]; a second copy
+of that rule here would be free to drift from the one the command
+actually follows.
+One value rather than three keyword arguments, because it has to pass
+through both playback media on its way here (\cref{viewer}), and one
+name is one thing to thread.
+[[None]] means the student's own log and keeps the hint every earlier
+card has had.
+
+<<render types>>=
+OtherLog = collections.namedtuple(
+    "OtherLog", ["source", "folder", "stable"], defaults=(True,),
+)
+@
+
+Two of the values can say that no command would work, and then the
+card has no hint rather than one that fails.
+[[folder]] is [[None]] when the student has no project of their own:
+a teacher playing a submission in their downloads folder has nowhere
+for [[checkout]] to copy to.
+[[stable]] is false for a ProgSnap2 archive.
+An archive is not a Git repository; [[play]] and [[checkout]] each
+rebuild one from it when they read it (\cref{sec:reconstruct}), and the
+rebuilt commits carry the time of that read as their dates, so the same
+archive read twice gives every record a new hash.
+A hash on the card is gone by the time [[checkout -f]] reads the
+archive again.
+A tag survives, since the rebuild recreates tags by name, so a tagged
+record's hint names its tag and an untagged one goes without.
+
 <<render functions>>=
-def _checkout_hint(commit):
-    """The command that brings this version back."""
+def _checkout_hint(commit, tags=(), other_log=None):
+    """The command that brings this version back, as card lines."""
     short = commit.get("hash", "")[:SHORT_HASH_LEN]
-    if not short:
+    if other_log is None:
+        if not short:
+            return []
+        return [StyledLine(
+            f"To go back to this version: learnlog checkout {short}",
+            KIND_META,
+        )]
+    ref = short if other_log.stable else next(iter(tags), "")
+    if not ref or other_log.folder is None:
         return []
-    return [StyledLine(
-        f"To go back to this version: learnlog checkout {short}",
-        KIND_META,
-    )]
+    return [
+        StyledLine(
+            f"To copy this version into {other_log.folder}/:",
+            KIND_META,
+        ),
+        StyledLine(
+            f"{FILE_INDENT}learnlog checkout -f "
+            f"{shell_word(other_log.source)} {shell_word(ref)}",
+            KIND_META,
+        ),
+    ]
+@
+
+The copy is said on two lines where the own checkout takes one.
+It names a source and a folder besides the hash, and on one line it
+runs past eighty columns for a name as short as
+[[livekod.learnlog]]; the viewer cuts every line at the window's
+edge (\cref{viewer}), and what it would cut is the hash, the one word
+the command cannot do without.
+On a line of its own the command also starts where the student's
+selection starts, with nothing to trim before pasting it.
+
+The source is the one word in the hint the student did not choose
+from what the card shows, and a lecture saved as
+[[föreläsning 3.learnlog]] must still come out as a command that works
+when pasted.
+[[shlex.quote]] is the standard answer and the wrong one here: it
+quotes everything outside ASCII, so [[föreläsning.learnlog]] would
+arrive in single quotes it does not need, and single quotes are no
+quotes at all to Windows' [[cmd]].
+Letters of any script are word characters to bash, zsh, PowerShell
+and [[cmd]] alike, so a word of letters, digits and path punctuation
+stays bare.
+A word with a space gets double quotes, which all four shells read as
+quotes, provided nothing inside is special between them: [[$]] and
+the backtick are special there to both bash and PowerShell, and [[!]]
+and a backslash to bash.
+The backslash is the platform's separator on Windows, where no shell
+gives it a meaning, so there it counts as path punctuation instead.
+Anything else falls back to [[shlex.quote]], which is right for the
+POSIX shells; a source that needs it is rare enough that the
+fallback does not have to be right everywhere.
+
+<<render imports>>=
+import shlex
+<<render constants>>=
+WORD_PUNCTUATION = "_.-/:" + ("\\" if os.name == "nt" else "")
+DOUBLE_QUOTE_SPECIAL = "$`\"!" + ("" if os.name == "nt" else "\\")
+<<render functions>>=
+def shell_word(text):
+    """`text` as one word a student can paste into their shell."""
+    if text and all(
+        char.isalnum() or char in WORD_PUNCTUATION for char in text
+    ):
+        return text
+    if not any(char in DOUBLE_QUOTE_SPECIAL for char in text):
+        return f'"{text}"'
+    return shlex.quote(text)
+@
+
+Let's verify each way of spelling a source: a plain name and a Swedish
+one stay bare, a space earns double quotes that a POSIX shell splits
+back into the one word, and a dollar sign falls back to single quotes
+that keep it from expanding:
+
+<<render test functions>>=
+def test_shell_word_quotes_only_what_needs_it():
+  import shlex
+  assert shell_word("livekod.learnlog") == "livekod.learnlog"
+  assert shell_word("föreläsning.learnlog") == "föreläsning.learnlog"
+  assert shell_word("../lectures/l3.learnlog") == \
+      "../lectures/l3.learnlog"
+  spaced = shell_word("föreläsning 3.learnlog")
+  assert spaced == '"föreläsning 3.learnlog"'
+  assert shlex.split(spaced) == ["föreläsning 3.learnlog"]
+  dollar = shell_word("$HOME.learnlog")
+  assert shlex.split(dollar) == ["$HOME.learnlog"]
+  assert dollar.startswith("'")
+  assert shlex.split(shell_word("")) == [""]
+
+def test_shell_word_keeps_windows_paths_bare(monkeypatch):
+  import learnlog.render as render
+  monkeypatch.setattr(render, "WORD_PUNCTUATION", "_.-/:\\")
+  monkeypatch.setattr(render, "DOUBLE_QUOTE_SPECIAL", "$`\"!")
+  assert render.shell_word("C:\\kurs\\livekod.learnlog") == \
+      "C:\\kurs\\livekod.learnlog"
+  assert render.shell_word("C:\\kurs\\föreläsning 3.learnlog") == \
+      '"C:\\kurs\\föreläsning 3.learnlog"'
 @
 
 \subsection{Assembling the card}
@@ -1293,7 +1442,7 @@ changes no fetch.
 
 <<render functions>>=
 def record_lines(commit, detail, *, index, total, elapsed=None,
-                 tags=(), raw=False):
+                 tags=(), raw=False, other_log=None):
     """Render one record as a list of styled lines.
 
     ``commit`` is an entry from ``get_commits`` and ``detail``
@@ -1302,7 +1451,10 @@ def record_lines(commit, detail, *, index, total, elapsed=None,
     position among ``total`` records, ``elapsed`` the seconds
     since the previous student run, and ``tags`` the tag names
     on this commit.  With ``raw`` true the same text comes back
-    unchanged but coloured, instead of a card.
+    unchanged but coloured, instead of a card.  ``other_log`` is
+    an `OtherLog` when the record is not from the student's own
+    log, and changes the closing hint to the command that copies
+    the version in.
     """
     if raw:
         return raw_lines(detail)
@@ -1382,7 +1534,7 @@ Every card ends the same way, whatever it described, so the hint is
 appended after the branches rather than inside each of them.
 
 <<close the card with the way back>>=
-hint = _checkout_hint(commit)
+hint = _checkout_hint(commit, tags, other_log)
 if hint:
     lines.append(BLANK_LINE)
     lines.extend(hint)
@@ -1670,6 +1822,47 @@ def test_record_lines_of_a_checkout():
   )
   assert "Result:" not in text
   assert "  hello.py" in text
+@
+
+The way back (\cref{sec:way-back}) has four shapes, and each is
+checked on a whole card: the student's own log keeps the
+plain checkout; another log gets the copy, with the source as given and
+the folder named; an archive's record gets its tag or nothing; and no
+project of one's own means no hint at all.
+
+<<render test functions>>=
+def hint_of(**options):
+  """The card's lines from its last `To ...` line on, or None."""
+  text = styled_text(record_lines(
+    a_commit(), a_detail(CRASHED_RUN, A_DIFF),
+    index=0, total=1, **options,
+  ))
+  start = text.rfind("\nTo ")
+  return text[start + 1:] if start >= 0 else None
+
+def test_checkout_hint_for_the_own_log():
+  assert hint_of() == \
+      "To go back to this version: learnlog checkout 309a26b"
+
+def test_checkout_hint_for_another_log():
+  assert hint_of(other_log=OtherLog("livekod.learnlog", "livekod")) \
+      == "To copy this version into livekod/:\n" \
+         "  learnlog checkout -f livekod.learnlog 309a26b"
+  spaced = hint_of(other_log=OtherLog(
+    "föreläsning 3.learnlog", "föreläsning 3",
+  ))
+  assert spaced == "To copy this version into föreläsning 3/:\n" \
+      '  learnlog checkout -f "föreläsning 3.learnlog" 309a26b'
+
+def test_checkout_hint_for_an_archive_names_a_tag():
+  archive = OtherLog("lab.progsnap2", "lab", stable=False)
+  assert hint_of(other_log=archive, tags=("lab1",)) == \
+      "To copy this version into lab/:\n" \
+      "  learnlog checkout -f lab.progsnap2 lab1"
+  assert hint_of(other_log=archive) is None
+
+def test_checkout_hint_needs_a_project_to_copy_into():
+  assert hint_of(other_log=OtherLog("livekod.learnlog", None)) is None
 @
 
 Finally, a card built from a record this test wrote into a real
