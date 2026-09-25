@@ -2664,6 +2664,69 @@ app = typer.Typer(
 @
 
 
+\subsection{Running the CLI as a module}
+\label{sec:module-entry}
+
+[[python -m learnlog]] is the spelling that works when the venv's
+[[Scripts/]] or [[bin/]] is not on [[PATH]]---an unactivated Windows
+venv, typically---and the one students already know from
+[[python -m pip]].
+Without an entry point neither spelling worked:
+[[python -m learnlog]] stopped with \enquote{No module named
+learnlog.\_\_main\_\_}, and [[python -m learnlog.cli]] exited with
+status 0 having done nothing.
+Either way the autostart hook had already written the run's header,
+so the failure was recorded as one of the student's own runs.
+The recorder now recognises both spellings as the CLI
+(\cref{sec:veto}), so the veto and the review classification hold
+whichever way the command is typed, and the package gets the
+[[__main__.py]] that makes the first spelling run.
+
+Passing [[prog_name]] keeps the usage text saying [[learnlog]]
+however the command was started: Click would otherwise print
+[[python -m learnlog]] or [[python -m learnlog.cli]], and the help a
+student reads should name the command the tutorials teach.
+
+<<[[__main__.py]]>>=
+"""Run the learnlog CLI as `python -m learnlog`."""
+from learnlog.cli import PROG_NAME, app
+
+app(prog_name=PROG_NAME)
+<<constants>>=
+PROG_NAME = "learnlog"
+@
+
+[[python -m learnlog.cli]] needs one more step.
+[[runpy]] runs this file under the name [[__main__]], which is a
+second copy of the module beside the [[learnlog.cli]] that the rest of
+the package imports (the ProgSnap2 exporter imports it lazily, for
+one).
+Running the canonical module's [[app]] keeps a single set of
+definitions in play.
+
+<<typer app>>=
+if __name__ == "__main__":
+    from learnlog.cli import app as canonical_app
+
+    canonical_app(prog_name=PROG_NAME)
+@
+
+Both spellings are checked in a subprocess, since running a module is
+exactly what [[CliRunner]] skips.
+
+<<test functions>>=
+@pytest.mark.parametrize("module", ["learnlog", "learnlog.cli"])
+def test_the_cli_runs_as_a_module(module):
+    result = subprocess.run(
+        [sys.executable, "-m", module, "--help"],
+        capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, LEARNLOG_SKIP_AUTOSTART="1"),
+    )
+    assert result.returncode == 0
+    assert "Usage: learnlog" in result.stdout
+@
+
+
 \subsection{The [[tutorial]] command}
 \label{sec:tutorial}
 

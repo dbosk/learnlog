@@ -910,8 +910,10 @@ versions run [[python -m pip]] instead, because that launcher was the
 file [[init]] tripped over on a Windows venv shared with WSL
 (\cref{sec:setup-pip-in-venv}), and the recorder writes such a run as
 [[<python -m> pip install learnlog]].  The [[<python -m>]] marker is
-stripped before the installer check and nowhere else, so a
-[[python -m learnlog play]] keeps whatever status it has today.
+stripped before the installer check and nowhere else.  A
+[[python -m learnlog play]] does not need it: the recorder writes that
+run as [[learnlog play]], like the console script (\cref{sec:veto}),
+so it is recognised by the first rule.
 
 <<commits functions>>=
 def is_learnlog_command(command):

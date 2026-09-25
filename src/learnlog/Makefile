@@ -8,7 +8,7 @@ MODULES+=	render.py render.tex
 MODULES+=	progsnap2.py progsnap2.tex
 MODULES+=	metrics.py metrics.tex
 MODULES+=	viewer.py viewer.tex
-MODULES+=	cli.py cli.tex
+MODULES+=	cli.py cli.tex __main__.py
 # The tutorial catalog has its own Makefile in tutorials/, so that the
 # doc build can recurse into that directory for a missing weave; all,
 # clean and distclean recurse into it from here.
@@ -35,6 +35,9 @@ progsnap2.py: progsnap2.nw
 metrics.py: metrics.nw
 viewer.py: viewer.nw
 cli.py: cli.nw
+
+__main__.py: cli.nw
+	${NOTANGLE.py}
 
 
 .PHONY: clean
