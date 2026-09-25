@@ -9536,10 +9536,12 @@ def play(
 
     if start and resume:
         raise SystemExit(START_OR_CONTINUE_NOTE)
+    typed_source = source
     if resume:
         <<find the playback to continue>>
     repo, tmpdir = resolve_source(source)
     try:
+        other_log = played_log(repo, typed_source, find_learnlog_dir())
         commits = get_commits(repo)
         if not commits:
             raise SystemExit("No commits found.")
@@ -9577,14 +9579,14 @@ if use_batch:
         start_index = 0
     play_batch(repo, records, start_index, show_all,
                trailers=scan.trailers, tag_map=tag_map,
-               raw=raw, color=color)
+               raw=raw, color=color, other_log=other_log)
 else:
     if start_index is None:
         start_index = len(records) - 1
     viewer = PlaybackViewer(
         repo, records, start_index, show_all,
         trailers=scan.trailers, tag_map=tag_map,
-        raw=raw, color=color,
+        raw=raw, color=color, other_log=other_log,
     )
     viewer.run()
 @
@@ -10088,6 +10090,8 @@ it refers to.
 The source handed on is the resolved path, since the recorded words
 were relative to where they were typed, and the name shown is that
 path relative to here, the way the student would type it now.
+The cards need the same kind of spelling for their closing command,
+and get theirs from [[typable_path]] (\cref{sec:play-other-log}).
 
 <<find the playback to continue>>=
 own = find_learnlog_dir()
@@ -10121,6 +10125,7 @@ if source is None:
                 "playing, is not here any more."
             )
         source = str(played)
+        typed_source = typable_path(played)
         typer.echo(
             f"Continuing {shown} where you left off.", err=True,
         )
@@ -10433,6 +10438,261 @@ def test_play_continue_resolves_the_source_from_its_directory(
     assert result.exit_code == 0, result.output
     shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
     assert shown[0] == first
+@
+
+\paragraph{Whose log is on the cards.}
+\label{sec:play-other-log}
+
+Every card closes with the command that brings its version back
+(\cref{sec:way-back}), and which command that is depends on whose log
+is being played.
+For the student's own it is [[learnlog checkout <hash>]]; for a
+lecture played with [[-f livekod.learnlog]] it is
+[[learnlog checkout -f livekod.learnlog <hash>]], which copies the
+version into [[livekod/]] (\cref{sec:checkout-from}).
+Before this distinction existed, every card said the first, and a
+student following a lecture's card ran a checkout of a hash their own
+log had never held.
+[[render]] has no way to tell the two apart, so [[play]] says which in
+an [[OtherLog]], and everything in it is decided here, where the
+source, the student's project and the rules of [[checkout]] are all
+known.
+
+<<imports>>=
+from learnlog.render import OtherLog
+@
+
+The log played is the student's own when it \emph{is} their project:
+[[-f .]] from the root, or any other path to the same directory, is
+still the own log, and its cards keep the plain hint, which is the
+shorter command and the one that restores in place.
+Comparing the resolved repository directory with the project's
+catches every spelling of that at once; a bundle or a ProgSnap2
+archive is read from a temporary directory and never compares equal,
+even when it was exported from this very project, which costs nothing
+since the copy command works for it too.
+
+The folder is [[default_output]] of the source, the same call
+[[checkout --from]] makes when no [[-o]] is given, so the card cannot
+promise a folder the command then does not use.
+It is relative to the current directory, where [[checkout]] resolves
+it, and that is also where the student will type the command.
+With no project of the student's own there is no folder, and the card
+drops the hint: [[checkout]] would refuse to run at all.
+
+The hash is stable unless the source is a ProgSnap2 archive, which
+[[resolve_source]] recognises the same way, with
+[[zipfile.is_zipfile]]: an archive is rebuilt with fresh commit dates
+on every read (\cref{sec:reconstruct}), so its hashes are new each
+time and only its tags carry over.
+
+<<helper functions>>=
+def played_log(repo, typed, own):
+    """The `OtherLog` for a playback of `repo`, or `None` if it is own.
+
+    `typed` is the source as the student would type it here, `None`
+    when no source was given; `own` is the student's project
+    directory, or `None` when there is none.
+    """
+    if typed is None:
+        return None
+    if own is not None and \
+            repo.workdir.resolve() == pathlib.Path(own).resolve():
+        return None
+    return OtherLog(
+        source=typed,
+        folder=None if own is None else default_output(typed),
+        stable=not zipfile.is_zipfile(pathlib.Path(typed).resolve()),
+    )
+@
+
+The source goes on the card as the student would type it from where
+they ran [[play]], because that is where they will paste the command.
+With [[-f]] that is exactly what they typed.
+With [[-c]] the source came out of an earlier playback's record
+(\cref{sec:last-viewed}), spelt relative to wherever that playback
+ran, so it is spelt again for here: relative when it lies under the
+current directory, absolute otherwise.
+An absolute path is chosen over a chain of [[..]] because it is the
+one form that cannot fail: [[os.path.relpath]] raises on Windows for a
+path on another drive, and [[../../lecture.learnlog]] is harder to
+check by eye than the path itself.
+
+<<helper functions>>=
+def typable_path(path):
+    """`path` spelt for typing here: relative below the cwd, else absolute."""
+    path = pathlib.Path(path).resolve()
+    try:
+        return str(path.relative_to(pathlib.Path.cwd().resolve()))
+    except ValueError:
+        return str(path)
+@
+
+Let's verify the three answers for one lecture bundle: played by name
+from the project, the cards name the copy with the source as typed
+and the folder; the project's own log keeps the plain checkout; and
+[[-f]] naming the project itself, relatively or absolutely, is the own
+log too.
+
+<<test functions>>=
+def test_play_names_the_way_back_for_the_log_it_plays(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    bundle, (first, second) = _lecture_bundle(tmp_path, workdir)
+    repo = LearnlogRepo(workdir)
+    repo.begin_run("hello.py", [], datetime.datetime(2026, 1, 1, 10, 0))
+    own = repo.run_commit
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["play", "-b", "-f", "lecture.learnlog"])
+    assert result.exit_code == 0, result.output
+    for run in (first, second):
+        assert "To copy this version into lecture/:\n  learnlog " \
+            f"checkout -f lecture.learnlog {run[:7]}\n" in result.output
+    assert "To go back" not in result.output
+
+    for source in ([], ["-f", "."], ["-f", str(workdir)]):
+        result = runner.invoke(app, ["play", "-b", *source])
+        assert result.exit_code == 0, result.output
+        assert "To go back to this version: learnlog checkout " \
+            f"{own[:7]}" in result.output
+        assert "checkout -f" not in result.output
+@
+
+A student who is in no project at all---a teacher reading a
+submission in their downloads folder---has nowhere to copy to, and the
+cards say nothing rather than name a command that would refuse:
+
+<<test functions>>=
+def test_play_outside_a_project_names_no_way_back(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    bundle, _ = _lecture_bundle(tmp_path, workdir)
+    elsewhere = tmp_path / "downloads"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    result = CliRunner().invoke(app, ["play", "-b", "-f", str(bundle)])
+    assert result.exit_code == 0, result.output
+    assert "You ran lecture.py" in result.output
+    assert "learnlog checkout" not in result.output
+@
+
+The source a [[-c]] brings back is respelt for where the student is
+now: the playback below was recorded in [[notes/]] as
+[[-f ../lecture.learnlog]], continued from the root it is
+[[lecture.learnlog]], and continued from inside [[notes/]], where the
+bundle is not below the current directory, it is the absolute path:
+
+<<test functions>>=
+def test_play_continue_spells_the_source_for_here(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    bundle, (first, second) = _lecture_bundle(tmp_path, workdir)
+    repo = LearnlogRepo(workdir)
+    (workdir / "notes").mkdir()
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    repo.begin_run(
+        "learnlog", ["play", "-f", "../lecture.learnlog"],
+        t, directory="notes",
+    )
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=1), exit_code=0,
+        view_trace=[(t.replace(second=1), first, "open")],
+    )
+    runner = CliRunner()
+    monkeypatch.chdir(workdir)
+    result = runner.invoke(app, ["play", "-c", "-b"])
+    assert result.exit_code == 0, result.output
+    assert f"checkout -f lecture.learnlog {first[:7]}" in result.output
+    monkeypatch.chdir(workdir / "notes")
+    result = runner.invoke(app, ["play", "-c", "-b"])
+    assert result.exit_code == 0, result.output
+    assert f"checkout -f {bundle.resolve()} {first[:7]}" \
+        in result.output
+@
+
+The hint is only worth printing if it works, so the last test pastes
+it.
+The lecture is saved under a Swedish name with a space in it, the case
+the quoting rule exists for (\cref{sec:way-back}); the command is taken
+from the card exactly as printed, split the way a POSIX shell splits
+it, and run.
+The lecture's file must then be in the folder the card named:
+
+<<test functions>>=
+def test_play_hint_for_another_log_works_when_pasted(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    name = "föreläsning 3.learnlog"
+    bundle, (first, second) = _lecture_bundle(tmp_path, workdir, name)
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["play", "-b", "-f", name])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    at = next(
+        index for index, line in enumerate(lines)
+        if "learnlog checkout" in line and first[:7] in line
+    )
+    assert lines[at - 1] == "To copy this version into föreläsning 3/:"
+    command = shlex.split(lines[at])
+    assert command[:2] == ["learnlog", "checkout"]
+    result = runner.invoke(app, command[1:])
+    assert result.exit_code == 0, result.output
+    assert (workdir / "föreläsning 3" / "lecture.py").read_text() == \
+        'print("part 0")\n'
+@
+
+A ProgSnap2 archive gives its records new hashes on every read, so the
+card of a tagged record names the tag and that of an untagged one
+names nothing---and the tag, pasted, finds the same record in the next
+rebuild:
+
+<<test functions>>=
+def test_play_hint_for_an_archive_names_its_tags(
+    workdir, tmp_path, monkeypatch,
+):
+    from learnlog.cli import app
+    from learnlog.progsnap2 import do_export_progsnap2
+    from typer.testing import CliRunner
+    lecture_dir = tmp_path / "lecturer"
+    lecture_dir.mkdir()
+    lecture = LearnlogRepo(lecture_dir)
+    t = datetime.datetime(2026, 1, 1, 9, 0)
+    for n in range(2):
+        (lecture_dir / "lecture.py").write_text(f'print("part {n}")\n')
+        lecture.begin_run("lecture.py", [], t.replace(minute=n))
+        if n == 0:
+            lecture.git("tag", "part0")
+    do_export_progsnap2(lecture, workdir / "lecture.progsnap2")
+    LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+    result = runner.invoke(app, ["play", "-b", "-f", "lecture.progsnap2"])
+    assert result.exit_code == 0, result.output
+    hints = [
+        line for line in result.output.splitlines()
+        if "learnlog checkout" in line
+    ]
+    assert hints == ["  learnlog checkout -f lecture.progsnap2 part0"]
+    assert result.output.count("To copy this version into lecture/:") \
+        == 1
+    command = shlex.split(hints[0])
+    result = runner.invoke(app, command[1:])
+    assert result.exit_code == 0, result.output
+    assert (workdir / "lecture" / "lecture.py").read_text() == \
+        'print("part 0")\n'
 @
 
 

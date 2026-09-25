@@ -166,6 +166,9 @@ FILTERED_NOTE = (
 arguments to [[_draw]] because they are properties of the session the
 student asked for, not of a redraw: every keystroke would otherwise
 have to carry them down three call levels to reach the line builder.
+[[other_log]] is one more property of that kind: whether the log being
+played is the student's own, which decides the command each card
+closes with (\cref{sec:way-back}).
 
 [[styles]] and [[page]] start at values that make sense with no
 terminal behind them.
@@ -187,12 +190,15 @@ class PlaybackViewer:
     true the records are shown in the stored log format
     instead of the reading view.  ``color`` is ``True`` or
     ``False`` to force colour on or off, ``None`` to use it
-    whenever the terminal has it.
+    whenever the terminal has it.  ``other_log`` is an
+    `OtherLog` when the records come from a log that is not
+    the student's own, ``None`` when they do.
     """
 
     def __init__(self, repo, commits, start_index=0,
                  show_all=False, trailers=None,
-                 tag_map=None, raw=False, color=None):
+                 tag_map=None, raw=False, color=None,
+                 other_log=None):
         self.repo = repo
         self.commits = commits
         self.index = start_index
@@ -202,6 +208,7 @@ class PlaybackViewer:
         self.tag_map = tag_map
         self.raw = raw
         self.color = color
+        self.other_log = other_log
         self.styles = {}
         self.page = DEFAULT_PAGE
         self._detail_cache = {}
@@ -554,6 +561,7 @@ else:
         ),
         tags=self._tags_for(commit),
         raw=self.raw,
+        other_log=self.other_log,
     )
 @
 
@@ -866,6 +874,33 @@ def test_draw_without_styles_uses_no_attributes(workdir):
     assert {attribute for _, _, _, attribute in screen.calls} == {0}
 @
 
+Whose log is on screen has to reach the card, or a lecture's records
+close with the student's own hint again.
+The viewer is given an [[OtherLog]], and its card must end with the
+command that copies the version in rather than the one that checks it
+out:
+
+<<viewer test functions>>=
+def test_draw_closes_another_log_with_its_hint(workdir):
+    """The viewer hands the played log to the card."""
+    pytest.importorskip("curses")
+    from learnlog.render import OtherLog
+    viewer = _drawable_viewer(
+        workdir, other_log=OtherLog("livekod.learnlog", "livekod"),
+    )
+    screen = FakeScreen(height=40)
+
+    viewer._draw(screen)
+
+    texts = [text for _, _, text, _ in screen.calls]
+    short = viewer.commits[viewer.index]["hash"][:7]
+    assert "To copy this version into livekod/:" in texts
+    assert f"  learnlog checkout -f livekod.learnlog {short}" in texts
+    assert not any(
+        text.startswith("To go back") for text in texts
+    )
+@
+
 The two headers are the one place the views deliberately differ, so
 each has to say what its own reader came for---the record's name in
 the reading view, the hash in the raw one:
@@ -1159,12 +1194,14 @@ would capture the real one and write past them.
 Colour is decided once per call rather than per line, since the
 question [[use_color]] answers (\cref{sec:use-color}) is about the
 destination and cannot change halfway down the log.
+[[other_log]] is handed to every card unchanged, as the viewer hands
+it: whose log this is does not change halfway down it either.
 
 <<viewer functions>>=
 def play_batch(repo, commits, start_index=0,
                show_all=False, trailers=None,
                tag_map=None, raw=False, color=None,
-               stream=None):
+               stream=None, other_log=None):
     """Print commit records sequentially to stdout.
 
     Learnlog's own runs---the reviews and the plumbing---are
@@ -1176,6 +1213,8 @@ def play_batch(repo, commits, start_index=0,
     stored log format is printed instead of the reading view.
     ``color`` forces colour on or off; ``None`` writes it only
     to a terminal.  ``stream`` defaults to ``sys.stdout``.
+    ``other_log`` is an `OtherLog` when the records come from a
+    log that is not the student's own.
 
     Every commit that is printed is reported to
     :func:`learnlog.record_view` with the action ``batch``.
@@ -1207,6 +1246,7 @@ def play_batch(repo, commits, start_index=0,
             ),
             tags=tags,
             raw=raw,
+            other_log=other_log,
         )
         for text in ansi_lines(lines, colored):
             stream.write(text)
@@ -1286,6 +1326,37 @@ def test_play_batch_raw_shows_the_stored_format(
     assert "diff --git" in captured
     assert "Run-Id:" in captured
     assert "You ran hello.py" not in captured
+@
+
+Batch mode must hand the played log to every card it prints, just as
+the viewer does, so each record of a lecture's log closes with the
+copy and none with the student's own checkout:
+
+<<viewer test functions>>=
+def test_play_batch_closes_another_log_with_its_hint(
+    workdir, capsys,
+):
+    """Every printed card names the other log's command."""
+    import datetime
+    from learnlog.viewer import play_batch
+    from learnlog.commits import get_commits
+    from learnlog.gitrepo import LearnlogRepo
+    from learnlog.render import OtherLog
+    repo = LearnlogRepo(workdir)
+    repo.begin_run(
+        "hello.py", [],
+        datetime.datetime(2026, 1, 1, 10, 0),
+    )
+    commits = get_commits(repo)
+    play_batch(
+        repo, commits,
+        other_log=OtherLog("livekod.learnlog", "livekod"),
+    )
+    out = capsys.readouterr().out
+    for commit in commits:
+        assert "learnlog checkout -f livekod.learnlog " \
+            f"{commit['hash'][:7]}" in out
+    assert "To go back to this version" not in out
 @
 
 Let's verify the tag display in both media: the [[Tags:]] line in
