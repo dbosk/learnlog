@@ -2671,17 +2671,21 @@ app = typer.Typer(
 [[Scripts/]] or [[bin/]] is not on [[PATH]]---an unactivated Windows
 venv, typically---and the one students already know from
 [[python -m pip]].
-Without an entry point, both it and [[python -m learnlog.cli]] exited
-with status 0 having done nothing, while the autostart hook recorded
-the non-event as one of the student's own runs.
+Without an entry point neither spelling worked:
+[[python -m learnlog]] stopped with \enquote{No module named
+learnlog.\_\_main\_\_}, and [[python -m learnlog.cli]] exited with
+status 0 having done nothing.
+Either way the autostart hook had already written the run's header,
+so the failure was recorded as one of the student's own runs.
 The recorder now recognises both spellings as the CLI
 (\cref{sec:veto}), so the veto and the review classification hold
 whichever way the command is typed, and the package gets the
 [[__main__.py]] that makes the first spelling run.
 
-Passing [[prog_name]] keeps the usage text saying [[learnlog]]:
-Click would otherwise name the program after [[argv[0]]], which under
-[[-m]] is the path of [[__main__.py]].
+Passing [[prog_name]] keeps the usage text saying [[learnlog]]
+however the command was started: Click would otherwise print
+[[python -m learnlog]] or [[python -m learnlog.cli]], and the help a
+student reads should name the command the tutorials teach.
 
 <<[[__main__.py]]>>=
 """Run the learnlog CLI as `python -m learnlog`."""

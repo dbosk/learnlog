@@ -2455,14 +2455,13 @@ def _wrap_pyrepl_input(original_input, iolog):
 \paragraph{The classic frontend.}
 The classic REPL gives us no Python call to wrap, but since CPython
 3.13 it announces every statement it is about to run.
-It compiles each one under a name of its own, [[<stdin-0>]],
-[[<stdin-1>]], and so on, registers the typed source under that code
-object so that a traceback can quote the line, and raises the [[exec]]
+It compiles each one under a name of its own, registers the typed
+source so that a traceback can quote the line, and raises the [[exec]]
 audit event with the code object just before running it.
-An audit hook therefore sees each statement, with its source, before
-the statement can print anything or ask for [[input()]], so the
-order in the log is the order on the screen without any deferred
-flushing.
+An audit hook therefore sees each statement that compiles, with its
+source, before the statement can print anything or ask for
+[[input()]], so the order in the log is the order on the screen
+without any deferred flushing.
 
 That this lives in the interpreter core rather than in a line editor
 is what makes it the right hook.
@@ -2475,13 +2474,63 @@ It also avoids everything that makes the history route below fragile:
 nothing is read from a history file, and no hook slot is shared with
 the student's own startup script.
 
+The details moved within the 3.13 series, and the hook has to follow
+them, since 3.13 is the version a student is likely to have.
+The statements are named [[<stdin>-0]], [[<stdin>-1]], \dots, up to
+3.13.7 and [[<stdin-0>]], [[<stdin-1>]], \dots, from 3.13.8 on.
+The source is kept by name in [[linecache]]'s ordinary cache up to
+3.13.2, and from 3.13.3 by code object, which only the private
+[[linecache._getlines_from_code]] reads.
+A first version accepted only the later name and chose this route by
+the presence of the later registry; on 3.13.3--3.13.7, which have that
+registry but the earlier name, the hook was installed, never matched,
+and recorded nothing.
+So both names are accepted, the source is looked up in both places,
+and the route is chosen by the version that introduced all of it.
+
+<<functions>>=
+def _interactive_source(code):
+    """Return the source lines the interpreter registered for `code`."""
+    by_code = getattr(linecache, "_getlines_from_code", None)
+    lines = by_code(code) if by_code is not None else []
+    return lines or linecache.getlines(code.co_filename)
+
+
+def _is_classic_repl_statement(filename):
+    """True if `filename` names a statement typed at the classic REPL."""
+    for prefix, suffix in CLASSIC_REPL_NAME_SHAPES:
+        if filename.startswith(prefix) and filename.endswith(suffix):
+            number = filename[len(prefix):len(filename) - len(suffix)]
+            if number.isdigit():
+                return True
+    return False
+<<constants>>=
+INTERACTIVE_SOURCE_VERSION = (3, 13)
+CLASSIC_REPL_NAME_SHAPES = (("<stdin>-", ""), ("<stdin-", ">"))
+@
+
 The name is what keeps the hook to the classic REPL's statements.
 The [[exec]] event is raised for other code too, and two kinds matter
 here: pyrepl runs its statements through [[exec]] as well, but names
 them [[<python-input-N>]] and is logged by its own hook, and a student
 typing [[exec("y = 1")]] runs code named [[<string>]] inside a
 statement we have already logged.
-Only a [[<stdin-N>]] name is taken.
+
+A statement that does not compile raises no [[exec]] event, because
+there is no code object to run: [[1 +]], or a [[return]] outside a
+function, goes straight to the error report.
+Those are the statements an error metric cares about most, and the
+other two routes do see them---pyrepl hands us the text before
+compiling, the history keeps whatever was typed---so this route
+catches them where the report is made.
+The REPL reports the error through [[sys.excepthook]], whose wrapper
+(\cref{sec:exceptions}) flushes pending REPL capture first and hands
+over the exception; a [[SyntaxError]] from a classic REPL statement
+carries the offending line, which is logged as the statement.
+Its file name is [[<stdin>]] when parsing failed and the statement's
+own name when compiling did.
+That text is only the line the error is on, so for a failing block
+the log keeps that line and not the ones before it.
 
 Two properties of audit hooks shape the code.
 A hook cannot be removed once added, so [[restore]] disarms it
@@ -2489,17 +2538,14 @@ instead.
 And an exception raised in a hook aborts the audited operation---here,
 the student's statement---so the hook swallows its own failures, the
 same rule as for every other wrapper around the student's program.
-The source registry, [[linecache._getlines_from_code]], is private;
-the installer uses this path only where it exists, so an interpreter
-that drops or renames it falls back to the history route rather than
-logging empty statements.
 
 <<functions>>=
 def _install_audit_repl_capture(iolog, source_lines):
     """Log classic-REPL statements from the `exec` audit event.
 
-    Returns a function that disarms the hook, since audit hooks cannot
-    be removed.
+    Returns `(flush, restore)`: `flush(exception)` logs a statement
+    that failed to compile, and `restore` disarms the hook, since
+    audit hooks cannot be removed.
     """
     armed = True
 
@@ -2513,24 +2559,19 @@ def _install_audit_repl_capture(iolog, source_lines):
         except Exception:
             pass
 
+    def flush(exception=None):
+        if not armed or not isinstance(exception, SyntaxError):
+            return
+        filename = exception.filename or ""
+        if filename == "<stdin>" or _is_classic_repl_statement(filename):
+            _log_repl_statement(iolog, exception.text)
+
     def restore():
         nonlocal armed
         armed = False
 
     sys.addaudithook(on_audit)
-    return restore
-
-
-def _is_classic_repl_statement(filename):
-    """True if `filename` names a statement typed at the classic REPL."""
-    prefix = CLASSIC_REPL_NAME_PREFIX
-    return (
-        filename.startswith(prefix)
-        and filename.endswith(">")
-        and filename[len(prefix):-1].isdigit()
-    )
-<<constants>>=
-CLASSIC_REPL_NAME_PREFIX = "<stdin-"
+    return flush, restore
 @
 
 A block typed at the classic REPL is ended by an empty line, and its
@@ -2538,7 +2579,7 @@ registered source keeps that line; [[_log_repl_statement]] writes it
 as a bare [[... ]] continuation, which is what the screen showed.
 
 \paragraph{Before 3.13: the readline history.}
-Older interpreters compile the classic REPL's statements under the
+Older interpreters compile every classic REPL statement under the
 plain name [[<stdin>]] and keep no source, so the audit event carries
 nothing we could log.
 They leave one other trace, on platforms with [[readline]]: once the
@@ -2602,7 +2643,7 @@ length stops growing, and this path goes quiet---losing statements
 rather than inventing them.
 
 <<flush the statements added since [[history_length]]>>=
-def flush():
+def flush(exception=None):
     nonlocal history_length
     try:
         current = readline_module.get_current_history_length()
@@ -2687,12 +2728,16 @@ control back to us between prompts: output writes, nested [[input()]]
 calls, unhandled exceptions, and exit cleanup.
 
 <<functions>>=
-def _flush_pending_repl_capture():
-    """Flush any deferred REPL capture state."""
+def _flush_pending_repl_capture(exception=None):
+    """Flush any deferred REPL capture state.
+
+    `exception` is the one about to be reported, if any, for a
+    capture route that learns of a statement only from its error.
+    """
     if repl_capture_flush is None:
         return
     try:
-        repl_capture_flush()
+        repl_capture_flush(exception)
     except Exception:
         pass
 
@@ -2795,14 +2840,15 @@ if pyrepl_readline is not None and simple_interact is not None:
     restorers.append(restore_pyrepl)
 @
 
-The audit route is chosen by the presence of the source registry it
-reads, the one thing it cannot work without.
+The audit route is chosen by version, for the reasons given with it.
 
 <<hook the classic frontend>>=
 flush = skip_input = None
-source_lines = getattr(linecache, "_getlines_from_code", None)
-if source_lines is not None:
-    restorers.append(_install_audit_repl_capture(iolog, source_lines))
+if sys.version_info >= INTERACTIVE_SOURCE_VERSION:
+    flush, restore_audit = _install_audit_repl_capture(
+        iolog, _interactive_source,
+    )
+    restorers.append(restore_audit)
 else:
     <<hook the classic frontend through [[readline]], if present>>
 @
@@ -4750,7 +4796,7 @@ class FakeReadline:
 def test_install_repl_capture_logs_inline_repl_events(monkeypatch):
     import learnlog
 
-    monkeypatch.delattr(linecache, "_getlines_from_code", raising=False)
+    monkeypatch.setattr(learnlog, "INTERACTIVE_SOURCE_VERSION", (99,))
 
     class FakePyreplWrapper:
         def input(self, prompt=""):
@@ -4805,9 +4851,9 @@ def test_install_repl_capture_prefers_the_audit_hook(monkeypatch):
 
     hooks = []
     monkeypatch.setattr(sys, "addaudithook", hooks.append)
+    monkeypatch.setattr(learnlog, "INTERACTIVE_SOURCE_VERSION", (0,))
     monkeypatch.setattr(
-        linecache, "_getlines_from_code",
-        lambda code: ["x = 5\n"], raising=False,
+        learnlog, "_interactive_source", lambda code: ["x = 5\n"],
     )
     readline = FakeReadline()
     log = learnlog.IOLog()
@@ -4819,7 +4865,7 @@ def test_install_repl_capture_prefers_the_audit_hook(monkeypatch):
 
     assert len(hooks) == 1
     assert "read_history_file" not in vars(readline)
-    assert (flush, skip_input) == (None, None)
+    assert skip_input is None
     hooks[0]("exec", (types.SimpleNamespace(co_filename="<stdin-0>"),))
     restore()
     hooks[0]("exec", (types.SimpleNamespace(co_filename="<stdin-1>"),))
@@ -4833,8 +4879,12 @@ nothing else, and must never raise into the statement it is watching.
 @pytest.mark.parametrize("filename,expected", [
     ("<stdin-0>", True),
     ("<stdin-12>", True),
+    ("<stdin>-0", True),
+    ("<stdin>-12", True),
     ("<stdin>", False),
     ("<stdin-x>", False),
+    ("<stdin>-", False),
+    ("<stdin>-1>", False),
     ("<python-input-0>", False),
     ("<string>", False),
     ("/home/x/stdin-0.py", False),
@@ -4890,6 +4940,63 @@ def test_audit_repl_capture_never_raises_into_the_statement(
     assert log.getvalue() == ""
 @
 
+A statement that fails to compile reaches the log through the flush
+the exception hook makes before reporting it: from the classic REPL,
+by either kind of name, but not a pyrepl statement's error (pyrepl has
+logged it already) and nothing that is not a [[SyntaxError]].
+
+<<test functions>>=
+def test_audit_repl_capture_logs_statements_that_do_not_compile(
+    monkeypatch,
+):
+    import learnlog
+
+    monkeypatch.setattr(sys, "addaudithook", lambda hook: None)
+    log = learnlog.IOLog()
+    flush, restore = learnlog._install_audit_repl_capture(
+        log, lambda code: [],
+    )
+
+    def syntax_error(text, filename):
+        error = SyntaxError("invalid syntax")
+        error.text, error.filename = text, filename
+        return error
+
+    flush()
+    flush(ValueError("x"))
+    flush(syntax_error("1 +\n", "<stdin>"))
+    flush(syntax_error("return\n", "<stdin>-3"))
+    flush(syntax_error("2 +\n", "<python-input-0>"))
+    restore()
+    flush(syntax_error("3 +\n", "<stdin>"))
+
+    assert log.getvalue() == "stdin: >>> 1 +\nstdin: >>> return\n"
+@
+
+Up to 3.13.2 the source is found by name, from 3.13.3 by code object;
+the lookup must find it in either place.
+
+<<test functions>>=
+def test_interactive_source_reads_either_registry(monkeypatch):
+    import learnlog
+
+    code = types.SimpleNamespace(co_filename="<stdin>-0")
+    monkeypatch.setattr(
+        linecache, "getlines",
+        lambda name, *rest: ["by name\n"] if name == "<stdin>-0" else [],
+    )
+    monkeypatch.setattr(
+        linecache, "_getlines_from_code", lambda code: [], raising=False,
+    )
+    assert learnlog._interactive_source(code) == ["by name\n"]
+
+    monkeypatch.setattr(
+        linecache, "_getlines_from_code",
+        lambda code: ["by code\n"], raising=False,
+    )
+    assert learnlog._interactive_source(code) == ["by code\n"]
+@
+
 Where no frontend can be reached, the installer hands back nothing at
 all.
 
@@ -4908,7 +5015,7 @@ def test_install_repl_capture_returns_no_hooks_without_support(
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    monkeypatch.delattr(linecache, "_getlines_from_code", raising=False)
+    monkeypatch.setattr(learnlog, "INTERACTIVE_SOURCE_VERSION", (99,))
 
     log = learnlog.IOLog()
     assert learnlog._install_repl_capture(
@@ -5027,7 +5134,7 @@ def test_repl_aware_stream_capture_flushes_pending_repl_history(
     monkeypatch.setattr(
         learnlog,
         "repl_capture_flush",
-        lambda: flushed.append("flushed"),
+        lambda exception=None: flushed.append("flushed"),
     )
 
     original = io.StringIO()
@@ -5043,6 +5150,7 @@ def test_repl_aware_stream_capture_flushes_pending_repl_history(
 
 
 \section{Exception handling}
+\label{sec:exceptions}
 
 We install a custom [[sys.excepthook]] to capture unhandled exceptions
 before the program terminates.
@@ -5060,7 +5168,7 @@ original_excepthook = sys.excepthook
 
 def exception_hook(exc_type, exc_value, exc_tb):
     global exception_info
-    _flush_pending_repl_capture()
+    _flush_pending_repl_capture(exc_value)
     exception_info = "".join(
         traceback.format_exception(
             exc_type, exc_value, exc_tb
@@ -7789,7 +7897,8 @@ They are loaded just before the first prompt and must not appear in
 the log, while every statement typed here must, the silent [[x = 5]]
 included.
 The [[input()]] reply must appear exactly once, although it lands in
-the [[readline]] history too.
+the [[readline]] history too, and [[1 +]], which never compiles, must
+be logged before the error it causes.
 
 The test runs twice, the second time with [[readline]] made
 unimportable by a [[readline.py]] on [[PYTHONPATH]] that raises
@@ -7837,6 +7946,7 @@ def test_autostart_captures_basic_repl_statements(
             "-x\n"
             "value = input()\n"
             "hej\n"
+            "1 +\n"
             "exit()\n"
         ),
     )
@@ -7852,9 +7962,12 @@ def test_autostart_captures_basic_repl_statements(
         "stdout: -5\n"
         "stdin: >>> value = input()\n"
         "stdin: hej\n"
-        "stdin: >>> exit()\n"
+        "stdin: >>> 1 +\n"
+        "stderr: "
     )
     assert expected in history
+    assert "SyntaxError" in history
+    assert "stdin: >>> exit()\n" in history
     assert history.count("hej") == 1
 @
 
