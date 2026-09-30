@@ -94,6 +94,7 @@ def workdir(tmp_path, monkeypatch):
 
 
 \section{The [[LearnlogRepo]] class}
+\label{sec:repo-constructor}
 
 The class needs four operations: running Git commands, initialising the
 repository, beginning a run (committing the code state and the run
@@ -126,6 +127,7 @@ class LearnlogRepo:
         self.run_script = None
         self.run_args = []
         self.run_commit = None
+        self.rebuilt = False
         self.init_repo()
 
     <<repo methods>>
@@ -151,6 +153,16 @@ three string literals.
 <<constants>>=
 GIT_DIR_NAME = ".learnlog"
 @
+
+One attribute says where the history came from rather than what it
+holds.
+[[rebuilt]] is true for a repository reconstructed from a ProgSnap2
+archive (\cref{sec:reconstruct}), whose commits are made afresh on
+every read, so their hashes mean nothing the next time.
+The playback cards need to know that before they print a hash to type
+later (\cref{sec:play-other-log}), and the repository is the one thing
+they have that knows it however the source was spelled---a path, a
+renamed file, or a link that was downloaded and is gone.
 
 
 \section{The environment Git runs in}
@@ -3946,6 +3958,139 @@ SOURCE_OPTIONS = ("-f", "--from")
 SOURCE_OPTION_PREFIX = "--from="
 @
 
+\paragraph{A source can be a link.}
+A lecturer who publishes a lecture's log puts it where students can
+reach it: a course web page or a Canvas file, which is a link to a
+bundle or a ProgSnap2 archive, or a Git host they pushed it to with
+[[learnlog push]].
+Downloading it by hand first, only to type its path, is a step the
+novice gets wrong in every way there is---the browser saves it under
+[[Downloads]], outside the project, or renames it [[lecture21(1).learnlog]].
+So a source may be a URL, and every reader of the option has to tell
+the two apart the same way.
+
+The test is on the spelling, because a URL cannot be looked at before
+it is fetched.
+Two groups of schemes count.
+[[http]] and [[https]] can serve either a file or a Git repository,
+and the fetcher (\cref{sec:resolve-remote}) tries both;
+[[ssh]], [[git]] and [[git+ssh]] only ever mean Git, and so does the
+form Git itself accepts without a scheme, [[git@github.com:user/repo]].
+That scp-like form is recognised only with its [[@]], so that a
+Windows path such as [[C:\Users\ada\lecture.learnlog]], a single
+letter and a colon, never reads as a host.
+A path that exists wins over every rule: whatever the student has on
+disk under that name is what they mean.
+The check is [[os.path.exists]] rather than [[pathlib.Path.exists]],
+because a link is not a path the file system has to like: a Canvas
+link's [[verifier=]] token can make one component longer than a file
+name may be, and before Python~3.12 [[pathlib]] raised on that where
+[[os.path]] answers [[False]].
+
+A [[file://]] URL is deliberately \emph{not} remote.
+It names a file on this machine, which the existing readers handle
+already, so [[local_source_path]] turns it back into a path, and every
+reader that wants a path from a source goes through it.
+The conversion is imported only when a [[file://]] URL is seen:
+[[urllib.request]], which holds it, pulls in the whole HTTP client,
+and this module is imported by every recorded run of a student
+program (\cref{sec:initialize}).
+
+<<functions>>=
+def is_remote_source(value):
+    """Whether the source `value` is a URL to fetch rather than a path."""
+    if value is None or os.path.exists(value):
+        return False
+    scheme = value.split("://", 1)[0].lower() if "://" in value else None
+    if scheme is not None:
+        return scheme in REMOTE_SCHEMES
+    return SCP_LIKE_REMOTE.match(value) is not None
+
+
+def local_source_path(value):
+    """The path the local source `value` names; `file://` URLs unwrapped."""
+    if value.lower().startswith(FILE_URL_PREFIX):
+        from urllib.parse import urlsplit
+        from urllib.request import url2pathname
+        return pathlib.Path(url2pathname(urlsplit(value).path))
+    return pathlib.Path(value)
+<<constants>>=
+REMOTE_SCHEMES = ("http", "https", "ssh", "git", "git+ssh")
+SCP_LIKE_REMOTE = re.compile(r"^[\w.+-]+@[\w.-]+:")
+FILE_URL_PREFIX = "file://"
+@
+
+Let's verify the spellings that are links and the ones that only look
+a little like them:
+
+<<test functions>>=
+def test_is_remote_source_tells_links_from_paths():
+    for value in (
+        "https://example.com/lecture21.learnlog",
+        "HTTP://example.com/x",
+        "ssh://git@example.com/course/lecture.git",
+        "git://example.com/lecture",
+        "git@github.com:teacher/lecture21.git",
+    ):
+        assert is_remote_source(value), value
+    for value in (
+        None, "lecture.learnlog", "./a", "../x/y.learnlog",
+        r"C:\Users\ada\lecture.learnlog", "C:/x/lecture.learnlog",
+        "file:///tmp/lecture.learnlog", "ftp://example.com/x",
+    ):
+        assert not is_remote_source(value), value
+
+def test_an_existing_path_is_never_remote(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "ada@host:notes").write_text("x")
+    assert not is_remote_source("ada@host:notes")
+    assert is_remote_source("https://example.com/f?t=" + "x" * 300)
+
+def test_local_source_path_unwraps_file_urls(tmp_path):
+    bundle = tmp_path / "lecture 21.learnlog"
+    assert local_source_path(bundle.as_uri()) == bundle
+    assert local_source_path("lecture.learnlog") \
+        == pathlib.Path("lecture.learnlog")
+@
+
+The commands that read a link are tested against a real web server,
+the standard library's, on a free port of this machine, so the tests
+need no network and exercise the same HTTP code a student's download
+does.
+The fixture is shared because two suites use it: the CLI's
+(\cref{sec:resolve-remote}) and the end-to-end suite, whose recorded
+playback of a link is the only place [[play --continue]] can be seen
+following one.
+It yields the directory served and the URL it is served at; whatever
+a test puts in the directory is then on the web.
+
+<<[[conftest.py]]>>=
+import functools
+import http.server
+import threading
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+@pytest.fixture
+def web_root(tmp_path):
+    """Serve a fresh directory over HTTP; yield `(directory, base_url)`."""
+    root = tmp_path / "web"
+    root.mkdir()
+    handler = functools.partial(QuietHandler, directory=str(root))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield root, f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+@
+
 The second function keeps the values that can be recorded at all.
 A relative name is resolved against the current directory, which is
 where the student typed it.
@@ -3956,20 +4101,26 @@ Each of those is left out silently rather than reported, because the
 caller records the run either way---a lecture the student keeps in
 their downloads folder is still a lecture they watched, only one the
 log cannot carry.
+A link is left out for the same reason, before it is taken for a
+relative path: what it points to is not in the project, and the
+recorded command line keeps the link itself, which is what a reader
+would follow.
 
 <<functions>>=
 def source_files(args, workdir):
     """Return the files under ``workdir`` that the sources in ``args`` name.
 
     Relative names are resolved against the current directory.
-    Directories, missing files, files outside ``workdir`` and files
-    under its Git directory are left out.
+    Directories, missing files, files outside ``workdir``, files
+    under its Git directory and URLs are left out.
     """
     workdir = pathlib.Path(workdir).resolve()
     git_dir = workdir / GIT_DIR_NAME
     found = []
     for value in source_arguments(args):
-        path = pathlib.Path(value).resolve()
+        if is_remote_source(value):
+            continue
+        path = local_source_path(value).resolve()
         if (
             path.is_file()
             and path.is_relative_to(workdir)
@@ -4006,6 +4157,11 @@ def test_source_files_keeps_only_recordable_files(
     assert source_files(["play", "-f", str(outside)], workdir) == []
     assert source_files(["play", "-f", "missing.learnlog"], workdir) \
         == []
+    assert source_files(
+        ["play", "-f", "https://example.com/lecture.learnlog"], workdir,
+    ) == []
+    assert source_files(["play", "-f", bundle.as_uri()], workdir) \
+        == [bundle.resolve()]
 @
 
 
