@@ -134,6 +134,15 @@ later needs a place to come back to---and to note a moment they want
 the code of, which the next step uses.
 The expert extra is what the log records: a review run in the
 learner's own log, with the lecture file in its snapshot.
+It also names the other way of giving the source, a link, together
+with what that costs in the log's terms---the link is recorded, not the
+lecture.
+The novice text leaves the link out on purpose.
+The first step's object of learning is that the file's place matters,
+and offering a way around the file in the same breath would give the
+novice two things varying at once.
+Where the link is used, the step's check still accepts it, as long as
+it ends in [[.learnlog]].
 
 <<shared step: play the lecture>>=
 # Play the lecture
@@ -166,6 +175,13 @@ The lecture file goes into that run's snapshot, even though
 `.learnlog` files are otherwise kept out of every snapshot so that a
 log never contains its own exports: a teacher reading your log later
 can open the lecture you watched.
+
+If your teacher gives you a link rather than a file, `-f` takes the
+link, as in `learnlog play -f https://example.com/lecture.learnlog`,
+here and in every later step.
+Your log then keeps only the link, in the command line it records: a
+teacher reading it later sees what you played only as long as the
+link still works.
 @
 
 \subsection{Find the lecture's parts}

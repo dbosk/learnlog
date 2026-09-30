@@ -75,8 +75,9 @@ import sys
 import datetime
 import zipfile
 import json
+import shutil
 import pytest
-from learnlog.gitrepo import LearnlogRepo
+from learnlog.gitrepo import LearnlogRepo, run_git
 
 <<test functions>>
 @
@@ -143,6 +144,8 @@ from learnlog.gitrepo import (
     GitNotFoundError,
     LearnlogRepo,
     git_environment,
+    is_remote_source,
+    local_source_path,
     parse_run_arguments,
     PROGSNAP2_SUFFIX,
     run_git,
@@ -286,9 +289,11 @@ def test_resolve_workdir_none_no_repo(tmp_path, monkeypatch):
 \section{Resolving the source}
 \label{sec:resolve-source}
 
-The [[play]], [[list]], and [[analyse]] commands accept an
+Every command that reads another log---[[play]], [[list]],
+[[checkout]], [[analyse]] and the [[metrics]] family---accepts an
 optional source that can be a directory (containing
-[[.learnlog/]]), a bundle file, or a ProgSnap2 zip.
+[[.learnlog/]]), a bundle file, a ProgSnap2 zip, or a link to one of
+the latter two or to a Git repository (\cref{sec:resolve-remote}).
 We need a single function that resolves any of these into a
 [[LearnlogRepo]] ready for querying.
 
@@ -311,7 +316,8 @@ def resolve_source(source=None):
     """Resolve a source into a ``(LearnlogRepo, tmpdir)`` pair.
 
     ``source`` can be ``None`` (search current directory),
-    a directory path, a ProgSnap2 zip file, or a bundle file.
+    a directory path, a ProgSnap2 zip file, a bundle file, or a
+    URL to a bundle, a ProgSnap2 zip or a Git repository.
     When a temporary repository is used, ``tmpdir`` is the
     temporary directory that should be cleaned up by the caller;
     otherwise it is ``None``.
@@ -325,7 +331,10 @@ def resolve_source(source=None):
             )
         return LearnlogRepo(workdir), None
 
-    path = pathlib.Path(source).resolve()
+    if is_remote_source(source):
+        return resolve_remote_source(source)
+
+    path = local_source_path(source).resolve()
 
     if path.is_dir():
         if not (path / ".learnlog").is_dir():
@@ -334,6 +343,16 @@ def resolve_source(source=None):
             )
         return LearnlogRepo(path), None
 
+    return resolve_source_file(path)
+@
+
+A file is read by its contents alone, which is what lets a downloaded
+file take the same road as one on disk: the download has no name
+worth trusting, and needs none.
+
+<<helper functions>>=
+def resolve_source_file(path):
+    """Resolve a bundle or ProgSnap2 file into `(LearnlogRepo, tmpdir)`."""
     if zipfile.is_zipfile(path):
         return read_progsnap2_as_repo(path)
 
@@ -358,25 +377,43 @@ everywhere else.
 <<resolve bundle file>>=
 if not path.is_file():
     raise SystemExit(f"Not a file or directory: {path}")
-
-verify = run_git(
-    ["bundle", "list-heads", str(path)],
-    capture_output=True, text=True, encoding="utf-8", errors="replace",
-)
-if verify.returncode != 0:
+if not is_bundle_file(path):
     raise SystemExit(
         f"Not a valid bundle file: {path}"
     )
-
-tmpdir = tempfile.mkdtemp(prefix="learnlog-play-")
-try:
-    <<clone the bundle into the temporary directory>>
-except BaseException:
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    raise
+return clone_as_repo(path)
+<<helper functions>>=
+def is_bundle_file(path):
+    """Whether Git can read `path` as a bundle."""
+    verify = run_git(
+        ["bundle", "list-heads", str(path)],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace",
+    )
+    return verify.returncode == 0
 @
 
-Ownership of that directory changes hands halfway through the branch,
+The clone is a function of its own because a bundle is not the only
+thing cloned this way: a link to a Git repository is cloned into a
+temporary directory for the same reasons (\cref{sec:resolve-remote}),
+and needs only a different environment---[[None]] inherits ours.
+
+<<helper functions>>=
+def clone_as_repo(location, env=None):
+    """Clone `location` into a temporary `(LearnlogRepo, tmpdir)` pair.
+
+    `location` is a bundle path or a Git URL.  A failing clone raises
+    `subprocess.CalledProcessError` with Git's message in `stderr`.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="learnlog-play-")
+    try:
+        <<clone the source into the temporary directory>>
+    except BaseException:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+@
+
+Ownership of that directory changes hands halfway through the function,
 and the guard exists to make the handover total.
 Once we return, the directory is the caller's---the return value says
 so---and the caller frees it in its own [[finally]].
@@ -404,12 +441,13 @@ And catching less would miss the case that actually happens:
 [[Ctrl-C]] is the one exit from here a person takes deliberately, and
 it is precisely the one [[except Exception]] is defined not to see.
 
-<<clone the bundle into the temporary directory>>=
+<<clone the source into the temporary directory>>=
 tmppath = pathlib.Path(tmpdir)
 
 run_git(
-    ["clone", str(path), str(tmppath / "repo")],
-    capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
+    ["clone", str(location), str(tmppath / "repo")],
+    capture_output=True, text=True, encoding="utf-8", errors="replace",
+    check=True, env=env,
 )
 
 cloned = tmppath / "repo"
@@ -549,6 +587,319 @@ def test_resolve_source_bundle_cleans_up_on_interrupt(
         cli.resolve_source(str(bundle_path))
 
     assert list(scratch.glob("learnlog-play-*")) == []
+@
+
+
+\subsection{Sources given as links}
+\label{sec:resolve-remote}
+
+A lecturer publishes a lecture's log where the students can reach it,
+and that is seldom their project folder: a course page or a Canvas
+file serving [[lecture21.learnlog]], or a Git host the log was pushed
+to.
+So [[-f]] takes a link as well as a path, with
+[[is_remote_source]] (\cref{sec:source-files}) deciding which one it
+was given.
+Nothing about a link survives the command but the link itself: the
+recorded command line keeps it as typed, and what was fetched is
+thrown away with the temporary repository.
+That is also the one privacy cost worth naming: a link with a token
+in it---Canvas's [[verifier=]]---goes into the student's log with the
+rest of the command line, and travels wherever the log does.
+
+A web link is ambiguous in a way a path is not.
+[[https://example.com/lecture21.learnlog]] serves a file, while
+[[https://github.com/teacher/lecture21]] is a Git repository whose web
+page is HTML, and the two are told apart only by what comes back.
+So a web link is downloaded first and read by content, exactly as a
+file on disk is (\cref{sec:resolve-source}); only when that yields
+no log---the server refused, or the page was a repository's front
+page---is the link handed to [[git clone]].
+The other order would cost more for the common case: a bundle on a
+web server is not a Git remote, and Git would first have to fail on
+it, possibly after asking for a password.
+An [[ssh]] or [[git]] link, or the scheme-less [[git@host:path]], can
+only mean a repository, and goes straight to the clone.
+
+<<helper functions>>=
+def resolve_remote_source(url):
+    """Resolve a link to a log into a `(LearnlogRepo, tmpdir)` pair.
+
+    A web link is downloaded and read as a bundle or ProgSnap2 file
+    if it is one, and cloned as a Git repository otherwise; other
+    links are cloned.
+    """
+    download_failure = None
+    if url.split("://", 1)[0].lower() in DOWNLOAD_SCHEMES:
+        <<read the download if it is a log>>
+    <<clone the link as a Git repository>>
+<<constants>>=
+DOWNLOAD_SCHEMES = ("http", "https")
+@
+
+The download goes into a scratch directory of its own and is deleted
+whether or not it was a log.
+It can be, because neither reader keeps the file: a bundle is cloned
+out of it, and a ProgSnap2 archive is rebuilt into a repository of its
+own (\cref{sec:reconstruct}), so the temporary directory the caller
+frees is theirs, and the download never has to be handed on.
+The failure is kept as a sentence rather than raised, because it is
+only half the story if the clone fails too.
+
+<<read the download if it is a log>>=
+scratch = tempfile.mkdtemp(prefix="learnlog-fetch-")
+try:
+    download = pathlib.Path(scratch) / "source"
+    try:
+        download_url(url, download)
+    except DOWNLOAD_ERRORS as error:
+        download_failure = describe_download_failure(error)
+    else:
+        if zipfile.is_zipfile(download) or is_bundle_file(download):
+            return resolve_source_file(download)
+        download_failure = (
+            "it is neither a learnlog bundle nor a ProgSnap2 archive"
+        )
+finally:
+    shutil.rmtree(scratch, ignore_errors=True)
+@
+
+The download itself is the standard library's: redirects are
+followed, which Canvas and cloud storage use for every file, and the
+body is streamed to disk rather than read into memory, since a whole
+course's bundle can be large.
+The timeout bounds each wait on the network, not the transfer, so a
+slow but moving download is never cut off.
+The request names learnlog as its client, because some servers refuse
+the default [[Python-urllib]] agent outright.
+
+<<helper functions>>=
+def download_url(url, path):
+    """Save what `url` serves to `path`."""
+    request = urllib.request.Request(
+        url, headers={"User-Agent": DOWNLOAD_USER_AGENT},
+    )
+    with urllib.request.urlopen(
+        request, timeout=DOWNLOAD_TIMEOUT,
+    ) as response, open(path, "wb") as file:
+        shutil.copyfileobj(response, file)
+<<constants>>=
+DOWNLOAD_USER_AGENT = "learnlog"
+DOWNLOAD_TIMEOUT = 60
+<<imports>>=
+import http.client
+import urllib.error
+import urllib.parse
+import urllib.request
+@
+
+What can go wrong on the way is spread over three exception families:
+[[OSError]] for the network (a refused connection, a timeout, and
+[[urllib.error.URLError]] with its [[HTTPError]] subclass),
+[[http.client.HTTPException]] for a connection dropped mid-body, and
+[[ValueError]] for a link [[urlopen]] cannot parse.
+A server's refusal is reported by its status, since [[404]] is what a
+lecturer's mistyped link produces and the student can pass it on as
+it stands; the rest by the reason the library gives.
+
+<<helper functions>>=
+def describe_download_failure(error):
+    """A phrase saying why a download failed, for an error message."""
+    if isinstance(error, urllib.error.HTTPError):
+        return f"the server answered {error.code} {error.reason}"
+    if isinstance(error, urllib.error.URLError):
+        return f"it could not be downloaded ({error.reason})"
+    return f"it could not be downloaded ({error})"
+<<constants>>=
+DOWNLOAD_ERRORS = (OSError, http.client.HTTPException, ValueError)
+@
+
+The clone runs with [[GIT_TERMINAL_PROMPT=0]].
+A web link that was not a log is not necessarily a repository either,
+and Git asked to clone a URL it gets no repository from answers with a
+username prompt---which, with the output captured, would hang the
+command on a question the student never sees.
+With terminal prompts off, Git fails instead; a credential helper,
+which is how a student who has signed in to their Git host
+authenticates, still answers.
+When the clone fails the message says what both attempts found, since
+either one could be the one the student needs to fix.
+
+<<clone the link as a Git repository>>=
+try:
+    return clone_as_repo(
+        url, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+except subprocess.CalledProcessError as error:
+    clone_failure = git_failure_line(error.stderr)
+if download_failure is None:
+    raise SystemExit(
+        f"Cannot read {url}: Git could not clone it "
+        f"({clone_failure})."
+    )
+raise SystemExit(
+    f"Cannot read {url}: {download_failure}, and Git could not "
+    f"clone it either ({clone_failure})."
+)
+@
+
+Git's message ends with the line that says what failed, after any
+progress and hints, so that is the one quoted.
+
+<<helper functions>>=
+def git_failure_line(stderr):
+    """The last non-blank line of Git's `stderr`, or a placeholder."""
+    lines = [line.strip() for line in (stderr or "").splitlines()]
+    lines = [line for line in lines if line]
+    return lines[-1] if lines else "no message from Git"
+@
+
+Let's verify each road with a web server of our own (the [[web_root]]
+fixture, \cref{sec:source-files}): a bundle and a ProgSnap2 archive
+are downloaded and read, the archive's repository says it was rebuilt,
+and nothing downloaded is left behind.
+The scratch directories are made in a [[tempfile.tempdir]] of the
+test's own, as in the interrupt test above, so that \enquote{left
+behind} is a statement about one directory.
+
+<<test functions>>=
+def make_lecture_log(workdir):
+    """A log with one run of `hello.py`, the way a lecturer has one."""
+    repo = LearnlogRepo(workdir)
+    repo.begin_run("hello.py", [], datetime.datetime(2026, 1, 1, 10, 0))
+    repo.finalize_run(
+        io_log="stdout: hello\n",
+        exception_info=None,
+        end_time=datetime.datetime(2026, 1, 1, 10, 0, 1),
+        exit_code=0,
+    )
+    return repo
+
+def test_resolve_source_reads_a_bundle_link(
+    workdir, web_root, monkeypatch, tmp_path_factory,
+):
+    import tempfile
+    from learnlog.cli import resolve_source
+    root, base = web_root
+    repo = make_lecture_log(workdir)
+    repo.git("bundle", "create", str(root / "lecture.learnlog"), "--all")
+    scratch = tmp_path_factory.mktemp("fetch-tmp")
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    resolved, tmpdir = resolve_source(f"{base}/lecture.learnlog")
+    try:
+        assert "hello.py" in resolved.git("log").stdout
+        assert not resolved.rebuilt
+    finally:
+        shutil.rmtree(tmpdir)
+    assert list(scratch.iterdir()) == []
+
+def test_resolve_source_reads_a_progsnap2_link(workdir, web_root):
+    from learnlog.cli import resolve_source
+    from learnlog.progsnap2 import do_export_progsnap2
+    root, base = web_root
+    do_export_progsnap2(make_lecture_log(workdir), root / "lecture.zip")
+
+    resolved, tmpdir = resolve_source(f"{base}/lecture.zip")
+    try:
+        assert "hello.py" in resolved.git("log").stdout
+        assert resolved.rebuilt
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+@
+
+A Git repository can be served by the same web server: Git's
+\enquote{dumb} HTTP protocol needs nothing but the files of a bare
+repository and the index [[git update-server-info]] writes.
+That lets the fallback be tested end to end without a Git host---the
+download returns the server's HTML listing of the directory, which is
+no log, and the clone then succeeds.
+
+<<test functions>>=
+def test_resolve_source_clones_a_repository_link(workdir, web_root):
+    from learnlog.cli import resolve_source
+    root, base = web_root
+    make_lecture_log(workdir)
+    bare = root / "lecture.git"
+    run_git(
+        ["clone", "--bare", str(workdir / ".learnlog"), str(bare)],
+        check=True, capture_output=True,
+    )
+    run_git(
+        ["--git-dir", str(bare), "update-server-info"],
+        check=True, capture_output=True,
+    )
+
+    resolved, tmpdir = resolve_source(f"{base}/lecture.git")
+    try:
+        assert "hello.py" in resolved.git("log").stdout
+    finally:
+        shutil.rmtree(tmpdir)
+@
+
+A link that leads nowhere is refused with the link and both reasons,
+and still leaves nothing behind:
+
+<<test functions>>=
+def test_resolve_source_refuses_a_broken_link(
+    workdir, web_root, monkeypatch, tmp_path_factory,
+):
+    import tempfile
+    from learnlog.cli import resolve_source
+    root, base = web_root
+    (root / "page.html").write_text("<html>not a log</html>")
+    scratch = tmp_path_factory.mktemp("fetch-tmp")
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    with pytest.raises(SystemExit, match="404") as missing:
+        resolve_source(f"{base}/missing.learnlog")
+    assert f"{base}/missing.learnlog" in str(missing.value)
+    with pytest.raises(SystemExit, match="neither a learnlog bundle"):
+        resolve_source(f"{base}/page.html")
+    assert list(scratch.iterdir()) == []
+@
+
+The promise is made to every command with [[-f]], so let's hold each of
+them to it on one published lecture ([[_lecture_bundle]],
+\cref{sec:play}): [[list]], [[play]], [[analyse]] and [[metrics]] read
+the link, the playback's cards name the link in their way back, and
+[[checkout]] copies into the folder the link names and records the
+link, not a file, in its record.
+
+<<test functions>>=
+def test_every_source_option_takes_a_link(
+    workdir, tmp_path, web_root, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    root, base = web_root
+    _, (first, second) = _lecture_bundle(
+        tmp_path, root, "lecture21.learnlog",
+    )
+    url = f"{base}/lecture21.learnlog"
+    repo = LearnlogRepo(workdir)
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+
+    for command in (
+        ["list"], ["analyse"], ["metrics", "time", "--period", "all"],
+    ):
+        result = runner.invoke(app, [*command, "-f", url])
+        assert result.exit_code == 0, (command, result.output)
+    result = runner.invoke(app, ["play", "-b", "--no-color", "-f", url])
+    assert result.exit_code == 0, result.output
+    assert f"learnlog checkout -f {url} " in result.output
+    assert "lecture21/" in result.output
+
+    result = runner.invoke(app, ["checkout", "-f", url, second[:7]])
+    assert result.exit_code == 0, result.output
+    assert (workdir / "lecture21" / "lecture.py").read_text() \
+        == 'print("part 1")\n'
+    assert repo.git(
+        "log", "-1", "--format=%s", f"{repo.recording_branch()}~1",
+    ).stdout.strip() == (
+        f"Run: learnlog checkout --from {url} {second[:7]}"
+    )
 @
 
 
@@ -4127,8 +4478,9 @@ def list_commits(
             "--from", "-f",
             help=(
                 "Source: directory with .learnlog/, "
-                "a ProgSnap2 zip, or a .learnlog bundle "
-                "file. Defaults to current directory."
+                "a ProgSnap2 zip, a .learnlog bundle "
+                "file, or a URL to a bundle, zip or Git "
+                "repository. Defaults to current directory."
             ),
         ),
     ] = None,
@@ -8334,7 +8686,8 @@ def checkout(
         "--from", "-f",
         help=(
             "Take the run from another log: a directory with "
-            ".learnlog/, a bundle, or a ProgSnap2 zip.  Its files "
+            ".learnlog/, a bundle, a ProgSnap2 zip, or a URL to a "
+            "bundle, zip or Git repository.  Its files "
             "are copied into your project over files of the same "
             "name; your other files stay."
         ),
@@ -8414,6 +8767,16 @@ project root explicitly.
 The name is the source's last path component with the export suffix
 gone, which serves a bundle, a ProgSnap2 archive and a directory
 alike.
+A link (\cref{sec:resolve-remote}) is named the same way from the
+last component of its path, unquoted and with [[.git]] gone as well,
+so [[https://example.com/c/lecture21.learnlog?dl=1]] and
+[[git@github.com:teacher/lecture21.git]] both give [[lecture21/]].
+When a link's path has nothing left to name---[[https://example.com/]]---the
+host names the folder instead, never [[.]], because a copy into the
+root that nobody asked for is the very thing the folder is there to
+prevent.
+A link can still name its folder badly: a Canvas file link ends in
+[[download]], and that is what [[-o]] is for.
 
 <<refuse option combinations that do not make sense>>=
 if restore and (source is not None or output is not None):
@@ -8444,11 +8807,30 @@ if source is not None:
 <<helper functions>>=
 def default_output(source):
     """The directory a copy from ``source`` goes into by default."""
-    name = pathlib.Path(source).resolve().name
-    for suffix in (BUNDLE_SUFFIX, PROGSNAP2_SUFFIX):
+    if is_remote_source(source):
+        host, path = remote_host_and_path(source)
+        name = urllib.parse.unquote(path.rstrip("/").rpartition("/")[2])
+        suffixes = (BUNDLE_SUFFIX, PROGSNAP2_SUFFIX, GIT_REPO_SUFFIX)
+        fallback = host
+    else:
+        name = local_source_path(source).resolve().name
+        suffixes = (BUNDLE_SUFFIX, PROGSNAP2_SUFFIX)
+        fallback = "."
+    for suffix in suffixes:
         if name.endswith(suffix):
             name = name[:-len(suffix)]
-    return name or "."
+    return name or fallback
+
+
+def remote_host_and_path(url):
+    """The host and the path of a link, scp-like `host:path` included."""
+    if "://" in url:
+        parts = urllib.parse.urlsplit(url)
+        return parts.hostname or "", parts.path
+    host, _, path = url.partition(":")
+    return host.rpartition("@")[2], path
+<<constants>>=
+GIT_REPO_SUFFIX = ".git"
 @
 
 The argument is whatever the student has to hand: the seven-character
@@ -9186,6 +9568,19 @@ def test_default_output_is_the_source_name_without_its_suffix():
     assert default_output("lecture21.learnlog") == "lecture21"
     assert default_output("/tmp/x/dataset.progsnap2") == "dataset"
     assert default_output("../lecture-dir") == "lecture-dir"
+
+def test_default_output_names_a_link_by_its_path():
+    from learnlog.cli import default_output
+    assert default_output(
+        "https://example.com/c/lecture21.learnlog?dl=1"
+    ) == "lecture21"
+    assert default_output(
+        "https://example.com/c/lecture%2021.progsnap2"
+    ) == "lecture 21"
+    assert default_output("git@github.com:teacher/lecture21.git") \
+        == "lecture21"
+    assert default_output("ssh://git@example.com/course/lab/") == "lab"
+    assert default_output("https://example.com/") == "example.com"
 @
 
 Let's verify the chooser on a history with two checkouts and edits
@@ -9471,8 +9866,9 @@ def play(
             "--from", "-f",
             help=(
                 "Source: directory with .learnlog/, "
-                "a ProgSnap2 zip, or a .learnlog bundle "
-                "file. Defaults to current directory."
+                "a ProgSnap2 zip, a .learnlog bundle "
+                "file, or a URL to a bundle, zip or Git "
+                "repository. Defaults to current directory."
             ),
         ),
     ] = None,
@@ -10054,6 +10450,10 @@ than the current directory, and a mismatch there costs at most a
 \enquote{nothing to continue}, never a wrong record.
 No [[-f]] means the project's own log, so a playback without one and
 [[-f .]] name the same log and match.
+A link (\cref{sec:resolve-remote}) is not relative to anything, and is
+compared as the text it is: resolving it as a path would glue it to a
+directory and make [[https://example.com/l.learnlog]] typed in the root
+and in a subfolder two different lectures.
 
 <<helper functions>>=
 def playback_source_argument(run):
@@ -10072,12 +10472,15 @@ def source_path(value, own, directory=None):
 
     A relative ``value`` is taken from ``directory``, a path relative
     to ``own``, when given, and from the current directory otherwise.
+    A link is returned as it is.
     """
     if value is None:
         return pathlib.Path(own).resolve()
+    if is_remote_source(value):
+        return value
     base = pathlib.Path.cwd() if directory is None \
         else pathlib.Path(own) / directory
-    return (base / value).resolve()
+    return (base / local_source_path(value)).resolve()
 @
 
 The bookmark is found before the source is resolved, because it may
@@ -10092,6 +10495,10 @@ were relative to where they were typed, and the name shown is that
 path relative to here, the way the student would type it now.
 The cards need the same kind of spelling for their closing command,
 and get theirs from [[typable_path]] (\cref{sec:play-other-log}).
+A recorded link needs none of this: it means the same from every
+directory, so it is handed on and shown as it was typed, and whether
+it still leads anywhere is for [[resolve_source]] to find out, which
+names the link when it does not.
 
 <<find the playback to continue>>=
 own = find_learnlog_dir()
@@ -10116,7 +10523,12 @@ if playback is None:
 viewed = playback["viewed"][-1][0]
 if source is None:
     recorded = playback_source_argument(playback)
-    if recorded is not None:
+    if recorded is not None and is_remote_source(recorded):
+        source = typed_source = recorded
+        typer.echo(
+            f"Continuing {recorded} where you left off.", err=True,
+        )
+    elif recorded is not None:
         played = source_path(recorded, own, playback["directory"])
         shown = os.path.relpath(played)
         if not played.exists():
@@ -10363,6 +10775,50 @@ def test_play_continue_reads_the_students_own_log_for_a_bundle(
     assert "lecture.learnlog, which you were playing" in result.output
 @
 
+A lecture played from a link is continued from the link: the recorded
+URL comes back as typed, from the root and from a subfolder alike, and
+a link that has stopped working is named in the refusal.
+
+<<test functions>>=
+def test_play_continue_follows_a_recorded_link(
+    workdir, tmp_path, web_root, monkeypatch,
+):
+    from learnlog.cli import app
+    from typer.testing import CliRunner
+    root, base = web_root
+    bundle, (first, second) = _lecture_bundle(tmp_path, root)
+    url = f"{base}/lecture.learnlog"
+    repo = LearnlogRepo(workdir)
+    t = datetime.datetime(2026, 1, 1, 10, 0)
+    (workdir / "sub").mkdir()
+    monkeypatch.chdir(workdir / "sub")
+    repo.begin_run("learnlog", ["play", "-f", url], t)
+    repo.finalize_run(
+        io_log="", exception_info=None,
+        end_time=t.replace(minute=1), exit_code=0,
+        view_trace=[(t.replace(second=1), second, "open")],
+    )
+    assert repo.git(
+        "ls-tree", "-r", "--name-only", repo.recording_branch(),
+    ).stdout.split() == ["hello.py"]
+    monkeypatch.chdir(workdir)
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["play", "-c", "-b", "--raw"])
+    assert result.exit_code == 0, result.output
+    assert f"Continuing {url} where you left off." in result.output
+    shown = re.findall(r"^commit ([0-9a-f]{40})$", result.output, re.M)
+    assert shown == [second]
+
+    result = runner.invoke(app, ["play", "-c", "-f", url, "-b"])
+    assert result.exit_code == 0, result.output
+
+    bundle.unlink()
+    result = runner.invoke(app, ["play", "-c", "-b"])
+    assert result.exit_code == 1
+    assert url in result.output and "404" in result.output
+@
+
 The other half of the rule: a bundle that carries its author's own
 playbacks lends none of them to a student who has not played it.
 
@@ -10480,11 +10936,18 @@ it, and that is also where the student will type the command.
 With no project of the student's own there is no folder, and the card
 drops the hint: [[checkout]] would refuse to run at all.
 
-The hash is stable unless the source is a ProgSnap2 archive, which
-[[resolve_source]] recognises the same way, with
-[[zipfile.is_zipfile]]: an archive is rebuilt with fresh commit dates
-on every read (\cref{sec:reconstruct}), so its hashes are new each
-time and only its tags carry over.
+The hash is stable unless the source is a ProgSnap2 archive: an
+archive is rebuilt with fresh commit dates on every read
+(\cref{sec:reconstruct}), so its hashes are new each time and only its
+tags carry over.
+The repository says so itself, in [[rebuilt]]
+(\cref{sec:repo-constructor}).
+Asking the file with [[zipfile.is_zipfile]], as this function once
+did, only works while the source is a file on disk: a ProgSnap2
+archive played from a link (\cref{sec:resolve-remote}) has been
+downloaded and deleted by the time the cards are drawn, and the link
+itself is no zip, so its cards promised hashes that the next read
+would not have.
 
 <<helper functions>>=
 def played_log(repo, typed, own):
@@ -10502,7 +10965,7 @@ def played_log(repo, typed, own):
     return OtherLog(
         source=typed,
         folder=None if own is None else default_output(typed),
-        stable=not zipfile.is_zipfile(pathlib.Path(typed).resolve()),
+        stable=not repo.rebuilt,
     )
 @
 
@@ -10800,8 +11263,9 @@ def analyse(
             "--from", "-f",
             help=(
                 "Source: ProgSnap2 zip file, "
-                "directory with .learnlog/, or a "
-                ".learnlog bundle file. "
+                "directory with .learnlog/, a "
+                ".learnlog bundle file, or a URL to a "
+                "zip, bundle or Git repository. "
                 "Defaults to current directory."
             ),
         ),
@@ -11475,8 +11939,9 @@ it keeps the help texts in one place.
 METRICS_SOURCE_OPTION = typer.Option(
     "--from", "-f",
     help=(
-        "Source: directory with .learnlog/, a ProgSnap2 zip, or "
-        "a .learnlog bundle file. Defaults to current directory."
+        "Source: directory with .learnlog/, a ProgSnap2 zip, a "
+        ".learnlog bundle file, or a URL to a bundle, zip or Git "
+        "repository. Defaults to current directory."
     ),
 )
 METRICS_PERIOD_OPTION = typer.Option(

@@ -2457,6 +2457,9 @@ exception, and merged I/O.
 The public entry point returns the reconstructed repository and
 the temporary directory that owns it.  The caller removes that
 directory after playback or listing finishes.
+The repository is marked [[rebuilt]] (\cref{sec:repo-constructor})
+because its hashes are this reconstruction's only, and a caller that
+shows one for later use has to know.
 
 Everything after [[mkdtemp]] therefore runs inside a guard, for the
 reasons spelled out where [[resolve_source]] does the same for
@@ -2502,6 +2505,7 @@ leak was reported in the first place.
 repo_path = pathlib.Path(tmpdir) / "repo"
 repo_path.mkdir()
 repo = LearnlogRepo(repo_path)
+repo.rebuilt = True
 subject_id = commit_groups[0]["events"][0].get(
     "SubjectID", "learnlog"
 ) or "learnlog"
